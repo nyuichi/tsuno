@@ -157,7 +157,7 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
                 }
             }
             StatementKind::StorageDead(local) => {
-                state.storage_dead(*local);
+                self.close_local(&mut state, *local, stmt.source_info.span)?;
             }
             StatementKind::Assign(assign) => {
                 let (place, rvalue) = &**assign;
@@ -195,7 +195,10 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
             .push(format!("bb{}:term", state.ctrl.basic_block.index()));
         match &term.kind {
             TerminatorKind::Goto { target } => Ok(vec![state.goto(*target)]),
-            TerminatorKind::Return => Ok(Vec::new()),
+            TerminatorKind::Return => {
+                self.close_live_mut_refs(&mut state, term.source_info.span)?;
+                Ok(Vec::new())
+            }
             TerminatorKind::SwitchInt { discr, targets } => {
                 self.step_switch(state, discr, targets, term.source_info.span)
             }
@@ -346,12 +349,24 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
                     _ => self.body.local_decls[place.local].ty,
                 };
                 let fresh = self.fresh_scalar_for_ty(&mut state, target_ty, "call_mut")?;
+                let fin = match state.store.get(&base_loc).cloned() {
+                    Some(SymVal::MutRef { fin, .. }) => fin,
+                    _ => {
+                        return Err(self.unsupported_result(
+                            span,
+                            Some(state.ctrl.basic_block.index()),
+                            None,
+                            "missing mutable reference argument".to_owned(),
+                            state.trace.clone(),
+                        ));
+                    }
+                };
                 state.store.insert(
                     base_loc,
                     SymVal::MutRef {
                         target: target_loc,
                         cur: fresh.clone(),
-                        fin: fresh.clone(),
+                        fin,
                     },
                 );
                 state.store.insert(target_loc, SymVal::Scalar(fresh));
@@ -1110,6 +1125,51 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
         }
         state
     }
+
+    fn close_live_mut_refs(
+        &self,
+        state: &mut State<'ctx>,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        let return_local = Local::from_usize(0);
+        let locals: Vec<_> = state
+            .env
+            .iter()
+            .filter_map(|(local, loc)| match state.store.get(loc) {
+                Some(SymVal::MutRef { .. }) if *local != return_local => Some(*local),
+                _ => None,
+            })
+            .collect();
+        for local in locals {
+            self.close_local(state, local, span)?;
+        }
+        Ok(())
+    }
+
+    fn close_local(
+        &self,
+        state: &mut State<'ctx>,
+        local: Local,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        let Some(loc) = state.env.remove(&local) else {
+            return Ok(());
+        };
+        let Some(value) = state.store.remove(&loc) else {
+            return Ok(());
+        };
+        let SymVal::MutRef { target, cur, fin } = value else {
+            return Ok(());
+        };
+        self.ensure_formula(
+            state,
+            cur.eq(&fin, self.z3)?,
+            span,
+            "mutable reference close failed".to_owned(),
+        )?;
+        state.store.insert(target, SymVal::Scalar(cur));
+        Ok(())
+    }
 }
 
 impl<'ctx> State<'ctx> {
@@ -1142,16 +1202,6 @@ impl<'ctx> State<'ctx> {
             statement_index: 0,
         };
         self
-    }
-
-    fn storage_dead(&mut self, local: Local) {
-        let Some(loc) = self.env.remove(&local) else {
-            return;
-        };
-        if let Some(SymVal::MutRef { target, fin, .. }) = self.store.remove(&loc) {
-            self.store.insert(target, SymVal::Scalar(fin));
-        }
-        self.store.remove(&loc);
     }
 }
 

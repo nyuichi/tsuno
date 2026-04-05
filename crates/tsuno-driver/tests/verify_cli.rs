@@ -138,6 +138,89 @@ fn main() {}
 }
 
 #[test]
+fn rejects_open_mutable_reference_after_abstract_call() {
+    let output = run_fixture(
+        r#"#![feature(stmt_expr_attributes, proc_macro_hygiene)]
+
+fn opaque(_: &mut i32) {}
+
+#[tsuno::verify]
+fn bad_close(mut x: i32) {
+    let r = &mut x;
+    opaque(r);
+}
+
+fn main() {}
+"#,
+    );
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("FAIL"));
+    assert!(stdout.contains("mutable reference close failed"));
+}
+
+#[test]
+fn allows_reestablishing_mutable_reference_after_abstract_call() {
+    let output = run_fixture(
+        r#"#![feature(stmt_expr_attributes, proc_macro_hygiene)]
+
+fn opaque(_: &mut i32) {}
+
+#[tsuno::verify]
+fn close_ok(mut x: i32) {
+    let r = &mut x;
+    opaque(r);
+    *r = 1;
+}
+
+fn main() {}
+"#,
+    );
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("PASS"));
+}
+
+#[test]
+fn rejects_open_mutable_reference_on_storage_dead() {
+    let output = run_fixture(
+        r#"#![feature(stmt_expr_attributes, proc_macro_hygiene)]
+
+fn opaque(_: &mut i32) {}
+
+#[tsuno::verify]
+fn bad_scope(mut x: i32) {
+    {
+        let r = &mut x;
+        opaque(r);
+    }
+}
+
+fn main() {}
+"#,
+    );
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("FAIL"));
+    assert!(stdout.contains("mutable reference close failed"));
+}
+
+#[test]
 fn verifies_checked_integer_arithmetic() {
     let output = run_fixture(
         r#"#![feature(stmt_expr_attributes, proc_macro_hygiene)]
