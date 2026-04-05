@@ -13,8 +13,8 @@ use rustc_span::source_map::Spanned;
 use z3::ast::{Bool, Int};
 use z3::{SatResult, Solver, set_global_param};
 
-use crate::diagnostic::{VerificationResult, VerificationStatus};
-use crate::loop_info::{LoopInfo, compute_loops};
+use crate::prepass::{LoopInfo, compute_loops};
+use crate::report::{VerificationResult, VerificationStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Loc(pub usize);

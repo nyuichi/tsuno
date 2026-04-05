@@ -6,8 +6,8 @@ use rustc_driver::{Callbacks, Compilation, run_compiler};
 use rustc_hir::ItemKind;
 use rustc_middle::ty::TyCtxt;
 
+use crate::engine::{Verifier, default_z3};
 use crate::report::append_result;
-use crate::symbolic::{Verifier, default_z3};
 
 pub const WRAPPER_ENV: &str = "TSUNO_WRAPPER_MODE";
 pub const REPORT_PATH_ENV: &str = "TSUNO_REPORT_PATH";

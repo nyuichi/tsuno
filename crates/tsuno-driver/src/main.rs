@@ -8,8 +8,7 @@ use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use tempfile::NamedTempFile;
 use tsuno_driver::cargo_api::CargoInvocation;
-use tsuno_driver::diagnostic::VerificationStatus;
-use tsuno_driver::report::load_results;
+use tsuno_driver::report::{VerificationStatus, load_results};
 use tsuno_driver::wrapper::{REPORT_PATH_ENV, WRAPPER_ENV, maybe_run_wrapper};
 
 #[derive(Parser)]
