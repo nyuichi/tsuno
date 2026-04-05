@@ -5,7 +5,7 @@ expression: snapshot_output(output)
 status: Some(1)
 stdout:
 UNSUPPORTED bad_loop
-  loop at bb1 requires #[tsuno::invariant(..)]
+  loop at bb1 requires invariant!(..)
   bb1
 
 stderr:

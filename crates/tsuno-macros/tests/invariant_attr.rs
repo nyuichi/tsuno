@@ -1,10 +1,10 @@
-#![feature(stmt_expr_attributes, proc_macro_hygiene)]
-
 #[test]
-fn loop_attribute_is_accepted() {
+fn loop_macro_is_accepted() {
+    use tsuno::invariant;
+
     let mut x = 0;
-    #[tsuno::invariant(x >= 0)]
     loop {
+        invariant!(x >= 0);
         x += 1;
         if x > 1 {
             break;
