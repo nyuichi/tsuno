@@ -1,4 +1,4 @@
-pub use tsuno_macros::{invariant, verify};
+pub use tsuno_macros::verify;
 
 #[doc(hidden)]
 pub fn __tsuno_verify() {}
@@ -8,6 +8,13 @@ pub fn __tsuno_assert(_value: bool) {}
 
 #[doc(hidden)]
 pub fn __tsuno_invariant(_value: bool) {}
+
+#[macro_export]
+macro_rules! invariant {
+    ($cond:expr $(,)?) => {{
+        $crate::__tsuno_invariant($cond);
+    }};
+}
 
 #[macro_export]
 macro_rules! assert {

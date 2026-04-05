@@ -124,7 +124,7 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
                     Some(header.index()),
                     None,
                     format!(
-                        "loop at bb{} requires #[tsuno::invariant(..)]",
+                        "loop at bb{} requires invariant!(..)",
                         loop_info.header.index()
                     ),
                     Vec::new(),
