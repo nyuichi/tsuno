@@ -1,25 +1,59 @@
 use std::fs;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
 use tempfile::tempdir;
 
-fn run_fixture(main_rs: &str) -> std::process::Output {
+fn fixture_file(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/verify_cli")
+        .join(format!("{name}.rs"))
+}
+
+fn fixture_names() -> Vec<String> {
+    let mut names = Vec::new();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/verify_cli");
+    for entry in fs::read_dir(dir).expect("read fixture dir") {
+        let entry = entry.expect("fixture entry");
+        if !entry.file_type().expect("fixture type").is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        names.push(
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("fixture stem")
+                .to_owned(),
+        );
+    }
+    names.sort();
+    names
+}
+
+fn run_fixture(name: &str) -> Output {
     let tmp = tempdir().expect("tempdir");
     let root = tmp.path();
+    let tsuno = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tsuno");
     fs::write(
         root.join("Cargo.toml"),
-        r#"[package]
+        format!(
+            r#"[package]
 name = "fixture"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tsuno = { path = "/Users/yuichi/tsuno/crates/tsuno" }
+tsuno = {{ path = "{}" }}
 "#,
+            tsuno.display()
+        ),
     )
     .expect("manifest");
     fs::create_dir(root.join("src")).expect("src dir");
-    fs::write(root.join("src/main.rs"), main_rs).expect("main");
+    fs::copy(fixture_file(name), root.join("src/main.rs")).expect("copy fixture");
 
     Command::new(env!("CARGO_BIN_EXE_tsuno-driver"))
         .args(["verify", "--manifest-path"])
@@ -28,248 +62,23 @@ tsuno = { path = "/Users/yuichi/tsuno/crates/tsuno" }
         .expect("driver output")
 }
 
-#[test]
-fn verifies_a_trivial_assertion_fixture() {
-    let output = run_fixture(
-        r#"#![feature(stmt_expr_attributes, proc_macro_hygiene)]
-
-#[tsuno::verify]
-fn ok(x: i32) {
-    tsuno::assert!(x == x);
-}
-
-fn main() {}
-"#,
-    );
-    assert!(
-        output.status.success(),
+fn snapshot_output(output: &Output) -> String {
+    format!(
         "status: {:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
+        output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("ok"));
-    assert!(stdout.contains("PASS"));
+    )
+}
+
+fn assert_cli_snapshot(name: &str, output: &Output) {
+    insta::assert_snapshot!(name, snapshot_output(output));
 }
 
 #[test]
-fn reports_failing_assertion() {
-    let output = run_fixture(
-        r#"#![feature(stmt_expr_attributes, proc_macro_hygiene)]
-
-#[tsuno::verify]
-fn bad(x: i32) {
-    tsuno::assert!(x == 0);
-}
-
-fn main() {}
-"#,
-    );
-    assert!(
-        !output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("FAIL"));
-    assert!(stdout.contains("bad"));
-}
-
-#[test]
-fn rejects_loops_without_invariants() {
-    let output = run_fixture(
-        r#"#![feature(stmt_expr_attributes, proc_macro_hygiene)]
-
-#[tsuno::verify]
-fn bad_loop(mut x: i32) {
-    loop {
-        if x > 0 {
-            break;
-        }
-        x = x + 1;
+fn verify_cli_fixtures() {
+    for name in fixture_names() {
+        let output = run_fixture(&name);
+        assert_cli_snapshot(&name, &output);
     }
-}
-
-fn main() {}
-"#,
-    );
-    assert!(
-        !output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("UNSUPPORTED"));
-    assert!(stdout.contains("requires #[tsuno::invariant(..)]"));
-}
-
-#[test]
-fn abstracts_mutable_reference_calls() {
-    let output = run_fixture(
-        r#"#![feature(stmt_expr_attributes, proc_macro_hygiene)]
-
-fn bump(x: &mut i32) -> i32 {
-    *x += 1;
-    *x
-}
-
-#[tsuno::verify]
-fn bad_after_call(mut x: i32) {
-    let r = &mut x;
-    let _ = bump(r);
-    tsuno::assert!(x == 0);
-}
-
-fn main() {}
-"#,
-    );
-    assert!(
-        !output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("FAIL"));
-    assert!(stdout.contains("bad_after_call"));
-}
-
-#[test]
-fn rejects_open_mutable_reference_after_abstract_call() {
-    let output = run_fixture(
-        r#"#![feature(stmt_expr_attributes, proc_macro_hygiene)]
-
-fn opaque(_: &mut i32) {}
-
-#[tsuno::verify]
-fn bad_close(mut x: i32) {
-    let r = &mut x;
-    opaque(r);
-}
-
-fn main() {}
-"#,
-    );
-    assert!(
-        !output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("FAIL"));
-    assert!(stdout.contains("mutable reference close failed"));
-}
-
-#[test]
-fn allows_reestablishing_mutable_reference_after_abstract_call() {
-    let output = run_fixture(
-        r#"#![feature(stmt_expr_attributes, proc_macro_hygiene)]
-
-fn opaque(_: &mut i32) {}
-
-#[tsuno::verify]
-fn close_ok(mut x: i32) {
-    let r = &mut x;
-    opaque(r);
-    *r = 1;
-}
-
-fn main() {}
-"#,
-    );
-    assert!(
-        output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("PASS"));
-}
-
-#[test]
-fn rejects_open_mutable_reference_on_storage_dead() {
-    let output = run_fixture(
-        r#"#![feature(stmt_expr_attributes, proc_macro_hygiene)]
-
-fn opaque(_: &mut i32) {}
-
-#[tsuno::verify]
-fn bad_scope(mut x: i32) {
-    {
-        let r = &mut x;
-        opaque(r);
-    }
-}
-
-fn main() {}
-"#,
-    );
-    assert!(
-        !output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("FAIL"));
-    assert!(stdout.contains("mutable reference close failed"));
-}
-
-#[test]
-fn verifies_checked_integer_arithmetic() {
-    let output = run_fixture(
-        r#"#![feature(stmt_expr_attributes, proc_macro_hygiene)]
-
-#[tsuno::verify]
-fn arithmetic() {
-    let y = 1_i32 + 1_i32;
-    tsuno::assert!(y == 2);
-}
-
-fn main() {}
-"#,
-    );
-    assert!(
-        output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("PASS"));
-}
-
-#[test]
-fn verifies_loop_invariant_on_simple_loop() {
-    let output = run_fixture(
-        r#"#![feature(stmt_expr_attributes, proc_macro_hygiene)]
-
-#[tsuno::verify]
-fn loop_ok() {
-    let mut x = 0_i32;
-    #[tsuno::invariant(x <= 10)]
-    loop {
-        if x >= 10 {
-            break;
-        }
-        x = x + 1;
-    }
-}
-
-fn main() {}
-"#,
-    );
-    assert!(
-        output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("PASS"));
 }

@@ -1,0 +1,11 @@
+---
+source: crates/tsuno-driver/tests/verify_cli.rs
+expression: snapshot_output(output)
+---
+status: Some(1)
+stdout:
+UNSUPPORTED bad_loop
+  loop at bb1 requires #[tsuno::invariant(..)]
+  bb1
+
+stderr:
