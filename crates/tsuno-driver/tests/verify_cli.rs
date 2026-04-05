@@ -1,21 +1,26 @@
 use std::fs;
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, Output};
 
 use tempfile::tempdir;
 
-fn run_fixture(main_rs: &str) -> std::process::Output {
+fn run_fixture(main_rs: &str) -> Output {
     let tmp = tempdir().expect("tempdir");
     let root = tmp.path();
+    let tsuno = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tsuno");
     fs::write(
         root.join("Cargo.toml"),
-        r#"[package]
+        format!(
+            r#"[package]
 name = "fixture"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tsuno = { path = "/Users/yuichi/tsuno/crates/tsuno" }
+tsuno = {{ path = "{}" }}
 "#,
+            tsuno.display()
+        ),
     )
     .expect("manifest");
     fs::create_dir(root.join("src")).expect("src dir");
@@ -26,6 +31,19 @@ tsuno = { path = "/Users/yuichi/tsuno/crates/tsuno" }
         .arg(root.join("Cargo.toml"))
         .output()
         .expect("driver output")
+}
+
+fn snapshot_output(output: &Output) -> String {
+    format!(
+        "status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+fn assert_cli_snapshot(name: &str, output: &Output) {
+    insta::assert_snapshot!(name, snapshot_output(output));
 }
 
 #[test]
@@ -41,16 +59,7 @@ fn ok(x: i32) {
 fn main() {}
 "#,
     );
-    assert!(
-        output.status.success(),
-        "status: {:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("ok"));
-    assert!(stdout.contains("PASS"));
+    assert_cli_snapshot("verifies_a_trivial_assertion_fixture", &output);
 }
 
 #[test]
@@ -66,15 +75,7 @@ fn bad(x: i32) {
 fn main() {}
 "#,
     );
-    assert!(
-        !output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("FAIL"));
-    assert!(stdout.contains("bad"));
+    assert_cli_snapshot("reports_failing_assertion", &output);
 }
 
 #[test]
@@ -95,15 +96,7 @@ fn bad_loop(mut x: i32) {
 fn main() {}
 "#,
     );
-    assert!(
-        !output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("UNSUPPORTED"));
-    assert!(stdout.contains("requires #[tsuno::invariant(..)]"));
+    assert_cli_snapshot("rejects_loops_without_invariants", &output);
 }
 
 #[test]
@@ -126,15 +119,7 @@ fn bad_after_call(mut x: i32) {
 fn main() {}
 "#,
     );
-    assert!(
-        !output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("FAIL"));
-    assert!(stdout.contains("bad_after_call"));
+    assert_cli_snapshot("abstracts_mutable_reference_calls", &output);
 }
 
 #[test]
@@ -153,15 +138,10 @@ fn bad_close(mut x: i32) {
 fn main() {}
 "#,
     );
-    assert!(
-        !output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    assert_cli_snapshot(
+        "rejects_open_mutable_reference_after_abstract_call",
+        &output,
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("FAIL"));
-    assert!(stdout.contains("mutable reference close failed"));
 }
 
 #[test]
@@ -181,14 +161,10 @@ fn close_ok(mut x: i32) {
 fn main() {}
 "#,
     );
-    assert!(
-        output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+    assert_cli_snapshot(
+        "allows_reestablishing_mutable_reference_after_abstract_call",
+        &output,
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("PASS"));
 }
 
 #[test]
@@ -209,15 +185,7 @@ fn bad_scope(mut x: i32) {
 fn main() {}
 "#,
     );
-    assert!(
-        !output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("FAIL"));
-    assert!(stdout.contains("mutable reference close failed"));
+    assert_cli_snapshot("rejects_open_mutable_reference_on_storage_dead", &output);
 }
 
 #[test]
@@ -234,14 +202,7 @@ fn arithmetic() {
 fn main() {}
 "#,
     );
-    assert!(
-        output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("PASS"));
+    assert_cli_snapshot("verifies_checked_integer_arithmetic", &output);
 }
 
 #[test]
@@ -264,12 +225,5 @@ fn loop_ok() {
 fn main() {}
 "#,
     );
-    assert!(
-        output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("PASS"));
+    assert_cli_snapshot("verifies_loop_invariant_on_simple_loop", &output);
 }

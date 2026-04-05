@@ -1,0 +1,10 @@
+---
+source: crates/tsuno-driver/tests/verify_cli.rs
+expression: snapshot_output(output)
+---
+status: Some(0)
+stdout:
+PASS close_ok
+  all assertions discharged
+
+stderr:
