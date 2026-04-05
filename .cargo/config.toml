@@ -1,0 +1,6 @@
+[env]
+Z3_SYS_Z3_HEADER = "/opt/homebrew/opt/z3/include/z3.h"
+BINDGEN_EXTRA_CLANG_ARGS = "-I/opt/homebrew/opt/z3/include"
+
+[build]
+rustflags = ["-L", "native=/opt/homebrew/opt/z3/lib"]
