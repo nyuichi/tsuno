@@ -5,7 +5,7 @@ expression: snapshot_output(output)
 status: Some(1)
 stdout:
 UNSUPPORTED bad_loop
-  loop at bb2 requires tsuno::inv!(..)
-  bb2
+  tsuno::inv! is only allowed at the start of a loop body
+  bb3
 
 stderr:

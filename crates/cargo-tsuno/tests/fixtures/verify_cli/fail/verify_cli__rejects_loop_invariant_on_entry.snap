@@ -7,7 +7,7 @@ status: Some(1)
 stdout:
 FAIL bad_loop
   loop invariant does not hold
-  bb5
-  model: [("model", "arg_10_4 -> 0\nlive_5_6 -> 0\nlive_10_18 -> 0\nlive_10_8 -> 0\narg_1_0 -> 0\nloop_havoc_13 -> 0\nloop_havoc_11 -> 0\narg_5_2 -> 0\nloop_havoc_12 -> true\n")]
+  bb6
+  model: [("model", "live_13_14 -> 0\narg_13_6 -> 0\nlive_5_8 -> 0\nlive_8_18 -> 0\nlive_13_22 -> 0\nlive_8_10 -> 0\narg_1_0 -> 0\narg_8_4 -> 0\narg_5_2 -> 0\n")]
 
 stderr:
