@@ -10,8 +10,8 @@ use rustc_middle::mir::{
 use rustc_middle::ty::{IntTy, TyCtxt, TyKind, UintTy};
 use rustc_span::Span;
 use rustc_span::source_map::Spanned;
-use z3::ast::{Ast, Bool, Int};
-use z3::{Config, Context as Z3Context, SatResult, Solver};
+use z3::ast::{Bool, Int};
+use z3::{SatResult, Solver, set_global_param};
 
 use crate::diagnostic::{VerificationResult, VerificationStatus};
 use crate::loop_info::{LoopInfo, compute_loops};
@@ -20,10 +20,10 @@ use crate::loop_info::{LoopInfo, compute_loops};
 pub struct Loc(pub usize);
 
 #[derive(Debug, Clone)]
-pub struct State<'ctx> {
+pub struct State {
     env: BTreeMap<Local, Loc>,
-    store: BTreeMap<Loc, SymVal<'ctx>>,
-    pc: Vec<Bool<'ctx>>,
+    store: BTreeMap<Loc, SymVal>,
+    pc: Vec<Bool>,
     ctrl: ControlPoint,
     next_loc: usize,
     next_sym: usize,
@@ -38,40 +38,33 @@ pub struct ControlPoint {
 }
 
 #[derive(Debug, Clone)]
-pub enum SymVal<'ctx> {
-    Scalar(TypedExpr<'ctx>),
-    Pair(TypedExpr<'ctx>, TypedExpr<'ctx>),
+pub enum SymVal {
+    Scalar(TypedExpr),
+    Pair(TypedExpr, TypedExpr),
     MutRef {
         target: Loc,
-        cur: TypedExpr<'ctx>,
-        fin: TypedExpr<'ctx>,
+        cur: TypedExpr,
+        fin: TypedExpr,
     },
 }
 
 #[derive(Debug, Clone)]
-pub enum TypedExpr<'ctx> {
-    Bool(Bool<'ctx>),
-    Int(Int<'ctx>),
+pub enum TypedExpr {
+    Bool(Bool),
+    Int(Int),
     Unit,
 }
 
-pub struct Verifier<'ctx, 'tcx> {
-    z3: &'ctx Z3Context,
+pub struct Verifier<'tcx> {
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     body: &'tcx Body<'tcx>,
     loops: HashMap<BasicBlock, LoopInfo>,
 }
 
-impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
-    pub fn new(
-        z3: &'ctx Z3Context,
-        tcx: TyCtxt<'tcx>,
-        def_id: LocalDefId,
-        body: &'tcx Body<'tcx>,
-    ) -> Self {
+impl<'tcx> Verifier<'tcx> {
+    pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &'tcx Body<'tcx>) -> Self {
         Self {
-            z3,
             tcx,
             def_id,
             body,
@@ -136,9 +129,9 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn step_statement(
         &self,
-        mut state: State<'ctx>,
+        mut state: State,
         stmt: &Statement<'tcx>,
-    ) -> Result<State<'ctx>, VerificationResult> {
+    ) -> Result<State, VerificationResult> {
         state.trace.push(format!(
             "bb{}:stmt{}",
             state.ctrl.basic_block.index(),
@@ -186,9 +179,9 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn step_terminator(
         &self,
-        state: State<'ctx>,
+        state: State,
         term: &Terminator<'tcx>,
-    ) -> Result<Vec<State<'ctx>>, VerificationResult> {
+    ) -> Result<Vec<State>, VerificationResult> {
         let mut state = state;
         state
             .trace
@@ -211,9 +204,9 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
             } => {
                 let cond = self.scalar_from_operand(&state, cond, term.source_info.span)?;
                 let formula = if *expected {
-                    cond.as_bool(self.z3)?
+                    cond.as_bool()?
                 } else {
-                    cond.as_bool(self.z3)?.not()
+                    cond.as_bool()?.not()
                 };
                 self.ensure_formula(
                     &state,
@@ -249,18 +242,18 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn step_switch(
         &self,
-        state: State<'ctx>,
+        state: State,
         discr: &Operand<'tcx>,
         targets: &rustc_middle::mir::SwitchTargets,
         span: Span,
-    ) -> Result<Vec<State<'ctx>>, VerificationResult> {
+    ) -> Result<Vec<State>, VerificationResult> {
         let discr = self.scalar_from_operand(&state, discr, span)?;
         let mut explicit = Vec::new();
         let mut next_states = Vec::new();
         for (value, target) in targets.iter() {
             let cond = match &discr {
-                TypedExpr::Bool(expr) => expr._eq(&Bool::from_bool(self.z3, value != 0)),
-                TypedExpr::Int(expr) => expr._eq(&Int::from_i64(self.z3, value as i64)),
+                TypedExpr::Bool(expr) => expr.eq(Bool::from_bool(value != 0)),
+                TypedExpr::Int(expr) => expr.eq(Int::from_i64(value as i64)),
                 TypedExpr::Unit => {
                     return Err(self.unsupported_result(
                         span,
@@ -281,9 +274,9 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
         let mut otherwise = state.goto(targets.otherwise());
         let negated: Vec<_> = explicit.iter().map(|cond| cond.not()).collect();
         otherwise.pc.push(if negated.is_empty() {
-            Bool::from_bool(self.z3, true)
+            Bool::from_bool(true)
         } else {
-            Bool::and(self.z3, &negated.iter().collect::<Vec<_>>())
+            Bool::and(&negated.iter().collect::<Vec<_>>())
         });
         if self.path_is_feasible(&otherwise) {
             next_states.push(otherwise);
@@ -293,13 +286,13 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn step_call(
         &self,
-        mut state: State<'ctx>,
+        mut state: State,
         func: &Operand<'tcx>,
         args: &[Spanned<Operand<'tcx>>],
         destination: Place<'tcx>,
         target: Option<BasicBlock>,
         span: Span,
-    ) -> Result<Vec<State<'ctx>>, VerificationResult> {
+    ) -> Result<Vec<State>, VerificationResult> {
         if self.is_marker(func, "__tsuno_verify") {
             let target = target.expect("verify marker should return");
             return Ok(vec![state.goto(target)]);
@@ -308,7 +301,7 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
             let cond = self.scalar_from_operand(&state, &args[0].node, span)?;
             self.ensure_formula(
                 &state,
-                cond.as_bool(self.z3)?,
+                cond.as_bool()?,
                 span,
                 "tsuno assertion failed".to_owned(),
             )?;
@@ -320,7 +313,7 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
             let header = state.ctrl.basic_block.index();
             self.ensure_formula(
                 &state,
-                cond.as_bool(self.z3)?,
+                cond.as_bool()?,
                 span,
                 "loop invariant does not hold".to_owned(),
             )?;
@@ -333,7 +326,7 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
                 next.assumed_loops.insert(header);
                 self.havoc_loop(&mut next, loop_info, span)?;
                 let assumed = self.scalar_from_operand(&next, &args[0].node, span)?;
-                next.pc.push(assumed.as_bool(self.z3)?);
+                next.pc.push(assumed.as_bool()?);
                 return Ok(vec![next]);
             }
             return Ok(vec![state.goto(target)]);
@@ -388,7 +381,7 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn havoc_loop(
         &self,
-        state: &mut State<'ctx>,
+        state: &mut State,
         loop_info: &LoopInfo,
         span: Span,
     ) -> Result<(), VerificationResult> {
@@ -435,7 +428,7 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn assign(
         &self,
-        state: &mut State<'ctx>,
+        state: &mut State,
         place: Place<'tcx>,
         rvalue: &Rvalue<'tcx>,
         span: Span,
@@ -487,51 +480,37 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn binary_value(
         &self,
-        state: &State<'ctx>,
+        state: &State,
         op: BinOp,
         lhs_operand: &Operand<'tcx>,
         rhs_operand: &Operand<'tcx>,
         span: Span,
-    ) -> Result<SymVal<'ctx>, VerificationResult> {
+    ) -> Result<SymVal, VerificationResult> {
         let lhs_ty = self.operand_ty(lhs_operand, span, state)?;
         let lhs = self.scalar_from_operand(state, lhs_operand, span)?;
         let rhs = self.scalar_from_operand(state, rhs_operand, span)?;
         let value = match op {
-            BinOp::Add => {
-                SymVal::Scalar(TypedExpr::Int(lhs.as_int(self.z3)? + rhs.as_int(self.z3)?))
-            }
-            BinOp::Sub => {
-                SymVal::Scalar(TypedExpr::Int(lhs.as_int(self.z3)? - rhs.as_int(self.z3)?))
-            }
-            BinOp::Mul => {
-                SymVal::Scalar(TypedExpr::Int(lhs.as_int(self.z3)? * rhs.as_int(self.z3)?))
-            }
-            BinOp::Eq => SymVal::Scalar(TypedExpr::Bool(lhs.eq(&rhs, self.z3)?)),
-            BinOp::Ne => SymVal::Scalar(TypedExpr::Bool(lhs.eq(&rhs, self.z3)?.not())),
-            BinOp::Gt => SymVal::Scalar(TypedExpr::Bool(
-                lhs.as_int(self.z3)?.gt(&rhs.as_int(self.z3)?),
-            )),
-            BinOp::Ge => SymVal::Scalar(TypedExpr::Bool(
-                lhs.as_int(self.z3)?.ge(&rhs.as_int(self.z3)?),
-            )),
-            BinOp::Lt => SymVal::Scalar(TypedExpr::Bool(
-                lhs.as_int(self.z3)?.lt(&rhs.as_int(self.z3)?),
-            )),
-            BinOp::Le => SymVal::Scalar(TypedExpr::Bool(
-                lhs.as_int(self.z3)?.le(&rhs.as_int(self.z3)?),
-            )),
+            BinOp::Add => SymVal::Scalar(TypedExpr::Int(lhs.as_int()? + rhs.as_int()?)),
+            BinOp::Sub => SymVal::Scalar(TypedExpr::Int(lhs.as_int()? - rhs.as_int()?)),
+            BinOp::Mul => SymVal::Scalar(TypedExpr::Int(lhs.as_int()? * rhs.as_int()?)),
+            BinOp::Eq => SymVal::Scalar(TypedExpr::Bool(lhs.eq(&rhs)?)),
+            BinOp::Ne => SymVal::Scalar(TypedExpr::Bool(lhs.eq(&rhs)?.not())),
+            BinOp::Gt => SymVal::Scalar(TypedExpr::Bool(lhs.as_int()?.gt(&rhs.as_int()?))),
+            BinOp::Ge => SymVal::Scalar(TypedExpr::Bool(lhs.as_int()?.ge(&rhs.as_int()?))),
+            BinOp::Lt => SymVal::Scalar(TypedExpr::Bool(lhs.as_int()?.lt(&rhs.as_int()?))),
+            BinOp::Le => SymVal::Scalar(TypedExpr::Bool(lhs.as_int()?.le(&rhs.as_int()?))),
             BinOp::AddWithOverflow => {
-                let result = lhs.as_int(self.z3)? + rhs.as_int(self.z3)?;
+                let result = lhs.as_int()? + rhs.as_int()?;
                 let overflow = self.overflow_formula(&result, lhs_ty, span, state)?;
                 SymVal::Pair(TypedExpr::Int(result), TypedExpr::Bool(overflow))
             }
             BinOp::SubWithOverflow => {
-                let result = lhs.as_int(self.z3)? - rhs.as_int(self.z3)?;
+                let result = lhs.as_int()? - rhs.as_int()?;
                 let overflow = self.overflow_formula(&result, lhs_ty, span, state)?;
                 SymVal::Pair(TypedExpr::Int(result), TypedExpr::Bool(overflow))
             }
             BinOp::MulWithOverflow => {
-                let result = lhs.as_int(self.z3)? * rhs.as_int(self.z3)?;
+                let result = lhs.as_int()? * rhs.as_int()?;
                 let overflow = self.overflow_formula(&result, lhs_ty, span, state)?;
                 SymVal::Pair(TypedExpr::Int(result), TypedExpr::Bool(overflow))
             }
@@ -550,15 +529,15 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn unary_value(
         &self,
-        state: &State<'ctx>,
+        state: &State,
         op: UnOp,
         operand: &Operand<'tcx>,
         span: Span,
-    ) -> Result<TypedExpr<'ctx>, VerificationResult> {
+    ) -> Result<TypedExpr, VerificationResult> {
         let value = self.scalar_from_operand(state, operand, span)?;
         match op {
-            UnOp::Not => Ok(TypedExpr::Bool(value.as_bool(self.z3)?.not())),
-            UnOp::Neg => Ok(TypedExpr::Int(-value.as_int(self.z3)?)),
+            UnOp::Not => Ok(TypedExpr::Bool(value.as_bool()?.not())),
+            UnOp::Neg => Ok(TypedExpr::Int(-value.as_int()?)),
             other => Err(self.unsupported_result(
                 span,
                 Some(state.ctrl.basic_block.index()),
@@ -571,10 +550,10 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn operand_to_symval(
         &self,
-        state: &State<'ctx>,
+        state: &State,
         operand: &Operand<'tcx>,
         span: Span,
-    ) -> Result<SymVal<'ctx>, VerificationResult> {
+    ) -> Result<SymVal, VerificationResult> {
         match operand {
             Operand::Copy(place) | Operand::Move(place) => self.read_place(state, *place, span),
             Operand::Constant(constant) => self.constant_to_symval(constant, span),
@@ -583,10 +562,10 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn scalar_from_operand(
         &self,
-        state: &State<'ctx>,
+        state: &State,
         operand: &Operand<'tcx>,
         span: Span,
-    ) -> Result<TypedExpr<'ctx>, VerificationResult> {
+    ) -> Result<TypedExpr, VerificationResult> {
         match self.operand_to_symval(state, operand, span)? {
             SymVal::Scalar(expr) => Ok(expr),
             SymVal::MutRef { cur, .. } => Ok(cur),
@@ -602,10 +581,10 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn scalar_from_place(
         &self,
-        state: &State<'ctx>,
+        state: &State,
         place: Place<'tcx>,
         span: Span,
-    ) -> Result<TypedExpr<'ctx>, VerificationResult> {
+    ) -> Result<TypedExpr, VerificationResult> {
         match self.read_place(state, place, span)? {
             SymVal::Scalar(expr) => Ok(expr),
             SymVal::MutRef { cur, .. } => Ok(cur),
@@ -621,10 +600,10 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn read_place(
         &self,
-        state: &State<'ctx>,
+        state: &State,
         place: Place<'tcx>,
         span: Span,
-    ) -> Result<SymVal<'ctx>, VerificationResult> {
+    ) -> Result<SymVal, VerificationResult> {
         if let Some(local) = place.as_local() {
             let loc = state.env.get(&local).copied().ok_or_else(|| {
                 self.unsupported_result(
@@ -722,9 +701,9 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn write_place(
         &self,
-        state: &mut State<'ctx>,
+        state: &mut State,
         place: Place<'tcx>,
-        value: SymVal<'ctx>,
+        value: SymVal,
         span: Span,
     ) -> Result<(), VerificationResult> {
         if let Some(local) = place.as_local() {
@@ -795,7 +774,7 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn place_loc(
         &self,
-        state: &State<'ctx>,
+        state: &State,
         place: Place<'tcx>,
         span: Span,
     ) -> Result<Loc, VerificationResult> {
@@ -833,7 +812,7 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
         }
     }
 
-    fn mut_ref_targets(&self, state: &State<'ctx>, place: Place<'tcx>) -> Option<(Loc, Loc)> {
+    fn mut_ref_targets(&self, state: &State, place: Place<'tcx>) -> Option<(Loc, Loc)> {
         let local = place.as_local()?;
         let base_loc = state.env.get(&local).copied()?;
         match state.store.get(&base_loc) {
@@ -846,14 +825,12 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
         &self,
         constant: &ConstOperand<'tcx>,
         span: Span,
-    ) -> Result<SymVal<'ctx>, VerificationResult> {
+    ) -> Result<SymVal, VerificationResult> {
         let ty = constant.const_.ty();
         match ty.kind() {
             TyKind::Bool => {
                 let value = constant.const_.try_to_bool().unwrap_or(false);
-                Ok(SymVal::Scalar(TypedExpr::Bool(Bool::from_bool(
-                    self.z3, value,
-                ))))
+                Ok(SymVal::Scalar(TypedExpr::Bool(Bool::from_bool(value))))
             }
             TyKind::Int(_) | TyKind::Uint(_) => {
                 let scalar = constant.const_.try_to_scalar_int().ok_or_else(|| {
@@ -866,9 +843,9 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
                     )
                 })?;
                 let expr = if matches!(ty.kind(), TyKind::Int(_)) {
-                    Int::from_i64(self.z3, scalar.to_int(scalar.size()) as i64)
+                    Int::from_i64(scalar.to_int(scalar.size()) as i64)
                 } else {
-                    Int::from_u64(self.z3, scalar.to_uint(scalar.size()) as u64)
+                    Int::from_u64(scalar.to_uint(scalar.size()) as u64)
                 };
                 Ok(SymVal::Scalar(TypedExpr::Int(expr)))
             }
@@ -892,17 +869,17 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn fresh_symval_for_ty(
         &self,
-        state: &mut State<'ctx>,
+        state: &mut State,
         ty: rustc_middle::ty::Ty<'tcx>,
         prefix: &str,
-    ) -> Result<SymVal<'ctx>, VerificationResult> {
+    ) -> Result<SymVal, VerificationResult> {
         match ty.kind() {
             TyKind::Bool => Ok(SymVal::Scalar(TypedExpr::Bool(
                 self.fresh_bool(state, prefix),
             ))),
             TyKind::Int(_) | TyKind::Uint(_) => {
                 let expr = self.fresh_int(state, prefix);
-                if let Some(bounds) = int_range_constraint(self.z3, &expr, self.tcx, ty) {
+                if let Some(bounds) = int_range_constraint(&expr, self.tcx, ty) {
                     state.pc.push(bounds);
                 }
                 Ok(SymVal::Scalar(TypedExpr::Int(expr)))
@@ -950,10 +927,10 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn fresh_scalar_for_ty(
         &self,
-        state: &mut State<'ctx>,
+        state: &mut State,
         ty: rustc_middle::ty::Ty<'tcx>,
         prefix: &str,
-    ) -> Result<TypedExpr<'ctx>, VerificationResult> {
+    ) -> Result<TypedExpr, VerificationResult> {
         match self.fresh_symval_for_ty(state, ty, prefix)? {
             SymVal::Scalar(expr) => Ok(expr),
             _ => Err(self.unsupported_result(
@@ -966,20 +943,20 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
         }
     }
 
-    fn fresh_bool(&self, state: &mut State<'ctx>, prefix: &str) -> Bool<'ctx> {
+    fn fresh_bool(&self, state: &mut State, prefix: &str) -> Bool {
         let name = format!("{prefix}_{}", state.next_sym);
         state.next_sym += 1;
-        Bool::new_const(self.z3, name)
+        Bool::new_const(name)
     }
 
-    fn fresh_int(&self, state: &mut State<'ctx>, prefix: &str) -> Int<'ctx> {
+    fn fresh_int(&self, state: &mut State, prefix: &str) -> Int {
         let name = format!("{prefix}_{}", state.next_sym);
         state.next_sym += 1;
-        Int::new_const(self.z3, name)
+        Int::new_const(name)
     }
 
-    fn path_is_feasible(&self, state: &State<'ctx>) -> bool {
-        let solver = Solver::new(self.z3);
+    fn path_is_feasible(&self, state: &State) -> bool {
+        let solver = Solver::new();
         for cond in &state.pc {
             solver.assert(cond);
         }
@@ -988,16 +965,16 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn ensure_formula(
         &self,
-        state: &State<'ctx>,
-        formula: Bool<'ctx>,
+        state: &State,
+        formula: Bool,
         span: Span,
         message: String,
     ) -> Result<(), VerificationResult> {
-        let solver = Solver::new(self.z3);
+        let solver = Solver::new();
         for cond in &state.pc {
             solver.assert(cond);
         }
-        solver.assert(&formula.not());
+        solver.assert(formula.not());
         if solver.check() == SatResult::Sat {
             let model = solver
                 .get_model()
@@ -1032,7 +1009,7 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
         &self,
         operand: &Operand<'tcx>,
         span: Span,
-        state: &State<'ctx>,
+        state: &State,
     ) -> Result<rustc_middle::ty::Ty<'tcx>, VerificationResult> {
         match operand {
             Operand::Copy(place) | Operand::Move(place) => Ok(self.place_ty(*place)),
@@ -1054,21 +1031,21 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn overflow_formula(
         &self,
-        result: &Int<'ctx>,
+        result: &Int,
         ty: rustc_middle::ty::Ty<'tcx>,
         span: Span,
-        state: &State<'ctx>,
-    ) -> Result<Bool<'ctx>, VerificationResult> {
+        state: &State,
+    ) -> Result<Bool, VerificationResult> {
         match int_bounds(self.tcx, ty) {
             Some(IntBounds::Signed { min, max }) => {
-                let low = result.lt(&Int::from_i64(self.z3, min));
-                let high = result.gt(&Int::from_i64(self.z3, max));
-                Ok(Bool::or(self.z3, &[&low, &high]))
+                let low = result.lt(Int::from_i64(min));
+                let high = result.gt(Int::from_i64(max));
+                Ok(Bool::or(&[&low, &high]))
             }
             Some(IntBounds::Unsigned { max }) => {
-                let low = result.lt(&Int::from_i64(self.z3, 0));
-                let high = result.gt(&Int::from_u64(self.z3, max));
-                Ok(Bool::or(self.z3, &[&low, &high]))
+                let low = result.lt(Int::from_i64(0));
+                let high = result.gt(Int::from_u64(max));
+                Ok(Bool::or(&[&low, &high]))
             }
             None => Err(self.unsupported_result(
                 span,
@@ -1113,7 +1090,7 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
         }
     }
 
-    fn initial_state(&self) -> State<'ctx> {
+    fn initial_state(&self) -> State {
         let mut state = State::empty();
         for local in std::iter::once(Local::from_usize(0)).chain(self.body.args_iter()) {
             let ty = self.body.local_decls[local].ty;
@@ -1126,11 +1103,7 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
         state
     }
 
-    fn close_live_mut_refs(
-        &self,
-        state: &mut State<'ctx>,
-        span: Span,
-    ) -> Result<(), VerificationResult> {
+    fn close_live_mut_refs(&self, state: &mut State, span: Span) -> Result<(), VerificationResult> {
         let return_local = Local::from_usize(0);
         let locals: Vec<_> = state
             .env
@@ -1148,7 +1121,7 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
 
     fn close_local(
         &self,
-        state: &mut State<'ctx>,
+        state: &mut State,
         local: Local,
         span: Span,
     ) -> Result<(), VerificationResult> {
@@ -1163,7 +1136,7 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
         };
         self.ensure_formula(
             state,
-            cur.eq(&fin, self.z3)?,
+            cur.eq(&fin)?,
             span,
             "mutable reference close failed".to_owned(),
         )?;
@@ -1172,7 +1145,7 @@ impl<'ctx, 'tcx> Verifier<'ctx, 'tcx> {
     }
 }
 
-impl<'ctx> State<'ctx> {
+impl State {
     fn empty() -> Self {
         Self {
             env: BTreeMap::new(),
@@ -1189,7 +1162,7 @@ impl<'ctx> State<'ctx> {
         }
     }
 
-    fn alloc(&mut self, value: SymVal<'ctx>) -> Loc {
+    fn alloc(&mut self, value: SymVal) -> Loc {
         let loc = Loc(self.next_loc);
         self.next_loc += 1;
         self.store.insert(loc, value);
@@ -1205,11 +1178,11 @@ impl<'ctx> State<'ctx> {
     }
 }
 
-impl<'ctx> TypedExpr<'ctx> {
-    fn as_bool(&self, z3: &'ctx Z3Context) -> Result<Bool<'ctx>, VerificationResult> {
+impl TypedExpr {
+    fn as_bool(&self) -> Result<Bool, VerificationResult> {
         match self {
             TypedExpr::Bool(expr) => Ok(expr.clone()),
-            TypedExpr::Unit => Ok(Bool::from_bool(z3, true)),
+            TypedExpr::Unit => Ok(Bool::from_bool(true)),
             TypedExpr::Int(_) => Err(VerificationResult {
                 function: String::new(),
                 status: VerificationStatus::Unsupported,
@@ -1223,7 +1196,7 @@ impl<'ctx> TypedExpr<'ctx> {
         }
     }
 
-    fn as_int(&self, _z3: &'ctx Z3Context) -> Result<Int<'ctx>, VerificationResult> {
+    fn as_int(&self) -> Result<Int, VerificationResult> {
         match self {
             TypedExpr::Int(expr) => Ok(expr.clone()),
             _ => Err(VerificationResult {
@@ -1239,11 +1212,11 @@ impl<'ctx> TypedExpr<'ctx> {
         }
     }
 
-    fn eq(&self, rhs: &Self, z3: &'ctx Z3Context) -> Result<Bool<'ctx>, VerificationResult> {
+    fn eq(&self, rhs: &Self) -> Result<Bool, VerificationResult> {
         match (self, rhs) {
-            (TypedExpr::Bool(lhs), TypedExpr::Bool(rhs)) => Ok(lhs._eq(rhs)),
-            (TypedExpr::Int(lhs), TypedExpr::Int(rhs)) => Ok(lhs._eq(rhs)),
-            (TypedExpr::Unit, TypedExpr::Unit) => Ok(Bool::from_bool(z3, true)),
+            (TypedExpr::Bool(lhs), TypedExpr::Bool(rhs)) => Ok(lhs.eq(rhs)),
+            (TypedExpr::Int(lhs), TypedExpr::Int(rhs)) => Ok(lhs.eq(rhs)),
+            (TypedExpr::Unit, TypedExpr::Unit) => Ok(Bool::from_bool(true)),
             _ => Err(VerificationResult {
                 function: String::new(),
                 status: VerificationStatus::Unsupported,
@@ -1272,10 +1245,8 @@ fn span_text(tcx: TyCtxt<'_>, span: Span) -> String {
     tcx.sess.source_map().span_to_diagnostic_string(span)
 }
 
-pub fn default_z3() -> Config {
-    let mut cfg = Config::new();
-    cfg.set_model_generation(true);
-    cfg
+pub fn default_z3() {
+    set_global_param("model", "true");
 }
 
 enum IntBounds {
@@ -1326,22 +1297,17 @@ fn int_bounds(tcx: TyCtxt<'_>, ty: rustc_middle::ty::Ty<'_>) -> Option<IntBounds
     }
 }
 
-fn int_range_constraint<'ctx>(
-    z3: &'ctx Z3Context,
-    expr: &Int<'ctx>,
-    tcx: TyCtxt<'_>,
-    ty: rustc_middle::ty::Ty<'_>,
-) -> Option<Bool<'ctx>> {
+fn int_range_constraint(expr: &Int, tcx: TyCtxt<'_>, ty: rustc_middle::ty::Ty<'_>) -> Option<Bool> {
     match int_bounds(tcx, ty)? {
         IntBounds::Signed { min, max } => {
-            let low = expr.ge(&Int::from_i64(z3, min));
-            let high = expr.le(&Int::from_i64(z3, max));
-            Some(Bool::and(z3, &[&low, &high]))
+            let low = expr.ge(Int::from_i64(min));
+            let high = expr.le(Int::from_i64(max));
+            Some(Bool::and(&[&low, &high]))
         }
         IntBounds::Unsigned { max } => {
-            let low = expr.ge(&Int::from_i64(z3, 0));
-            let high = expr.le(&Int::from_u64(z3, max));
-            Some(Bool::and(z3, &[&low, &high]))
+            let low = expr.ge(Int::from_i64(0));
+            let high = expr.le(Int::from_u64(max));
+            Some(Bool::and(&[&low, &high]))
         }
     }
 }
