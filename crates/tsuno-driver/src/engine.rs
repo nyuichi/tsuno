@@ -14,7 +14,7 @@ use rustc_span::source_map::Spanned;
 use z3::ast::{Bool, Int};
 use z3::{SatResult, Solver, set_global_param};
 
-use crate::prepass::{LoopInfo, SwitchJoin, compute_loops, compute_switch_joins};
+use crate::prepass::{LoopContracts, SwitchJoin, compute_loops, compute_switch_joins};
 use crate::report::{VerificationResult, VerificationStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -57,7 +57,8 @@ pub struct Verifier<'tcx> {
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     body: Body<'tcx>,
-    loops: HashMap<BasicBlock, LoopInfo>,
+    loop_contracts: LoopContracts,
+    prepass_error: Option<VerificationResult>,
     switch_joins: HashMap<BasicBlock, SwitchJoin>,
     next_loc: Cell<usize>,
     next_sym: Cell<usize>,
@@ -65,13 +66,29 @@ pub struct Verifier<'tcx> {
 
 impl<'tcx> Verifier<'tcx> {
     pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: Body<'tcx>) -> Self {
-        let loops = compute_loops(&body);
+        let (loop_contracts, prepass_error) = match compute_loops(tcx, &body) {
+            Ok(loop_contracts) => (loop_contracts, None),
+            Err(error) => (
+                LoopContracts::empty(),
+                Some(VerificationResult {
+                    function: tcx.def_path_str(def_id.to_def_id()),
+                    status: VerificationStatus::Unsupported,
+                    span: span_text(tcx, error.span),
+                    basic_block: error.basic_block.map(|bb| bb.index()),
+                    statement_index: error.statement_index,
+                    message: error.message,
+                    trace: Vec::new(),
+                    model: Vec::new(),
+                }),
+            ),
+        };
         let switch_joins = compute_switch_joins(&body);
         Self {
             tcx,
             def_id,
             body,
-            loops,
+            loop_contracts,
+            prepass_error,
             switch_joins,
             next_loc: Cell::new(0),
             next_sym: Cell::new(0),
@@ -88,7 +105,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     pub fn verify(&self) -> VerificationResult {
-        if let Some(result) = self.check_loop_annotations() {
+        if let Some(result) = self.prepass_error.clone() {
             return result;
         }
         let mut pending: BTreeMap<ControlPoint, Vec<State>> = BTreeMap::new();
@@ -203,29 +220,6 @@ impl<'tcx> Verifier<'tcx> {
             }
         }
         self.pass_result("all assertions discharged")
-    }
-
-    fn check_loop_annotations(&self) -> Option<VerificationResult> {
-        for (header, loop_info) in &self.loops {
-            let data = &self.body.basic_blocks[*header];
-            let term = data.terminator();
-            if !matches!(
-                &term.kind,
-                TerminatorKind::Call { func, .. } if self.is_marker(func, "__tsuno_invariant")
-            ) {
-                return Some(self.unsupported_result(
-                    term.source_info.span,
-                    Some(header.index()),
-                    None,
-                    format!(
-                        "loop at bb{} requires invariant!(..)",
-                        loop_info.header.index()
-                    ),
-                    Vec::new(),
-                ));
-            }
-        }
-        None
     }
 
     fn step_statement(
@@ -419,21 +413,30 @@ impl<'tcx> Verifier<'tcx> {
             return self.advance_or_close_loop(state, target, span);
         }
         if self.is_marker(func, "__tsuno_invariant") {
-            // TODO: This is still an ad hoc MIR-call encoding of a loop annotation.
-            // Prefer attaching loop invariants directly to the loop header so the
-            // verifier does not have to special-case a fake call in execution flow.
-            // Right now the invariant is attached to the end of the header block as
-            // an ordinary call, so proving preservation means replaying the header
-            // statements and re-evaluating the invariant after the backedge.
-            let header = state.ctrl.basic_block;
-            self.ensure_loop_invariant(&state, header, span)?;
+            let Some(header) = self
+                .loop_contracts
+                .header_for_invariant_block(state.ctrl.basic_block)
+            else {
+                return Err(self.unsupported_result(
+                    span,
+                    Some(state.ctrl.basic_block.index()),
+                    Some(state.ctrl.statement_index),
+                    "tsuno::inv! is only allowed at the start of a loop body".to_owned(),
+                    state.trace.clone(),
+                ));
+            };
+            let Some(loop_contract) = self.loop_contracts.contract_by_header(header) else {
+                return Err(self.unsupported_result(
+                    span,
+                    Some(state.ctrl.basic_block.index()),
+                    Some(state.ctrl.statement_index),
+                    "loop body is missing contract metadata".to_owned(),
+                    state.trace.clone(),
+                ));
+            };
+            self.ensure_loop_invariant(&state, loop_contract.invariant_block, span)?;
             let target = target.expect("invariant marker should return");
-            if let Some(loop_info) = self.loops.get(&state.ctrl.basic_block) {
-                let mut next = state.goto(target);
-                self.havoc_loop(&mut next, loop_info, span)?;
-                self.assume_loop_invariant(&mut next, header, span)?;
-                return Ok(vec![next]);
-            }
+            self.assume_loop_invariant(&mut state, loop_contract.invariant_block, span)?;
             return Ok(vec![state.goto(target)]);
         }
 
@@ -482,53 +485,6 @@ impl<'tcx> Verifier<'tcx> {
             )
         })?;
         self.advance_or_close_loop(state, target, span)
-    }
-
-    fn havoc_loop(
-        &self,
-        state: &mut State,
-        loop_info: &LoopInfo,
-        span: Span,
-    ) -> Result<(), VerificationResult> {
-        for local in &loop_info.written_locals {
-            let Some(loc) = state.env.get(local).copied() else {
-                continue;
-            };
-            let current = state.store.get(&loc).cloned();
-            match current {
-                Some(SymVal::Scalar(_)) | Some(SymVal::Pair(..)) => {
-                    let value = self.fresh_symval_for_ty(
-                        state,
-                        self.body.local_decls[*local].ty,
-                        "loop_havoc",
-                    )?;
-                    state.store.insert(loc, value);
-                }
-                Some(SymVal::MutRef { target, .. }) => {
-                    let TyKind::Ref(_, inner, _) = self.body.local_decls[*local].ty.kind() else {
-                        return Err(self.unsupported_result(
-                            span,
-                            Some(state.ctrl.basic_block.index()),
-                            None,
-                            "unexpected mutable reference type".to_owned(),
-                            state.trace.clone(),
-                        ));
-                    };
-                    let fresh = self.fresh_scalar_for_ty(state, *inner, "loop_ref")?;
-                    state.store.insert(
-                        loc,
-                        SymVal::MutRef {
-                            target,
-                            cur: fresh.clone(),
-                            fin: fresh.clone(),
-                        },
-                    );
-                    state.store.insert(target, SymVal::Scalar(fresh));
-                }
-                None => {}
-            }
-        }
-        Ok(())
     }
 
     fn assign(
@@ -1077,9 +1033,9 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn is_loop_backedge(&self, source: BasicBlock, target: BasicBlock) -> bool {
-        self.loops
-            .get(&target)
-            .is_some_and(|loop_info| loop_info.body_blocks.contains(&source))
+        self.loop_contracts
+            .contract_by_header(target)
+            .is_some_and(|loop_contract| loop_contract.body_blocks.contains(&source))
     }
 
     fn advance_or_close_loop(
@@ -1090,7 +1046,7 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<Vec<State>, VerificationResult> {
         if self.is_loop_backedge(state.ctrl.basic_block, target) {
             self.ensure_loop_invariant_on_reentry(&state, target, span)?;
-            return Ok(Vec::new());
+            return Ok(vec![state.goto(target)]);
         }
         Ok(vec![state.goto(target)])
     }
@@ -1101,22 +1057,25 @@ impl<'tcx> Verifier<'tcx> {
         header: BasicBlock,
         span: Span,
     ) -> Result<(), VerificationResult> {
-        let mut replayed = state.clone().goto(header);
-        let data = &self.body.basic_blocks[header];
-        for stmt_index in 0..data.statements.len() {
-            replayed.ctrl.statement_index = stmt_index;
-            replayed = self.step_statement(replayed, &data.statements[stmt_index])?;
-        }
-        self.ensure_loop_invariant(&replayed, header, span)
+        let Some(loop_contract) = self.loop_contracts.contract_by_header(header) else {
+            return Err(self.unsupported_result(
+                span,
+                Some(header.index()),
+                None,
+                "loop backedge without loop metadata".to_owned(),
+                state.trace.clone(),
+            ));
+        };
+        self.ensure_loop_invariant(state, loop_contract.invariant_block, span)
     }
 
     fn ensure_loop_invariant(
         &self,
         state: &State,
-        header: BasicBlock,
+        block: BasicBlock,
         span: Span,
     ) -> Result<(), VerificationResult> {
-        let invariant = self.loop_invariant(state, header, span)?;
+        let invariant = self.loop_invariant(state, block, span)?;
         self.ensure_formula(
             state,
             invariant,
@@ -1128,10 +1087,10 @@ impl<'tcx> Verifier<'tcx> {
     fn assume_loop_invariant(
         &self,
         state: &mut State,
-        header: BasicBlock,
+        block: BasicBlock,
         span: Span,
     ) -> Result<(), VerificationResult> {
-        let invariant = self.loop_invariant(state, header, span)?;
+        let invariant = self.loop_invariant(state, block, span)?;
         state.pc.push(invariant);
         Ok(())
     }
@@ -1139,26 +1098,26 @@ impl<'tcx> Verifier<'tcx> {
     fn loop_invariant(
         &self,
         state: &State,
-        header: BasicBlock,
+        block: BasicBlock,
         span: Span,
     ) -> Result<Bool, VerificationResult> {
-        let data = &self.body.basic_blocks[header];
+        let data = &self.body.basic_blocks[block];
         let rustc_middle::mir::TerminatorKind::Call { func, args, .. } = &data.terminator().kind
         else {
             return Err(self.unsupported_result(
                 span,
-                Some(header.index()),
+                Some(block.index()),
                 None,
-                "loop header is missing invariant marker".to_owned(),
+                "loop body is missing invariant marker".to_owned(),
                 state.trace.clone(),
             ));
         };
         if !self.is_marker(func, "__tsuno_invariant") {
             return Err(self.unsupported_result(
                 span,
-                Some(header.index()),
+                Some(block.index()),
                 None,
-                "loop header is missing invariant marker".to_owned(),
+                "loop body is missing invariant marker".to_owned(),
                 state.trace.clone(),
             ));
         }

@@ -1,13 +1,9 @@
 #[test]
 fn loop_macro_is_accepted() {
-    use tsuno::invariant;
-
     let mut x = 0;
-    loop {
-        invariant!(x >= 0);
+    let limit = 1;
+    while x < limit {
+        tsuno::inv!("0 <= {x} && {x} <= {limit}");
         x += 1;
-        if x > 1 {
-            break;
-        }
     }
 }
