@@ -61,8 +61,7 @@ impl Callbacks for VerifyCallbacks {
 }
 
 fn collect_results<'tcx>(tcx: TyCtxt<'tcx>, report_path: &Path) -> anyhow::Result<()> {
-    let cfg = default_z3();
-    let z3 = z3::Context::new(&cfg);
+    default_z3();
     for item_id in tcx.hir_free_items() {
         let item = tcx.hir_item(item_id);
         if !matches!(item.kind, ItemKind::Fn { .. }) {
@@ -70,7 +69,7 @@ fn collect_results<'tcx>(tcx: TyCtxt<'tcx>, report_path: &Path) -> anyhow::Resul
         }
         let local_def_id = item.owner_id.def_id;
         let body = tcx.optimized_mir(local_def_id.to_def_id());
-        let verifier = Verifier::new(&z3, tcx, local_def_id, body);
+        let verifier = Verifier::new(tcx, local_def_id, body);
         if !verifier.has_verify_marker() {
             continue;
         }
