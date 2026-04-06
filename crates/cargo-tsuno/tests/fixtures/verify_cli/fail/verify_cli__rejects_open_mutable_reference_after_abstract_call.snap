@@ -7,6 +7,6 @@ stdout:
 FAIL bad_close
   mutable reference close failed
   bb2
-  model: [("model", "arg_1_0 -> 0\ncall_mut_1 -> 1\n")]
+  model: [("model", "arg_5_2 -> 0\nlive_3_3 -> 0\narg_1_0 -> (- 1)\narg_3_1 -> 0\nlive_5_4 -> 0\ncall_mut_5 -> 0\n")]
 
 stderr:

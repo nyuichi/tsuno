@@ -7,6 +7,6 @@ stdout:
 FAIL bad
   tsuno assertion failed
   bb1
-  model: [("model", "arg_1_0 -> 369098740\n")]
+  model: [("model", "arg_6_2 -> 0\narg_1_0 -> (- 1)\nlive_6_4 -> 0\n")]
 
 stderr:

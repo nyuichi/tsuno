@@ -56,7 +56,7 @@ pub enum TypedExpr {
 pub struct Verifier<'tcx> {
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
-    body: &'tcx Body<'tcx>,
+    body: Body<'tcx>,
     loops: HashMap<BasicBlock, LoopInfo>,
     switch_joins: HashMap<BasicBlock, SwitchJoin>,
     next_loc: Cell<usize>,
@@ -64,13 +64,15 @@ pub struct Verifier<'tcx> {
 }
 
 impl<'tcx> Verifier<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &'tcx Body<'tcx>) -> Self {
+    pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: Body<'tcx>) -> Self {
+        let loops = compute_loops(&body);
+        let switch_joins = compute_switch_joins(&body);
         Self {
             tcx,
             def_id,
             body,
-            loops: compute_loops(body),
-            switch_joins: compute_switch_joins(body),
+            loops,
+            switch_joins,
             next_loc: Cell::new(0),
             next_sym: Cell::new(0),
         }
@@ -238,15 +240,13 @@ impl<'tcx> Verifier<'tcx> {
         ));
         match &stmt.kind {
             StatementKind::StorageLive(local) => {
-                if !state.env.contains_key(local) {
-                    let value = self.fresh_symval_for_ty(
-                        &mut state,
-                        self.body.local_decls[*local].ty,
-                        &format!("live_{}", local.as_usize()),
-                    )?;
-                    let loc = self.alloc(&mut state, value);
-                    state.env.insert(*local, loc);
-                }
+                let value = self.fresh_symval_for_ty(
+                    &mut state,
+                    self.body.local_decls[*local].ty,
+                    &format!("live_{}", local.as_usize()),
+                )?;
+                let loc = self.alloc(&mut state, value);
+                state.env.insert(*local, loc);
             }
             StatementKind::StorageDead(local) => {
                 self.close_local(&mut state, *local, stmt.source_info.span)?;
@@ -419,6 +419,12 @@ impl<'tcx> Verifier<'tcx> {
             return self.advance_or_close_loop(state, target, span);
         }
         if self.is_marker(func, "__tsuno_invariant") {
+            // TODO: This is still an ad hoc MIR-call encoding of a loop annotation.
+            // Prefer attaching loop invariants directly to the loop header so the
+            // verifier does not have to special-case a fake call in execution flow.
+            // Right now the invariant is attached to the end of the header block as
+            // an ordinary call, so proving preservation means replaying the header
+            // statements and re-evaluating the invariant after the backedge.
             let header = state.ctrl.basic_block;
             self.ensure_loop_invariant(&state, header, span)?;
             let target = target.expect("invariant marker should return");
@@ -1208,7 +1214,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn place_ty(&self, place: Place<'tcx>) -> rustc_middle::ty::Ty<'tcx> {
-        place.ty(self.body, self.tcx).ty
+        place.ty(&self.body, self.tcx).ty
     }
 
     fn operand_ty(
@@ -1298,11 +1304,11 @@ impl<'tcx> Verifier<'tcx> {
 
     fn initial_state(&self) -> State {
         let mut state = State::empty();
-        for local in std::iter::once(Local::from_usize(0)).chain(self.body.args_iter()) {
+        for local in self.body.local_decls.indices() {
             let ty = self.body.local_decls[local].ty;
             let value = self
                 .fresh_symval_for_ty(&mut state, ty, &format!("arg_{}", local.as_usize()))
-                .expect("initial locals should be supported");
+                .unwrap_or(SymVal::Scalar(TypedExpr::Unit));
             let loc = self.alloc(&mut state, value);
             state.env.insert(local, loc);
         }
@@ -1414,10 +1420,10 @@ impl<'tcx> Verifier<'tcx> {
         local: Local,
         span: Span,
     ) -> Result<(), VerificationResult> {
-        let Some(loc) = state.env.remove(&local) else {
+        let Some(loc) = state.env.get(&local).copied() else {
             return Ok(());
         };
-        let Some(value) = state.store.remove(&loc) else {
+        let Some(value) = state.store.get(&loc).cloned() else {
             return Ok(());
         };
         let SymVal::MutRef { target, cur, fin } = value else {
@@ -1430,6 +1436,7 @@ impl<'tcx> Verifier<'tcx> {
             "mutable reference close failed".to_owned(),
         )?;
         state.store.insert(target, SymVal::Scalar(cur));
+        state.store.insert(loc, SymVal::Scalar(TypedExpr::Unit));
         Ok(())
     }
 }
