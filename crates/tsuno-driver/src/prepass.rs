@@ -1,10 +1,12 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::ops::ControlFlow;
 
 use crate::contracts::{
     HirLoopContract, HirLoopContracts, SpecBinaryOp, SpecExpr as HirSpecExpr, SpecUnaryOp,
-    collect_hir_binding_spans, collect_hir_loop_contracts,
+    collect_hir_loop_contracts,
 };
-use rustc_hir::HirId;
+use rustc_hir::intravisit::{self, Visitor};
+use rustc_hir::{HirId, Pat, PatKind};
 use rustc_middle::mir::{
     BasicBlock, Body, Local, PlaceElem, Statement, StatementKind, TerminatorKind,
 };
@@ -124,6 +126,20 @@ pub fn compute_hir_locals<'tcx>(
         }
     }
     locals
+}
+
+pub fn collect_hir_binding_spans<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+) -> Result<HashMap<HirId, Span>, LoopPrepassError> {
+    let body = tcx.hir_body_owned_by(def_id);
+    let mut collector = HirBindingSpanCollector {
+        spans: HashMap::new(),
+    };
+    match intravisit::walk_body(&mut collector, body) {
+        ControlFlow::Continue(()) => Ok(collector.spans),
+        ControlFlow::Break(err) => Err(err),
+    }
 }
 
 fn spans_match<'tcx>(tcx: TyCtxt<'tcx>, left: Span, right: Span) -> bool {
@@ -247,6 +263,22 @@ fn lower_hir_spec_expr(
             lhs: Box::new(lower_hir_spec_expr(lhs, hir_locals, span)?),
             rhs: Box::new(lower_hir_spec_expr(rhs, hir_locals, span)?),
         }),
+    }
+}
+
+struct HirBindingSpanCollector {
+    spans: HashMap<HirId, Span>,
+}
+
+impl<'tcx> Visitor<'tcx> for HirBindingSpanCollector {
+    type NestedFilter = intravisit::nested_filter::None;
+    type Result = ControlFlow<LoopPrepassError>;
+
+    fn visit_pat(&mut self, pat: &'tcx Pat<'tcx>) -> Self::Result {
+        if let PatKind::Binding(..) = pat.kind {
+            self.spans.entry(pat.hir_id).or_insert(pat.span);
+        }
+        intravisit::walk_pat(self, pat)
     }
 }
 

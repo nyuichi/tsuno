@@ -5,8 +5,8 @@ use rustc_ast::LitKind;
 use rustc_hir::def::Res;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{
-    BinOpKind, Block, Expr, ExprKind, HirId, Lit, LoopSource, MatchSource, Pat, PatKind, QPath,
-    Stmt, StmtKind, UnOp,
+    BinOpKind, Block, Expr, ExprKind, HirId, Lit, LoopSource, MatchSource, QPath, Stmt, StmtKind,
+    UnOp,
 };
 use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;
@@ -79,13 +79,6 @@ impl HirLoopContracts {
     pub fn contract_by_loop_expr_id(&self, loop_expr_id: HirId) -> Option<&HirLoopContract> {
         self.by_loop_expr_id.get(&loop_expr_id)
     }
-
-    pub fn canonical_loop_expr_id(&self, hir_id: HirId) -> Option<HirId> {
-        self.by_loop_expr_id
-            .contains_key(&hir_id)
-            .then_some(hir_id)
-            .or_else(|| self.body_block_to_loop_expr_id.get(&hir_id).copied())
-    }
 }
 
 pub fn collect_hir_loop_contracts<'tcx>(
@@ -107,28 +100,10 @@ pub fn collect_hir_loop_contracts<'tcx>(
     }
 }
 
-pub fn collect_hir_binding_spans<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-) -> Result<HashMap<HirId, Span>, LoopPrepassError> {
-    let body = tcx.hir_body_owned_by(def_id);
-    let mut collector = HirBindingSpanCollector {
-        spans: HashMap::new(),
-    };
-    match intravisit::walk_body(&mut collector, body) {
-        ControlFlow::Continue(()) => Ok(collector.spans),
-        ControlFlow::Break(err) => Err(err),
-    }
-}
-
 struct HirLoopContractCollector<'tcx> {
     tcx: TyCtxt<'tcx>,
     contracts: HashMap<HirId, HirLoopContract>,
     body_block_to_loop_expr_id: HashMap<HirId, HirId>,
-}
-
-struct HirBindingSpanCollector {
-    spans: HashMap<HirId, Span>,
 }
 
 impl<'tcx> HirLoopContractCollector<'tcx> {
@@ -349,18 +324,6 @@ impl<'tcx> Visitor<'tcx> for HirLoopContractCollector<'tcx> {
             return ControlFlow::Break(err);
         }
         intravisit::walk_expr(self, expr)
-    }
-}
-
-impl<'tcx> Visitor<'tcx> for HirBindingSpanCollector {
-    type NestedFilter = intravisit::nested_filter::None;
-    type Result = ControlFlow<LoopPrepassError>;
-
-    fn visit_pat(&mut self, pat: &'tcx Pat<'tcx>) -> Self::Result {
-        if let PatKind::Binding(..) = pat.kind {
-            self.spans.entry(pat.hir_id).or_insert(pat.span);
-        }
-        intravisit::walk_pat(self, pat)
     }
 }
 
