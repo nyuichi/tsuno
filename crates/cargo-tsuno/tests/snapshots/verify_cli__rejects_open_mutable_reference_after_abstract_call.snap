@@ -1,10 +1,10 @@
 ---
-source: crates/tsuno-driver/tests/verify_cli.rs
+source: crates/cargo-tsuno/tests/verify_cli.rs
 expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
-FAIL bad_scope
+FAIL bad_close
   mutable reference close failed
   bb2
   model: [("model", "arg_1_0 -> 0\ncall_mut_1 -> 1\n")]

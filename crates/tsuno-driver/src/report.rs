@@ -1,6 +1,5 @@
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::Path;
 
 use anyhow::Context;
@@ -35,30 +34,33 @@ impl fmt::Display for VerificationStatus {
     }
 }
 
-pub fn append_result(path: &Path, result: &VerificationResult) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create report dir {}", parent.display()))?;
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("open report {}", path.display()))?;
-    serde_json::to_writer(&mut file, result).context("serialize verification result")?;
-    file.write_all(b"\n")
-        .context("terminate verification result line")?;
-    Ok(())
-}
-
-pub fn load_results(path: &Path) -> anyhow::Result<Vec<VerificationResult>> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err).with_context(|| format!("read report {}", path.display())),
+pub fn print_report(path: &Path) -> anyhow::Result<i32> {
+    let results = {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => return Err(err).with_context(|| format!("read report {}", path.display())),
+        };
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).context("parse verification result"))
+            .collect::<anyhow::Result<Vec<VerificationResult>>>()?
     };
-    text.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).context("parse verification result"))
-        .collect()
+    let mut exit_code = 0;
+    for result in results {
+        println!("{} {}", result.status, result.function);
+        if !result.message.is_empty() {
+            println!("  {}", result.message);
+        }
+        if let Some(bb) = result.basic_block {
+            println!("  bb{bb}");
+        }
+        if !result.model.is_empty() {
+            println!("  model: {:?}", result.model);
+        }
+        if !matches!(result.status, VerificationStatus::Pass) {
+            exit_code = 1;
+        }
+    }
+    Ok(exit_code)
 }
