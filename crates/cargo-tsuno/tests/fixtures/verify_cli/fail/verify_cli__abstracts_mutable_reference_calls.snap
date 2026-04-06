@@ -5,8 +5,8 @@ expression: snapshot_output(output)
 status: Some(1)
 stdout:
 FAIL bad_after_call
-  tsuno assertion failed
+  mutable reference close failed
   bb2
-  model: [("model", "arg_1_0 -> 0\ncall_ret_2 -> 0\ncall_mut_1 -> (- 1)\n")]
+  model: [("model", "live_5_8 -> 0\nlive_4_7 -> 0\narg_9_5 -> 0\nlive_3_6 -> 0\ncall_ret_10 -> 0\narg_4_2 -> 0\ncall_mut_9 -> 0\narg_1_0 -> (- 1)\narg_3_1 -> 0\narg_5_3 -> 0\n")]
 
 stderr:

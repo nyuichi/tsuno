@@ -68,7 +68,9 @@ fn collect_results<'tcx>(tcx: TyCtxt<'tcx>, report_path: &Path) -> anyhow::Resul
             continue;
         }
         let local_def_id = item.owner_id.def_id;
-        let body = tcx.optimized_mir(local_def_id.to_def_id());
+        let body = tcx
+            .mir_drops_elaborated_and_const_checked(local_def_id)
+            .steal();
         let verifier = Verifier::new(tcx, local_def_id, body);
         if !verifier.has_verify_marker() {
             continue;

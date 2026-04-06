@@ -1,7 +1,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::mir::{
@@ -27,7 +27,6 @@ pub struct State {
     pc: Vec<Bool>,
     ctrl: ControlPoint,
     trace: Vec<String>,
-    assumed_loops: BTreeSet<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -57,7 +56,7 @@ pub enum TypedExpr {
 pub struct Verifier<'tcx> {
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
-    body: &'tcx Body<'tcx>,
+    body: Body<'tcx>,
     loops: HashMap<BasicBlock, LoopInfo>,
     switch_joins: HashMap<BasicBlock, SwitchJoin>,
     next_loc: Cell<usize>,
@@ -65,13 +64,15 @@ pub struct Verifier<'tcx> {
 }
 
 impl<'tcx> Verifier<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &'tcx Body<'tcx>) -> Self {
+    pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: Body<'tcx>) -> Self {
+        let loops = compute_loops(&body);
+        let switch_joins = compute_switch_joins(&body);
         Self {
             tcx,
             def_id,
             body,
-            loops: compute_loops(body),
-            switch_joins: compute_switch_joins(body),
+            loops,
+            switch_joins,
             next_loc: Cell::new(0),
             next_sym: Cell::new(0),
         }
@@ -103,9 +104,7 @@ impl<'tcx> Verifier<'tcx> {
             {
                 let first = bucket[0].clone();
                 assert!(
-                    bucket.iter().skip(1).all(|state| {
-                        state.ctrl == first.ctrl && state.assumed_loops == first.assumed_loops
-                    }),
+                    bucket.iter().skip(1).all(|state| state.ctrl == first.ctrl),
                     "join bucket control-point mismatch at bb{}",
                     ctrl.basic_block.index()
                 );
@@ -241,15 +240,13 @@ impl<'tcx> Verifier<'tcx> {
         ));
         match &stmt.kind {
             StatementKind::StorageLive(local) => {
-                if !state.env.contains_key(local) {
-                    let value = self.fresh_symval_for_ty(
-                        &mut state,
-                        self.body.local_decls[*local].ty,
-                        &format!("live_{}", local.as_usize()),
-                    )?;
-                    let loc = self.alloc(&mut state, value);
-                    state.env.insert(*local, loc);
-                }
+                let value = self.fresh_symval_for_ty(
+                    &mut state,
+                    self.body.local_decls[*local].ty,
+                    &format!("live_{}", local.as_usize()),
+                )?;
+                let loc = self.alloc(&mut state, value);
+                state.env.insert(*local, loc);
             }
             StatementKind::StorageDead(local) => {
                 self.close_local(&mut state, *local, stmt.source_info.span)?;
@@ -289,7 +286,9 @@ impl<'tcx> Verifier<'tcx> {
             .trace
             .push(format!("bb{}:term", state.ctrl.basic_block.index()));
         match &term.kind {
-            TerminatorKind::Goto { target } => Ok(vec![state.goto(*target)]),
+            TerminatorKind::Goto { target } => {
+                self.advance_or_close_loop(state, *target, term.source_info.span)
+            }
             TerminatorKind::Return => {
                 self.close_live_mut_refs(&mut state, term.source_info.span)?;
                 Ok(Vec::new())
@@ -316,7 +315,7 @@ impl<'tcx> Verifier<'tcx> {
                     term.source_info.span,
                     format!("assertion failed: {msg:?}"),
                 )?;
-                Ok(vec![state.goto(*target)])
+                self.advance_or_close_loop(state, *target, term.source_info.span)
             }
             TerminatorKind::Call {
                 func,
@@ -367,13 +366,22 @@ impl<'tcx> Verifier<'tcx> {
                 }
             };
             explicit.push(cond.clone());
+            if self.is_loop_backedge(state.ctrl.basic_block, target) {
+                self.ensure_loop_invariant_on_reentry(&state, target, span)?;
+                continue;
+            }
             let mut next = state.clone().goto(target);
             next.pc.push(cond);
             if self.path_is_feasible(&next, span)? {
                 next_states.push(next);
             }
         }
-        let mut otherwise = state.goto(targets.otherwise());
+        let otherwise_target = targets.otherwise();
+        if self.is_loop_backedge(state.ctrl.basic_block, otherwise_target) {
+            self.ensure_loop_invariant_on_reentry(&state, otherwise_target, span)?;
+            return Ok(next_states);
+        }
+        let mut otherwise = state.goto(otherwise_target);
         let negated: Vec<_> = explicit.iter().map(|cond| cond.not()).collect();
         otherwise.pc.push(if negated.is_empty() {
             Bool::from_bool(true)
@@ -408,27 +416,22 @@ impl<'tcx> Verifier<'tcx> {
                 "tsuno assertion failed".to_owned(),
             )?;
             let target = target.expect("assert marker should return");
-            return Ok(vec![state.goto(target)]);
+            return self.advance_or_close_loop(state, target, span);
         }
         if self.is_marker(func, "__tsuno_invariant") {
-            let cond = self.scalar_from_operand(&state, &args[0].node, span)?;
-            let header = state.ctrl.basic_block.index();
-            self.ensure_formula(
-                &state,
-                cond.as_bool()?,
-                span,
-                "loop invariant does not hold".to_owned(),
-            )?;
+            // TODO: This is still an ad hoc MIR-call encoding of a loop annotation.
+            // Prefer attaching loop invariants directly to the loop header so the
+            // verifier does not have to special-case a fake call in execution flow.
+            // Right now the invariant is attached to the end of the header block as
+            // an ordinary call, so proving preservation means replaying the header
+            // statements and re-evaluating the invariant after the backedge.
+            let header = state.ctrl.basic_block;
+            self.ensure_loop_invariant(&state, header, span)?;
             let target = target.expect("invariant marker should return");
             if let Some(loop_info) = self.loops.get(&state.ctrl.basic_block) {
-                if state.assumed_loops.contains(&header) {
-                    return Ok(Vec::new());
-                }
                 let mut next = state.goto(target);
-                next.assumed_loops.insert(header);
                 self.havoc_loop(&mut next, loop_info, span)?;
-                let assumed = self.scalar_from_operand(&next, &args[0].node, span)?;
-                next.pc.push(assumed.as_bool()?);
+                self.assume_loop_invariant(&mut next, header, span)?;
                 return Ok(vec![next]);
             }
             return Ok(vec![state.goto(target)]);
@@ -478,7 +481,7 @@ impl<'tcx> Verifier<'tcx> {
                 state.trace.clone(),
             )
         })?;
-        Ok(vec![state.goto(target)])
+        self.advance_or_close_loop(state, target, span)
     }
 
     fn havoc_loop(
@@ -1073,6 +1076,96 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
+    fn is_loop_backedge(&self, source: BasicBlock, target: BasicBlock) -> bool {
+        self.loops
+            .get(&target)
+            .is_some_and(|loop_info| loop_info.body_blocks.contains(&source))
+    }
+
+    fn advance_or_close_loop(
+        &self,
+        state: State,
+        target: BasicBlock,
+        span: Span,
+    ) -> Result<Vec<State>, VerificationResult> {
+        if self.is_loop_backedge(state.ctrl.basic_block, target) {
+            self.ensure_loop_invariant_on_reentry(&state, target, span)?;
+            return Ok(Vec::new());
+        }
+        Ok(vec![state.goto(target)])
+    }
+
+    fn ensure_loop_invariant_on_reentry(
+        &self,
+        state: &State,
+        header: BasicBlock,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        let mut replayed = state.clone().goto(header);
+        let data = &self.body.basic_blocks[header];
+        for stmt_index in 0..data.statements.len() {
+            replayed.ctrl.statement_index = stmt_index;
+            replayed = self.step_statement(replayed, &data.statements[stmt_index])?;
+        }
+        self.ensure_loop_invariant(&replayed, header, span)
+    }
+
+    fn ensure_loop_invariant(
+        &self,
+        state: &State,
+        header: BasicBlock,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        let invariant = self.loop_invariant(state, header, span)?;
+        self.ensure_formula(
+            state,
+            invariant,
+            span,
+            "loop invariant does not hold".to_owned(),
+        )
+    }
+
+    fn assume_loop_invariant(
+        &self,
+        state: &mut State,
+        header: BasicBlock,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        let invariant = self.loop_invariant(state, header, span)?;
+        state.pc.push(invariant);
+        Ok(())
+    }
+
+    fn loop_invariant(
+        &self,
+        state: &State,
+        header: BasicBlock,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        let data = &self.body.basic_blocks[header];
+        let rustc_middle::mir::TerminatorKind::Call { func, args, .. } = &data.terminator().kind
+        else {
+            return Err(self.unsupported_result(
+                span,
+                Some(header.index()),
+                None,
+                "loop header is missing invariant marker".to_owned(),
+                state.trace.clone(),
+            ));
+        };
+        if !self.is_marker(func, "__tsuno_invariant") {
+            return Err(self.unsupported_result(
+                span,
+                Some(header.index()),
+                None,
+                "loop header is missing invariant marker".to_owned(),
+                state.trace.clone(),
+            ));
+        }
+        let cond = self.scalar_from_operand(state, &args[0].node, span)?;
+        cond.as_bool()
+    }
+
     fn ensure_formula(
         &self,
         state: &State,
@@ -1121,7 +1214,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn place_ty(&self, place: Place<'tcx>) -> rustc_middle::ty::Ty<'tcx> {
-        place.ty(self.body, self.tcx).ty
+        place.ty(&self.body, self.tcx).ty
     }
 
     fn operand_ty(
@@ -1211,11 +1304,11 @@ impl<'tcx> Verifier<'tcx> {
 
     fn initial_state(&self) -> State {
         let mut state = State::empty();
-        for local in std::iter::once(Local::from_usize(0)).chain(self.body.args_iter()) {
+        for local in self.body.local_decls.indices() {
             let ty = self.body.local_decls[local].ty;
             let value = self
                 .fresh_symval_for_ty(&mut state, ty, &format!("arg_{}", local.as_usize()))
-                .expect("initial locals should be supported");
+                .unwrap_or(SymVal::Scalar(TypedExpr::Unit));
             let loc = self.alloc(&mut state, value);
             state.env.insert(local, loc);
         }
@@ -1327,10 +1420,10 @@ impl<'tcx> Verifier<'tcx> {
         local: Local,
         span: Span,
     ) -> Result<(), VerificationResult> {
-        let Some(loc) = state.env.remove(&local) else {
+        let Some(loc) = state.env.get(&local).copied() else {
             return Ok(());
         };
-        let Some(value) = state.store.remove(&loc) else {
+        let Some(value) = state.store.get(&loc).cloned() else {
             return Ok(());
         };
         let SymVal::MutRef { target, cur, fin } = value else {
@@ -1343,6 +1436,7 @@ impl<'tcx> Verifier<'tcx> {
             "mutable reference close failed".to_owned(),
         )?;
         state.store.insert(target, SymVal::Scalar(cur));
+        state.store.insert(loc, SymVal::Scalar(TypedExpr::Unit));
         Ok(())
     }
 }
@@ -1358,7 +1452,6 @@ impl State {
                 statement_index: 0,
             },
             trace: Vec::new(),
-            assumed_loops: BTreeSet::new(),
         }
     }
 
