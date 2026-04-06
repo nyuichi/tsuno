@@ -16,7 +16,7 @@ jobs:
         with:
           toolchain: nightly-2025-11-25
           profile: minimal
-          components: rust-src,rustc-dev,llvm-tools
+          components: rustfmt,rust-src,rustc-dev,llvm-tools
           override: true
 
       - name: Cache cargo artifacts
