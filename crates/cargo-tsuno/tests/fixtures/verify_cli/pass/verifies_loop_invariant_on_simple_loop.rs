@@ -1,5 +1,3 @@
-#![feature(stmt_expr_attributes, proc_macro_hygiene)]
-
 use tsuno::invariant;
 
 #[tsuno::verify]

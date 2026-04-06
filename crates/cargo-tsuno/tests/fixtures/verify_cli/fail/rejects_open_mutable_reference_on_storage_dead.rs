@@ -1,5 +1,3 @@
-#![feature(stmt_expr_attributes, proc_macro_hygiene)]
-
 fn opaque(_: &mut i32) {}
 
 #[tsuno::verify]
