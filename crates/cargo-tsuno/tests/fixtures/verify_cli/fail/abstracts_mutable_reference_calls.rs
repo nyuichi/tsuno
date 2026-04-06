@@ -1,5 +1,3 @@
-#![feature(stmt_expr_attributes, proc_macro_hygiene)]
-
 fn bump(x: &mut i32) -> i32 {
     *x += 1;
     *x
