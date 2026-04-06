@@ -1073,8 +1073,8 @@ impl<'tcx> Verifier<'tcx> {
             invariant,
             span,
             format!(
-                "loop invariant does not hold for {:?} at {}",
-                loop_contract.hir_loop_id,
+                "loop invariant does not hold for bb{} at {}",
+                loop_contract.header.index(),
                 self.tcx
                     .sess
                     .source_map()
