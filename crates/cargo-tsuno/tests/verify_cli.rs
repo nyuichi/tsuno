@@ -55,7 +55,7 @@ tsuno = {{ path = "{}" }}
     fs::create_dir(root.join("src")).expect("src dir");
     fs::copy(fixture_file(name), root.join("src/main.rs")).expect("copy fixture");
 
-    Command::new(env!("CARGO_BIN_EXE_tsuno-driver"))
+    Command::new(env!("CARGO_BIN_EXE_cargo-tsuno"))
         .args(["verify", "--manifest-path"])
         .arg(root.join("Cargo.toml"))
         .output()

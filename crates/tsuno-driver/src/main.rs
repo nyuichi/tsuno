@@ -1,87 +1,97 @@
 #![feature(rustc_private)]
 
+extern crate rustc_driver;
+extern crate rustc_hir;
+extern crate rustc_interface;
+extern crate rustc_middle;
+
 use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use anyhow::{Context, bail};
-use clap::{Parser, Subcommand};
-use tempfile::NamedTempFile;
-use tsuno_driver::cargo_api::CargoInvocation;
-use tsuno_driver::diagnostic::VerificationStatus;
-use tsuno_driver::report::load_results;
-use tsuno_driver::wrapper::{REPORT_PATH_ENV, WRAPPER_ENV, maybe_run_wrapper};
-
-#[derive(Parser)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    Verify {
-        #[arg(long)]
-        manifest_path: PathBuf,
-    },
-}
+use anyhow::Context;
+use rustc_driver::{Callbacks, Compilation, run_compiler};
+use rustc_hir::ItemKind;
+use rustc_middle::ty::TyCtxt;
+use tsuno_driver::engine::{Verifier, default_z3};
+use tsuno_driver::report::VerificationResult;
 
 fn main() {
-    match try_main() {
-        Ok(code) => std::process::exit(code),
-        Err(err) => {
-            eprintln!("{err:#}");
-            std::process::exit(1);
-        }
+    if let Err(err) = run_wrapper() {
+        eprintln!("{err:#}");
+        std::process::exit(1);
     }
 }
 
-fn try_main() -> anyhow::Result<i32> {
-    if let Some(code) = maybe_run_wrapper()? {
-        return Ok(code);
+fn run_wrapper() -> anyhow::Result<()> {
+    let mut args = env::args().collect::<Vec<_>>();
+    // Cargo inserts the wrapped rustc path at argv[1]; rustc_driver consumes the rest.
+    if args.len() > 1 {
+        args.remove(1);
     }
-    let cli = Cli::parse();
-    match cli.command {
-        Commands::Verify { manifest_path } => verify_manifest(&manifest_path),
+    let report_path = env::var("TSUNO_REPORT_PATH").context("missing report path")?;
+    let mut callbacks = VerifyCallbacks {
+        report_path: PathBuf::from(report_path),
+        done: false,
+    };
+    run_compiler(&args, &mut callbacks);
+    Ok(())
+}
+
+struct VerifyCallbacks {
+    report_path: PathBuf,
+    done: bool,
+}
+
+impl Callbacks for VerifyCallbacks {
+    fn after_analysis<'tcx>(
+        &mut self,
+        _compiler: &rustc_interface::interface::Compiler,
+        tcx: TyCtxt<'tcx>,
+    ) -> Compilation {
+        if self.done {
+            return Compilation::Continue;
+        }
+        self.done = true;
+        let report_path = self.report_path.clone();
+        let _ = collect_results(tcx, &report_path);
+        Compilation::Continue
     }
 }
 
-fn verify_manifest(manifest_path: &Path) -> anyhow::Result<i32> {
-    let invocation = CargoInvocation::discover(manifest_path)?;
-    let report_file = NamedTempFile::new().context("create report file")?;
-    let exe = env::current_exe().context("locate current executable")?;
-    let output = Command::new("cargo")
-        .current_dir(&invocation.workspace_root)
-        .args(["check", "--offline", "--manifest-path"])
-        .arg(&invocation.manifest_path)
-        .env(WRAPPER_ENV, "1")
-        .env(REPORT_PATH_ENV, report_file.path())
-        .env("RUSTC_WORKSPACE_WRAPPER", exe)
-        .output()
-        .context("run cargo check")?;
-    if !output.status.success() {
-        bail!(
-            "cargo check failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+fn collect_results<'tcx>(tcx: TyCtxt<'tcx>, report_path: &Path) -> anyhow::Result<()> {
+    let cfg = default_z3();
+    let z3 = z3::Context::new(&cfg);
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
+        if !matches!(item.kind, ItemKind::Fn { .. }) {
+            continue;
+        }
+        let local_def_id = item.owner_id.def_id;
+        let body = tcx.optimized_mir(local_def_id.to_def_id());
+        let verifier = Verifier::new(&z3, tcx, local_def_id, body);
+        if !verifier.has_verify_marker() {
+            continue;
+        }
+        let result = verifier.verify();
+        append_result(report_path, &result)?;
     }
-    let results = load_results(report_file.path())?;
-    let mut exit_code = 0;
-    for result in &results {
-        println!("{} {}", result.status, result.function);
-        if !result.message.is_empty() {
-            println!("  {}", result.message);
-        }
-        if let Some(bb) = result.basic_block {
-            println!("  bb{bb}");
-        }
-        if !result.model.is_empty() {
-            println!("  model: {:?}", result.model);
-        }
-        if !matches!(result.status, VerificationStatus::Pass) {
-            exit_code = 1;
-        }
+    Ok(())
+}
+
+fn append_result(path: &Path, result: &VerificationResult) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create report dir {}", parent.display()))?;
     }
-    Ok(exit_code)
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open report {}", path.display()))?;
+    serde_json::to_writer(&mut file, result).context("serialize verification result")?;
+    file.write_all(b"\n")
+        .context("terminate verification result line")?;
+    Ok(())
 }

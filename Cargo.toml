@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/cargo-tsuno",
     "crates/tsuno",
     "crates/tsuno-driver",
     "crates/tsuno-macros",
@@ -19,6 +20,7 @@ proc-macro2 = "1.0"
 quote = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+insta = "1.31"
 syn = { version = "2.0", features = ["full", "visit-mut"] }
 tempfile = "3.12"
 thiserror = "2.0"

@@ -163,6 +163,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629a66d692cb9ff1a1c664e41771b3dcaf961985a9774c0eb0bd1b51cf60a48"
 
 [[package]]
+name = "cargo-tsuno"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "camino",
+ "clap",
+ "insta",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tsuno-driver",
+ "z3",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.59"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1728,13 +1743,8 @@ name = "tsuno-driver"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "camino",
- "clap",
- "insta",
  "serde",
  "serde_json",
- "tempfile",
- "thiserror",
  "z3",
 ]
 
