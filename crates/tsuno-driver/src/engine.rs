@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
+use rustc_hir::HirId;
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::mir::{
     BasicBlock, BinOp, Body, BorrowKind, ConstOperand, Local, Operand, Place, PlaceElem, Rvalue,
@@ -14,7 +15,11 @@ use rustc_span::source_map::Spanned;
 use z3::ast::{Bool, Int};
 use z3::{SatResult, Solver, set_global_param};
 
-use crate::prepass::{LoopContracts, SwitchJoin, compute_loops, compute_switch_joins};
+use crate::contracts::{SpecExpr, collect_hir_binding_spans};
+use crate::prepass::{
+    LoopContract, LoopContracts, SwitchJoin, compute_hir_locals, compute_loops,
+    compute_switch_joins,
+};
 use crate::report::{VerificationResult, VerificationStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -57,6 +62,8 @@ pub struct Verifier<'tcx> {
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     body: Body<'tcx>,
+    hir_binding_spans: HashMap<HirId, Span>,
+    hir_locals: HashMap<HirId, Local>,
     loop_contracts: LoopContracts,
     prepass_error: Option<VerificationResult>,
     switch_joins: HashMap<BasicBlock, SwitchJoin>,
@@ -66,7 +73,9 @@ pub struct Verifier<'tcx> {
 
 impl<'tcx> Verifier<'tcx> {
     pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: Body<'tcx>) -> Self {
-        let (loop_contracts, prepass_error) = match compute_loops(tcx, &body) {
+        let hir_binding_spans = collect_hir_binding_spans(tcx, def_id).unwrap_or_default();
+        let hir_locals = compute_hir_locals(tcx, def_id, &body);
+        let (loop_contracts, prepass_error) = match compute_loops(tcx, def_id, &body) {
             Ok(loop_contracts) => (loop_contracts, None),
             Err(error) => (
                 LoopContracts::empty(),
@@ -87,6 +96,8 @@ impl<'tcx> Verifier<'tcx> {
             tcx,
             def_id,
             body,
+            hir_binding_spans,
+            hir_locals,
             loop_contracts,
             prepass_error,
             switch_joins,
@@ -412,19 +423,10 @@ impl<'tcx> Verifier<'tcx> {
             let target = target.expect("assert marker should return");
             return self.advance_or_close_loop(state, target, span);
         }
-        if self.is_marker(func, "__tsuno_invariant") {
-            let Some(header) = self
-                .loop_contracts
-                .header_for_invariant_block(state.ctrl.basic_block)
-            else {
-                return Err(self.unsupported_result(
-                    span,
-                    Some(state.ctrl.basic_block.index()),
-                    Some(state.ctrl.statement_index),
-                    "tsuno::inv! is only allowed at the start of a loop body".to_owned(),
-                    state.trace.clone(),
-                ));
-            };
+        if let Some(header) = self
+            .loop_contracts
+            .header_for_invariant_block(state.ctrl.basic_block)
+        {
             let Some(loop_contract) = self.loop_contracts.contract_by_header(header) else {
                 return Err(self.unsupported_result(
                     span,
@@ -434,9 +436,8 @@ impl<'tcx> Verifier<'tcx> {
                     state.trace.clone(),
                 ));
             };
-            self.ensure_loop_invariant(&state, loop_contract.invariant_block, span)?;
             let target = target.expect("invariant marker should return");
-            self.assume_loop_invariant(&mut state, loop_contract.invariant_block, span)?;
+            self.assume_loop_invariant(&mut state, loop_contract, span)?;
             return Ok(vec![state.goto(target)]);
         }
 
@@ -1066,31 +1067,38 @@ impl<'tcx> Verifier<'tcx> {
                 state.trace.clone(),
             ));
         };
-        self.ensure_loop_invariant(state, loop_contract.invariant_block, span)
+        self.ensure_loop_invariant(state, loop_contract, span)
     }
 
     fn ensure_loop_invariant(
         &self,
         state: &State,
-        block: BasicBlock,
+        loop_contract: &LoopContract,
         span: Span,
     ) -> Result<(), VerificationResult> {
-        let invariant = self.loop_invariant(state, block, span)?;
+        let invariant = self.loop_invariant(state, loop_contract, span)?;
         self.ensure_formula(
             state,
             invariant,
             span,
-            "loop invariant does not hold".to_owned(),
+            format!(
+                "loop invariant does not hold for {:?} at {}",
+                loop_contract.hir_loop_id,
+                self.tcx
+                    .sess
+                    .source_map()
+                    .span_to_diagnostic_string(loop_contract.invariant_span)
+            ),
         )
     }
 
     fn assume_loop_invariant(
         &self,
         state: &mut State,
-        block: BasicBlock,
+        loop_contract: &LoopContract,
         span: Span,
     ) -> Result<(), VerificationResult> {
-        let invariant = self.loop_invariant(state, block, span)?;
+        let invariant = self.loop_invariant(state, loop_contract, span)?;
         state.pc.push(invariant);
         Ok(())
     }
@@ -1098,31 +1106,202 @@ impl<'tcx> Verifier<'tcx> {
     fn loop_invariant(
         &self,
         state: &State,
-        block: BasicBlock,
+        loop_contract: &LoopContract,
         span: Span,
     ) -> Result<Bool, VerificationResult> {
-        let data = &self.body.basic_blocks[block];
-        let rustc_middle::mir::TerminatorKind::Call { func, args, .. } = &data.terminator().kind
-        else {
+        self.spec_expr_to_bool(state, &loop_contract.invariant, span)
+    }
+
+    fn spec_expr_to_bool(
+        &self,
+        state: &State,
+        expr: &SpecExpr,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        match self.spec_expr_to_typed(state, expr, span)? {
+            TypedExpr::Bool(expr) => Ok(expr),
+            TypedExpr::Unit => Ok(Bool::from_bool(true)),
+            TypedExpr::Int(_) => Err(self.unsupported_result(
+                span,
+                Some(state.ctrl.basic_block.index()),
+                Some(state.ctrl.statement_index),
+                "expected boolean expression".to_owned(),
+                state.trace.clone(),
+            )),
+        }
+    }
+
+    fn spec_expr_to_typed(
+        &self,
+        state: &State,
+        expr: &SpecExpr,
+        span: Span,
+    ) -> Result<TypedExpr, VerificationResult> {
+        match expr {
+            SpecExpr::Bool(value) => Ok(TypedExpr::Bool(Bool::from_bool(*value))),
+            SpecExpr::Int(value) => Ok(TypedExpr::Int(Int::from_i64(*value))),
+            SpecExpr::Var { hir_id, name: _ } => {
+                let Some(local) = self.hir_locals.get(hir_id).copied() else {
+                    return self.lookup_local_by_binding_span(state, *hir_id, span);
+                };
+                let loc = state.env.get(&local).copied().ok_or_else(|| {
+                    self.unsupported_result(
+                        span,
+                        Some(state.ctrl.basic_block.index()),
+                        Some(state.ctrl.statement_index),
+                        format!("missing env for local {}", local.as_usize()),
+                        state.trace.clone(),
+                    )
+                })?;
+                match state.store.get(&loc).cloned().ok_or_else(|| {
+                    self.unsupported_result(
+                        span,
+                        Some(state.ctrl.basic_block.index()),
+                        Some(state.ctrl.statement_index),
+                        format!("missing store for local {}", local.as_usize()),
+                        state.trace.clone(),
+                    )
+                })? {
+                    SymVal::Scalar(expr) => Ok(expr),
+                    SymVal::MutRef { cur, .. } => Ok(cur),
+                    SymVal::Pair(..) => Err(self.unsupported_result(
+                        span,
+                        Some(state.ctrl.basic_block.index()),
+                        Some(state.ctrl.statement_index),
+                        "tuple value used where scalar was expected".to_owned(),
+                        state.trace.clone(),
+                    )),
+                }
+            }
+            SpecExpr::Unary { op, arg } => {
+                let arg = self.spec_expr_to_typed(state, arg, span)?;
+                match op {
+                    crate::contracts::SpecUnaryOp::Not => Ok(TypedExpr::Bool(arg.as_bool()?.not())),
+                    crate::contracts::SpecUnaryOp::Neg => Ok(TypedExpr::Int(-arg.as_int()?)),
+                }
+            }
+            SpecExpr::Binary { op, lhs, rhs } => {
+                let lhs = self.spec_expr_to_typed(state, lhs, span)?;
+                let rhs = self.spec_expr_to_typed(state, rhs, span)?;
+                match op {
+                    crate::contracts::SpecBinaryOp::Add => {
+                        Ok(TypedExpr::Int(lhs.as_int()? + rhs.as_int()?))
+                    }
+                    crate::contracts::SpecBinaryOp::Sub => {
+                        Ok(TypedExpr::Int(lhs.as_int()? - rhs.as_int()?))
+                    }
+                    crate::contracts::SpecBinaryOp::Mul => {
+                        Ok(TypedExpr::Int(lhs.as_int()? * rhs.as_int()?))
+                    }
+                    crate::contracts::SpecBinaryOp::Eq => Ok(TypedExpr::Bool(lhs.eq(&rhs)?)),
+                    crate::contracts::SpecBinaryOp::Ne => Ok(TypedExpr::Bool(lhs.eq(&rhs)?.not())),
+                    crate::contracts::SpecBinaryOp::Gt => {
+                        Ok(TypedExpr::Bool(lhs.as_int()?.gt(&rhs.as_int()?)))
+                    }
+                    crate::contracts::SpecBinaryOp::Ge => {
+                        Ok(TypedExpr::Bool(lhs.as_int()?.ge(&rhs.as_int()?)))
+                    }
+                    crate::contracts::SpecBinaryOp::Lt => {
+                        Ok(TypedExpr::Bool(lhs.as_int()?.lt(&rhs.as_int()?)))
+                    }
+                    crate::contracts::SpecBinaryOp::Le => {
+                        Ok(TypedExpr::Bool(lhs.as_int()?.le(&rhs.as_int()?)))
+                    }
+                    crate::contracts::SpecBinaryOp::And => {
+                        let lhs = lhs.as_bool()?;
+                        let rhs = rhs.as_bool()?;
+                        Ok(TypedExpr::Bool(Bool::and(&[&lhs, &rhs])))
+                    }
+                    crate::contracts::SpecBinaryOp::Or => {
+                        let lhs = lhs.as_bool()?;
+                        let rhs = rhs.as_bool()?;
+                        Ok(TypedExpr::Bool(Bool::or(&[&lhs, &rhs])))
+                    }
+                }
+            }
+        }
+    }
+
+    fn lookup_local_by_binding_span(
+        &self,
+        state: &State,
+        hir_id: HirId,
+        span: Span,
+    ) -> Result<TypedExpr, VerificationResult> {
+        let Some(binding_span) = self.hir_binding_spans.get(&hir_id).copied() else {
             return Err(self.unsupported_result(
                 span,
-                Some(block.index()),
-                None,
-                "loop body is missing invariant marker".to_owned(),
+                Some(state.ctrl.basic_block.index()),
+                Some(state.ctrl.statement_index),
+                format!("missing MIR binding span for HIR id {:?}", hir_id),
                 state.trace.clone(),
             ));
         };
-        if !self.is_marker(func, "__tsuno_invariant") {
-            return Err(self.unsupported_result(
-                span,
-                Some(block.index()),
-                None,
-                "loop body is missing invariant marker".to_owned(),
-                state.trace.clone(),
+        for (local, decl) in self.body.local_decls.iter_enumerated() {
+            if !self.spans_match(decl.source_info.span, binding_span) {
+                continue;
+            }
+            let loc = state.env.get(&local).copied().ok_or_else(|| {
+                self.unsupported_result(
+                    span,
+                    Some(state.ctrl.basic_block.index()),
+                    Some(state.ctrl.statement_index),
+                    format!("missing env for local {}", local.as_usize()),
+                    state.trace.clone(),
+                )
+            })?;
+            return match state.store.get(&loc).cloned().ok_or_else(|| {
+                self.unsupported_result(
+                    span,
+                    Some(state.ctrl.basic_block.index()),
+                    Some(state.ctrl.statement_index),
+                    format!("missing store for local {}", local.as_usize()),
+                    state.trace.clone(),
+                )
+            })? {
+                SymVal::Scalar(expr) => Ok(expr),
+                SymVal::MutRef { cur, .. } => Ok(cur),
+                SymVal::Pair(..) => Err(self.unsupported_result(
+                    span,
+                    Some(state.ctrl.basic_block.index()),
+                    Some(state.ctrl.statement_index),
+                    "tuple value used where scalar was expected".to_owned(),
+                    state.trace.clone(),
+                )),
+            };
+        }
+        let mut detail = format!(
+            "missing MIR local for HIR id {:?}\n  binding_span={:?}\n",
+            hir_id, binding_span
+        );
+        for (local, decl) in self.body.local_decls.iter_enumerated() {
+            detail.push_str(&format!(
+                "  local {} info={:?} decl_span={:?}\n",
+                local.as_usize(),
+                decl.local_info,
+                decl.source_info.span
             ));
         }
-        let cond = self.scalar_from_operand(state, &args[0].node, span)?;
-        cond.as_bool()
+        Err(self.unsupported_result(
+            span,
+            Some(state.ctrl.basic_block.index()),
+            Some(state.ctrl.statement_index),
+            detail,
+            state.trace.clone(),
+        ))
+    }
+
+    fn is_marker(&self, operand: &Operand<'tcx>, suffix: &str) -> bool {
+        let Some(def_id) = call_target_def_id(operand) else {
+            return false;
+        };
+        self.tcx.def_path_str(def_id).contains(suffix)
+    }
+
+    fn spans_match(&self, left: Span, right: Span) -> bool {
+        left == right
+            || self.tcx.sess.source_map().stmt_span(left, right) == right
+            || self.tcx.sess.source_map().stmt_span(right, left) == left
     }
 
     fn ensure_formula(
@@ -1163,13 +1342,6 @@ impl<'tcx> Verifier<'tcx> {
                 state.trace.clone(),
             )),
         }
-    }
-
-    fn is_marker(&self, operand: &Operand<'tcx>, suffix: &str) -> bool {
-        let Some(def_id) = call_target_def_id(operand) else {
-            return false;
-        };
-        self.tcx.def_path_str(def_id).contains(suffix)
     }
 
     fn place_ty(&self, place: Place<'tcx>) -> rustc_middle::ty::Ty<'tcx> {

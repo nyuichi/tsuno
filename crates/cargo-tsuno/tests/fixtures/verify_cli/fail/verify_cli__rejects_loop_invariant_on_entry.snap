@@ -6,8 +6,8 @@ expression: snapshot_output(output)
 status: Some(1)
 stdout:
 FAIL bad_loop
-  loop invariant does not hold
-  bb6
-  model: [("model", "live_13_14 -> 0\narg_13_6 -> 0\nlive_5_8 -> 0\nlive_8_18 -> 0\nlive_13_22 -> 0\nlive_8_10 -> 0\narg_1_0 -> 0\narg_8_4 -> 0\narg_5_2 -> 0\n")]
+  loop invariant does not hold for HirId(DefId(0:4 ~ fixture[8bc0]::bad_loop).23) at src/main.rs:7:9: 7:30
+  bb7
+  model: [("model", "live_13_14 -> 0\narg_13_6 -> 0\nlive_5_8 -> 0\nlive_8_10 -> 0\narg_1_0 -> 0\narg_8_4 -> 0\narg_5_2 -> 0\n")]
 
 stderr:
