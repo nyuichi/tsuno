@@ -1,0 +1,11 @@
+---
+source: crates/cargo-tsuno/tests/verify_cli.rs
+assertion_line: 93
+expression: snapshot_output(output)
+---
+status: Some(0)
+stdout:
+PASS shadowed_binding_contracts
+  all assertions discharged
+
+stderr:

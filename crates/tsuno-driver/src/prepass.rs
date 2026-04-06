@@ -1,10 +1,13 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use crate::contracts::{
-    HirLoopContract, HirLoopContracts, collect_hir_binding_spans, collect_hir_loop_contracts,
+    HirLoopContract, HirLoopContracts, SpecBinaryOp, SpecExpr as HirSpecExpr, SpecUnaryOp,
+    collect_hir_binding_spans, collect_hir_loop_contracts,
 };
 use rustc_hir::HirId;
-use rustc_middle::mir::{BasicBlock, Body, PlaceElem, Statement, StatementKind, TerminatorKind};
+use rustc_middle::mir::{
+    BasicBlock, Body, Local, PlaceElem, Statement, StatementKind, TerminatorKind,
+};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;
 use rustc_span::def_id::LocalDefId;
@@ -18,11 +21,27 @@ pub struct LoopPrepassError {
 }
 
 #[derive(Debug, Clone)]
+pub enum MirSpecExpr {
+    Bool(bool),
+    Int(i64),
+    Var(Local),
+    Unary {
+        op: SpecUnaryOp,
+        arg: Box<MirSpecExpr>,
+    },
+    Binary {
+        op: SpecBinaryOp,
+        lhs: Box<MirSpecExpr>,
+        rhs: Box<MirSpecExpr>,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub struct LoopContract {
     pub header: BasicBlock,
     pub hir_loop_id: HirId,
     pub invariant_block: BasicBlock,
-    pub invariant: crate::contracts::SpecExpr,
+    pub invariant: MirSpecExpr,
     pub invariant_span: Span,
     pub body_blocks: BTreeSet<BasicBlock>,
     pub exit_blocks: BTreeSet<BasicBlock>,
@@ -119,6 +138,7 @@ pub fn compute_loops<'tcx>(
     body: &Body<'tcx>,
 ) -> Result<LoopContracts, LoopPrepassError> {
     let hir_loop_contracts = collect_hir_loop_contracts(tcx, def_id)?;
+    let hir_locals = compute_hir_locals(tcx, def_id, body);
     let preds = body.basic_blocks.predecessors();
     let doms = body.basic_blocks.dominators();
     let mut loops = HashMap::new();
@@ -142,7 +162,7 @@ pub fn compute_loops<'tcx>(
                         header,
                         hir_loop_id: HirId::INVALID,
                         invariant_block: header,
-                        invariant: crate::contracts::SpecExpr::Bool(true),
+                        invariant: MirSpecExpr::Bool(true),
                         invariant_span: body.basic_blocks[header].terminator().source_info.span,
                         body_blocks,
                         exit_blocks,
@@ -168,6 +188,11 @@ pub fn compute_loops<'tcx>(
         let hir_loop_contract = hir_loop_contracts
             .contract_by_loop_expr_id(hir_loop_id)
             .expect("best_loop_contract_for_header returns collected contract");
+        let invariant = lower_hir_spec_expr(
+            &hir_loop_contract.invariant,
+            &hir_locals,
+            hir_loop_contract.invariant_span,
+        )?;
         loops
             .get_mut(&header)
             .expect("loop info present")
@@ -176,8 +201,7 @@ pub fn compute_loops<'tcx>(
             .get_mut(&header)
             .expect("loop info present")
             .invariant_block = invariant_block;
-        loops.get_mut(&header).expect("loop info present").invariant =
-            hir_loop_contract.invariant.clone();
+        loops.get_mut(&header).expect("loop info present").invariant = invariant;
         loops
             .get_mut(&header)
             .expect("loop info present")
@@ -193,6 +217,37 @@ pub fn compute_loops<'tcx>(
         by_header: loops,
         by_invariant_block,
     })
+}
+
+fn lower_hir_spec_expr(
+    expr: &HirSpecExpr,
+    hir_locals: &HashMap<HirId, Local>,
+    span: Span,
+) -> Result<MirSpecExpr, LoopPrepassError> {
+    match expr {
+        HirSpecExpr::Bool(value) => Ok(MirSpecExpr::Bool(*value)),
+        HirSpecExpr::Int(value) => Ok(MirSpecExpr::Int(*value)),
+        HirSpecExpr::Var { hir_id, .. } => {
+            let Some(local) = hir_locals.get(hir_id).copied() else {
+                return Err(LoopPrepassError {
+                    span,
+                    basic_block: None,
+                    statement_index: None,
+                    message: format!("missing MIR local for HIR id {:?}", hir_id),
+                });
+            };
+            Ok(MirSpecExpr::Var(local))
+        }
+        HirSpecExpr::Unary { op, arg } => Ok(MirSpecExpr::Unary {
+            op: *op,
+            arg: Box::new(lower_hir_spec_expr(arg, hir_locals, span)?),
+        }),
+        HirSpecExpr::Binary { op, lhs, rhs } => Ok(MirSpecExpr::Binary {
+            op: *op,
+            lhs: Box::new(lower_hir_spec_expr(lhs, hir_locals, span)?),
+            rhs: Box::new(lower_hir_spec_expr(rhs, hir_locals, span)?),
+        }),
+    }
 }
 
 fn resolve_loop_invariant_block<'tcx>(
