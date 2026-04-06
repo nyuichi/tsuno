@@ -13,12 +13,35 @@ pub struct LoopPrepassError {
 }
 
 #[derive(Debug, Clone)]
-pub struct LoopInfo {
+pub struct LoopContract {
     pub header: BasicBlock,
     pub invariant_block: BasicBlock,
     pub body_blocks: BTreeSet<BasicBlock>,
     pub exit_blocks: BTreeSet<BasicBlock>,
     pub written_locals: BTreeSet<rustc_middle::mir::Local>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoopContracts {
+    pub by_header: HashMap<BasicBlock, LoopContract>,
+    pub by_invariant_block: HashMap<BasicBlock, BasicBlock>,
+}
+
+impl LoopContracts {
+    pub fn empty() -> Self {
+        Self {
+            by_header: HashMap::new(),
+            by_invariant_block: HashMap::new(),
+        }
+    }
+
+    pub fn contract_by_header(&self, header: BasicBlock) -> Option<&LoopContract> {
+        self.by_header.get(&header)
+    }
+
+    pub fn header_for_invariant_block(&self, block: BasicBlock) -> Option<BasicBlock> {
+        self.by_invariant_block.get(&block).copied()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +77,7 @@ pub fn compute_switch_joins<'tcx>(body: &Body<'tcx>) -> HashMap<BasicBlock, Swit
 pub fn compute_loops<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
-) -> Result<HashMap<BasicBlock, LoopInfo>, LoopPrepassError> {
+) -> Result<LoopContracts, LoopPrepassError> {
     let preds = body.basic_blocks.predecessors();
     let doms = body.basic_blocks.dominators();
     let mut loops = HashMap::new();
@@ -69,12 +92,12 @@ pub fn compute_loops<'tcx>(
                 let exit_blocks = loop_exits(body, &body_blocks);
                 loops
                     .entry(header)
-                    .and_modify(|info: &mut LoopInfo| {
+                    .and_modify(|info: &mut LoopContract| {
                         info.body_blocks.extend(body_blocks.iter().copied());
                         info.exit_blocks.extend(exit_blocks.iter().copied());
                         info.written_locals.extend(written_locals.iter().copied());
                     })
-                    .or_insert(LoopInfo {
+                    .or_insert(LoopContract {
                         header,
                         invariant_block: header,
                         body_blocks,
@@ -94,13 +117,21 @@ pub fn compute_loops<'tcx>(
             .invariant_block = invariant_block;
     }
 
-    Ok(loops)
+    let by_invariant_block = loops
+        .iter()
+        .map(|(header, contract)| (contract.invariant_block, *header))
+        .collect();
+
+    Ok(LoopContracts {
+        by_header: loops,
+        by_invariant_block,
+    })
 }
 
 fn resolve_loop_invariant_block<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
-    loop_info: &LoopInfo,
+    loop_info: &LoopContract,
 ) -> Result<BasicBlock, LoopPrepassError> {
     let mut candidates = Vec::new();
     for block in &loop_info.body_blocks {
@@ -153,7 +184,11 @@ fn resolve_loop_invariant_block<'tcx>(
     Ok(invariant_block)
 }
 
-fn loop_entry_distance<'tcx>(body: &Body<'tcx>, loop_info: &LoopInfo, target: BasicBlock) -> usize {
+fn loop_entry_distance<'tcx>(
+    body: &Body<'tcx>,
+    loop_info: &LoopContract,
+    target: BasicBlock,
+) -> usize {
     let mut distance = HashMap::from([(loop_info.header, 0usize)]);
     let mut work = VecDeque::from([loop_info.header]);
     while let Some(block) = work.pop_front() {

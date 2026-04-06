@@ -14,7 +14,7 @@ use rustc_span::source_map::Spanned;
 use z3::ast::{Bool, Int};
 use z3::{SatResult, Solver, set_global_param};
 
-use crate::prepass::{LoopInfo, SwitchJoin, compute_loops, compute_switch_joins};
+use crate::prepass::{LoopContracts, SwitchJoin, compute_loops, compute_switch_joins};
 use crate::report::{VerificationResult, VerificationStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -57,7 +57,7 @@ pub struct Verifier<'tcx> {
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     body: Body<'tcx>,
-    loops: HashMap<BasicBlock, LoopInfo>,
+    loop_contracts: LoopContracts,
     prepass_error: Option<VerificationResult>,
     switch_joins: HashMap<BasicBlock, SwitchJoin>,
     next_loc: Cell<usize>,
@@ -66,10 +66,10 @@ pub struct Verifier<'tcx> {
 
 impl<'tcx> Verifier<'tcx> {
     pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: Body<'tcx>) -> Self {
-        let (loops, prepass_error) = match compute_loops(tcx, &body) {
-            Ok(loops) => (loops, None),
+        let (loop_contracts, prepass_error) = match compute_loops(tcx, &body) {
+            Ok(loop_contracts) => (loop_contracts, None),
             Err(error) => (
-                HashMap::new(),
+                LoopContracts::empty(),
                 Some(VerificationResult {
                     function: tcx.def_path_str(def_id.to_def_id()),
                     status: VerificationStatus::Unsupported,
@@ -87,7 +87,7 @@ impl<'tcx> Verifier<'tcx> {
             tcx,
             def_id,
             body,
-            loops,
+            loop_contracts,
             prepass_error,
             switch_joins,
             next_loc: Cell::new(0),
@@ -413,7 +413,10 @@ impl<'tcx> Verifier<'tcx> {
             return self.advance_or_close_loop(state, target, span);
         }
         if self.is_marker(func, "__tsuno_invariant") {
-            let Some(loop_info) = self.loop_info_for_invariant_block(state.ctrl.basic_block) else {
+            let Some(header) = self
+                .loop_contracts
+                .header_for_invariant_block(state.ctrl.basic_block)
+            else {
                 return Err(self.unsupported_result(
                     span,
                     Some(state.ctrl.basic_block.index()),
@@ -422,9 +425,18 @@ impl<'tcx> Verifier<'tcx> {
                     state.trace.clone(),
                 ));
             };
-            self.ensure_loop_invariant(&state, loop_info.invariant_block, span)?;
+            let Some(loop_contract) = self.loop_contracts.contract_by_header(header) else {
+                return Err(self.unsupported_result(
+                    span,
+                    Some(state.ctrl.basic_block.index()),
+                    Some(state.ctrl.statement_index),
+                    "loop body is missing contract metadata".to_owned(),
+                    state.trace.clone(),
+                ));
+            };
+            self.ensure_loop_invariant(&state, loop_contract.invariant_block, span)?;
             let target = target.expect("invariant marker should return");
-            self.assume_loop_invariant(&mut state, loop_info.invariant_block, span)?;
+            self.assume_loop_invariant(&mut state, loop_contract.invariant_block, span)?;
             return Ok(vec![state.goto(target)]);
         }
 
@@ -1021,9 +1033,9 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn is_loop_backedge(&self, source: BasicBlock, target: BasicBlock) -> bool {
-        self.loops
-            .get(&target)
-            .is_some_and(|loop_info| loop_info.body_blocks.contains(&source))
+        self.loop_contracts
+            .contract_by_header(target)
+            .is_some_and(|loop_contract| loop_contract.body_blocks.contains(&source))
     }
 
     fn advance_or_close_loop(
@@ -1045,7 +1057,7 @@ impl<'tcx> Verifier<'tcx> {
         header: BasicBlock,
         span: Span,
     ) -> Result<(), VerificationResult> {
-        let Some(loop_info) = self.loops.get(&header) else {
+        let Some(loop_contract) = self.loop_contracts.contract_by_header(header) else {
             return Err(self.unsupported_result(
                 span,
                 Some(header.index()),
@@ -1054,7 +1066,7 @@ impl<'tcx> Verifier<'tcx> {
                 state.trace.clone(),
             ));
         };
-        self.ensure_loop_invariant(state, loop_info.invariant_block, span)
+        self.ensure_loop_invariant(state, loop_contract.invariant_block, span)
     }
 
     fn ensure_loop_invariant(
@@ -1158,12 +1170,6 @@ impl<'tcx> Verifier<'tcx> {
             return false;
         };
         self.tcx.def_path_str(def_id).contains(suffix)
-    }
-
-    fn loop_info_for_invariant_block(&self, block: BasicBlock) -> Option<&LoopInfo> {
-        self.loops
-            .values()
-            .find(|loop_info| loop_info.invariant_block == block)
     }
 
     fn place_ty(&self, place: Place<'tcx>) -> rustc_middle::ty::Ty<'tcx> {
