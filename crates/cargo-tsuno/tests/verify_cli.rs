@@ -55,10 +55,8 @@ fn run_fixture(kind: FixtureKind, name: &str) -> Output {
     let tmp = tempdir().expect("tempdir");
     let root = tmp.path();
     let tsuno = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tsuno");
-    fs::write(
-        root.join("Cargo.toml"),
-        format!(
-            r#"[package]
+    let manifest = format!(
+        r#"[package]
 name = "fixture"
 version = "0.1.0"
 edition = "2024"
@@ -66,10 +64,9 @@ edition = "2024"
 [dependencies]
 tsuno = {{ path = "{}" }}
 "#,
-            tsuno.display()
-        ),
-    )
-    .expect("manifest");
+        tsuno.display()
+    );
+    fs::write(root.join("Cargo.toml"), manifest).expect("manifest");
     fs::create_dir(root.join("src")).expect("src dir");
     fs::copy(fixture_file(kind, name), root.join("src/main.rs")).expect("copy fixture");
 

@@ -1,6 +1,7 @@
 #![allow(clippy::result_large_err)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::mir::{
@@ -13,7 +14,7 @@ use rustc_span::source_map::Spanned;
 use z3::ast::{Bool, Int};
 use z3::{SatResult, Solver, set_global_param};
 
-use crate::prepass::{LoopInfo, compute_loops};
+use crate::prepass::{LoopInfo, SwitchJoin, compute_loops, compute_switch_joins};
 use crate::report::{VerificationResult, VerificationStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -25,13 +26,11 @@ pub struct State {
     store: BTreeMap<Loc, SymVal>,
     pc: Vec<Bool>,
     ctrl: ControlPoint,
-    next_loc: usize,
-    next_sym: usize,
     trace: Vec<String>,
     assumed_loops: BTreeSet<usize>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ControlPoint {
     basic_block: BasicBlock,
     statement_index: usize,
@@ -60,6 +59,9 @@ pub struct Verifier<'tcx> {
     def_id: LocalDefId,
     body: &'tcx Body<'tcx>,
     loops: HashMap<BasicBlock, LoopInfo>,
+    switch_joins: HashMap<BasicBlock, SwitchJoin>,
+    next_loc: Cell<usize>,
+    next_sym: Cell<usize>,
 }
 
 impl<'tcx> Verifier<'tcx> {
@@ -69,6 +71,9 @@ impl<'tcx> Verifier<'tcx> {
             def_id,
             body,
             loops: compute_loops(body),
+            switch_joins: compute_switch_joins(body),
+            next_loc: Cell::new(0),
+            next_sym: Cell::new(0),
         }
     }
 
@@ -85,20 +90,117 @@ impl<'tcx> Verifier<'tcx> {
         if let Some(result) = self.check_loop_annotations() {
             return result;
         }
-        let mut queue = vec![self.initial_state()];
-        while let Some(state) = queue.pop() {
-            let data = &self.body.basic_blocks[state.ctrl.basic_block];
-            if state.ctrl.statement_index < data.statements.len() {
-                let stmt_index = state.ctrl.statement_index;
-                match self.step_statement(state, &data.statements[stmt_index]) {
-                    Ok(next) => queue.push(next),
+        let mut pending: BTreeMap<ControlPoint, Vec<State>> = BTreeMap::new();
+        let mut worklist = VecDeque::new();
+        self.enqueue_state(&mut pending, &mut worklist, self.initial_state());
+        while let Some(ctrl) = worklist.pop_front() {
+            let Some(mut bucket) = pending.remove(&ctrl) else {
+                continue;
+            };
+            if ctrl.statement_index == 0
+                && self.switch_joins.contains_key(&ctrl.basic_block)
+                && bucket.len() > 1
+            {
+                let first = bucket[0].clone();
+                assert!(
+                    bucket.iter().skip(1).all(|state| {
+                        state.ctrl == first.ctrl && state.assumed_loops == first.assumed_loops
+                    }),
+                    "join bucket control-point mismatch at bb{}",
+                    ctrl.basic_block.index()
+                );
+
+                let mut common_len = 0;
+                'outer: for idx in 0..first.pc.len() {
+                    for state in &bucket[1..] {
+                        assert!(
+                            idx < state.pc.len(),
+                            "join bucket path-condition mismatch at bb{}",
+                            ctrl.basic_block.index()
+                        );
+                        if state.pc[idx].to_string() != first.pc[idx].to_string() {
+                            break 'outer;
+                        }
+                    }
+                    common_len += 1;
+                }
+
+                let mut merged = first.clone();
+                merged.pc = first.pc[..common_len].to_vec();
+                merged.env.clear();
+                merged.store.clear();
+                for state in &bucket {
+                    let guard = state.pc.get(common_len).cloned().expect(
+                        "join bucket must have a branch guard at the first divergent pc element",
+                    );
+                    for cond in &state.pc[common_len + 1..] {
+                        merged.pc.push(guard.implies(cond));
+                    }
+                    merged.trace = common_prefix(&merged.trace, &state.trace);
+                }
+
+                let shared_locals: Vec<_> = first
+                    .env
+                    .keys()
+                    .copied()
+                    .filter(|local| {
+                        bucket[1..]
+                            .iter()
+                            .all(|state| state.env.contains_key(local))
+                    })
+                    .collect();
+                for local in shared_locals {
+                    let first_loc = first
+                        .env
+                        .get(&local)
+                        .copied()
+                        .expect("shared local missing from first branch");
+                    let mut merged_value = first
+                        .store
+                        .get(&first_loc)
+                        .cloned()
+                        .expect("shared local missing from first branch store");
+                    for state in &bucket[1..] {
+                        let guard = state.pc.get(common_len).cloned().expect(
+                            "join bucket must have a branch guard at the first divergent pc element",
+                        );
+                        let incoming_loc = state
+                            .env
+                            .get(&local)
+                            .copied()
+                            .expect("shared local missing from incoming branch");
+                        let incoming_value = state
+                            .store
+                            .get(&incoming_loc)
+                            .cloned()
+                            .expect("shared local missing from incoming branch store");
+                        merged_value = self
+                            .merge_symval(&guard, &merged_value, &incoming_value)
+                            .expect("join bucket value shape mismatch");
+                    }
+                    let loc = self.alloc(&mut merged, merged_value);
+                    merged.env.insert(local, loc);
+                }
+                bucket = vec![merged];
+            }
+            while let Some(state) = bucket.pop() {
+                let data = &self.body.basic_blocks[state.ctrl.basic_block];
+                if state.ctrl.statement_index < data.statements.len() {
+                    let stmt_index = state.ctrl.statement_index;
+                    match self.step_statement(state, &data.statements[stmt_index]) {
+                        Ok(next) => self.enqueue_state(&mut pending, &mut worklist, next),
+                        Err(result) => return result,
+                    }
+                    continue;
+                }
+                match self.step_terminator(state, data.terminator()) {
+                    Ok(nexts) => {
+                        for next in nexts {
+                            self.enqueue_state(&mut pending, &mut worklist, next);
+                        }
+                    }
                     Err(result) => return result,
                 }
-                continue;
-            }
-            match self.step_terminator(state, data.terminator()) {
-                Ok(nexts) => queue.extend(nexts),
-                Err(result) => return result,
             }
         }
         self.pass_result("all assertions discharged")
@@ -145,7 +247,7 @@ impl<'tcx> Verifier<'tcx> {
                         self.body.local_decls[*local].ty,
                         &format!("live_{}", local.as_usize()),
                     )?;
-                    let loc = state.alloc(value);
+                    let loc = self.alloc(&mut state, value);
                     state.env.insert(*local, loc);
                 }
             }
@@ -267,7 +369,7 @@ impl<'tcx> Verifier<'tcx> {
             explicit.push(cond.clone());
             let mut next = state.clone().goto(target);
             next.pc.push(cond);
-            if self.path_is_feasible(&next) {
+            if self.path_is_feasible(&next, span)? {
                 next_states.push(next);
             }
         }
@@ -278,7 +380,7 @@ impl<'tcx> Verifier<'tcx> {
         } else {
             Bool::and(&negated.iter().collect::<Vec<_>>())
         });
-        if self.path_is_feasible(&otherwise) {
+        if self.path_is_feasible(&otherwise, span)? {
             next_states.push(otherwise);
         }
         Ok(next_states)
@@ -710,7 +812,7 @@ impl<'tcx> Verifier<'tcx> {
             let loc = if let Some(loc) = state.env.get(&local).copied() {
                 loc
             } else {
-                let loc = state.alloc(SymVal::Scalar(TypedExpr::Unit));
+                let loc = self.alloc(state, SymVal::Scalar(TypedExpr::Unit));
                 state.env.insert(local, loc);
                 loc
             };
@@ -874,11 +976,9 @@ impl<'tcx> Verifier<'tcx> {
         prefix: &str,
     ) -> Result<SymVal, VerificationResult> {
         match ty.kind() {
-            TyKind::Bool => Ok(SymVal::Scalar(TypedExpr::Bool(
-                self.fresh_bool(state, prefix),
-            ))),
+            TyKind::Bool => Ok(SymVal::Scalar(TypedExpr::Bool(self.fresh_bool(prefix)))),
             TyKind::Int(_) | TyKind::Uint(_) => {
-                let expr = self.fresh_int(state, prefix);
+                let expr = self.fresh_int(prefix);
                 if let Some(bounds) = int_range_constraint(&expr, self.tcx, ty) {
                     state.pc.push(bounds);
                 }
@@ -894,7 +994,7 @@ impl<'tcx> Verifier<'tcx> {
                 };
                 Ok(SymVal::Pair(
                     first,
-                    TypedExpr::Bool(self.fresh_bool(state, prefix)),
+                    TypedExpr::Bool(self.fresh_bool(prefix)),
                 ))
             }
             TyKind::Ref(_, inner, rustc_middle::mir::Mutability::Mut) => {
@@ -908,7 +1008,7 @@ impl<'tcx> Verifier<'tcx> {
                         Vec::new(),
                     ));
                 };
-                let target = state.alloc(SymVal::Scalar(target_scalar.clone()));
+                let target = self.alloc(state, SymVal::Scalar(target_scalar.clone()));
                 Ok(SymVal::MutRef {
                     target,
                     cur: target_scalar.clone(),
@@ -943,24 +1043,34 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn fresh_bool(&self, state: &mut State, prefix: &str) -> Bool {
-        let name = format!("{prefix}_{}", state.next_sym);
-        state.next_sym += 1;
+    fn fresh_bool(&self, prefix: &str) -> Bool {
+        let name = format!("{prefix}_{}", self.next_sym.get());
+        self.next_sym.set(self.next_sym.get() + 1);
         Bool::new_const(name)
     }
 
-    fn fresh_int(&self, state: &mut State, prefix: &str) -> Int {
-        let name = format!("{prefix}_{}", state.next_sym);
-        state.next_sym += 1;
+    fn fresh_int(&self, prefix: &str) -> Int {
+        let name = format!("{prefix}_{}", self.next_sym.get());
+        self.next_sym.set(self.next_sym.get() + 1);
         Int::new_const(name)
     }
 
-    fn path_is_feasible(&self, state: &State) -> bool {
-        let solver = Solver::new();
+    fn path_is_feasible(&self, state: &State, span: Span) -> Result<bool, VerificationResult> {
+        let solver = self.timeout_solver();
         for cond in &state.pc {
             solver.assert(cond);
         }
-        matches!(solver.check(), SatResult::Sat | SatResult::Unknown)
+        match solver.check() {
+            SatResult::Sat => Ok(true),
+            SatResult::Unsat => Ok(false),
+            SatResult::Unknown => Err(self.unsupported_result(
+                span,
+                Some(state.ctrl.basic_block.index()),
+                None,
+                "path feasibility check returned unknown".to_owned(),
+                state.trace.clone(),
+            )),
+        }
     }
 
     fn ensure_formula(
@@ -970,28 +1080,37 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
         message: String,
     ) -> Result<(), VerificationResult> {
-        let solver = Solver::new();
+        let solver = self.timeout_solver();
         for cond in &state.pc {
             solver.assert(cond);
         }
         solver.assert(formula.not());
-        if solver.check() == SatResult::Sat {
-            let model = solver
-                .get_model()
-                .map(|model| vec![("model".to_owned(), model.to_string())])
-                .unwrap_or_default();
-            return Err(VerificationResult {
-                function: self.tcx.def_path_str(self.def_id.to_def_id()),
-                status: VerificationStatus::Fail,
-                span: span_text(self.tcx, span),
-                basic_block: Some(state.ctrl.basic_block.index()),
-                statement_index: Some(state.ctrl.statement_index),
-                message,
-                trace: state.trace.clone(),
-                model,
-            });
+        match solver.check() {
+            SatResult::Sat => {
+                let model = solver
+                    .get_model()
+                    .map(|model| vec![("model".to_owned(), model.to_string())])
+                    .unwrap_or_default();
+                Err(VerificationResult {
+                    function: self.tcx.def_path_str(self.def_id.to_def_id()),
+                    status: VerificationStatus::Fail,
+                    span: span_text(self.tcx, span),
+                    basic_block: Some(state.ctrl.basic_block.index()),
+                    statement_index: Some(state.ctrl.statement_index),
+                    message,
+                    trace: state.trace.clone(),
+                    model,
+                })
+            }
+            SatResult::Unsat => Ok(()),
+            SatResult::Unknown => Err(self.unsupported_result(
+                span,
+                Some(state.ctrl.basic_block.index()),
+                Some(state.ctrl.statement_index),
+                "solver returned unknown while checking assertion".to_owned(),
+                state.trace.clone(),
+            )),
         }
-        Ok(())
     }
 
     fn is_marker(&self, operand: &Operand<'tcx>, suffix: &str) -> bool {
@@ -1097,10 +1216,93 @@ impl<'tcx> Verifier<'tcx> {
             let value = self
                 .fresh_symval_for_ty(&mut state, ty, &format!("arg_{}", local.as_usize()))
                 .expect("initial locals should be supported");
-            let loc = state.alloc(value);
+            let loc = self.alloc(&mut state, value);
             state.env.insert(local, loc);
         }
         state
+    }
+
+    fn alloc(&self, state: &mut State, value: SymVal) -> Loc {
+        let loc = Loc(self.next_loc.get());
+        self.next_loc.set(self.next_loc.get() + 1);
+        state.store.insert(loc, value);
+        loc
+    }
+
+    fn enqueue_state(
+        &self,
+        pending: &mut BTreeMap<ControlPoint, Vec<State>>,
+        worklist: &mut VecDeque<ControlPoint>,
+        state: State,
+    ) {
+        let ctrl = state.ctrl;
+        let bucket = pending.entry(ctrl).or_default();
+        if bucket.is_empty() {
+            bucket.push(state);
+            worklist.push_back(ctrl);
+            return;
+        }
+        bucket.push(state);
+    }
+
+    fn timeout_solver(&self) -> Solver {
+        let solver = Solver::new();
+        let mut params = z3::Params::new();
+        params.set_u32("timeout", 1_000);
+        solver.set_params(&params);
+        solver
+    }
+
+    fn merge_symval(&self, guard: &Bool, existing: &SymVal, incoming: &SymVal) -> Option<SymVal> {
+        match (existing, incoming) {
+            (SymVal::Scalar(existing), SymVal::Scalar(incoming)) => Some(SymVal::Scalar(
+                self.merge_typed_expr(guard, existing, incoming)?,
+            )),
+            (SymVal::Pair(existing_a, existing_b), SymVal::Pair(incoming_a, incoming_b)) => {
+                Some(SymVal::Pair(
+                    self.merge_typed_expr(guard, existing_a, incoming_a)?,
+                    self.merge_typed_expr(guard, existing_b, incoming_b)?,
+                ))
+            }
+            (
+                SymVal::MutRef {
+                    target: existing_target,
+                    cur: existing_cur,
+                    fin: existing_fin,
+                },
+                SymVal::MutRef {
+                    target: incoming_target,
+                    cur: incoming_cur,
+                    fin: incoming_fin,
+                },
+            ) if existing_target == incoming_target => Some(SymVal::MutRef {
+                target: *existing_target,
+                cur: self.merge_typed_expr(guard, existing_cur, incoming_cur)?,
+                fin: self.merge_typed_expr(guard, existing_fin, incoming_fin)?,
+            }),
+            _ => None,
+        }
+    }
+
+    fn merge_typed_expr(
+        &self,
+        guard: &Bool,
+        existing: &TypedExpr,
+        incoming: &TypedExpr,
+    ) -> Option<TypedExpr> {
+        if same_typed_expr(existing, incoming) {
+            return Some(existing.clone());
+        }
+        match (existing, incoming) {
+            (TypedExpr::Bool(existing), TypedExpr::Bool(incoming)) => {
+                Some(TypedExpr::Bool(guard.ite(incoming, existing)))
+            }
+            (TypedExpr::Int(existing), TypedExpr::Int(incoming)) => {
+                Some(TypedExpr::Int(guard.ite(incoming, existing)))
+            }
+            (TypedExpr::Unit, TypedExpr::Unit) => Some(TypedExpr::Unit),
+            _ => None,
+        }
     }
 
     fn close_live_mut_refs(&self, state: &mut State, span: Span) -> Result<(), VerificationResult> {
@@ -1155,18 +1357,9 @@ impl State {
                 basic_block: BasicBlock::from_usize(0),
                 statement_index: 0,
             },
-            next_loc: 0,
-            next_sym: 0,
             trace: Vec::new(),
             assumed_loops: BTreeSet::new(),
         }
-    }
-
-    fn alloc(&mut self, value: SymVal) -> Loc {
-        let loc = Loc(self.next_loc);
-        self.next_loc += 1;
-        self.store.insert(loc, value);
-        loc
     }
 
     fn goto(mut self, target: BasicBlock) -> Self {
@@ -1309,5 +1502,22 @@ fn int_range_constraint(expr: &Int, tcx: TyCtxt<'_>, ty: rustc_middle::ty::Ty<'_
             let high = expr.le(Int::from_u64(max));
             Some(Bool::and(&[&low, &high]))
         }
+    }
+}
+
+fn common_prefix(left: &[String], right: &[String]) -> Vec<String> {
+    left.iter()
+        .zip(right.iter())
+        .take_while(|(l, r)| l == r)
+        .map(|(item, _)| item.clone())
+        .collect()
+}
+
+fn same_typed_expr(left: &TypedExpr, right: &TypedExpr) -> bool {
+    match (left, right) {
+        (TypedExpr::Bool(left), TypedExpr::Bool(right)) => left.to_string() == right.to_string(),
+        (TypedExpr::Int(left), TypedExpr::Int(right)) => left.to_string() == right.to_string(),
+        (TypedExpr::Unit, TypedExpr::Unit) => true,
+        _ => false,
     }
 }
