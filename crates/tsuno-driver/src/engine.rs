@@ -59,6 +59,7 @@ pub enum TypedExpr {
 pub struct Verifier<'tcx> {
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
+    item_span: Span,
     body: Body<'tcx>,
     solver: Solver,
     loop_contracts: LoopContracts,
@@ -70,7 +71,7 @@ pub struct Verifier<'tcx> {
 }
 
 impl<'tcx> Verifier<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: Body<'tcx>) -> Self {
+    pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, item_span: Span, body: Body<'tcx>) -> Self {
         let (loop_contracts, mut prepass_error) = match compute_loops(tcx, def_id, &body) {
             Ok(loop_contracts) => (loop_contracts, None),
             Err(error) => (
@@ -111,6 +112,7 @@ impl<'tcx> Verifier<'tcx> {
         Self {
             tcx,
             def_id,
+            item_span,
             body,
             solver: {
                 let solver = Solver::new();
@@ -129,12 +131,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     pub fn has_verify_marker(&self) -> bool {
-        self.body.basic_blocks.iter_enumerated().any(|(_, bb)| {
-            matches!(
-                &bb.terminator().kind,
-                TerminatorKind::Call { func, .. } if self.is_marker(func, "__tsuno_verify")
-            )
-        })
+        verify_marker_before_span(self.tcx, self.item_span)
     }
 
     pub fn verify(&self) -> VerificationResult {
@@ -375,19 +372,12 @@ impl<'tcx> Verifier<'tcx> {
                 self.advance_or_close_loop(state, *target, term.source_info.span)
             }
             TerminatorKind::Call {
-                func,
+                func: _,
                 args,
                 destination,
                 target,
                 ..
-            } => self.step_call(
-                state,
-                func,
-                args,
-                *destination,
-                *target,
-                term.source_info.span,
-            ),
+            } => self.step_call(state, args, *destination, *target, term.source_info.span),
             other => Err(self.unsupported_result(
                 term.source_info.span,
                 Some(state.ctrl.basic_block.index()),
@@ -454,16 +444,11 @@ impl<'tcx> Verifier<'tcx> {
     fn step_call(
         &self,
         mut state: State,
-        func: &Operand<'tcx>,
         args: &[Spanned<Operand<'tcx>>],
         destination: Place<'tcx>,
         target: Option<BasicBlock>,
         span: Span,
     ) -> Result<Vec<State>, VerificationResult> {
-        if self.is_marker(func, "__tsuno_verify") {
-            let target = target.expect("verify marker should return");
-            return Ok(vec![self.enter_block(state, target, span)?]);
-        }
         for arg in args {
             if let Operand::Copy(place) | Operand::Move(place) = arg.node
                 && let Some((base_loc, target_loc)) = self.mut_ref_targets(&state, place)
@@ -1273,13 +1258,6 @@ impl<'tcx> Verifier<'tcx> {
         Ok(state.goto(target))
     }
 
-    fn is_marker(&self, operand: &Operand<'tcx>, suffix: &str) -> bool {
-        let Some(def_id) = call_target_def_id(operand) else {
-            return false;
-        };
-        self.tcx.def_path_str(def_id).contains(suffix)
-    }
-
     fn ensure_formula(
         &self,
         state: &State,
@@ -1623,18 +1601,26 @@ impl TypedExpr {
     }
 }
 
-fn call_target_def_id<'tcx>(operand: &Operand<'tcx>) -> Option<rustc_span::def_id::DefId> {
-    let Operand::Constant(constant) = operand else {
-        return None;
-    };
-    let TyKind::FnDef(def_id, _) = constant.const_.ty().kind() else {
-        return None;
-    };
-    Some(*def_id)
-}
-
 fn span_text(tcx: TyCtxt<'_>, span: Span) -> String {
     tcx.sess.source_map().span_to_diagnostic_string(span)
+}
+
+fn verify_marker_before_span(tcx: TyCtxt<'_>, span: Span) -> bool {
+    let loc = tcx.sess.source_map().lookup_char_pos(span.lo());
+    let Some(source) = loc.file.src.as_deref() else {
+        return false;
+    };
+    verify_marker_in_source(source, loc.line)
+}
+
+fn verify_marker_in_source(source: &str, line: usize) -> bool {
+    if line <= 1 {
+        return false;
+    }
+    source
+        .lines()
+        .nth(line - 2)
+        .is_some_and(|line| line.trim() == "//@ verify")
 }
 
 pub fn default_z3() {
@@ -1718,5 +1704,22 @@ fn same_typed_expr(left: &TypedExpr, right: &TypedExpr) -> bool {
         (TypedExpr::Int(left), TypedExpr::Int(right)) => left.to_string() == right.to_string(),
         (TypedExpr::Unit, TypedExpr::Unit) => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verify_marker_in_source;
+
+    #[test]
+    fn detects_verify_marker_on_previous_line() {
+        let source = "fn ignored() {}\n//@ verify\nfn marked() {}\n";
+        assert!(verify_marker_in_source(source, 3));
+    }
+
+    #[test]
+    fn ignores_non_adjacent_marker() {
+        let source = "//@ verify\n\nfn marked() {}\n";
+        assert!(!verify_marker_in_source(source, 3));
     }
 }

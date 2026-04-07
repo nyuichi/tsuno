@@ -1,6 +1,6 @@
 fn opaque(_: &mut i32) {}
 
-#[tsuno::verify]
+//@ verify
 fn bad_close(mut x: i32) {
     let r = &mut x;
     opaque(r);

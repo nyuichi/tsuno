@@ -5,4 +5,3 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-tsuno-macros = { path = "../tsuno-macros" }

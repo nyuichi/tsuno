@@ -1730,9 +1730,6 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "tsuno"
 version = "0.1.0"
-dependencies = [
- "tsuno-macros",
-]
 
 [[package]]
 name = "tsuno-driver"
@@ -1749,10 +1746,7 @@ dependencies = [
 name = "tsuno-macros"
 version = "0.1.0"
 dependencies = [
- "proc-macro2",
  "quote",
- "syn",
- "tsuno",
 ]
 
 [[package]]

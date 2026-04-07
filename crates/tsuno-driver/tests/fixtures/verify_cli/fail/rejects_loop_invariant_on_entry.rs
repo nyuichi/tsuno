@@ -1,4 +1,4 @@
-#[tsuno::verify]
+//@ verify
 fn bad_loop(mut x: i32) {
     if x > 1 {
         x = 1;
