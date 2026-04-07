@@ -7,13 +7,14 @@ extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_span;
 
-mod contracts;
+mod directive;
 mod engine;
 mod prepass;
 mod report;
 
 use std::env;
 
+use crate::directive::has_verify_marker;
 use crate::engine::{Verifier, default_z3};
 use crate::report::{VerificationResult, print_report};
 use rustc_driver::{Callbacks, Compilation, run_compiler};
@@ -59,13 +60,13 @@ impl Callbacks for VerifyCallbacks {
                 continue;
             }
             let local_def_id = item.owner_id.def_id;
+            if !has_verify_marker(tcx, item.span) {
+                continue;
+            }
             let body = tcx
                 .mir_drops_elaborated_and_const_checked(local_def_id)
                 .steal();
-            let verifier = Verifier::new(tcx, local_def_id, item.span, body);
-            if !verifier.has_verify_marker() {
-                continue;
-            }
+            let verifier = Verifier::new(tcx, local_def_id, body);
             self.results.push(verifier.verify());
         }
         Compilation::Continue

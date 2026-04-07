@@ -14,6 +14,7 @@ use rustc_span::source_map::Spanned;
 use z3::ast::{Bool, Int};
 use z3::{SatResult, Solver, set_global_param};
 
+use crate::directive::{SpecBinaryOp, SpecUnaryOp};
 use crate::prepass::{
     AssertionContracts, LoopContract, LoopContracts, MirSpecExpr, SwitchJoin, compute_assertions,
     compute_loops, compute_switch_joins,
@@ -59,7 +60,6 @@ pub enum TypedExpr {
 pub struct Verifier<'tcx> {
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
-    item_span: Span,
     body: Body<'tcx>,
     solver: Solver,
     loop_contracts: LoopContracts,
@@ -71,7 +71,7 @@ pub struct Verifier<'tcx> {
 }
 
 impl<'tcx> Verifier<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, item_span: Span, body: Body<'tcx>) -> Self {
+    pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: Body<'tcx>) -> Self {
         let (loop_contracts, mut prepass_error) = match compute_loops(tcx, def_id, &body) {
             Ok(loop_contracts) => (loop_contracts, None),
             Err(error) => (
@@ -112,7 +112,6 @@ impl<'tcx> Verifier<'tcx> {
         Self {
             tcx,
             def_id,
-            item_span,
             body,
             solver: {
                 let solver = Solver::new();
@@ -128,10 +127,6 @@ impl<'tcx> Verifier<'tcx> {
             next_loc: Cell::new(0),
             next_sym: Cell::new(0),
         }
-    }
-
-    pub fn has_verify_marker(&self) -> bool {
-        verify_marker_before_span(self.tcx, self.item_span)
     }
 
     pub fn verify(&self) -> VerificationResult {
@@ -1191,43 +1186,29 @@ impl<'tcx> Verifier<'tcx> {
             MirSpecExpr::Unary { op, arg } => {
                 let arg = self.spec_expr_to_typed(state, arg, span)?;
                 match op {
-                    crate::contracts::SpecUnaryOp::Not => Ok(TypedExpr::Bool(arg.as_bool()?.not())),
-                    crate::contracts::SpecUnaryOp::Neg => Ok(TypedExpr::Int(-arg.as_int()?)),
+                    SpecUnaryOp::Not => Ok(TypedExpr::Bool(arg.as_bool()?.not())),
+                    SpecUnaryOp::Neg => Ok(TypedExpr::Int(-arg.as_int()?)),
                 }
             }
             MirSpecExpr::Binary { op, lhs, rhs } => {
                 let lhs = self.spec_expr_to_typed(state, lhs, span)?;
                 let rhs = self.spec_expr_to_typed(state, rhs, span)?;
                 match op {
-                    crate::contracts::SpecBinaryOp::Add => {
-                        Ok(TypedExpr::Int(lhs.as_int()? + rhs.as_int()?))
-                    }
-                    crate::contracts::SpecBinaryOp::Sub => {
-                        Ok(TypedExpr::Int(lhs.as_int()? - rhs.as_int()?))
-                    }
-                    crate::contracts::SpecBinaryOp::Mul => {
-                        Ok(TypedExpr::Int(lhs.as_int()? * rhs.as_int()?))
-                    }
-                    crate::contracts::SpecBinaryOp::Eq => Ok(TypedExpr::Bool(lhs.eq(&rhs)?)),
-                    crate::contracts::SpecBinaryOp::Ne => Ok(TypedExpr::Bool(lhs.eq(&rhs)?.not())),
-                    crate::contracts::SpecBinaryOp::Gt => {
-                        Ok(TypedExpr::Bool(lhs.as_int()?.gt(&rhs.as_int()?)))
-                    }
-                    crate::contracts::SpecBinaryOp::Ge => {
-                        Ok(TypedExpr::Bool(lhs.as_int()?.ge(&rhs.as_int()?)))
-                    }
-                    crate::contracts::SpecBinaryOp::Lt => {
-                        Ok(TypedExpr::Bool(lhs.as_int()?.lt(&rhs.as_int()?)))
-                    }
-                    crate::contracts::SpecBinaryOp::Le => {
-                        Ok(TypedExpr::Bool(lhs.as_int()?.le(&rhs.as_int()?)))
-                    }
-                    crate::contracts::SpecBinaryOp::And => {
+                    SpecBinaryOp::Add => Ok(TypedExpr::Int(lhs.as_int()? + rhs.as_int()?)),
+                    SpecBinaryOp::Sub => Ok(TypedExpr::Int(lhs.as_int()? - rhs.as_int()?)),
+                    SpecBinaryOp::Mul => Ok(TypedExpr::Int(lhs.as_int()? * rhs.as_int()?)),
+                    SpecBinaryOp::Eq => Ok(TypedExpr::Bool(lhs.eq(&rhs)?)),
+                    SpecBinaryOp::Ne => Ok(TypedExpr::Bool(lhs.eq(&rhs)?.not())),
+                    SpecBinaryOp::Gt => Ok(TypedExpr::Bool(lhs.as_int()?.gt(&rhs.as_int()?))),
+                    SpecBinaryOp::Ge => Ok(TypedExpr::Bool(lhs.as_int()?.ge(&rhs.as_int()?))),
+                    SpecBinaryOp::Lt => Ok(TypedExpr::Bool(lhs.as_int()?.lt(&rhs.as_int()?))),
+                    SpecBinaryOp::Le => Ok(TypedExpr::Bool(lhs.as_int()?.le(&rhs.as_int()?))),
+                    SpecBinaryOp::And => {
                         let lhs = lhs.as_bool()?;
                         let rhs = rhs.as_bool()?;
                         Ok(TypedExpr::Bool(Bool::and(&[&lhs, &rhs])))
                     }
-                    crate::contracts::SpecBinaryOp::Or => {
+                    SpecBinaryOp::Or => {
                         let lhs = lhs.as_bool()?;
                         let rhs = rhs.as_bool()?;
                         Ok(TypedExpr::Bool(Bool::or(&[&lhs, &rhs])))
@@ -1605,24 +1586,6 @@ fn span_text(tcx: TyCtxt<'_>, span: Span) -> String {
     tcx.sess.source_map().span_to_diagnostic_string(span)
 }
 
-fn verify_marker_before_span(tcx: TyCtxt<'_>, span: Span) -> bool {
-    let loc = tcx.sess.source_map().lookup_char_pos(span.lo());
-    let Some(source) = loc.file.src.as_deref() else {
-        return false;
-    };
-    verify_marker_in_source(source, loc.line)
-}
-
-fn verify_marker_in_source(source: &str, line: usize) -> bool {
-    if line <= 1 {
-        return false;
-    }
-    source
-        .lines()
-        .nth(line - 2)
-        .is_some_and(|line| line.trim() == "//@ verify")
-}
-
 pub fn default_z3() {
     set_global_param("model", "true");
 }
@@ -1704,22 +1667,5 @@ fn same_typed_expr(left: &TypedExpr, right: &TypedExpr) -> bool {
         (TypedExpr::Int(left), TypedExpr::Int(right)) => left.to_string() == right.to_string(),
         (TypedExpr::Unit, TypedExpr::Unit) => true,
         _ => false,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::verify_marker_in_source;
-
-    #[test]
-    fn detects_verify_marker_on_previous_line() {
-        let source = "fn ignored() {}\n//@ verify\nfn marked() {}\n";
-        assert!(verify_marker_in_source(source, 3));
-    }
-
-    #[test]
-    fn ignores_non_adjacent_marker() {
-        let source = "//@ verify\n\nfn marked() {}\n";
-        assert!(!verify_marker_in_source(source, 3));
     }
 }

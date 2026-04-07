@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ops::ControlFlow;
 
-use crate::contracts::{
+use crate::directive::{
     SpecBinaryOp, SpecExpr as HirSpecExpr, SpecUnaryOp, collect_hir_assertions,
     collect_hir_loop_contracts,
 };
