@@ -1,13 +1,13 @@
 ---
 source: crates/cargo-tsuno/tests/verify_cli.rs
-assertion_line: 94
+assertion_line: 120
 expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
 FAIL bad
   assertion failed
-  bb1
-  model: [("model", "arg_1_0 -> 369098740\n")]
+  bb<N>
+  model: [("model", "<redacted>")]
 
 stderr:
