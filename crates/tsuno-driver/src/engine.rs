@@ -60,6 +60,7 @@ pub struct Verifier<'tcx> {
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     body: Body<'tcx>,
+    solver: Solver,
     loop_contracts: LoopContracts,
     assertion_contracts: AssertionContracts,
     prepass_error: Option<VerificationResult>,
@@ -111,6 +112,13 @@ impl<'tcx> Verifier<'tcx> {
             tcx,
             def_id,
             body,
+            solver: {
+                let solver = Solver::new();
+                let mut params = z3::Params::new();
+                params.set_u32("timeout", 1_000);
+                solver.set_params(&params);
+                solver
+            },
             loop_contracts,
             assertion_contracts,
             prepass_error,
@@ -1039,11 +1047,11 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn path_is_feasible(&self, state: &State, span: Span) -> Result<bool, VerificationResult> {
-        let solver = self.timeout_solver();
+        self.solver.push();
         for cond in &state.pc {
-            solver.assert(cond);
+            self.solver.assert(cond);
         }
-        match solver.check() {
+        let result = match self.solver.check() {
             SatResult::Sat => Ok(true),
             SatResult::Unsat => Ok(false),
             SatResult::Unknown => Err(self.unsupported_result(
@@ -1053,7 +1061,9 @@ impl<'tcx> Verifier<'tcx> {
                 "path feasibility check returned unknown".to_owned(),
                 state.trace.clone(),
             )),
-        }
+        };
+        self.solver.pop(1);
+        result
     }
 
     fn is_loop_backedge(&self, source: BasicBlock, target: BasicBlock) -> bool {
@@ -1277,14 +1287,15 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
         message: String,
     ) -> Result<(), VerificationResult> {
-        let solver = self.timeout_solver();
+        self.solver.push();
         for cond in &state.pc {
-            solver.assert(cond);
+            self.solver.assert(cond);
         }
-        solver.assert(formula.not());
-        match solver.check() {
+        self.solver.assert(formula.not());
+        let result = match self.solver.check() {
             SatResult::Sat => {
-                let model = solver
+                let model = self
+                    .solver
                     .get_model()
                     .map(|model| vec![("model".to_owned(), model.to_string())])
                     .unwrap_or_default();
@@ -1307,7 +1318,9 @@ impl<'tcx> Verifier<'tcx> {
                 "solver returned unknown while checking assertion".to_owned(),
                 state.trace.clone(),
             )),
-        }
+        };
+        self.solver.pop(1);
+        result
     }
 
     fn place_ty(&self, place: Place<'tcx>) -> rustc_middle::ty::Ty<'tcx> {
@@ -1437,14 +1450,6 @@ impl<'tcx> Verifier<'tcx> {
             return;
         }
         bucket.push(state);
-    }
-
-    fn timeout_solver(&self) -> Solver {
-        let solver = Solver::new();
-        let mut params = z3::Params::new();
-        params.set_u32("timeout", 1_000);
-        solver.set_params(&params);
-        solver
     }
 
     fn merge_symval(&self, guard: &Bool, existing: &SymVal, incoming: &SymVal) -> Option<SymVal> {
