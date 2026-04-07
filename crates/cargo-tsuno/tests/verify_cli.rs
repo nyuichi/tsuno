@@ -89,6 +89,7 @@ fn snapshot_output(output: &Output) -> String {
 fn assert_cli_snapshot(kind: FixtureKind, name: &str, output: &Output) {
     let mut settings = insta::Settings::clone_current();
     settings.set_snapshot_path(format!("fixtures/verify_cli/{}", kind.dir_name()));
+    settings.set_prepend_module_to_snapshot(false);
     settings.bind(|| {
         insta::assert_snapshot!(name, snapshot_output(output));
     });
