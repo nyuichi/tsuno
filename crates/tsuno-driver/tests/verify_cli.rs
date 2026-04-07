@@ -74,26 +74,24 @@ fn redact_model_details(text: &str) -> String {
 fn run_fixture(kind: FixtureKind, name: &str) -> Output {
     let tmp = tempdir().expect("tempdir");
     let root = tmp.path();
-    let manifest = r#"[package]
-name = "fixture"
-version = "0.1.0"
-edition = "2024"
-"#
-    .to_string();
-    fs::write(root.join("Cargo.toml"), manifest).expect("manifest");
     fs::create_dir(root.join("src")).expect("src dir");
     fs::copy(fixture_file(kind, name), root.join("src/main.rs")).expect("copy fixture");
 
-    let output = Command::new("cargo")
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());
+    let output = Command::new(env!("CARGO_BIN_EXE_tsuno-driver"))
         .current_dir(root)
-        .args(["check", "--offline", "--manifest-path"])
-        .arg(root.join("Cargo.toml"))
-        .env(
-            "RUSTC_WORKSPACE_WRAPPER",
-            env!("CARGO_BIN_EXE_tsuno-driver"),
-        )
+        .arg(rustc)
+        .args([
+            "--crate-name",
+            "fixture",
+            "--edition=2024",
+            "--crate-type",
+            "bin",
+            "--emit=metadata",
+            "src/main.rs",
+        ])
         .output()
-        .expect("cargo output");
+        .expect("driver output");
 
     Output {
         status: output.status,
