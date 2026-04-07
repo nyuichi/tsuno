@@ -1,4 +1,4 @@
-#[tsuno::verify]
+//@ verify
 fn loop_ok() {
     let mut x = 0_i32;
     let n = 10_i32;

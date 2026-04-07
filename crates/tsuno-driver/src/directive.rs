@@ -112,6 +112,14 @@ pub fn collect_hir_assertions<'tcx>(
     }
 }
 
+pub fn has_verify_marker(tcx: TyCtxt<'_>, span: Span) -> bool {
+    let loc = tcx.sess.source_map().lookup_char_pos(span.lo());
+    let Some(source) = loc.file.src.as_deref() else {
+        return false;
+    };
+    verify_marker_in_source(source, loc.line)
+}
+
 struct SpecExprLowerer<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     binding_info: &'a HirBindingInfo,
@@ -749,4 +757,31 @@ fn parse_spec_template(kind: &str, lit: &LitStr) -> syn::Result<SynExpr> {
             format!("failed to parse //@ {} predicate: {err}", kind),
         )
     })
+}
+
+fn verify_marker_in_source(source: &str, line: usize) -> bool {
+    if line <= 1 {
+        return false;
+    }
+    source
+        .lines()
+        .nth(line - 2)
+        .is_some_and(|line| line.trim() == "//@ verify")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verify_marker_in_source;
+
+    #[test]
+    fn detects_verify_marker_on_previous_line() {
+        let source = "fn ignored() {}\n//@ verify\nfn marked() {}\n";
+        assert!(verify_marker_in_source(source, 3));
+    }
+
+    #[test]
+    fn ignores_non_adjacent_marker() {
+        let source = "//@ verify\n\nfn marked() {}\n";
+        assert!(!verify_marker_in_source(source, 3));
+    }
 }

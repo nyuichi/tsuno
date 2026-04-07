@@ -1,4 +1,4 @@
-#[tsuno::verify]
+//@ verify
 fn branch_merge_explosion(
     b0: bool,
     b1: bool,

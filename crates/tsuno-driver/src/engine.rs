@@ -14,6 +14,7 @@ use rustc_span::source_map::Spanned;
 use z3::ast::{Bool, Int};
 use z3::{SatResult, Solver, set_global_param};
 
+use crate::directive::{SpecBinaryOp, SpecUnaryOp};
 use crate::prepass::{
     AssertionContracts, LoopContract, LoopContracts, MirSpecExpr, SwitchJoin, compute_assertions,
     compute_loops, compute_switch_joins,
@@ -126,15 +127,6 @@ impl<'tcx> Verifier<'tcx> {
             next_loc: Cell::new(0),
             next_sym: Cell::new(0),
         }
-    }
-
-    pub fn has_verify_marker(&self) -> bool {
-        self.body.basic_blocks.iter_enumerated().any(|(_, bb)| {
-            matches!(
-                &bb.terminator().kind,
-                TerminatorKind::Call { func, .. } if self.is_marker(func, "__tsuno_verify")
-            )
-        })
     }
 
     pub fn verify(&self) -> VerificationResult {
@@ -375,19 +367,12 @@ impl<'tcx> Verifier<'tcx> {
                 self.advance_or_close_loop(state, *target, term.source_info.span)
             }
             TerminatorKind::Call {
-                func,
+                func: _,
                 args,
                 destination,
                 target,
                 ..
-            } => self.step_call(
-                state,
-                func,
-                args,
-                *destination,
-                *target,
-                term.source_info.span,
-            ),
+            } => self.step_call(state, args, *destination, *target, term.source_info.span),
             other => Err(self.unsupported_result(
                 term.source_info.span,
                 Some(state.ctrl.basic_block.index()),
@@ -454,16 +439,11 @@ impl<'tcx> Verifier<'tcx> {
     fn step_call(
         &self,
         mut state: State,
-        func: &Operand<'tcx>,
         args: &[Spanned<Operand<'tcx>>],
         destination: Place<'tcx>,
         target: Option<BasicBlock>,
         span: Span,
     ) -> Result<Vec<State>, VerificationResult> {
-        if self.is_marker(func, "__tsuno_verify") {
-            let target = target.expect("verify marker should return");
-            return Ok(vec![self.enter_block(state, target, span)?]);
-        }
         for arg in args {
             if let Operand::Copy(place) | Operand::Move(place) = arg.node
                 && let Some((base_loc, target_loc)) = self.mut_ref_targets(&state, place)
@@ -1206,43 +1186,29 @@ impl<'tcx> Verifier<'tcx> {
             MirSpecExpr::Unary { op, arg } => {
                 let arg = self.spec_expr_to_typed(state, arg, span)?;
                 match op {
-                    crate::contracts::SpecUnaryOp::Not => Ok(TypedExpr::Bool(arg.as_bool()?.not())),
-                    crate::contracts::SpecUnaryOp::Neg => Ok(TypedExpr::Int(-arg.as_int()?)),
+                    SpecUnaryOp::Not => Ok(TypedExpr::Bool(arg.as_bool()?.not())),
+                    SpecUnaryOp::Neg => Ok(TypedExpr::Int(-arg.as_int()?)),
                 }
             }
             MirSpecExpr::Binary { op, lhs, rhs } => {
                 let lhs = self.spec_expr_to_typed(state, lhs, span)?;
                 let rhs = self.spec_expr_to_typed(state, rhs, span)?;
                 match op {
-                    crate::contracts::SpecBinaryOp::Add => {
-                        Ok(TypedExpr::Int(lhs.as_int()? + rhs.as_int()?))
-                    }
-                    crate::contracts::SpecBinaryOp::Sub => {
-                        Ok(TypedExpr::Int(lhs.as_int()? - rhs.as_int()?))
-                    }
-                    crate::contracts::SpecBinaryOp::Mul => {
-                        Ok(TypedExpr::Int(lhs.as_int()? * rhs.as_int()?))
-                    }
-                    crate::contracts::SpecBinaryOp::Eq => Ok(TypedExpr::Bool(lhs.eq(&rhs)?)),
-                    crate::contracts::SpecBinaryOp::Ne => Ok(TypedExpr::Bool(lhs.eq(&rhs)?.not())),
-                    crate::contracts::SpecBinaryOp::Gt => {
-                        Ok(TypedExpr::Bool(lhs.as_int()?.gt(&rhs.as_int()?)))
-                    }
-                    crate::contracts::SpecBinaryOp::Ge => {
-                        Ok(TypedExpr::Bool(lhs.as_int()?.ge(&rhs.as_int()?)))
-                    }
-                    crate::contracts::SpecBinaryOp::Lt => {
-                        Ok(TypedExpr::Bool(lhs.as_int()?.lt(&rhs.as_int()?)))
-                    }
-                    crate::contracts::SpecBinaryOp::Le => {
-                        Ok(TypedExpr::Bool(lhs.as_int()?.le(&rhs.as_int()?)))
-                    }
-                    crate::contracts::SpecBinaryOp::And => {
+                    SpecBinaryOp::Add => Ok(TypedExpr::Int(lhs.as_int()? + rhs.as_int()?)),
+                    SpecBinaryOp::Sub => Ok(TypedExpr::Int(lhs.as_int()? - rhs.as_int()?)),
+                    SpecBinaryOp::Mul => Ok(TypedExpr::Int(lhs.as_int()? * rhs.as_int()?)),
+                    SpecBinaryOp::Eq => Ok(TypedExpr::Bool(lhs.eq(&rhs)?)),
+                    SpecBinaryOp::Ne => Ok(TypedExpr::Bool(lhs.eq(&rhs)?.not())),
+                    SpecBinaryOp::Gt => Ok(TypedExpr::Bool(lhs.as_int()?.gt(&rhs.as_int()?))),
+                    SpecBinaryOp::Ge => Ok(TypedExpr::Bool(lhs.as_int()?.ge(&rhs.as_int()?))),
+                    SpecBinaryOp::Lt => Ok(TypedExpr::Bool(lhs.as_int()?.lt(&rhs.as_int()?))),
+                    SpecBinaryOp::Le => Ok(TypedExpr::Bool(lhs.as_int()?.le(&rhs.as_int()?))),
+                    SpecBinaryOp::And => {
                         let lhs = lhs.as_bool()?;
                         let rhs = rhs.as_bool()?;
                         Ok(TypedExpr::Bool(Bool::and(&[&lhs, &rhs])))
                     }
-                    crate::contracts::SpecBinaryOp::Or => {
+                    SpecBinaryOp::Or => {
                         let lhs = lhs.as_bool()?;
                         let rhs = rhs.as_bool()?;
                         Ok(TypedExpr::Bool(Bool::or(&[&lhs, &rhs])))
@@ -1271,13 +1237,6 @@ impl<'tcx> Verifier<'tcx> {
             self.assume_loop_invariant(&mut state, loop_contract, span)?;
         }
         Ok(state.goto(target))
-    }
-
-    fn is_marker(&self, operand: &Operand<'tcx>, suffix: &str) -> bool {
-        let Some(def_id) = call_target_def_id(operand) else {
-            return false;
-        };
-        self.tcx.def_path_str(def_id).contains(suffix)
     }
 
     fn ensure_formula(
@@ -1621,16 +1580,6 @@ impl TypedExpr {
             }),
         }
     }
-}
-
-fn call_target_def_id<'tcx>(operand: &Operand<'tcx>) -> Option<rustc_span::def_id::DefId> {
-    let Operand::Constant(constant) = operand else {
-        return None;
-    };
-    let TyKind::FnDef(def_id, _) = constant.const_.ty().kind() else {
-        return None;
-    };
-    Some(*def_id)
 }
 
 fn span_text(tcx: TyCtxt<'_>, span: Span) -> String {
