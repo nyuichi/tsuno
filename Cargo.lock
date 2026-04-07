@@ -1745,6 +1745,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "syn",
  "z3",
 ]
 

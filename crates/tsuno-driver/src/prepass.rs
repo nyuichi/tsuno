@@ -2,17 +2,20 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ops::ControlFlow;
 
 use crate::contracts::{
-    HirLoopContract, HirLoopContracts, SpecBinaryOp, SpecExpr as HirSpecExpr, SpecUnaryOp,
-    collect_hir_loop_contracts,
+    SpecBinaryOp, SpecExpr as HirSpecExpr, SpecUnaryOp, collect_hir_loop_contracts,
 };
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{HirId, Pat, PatKind};
-use rustc_middle::mir::{
-    BasicBlock, Body, Local, PlaceElem, Statement, StatementKind, TerminatorKind,
-};
+use rustc_middle::mir::{BasicBlock, Body, Local, PlaceElem, StatementKind, TerminatorKind};
 use rustc_middle::ty::TyCtxt;
-use rustc_span::Span;
 use rustc_span::def_id::LocalDefId;
+use rustc_span::{Span, Symbol};
+
+#[derive(Debug, Clone, Default)]
+pub struct HirBindingInfo {
+    pub spans: HashMap<HirId, Span>,
+    pub by_name: HashMap<Symbol, Vec<(HirId, Span)>>,
+}
 
 #[derive(Debug, Clone)]
 pub struct LoopPrepassError {
@@ -105,14 +108,13 @@ pub fn compute_switch_joins<'tcx>(body: &Body<'tcx>) -> HashMap<BasicBlock, Swit
 
 pub fn compute_hir_locals<'tcx>(
     tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
     body: &Body<'tcx>,
+    binding_info: &HirBindingInfo,
 ) -> HashMap<HirId, rustc_middle::mir::Local> {
-    let hir_binding_spans = collect_hir_binding_spans(tcx, def_id).unwrap_or_default();
     let mut locals = HashMap::new();
     for (local, decl) in body.local_decls.iter_enumerated() {
         let mut matched = None;
-        for (hir_id, span) in &hir_binding_spans {
+        for (hir_id, span) in &binding_info.spans {
             if spans_match(tcx, decl.source_info.span, *span) {
                 matched = Some(*hir_id);
                 break;
@@ -128,16 +130,16 @@ pub fn compute_hir_locals<'tcx>(
     locals
 }
 
-pub fn collect_hir_binding_spans<'tcx>(
+pub fn collect_hir_binding_info<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
-) -> Result<HashMap<HirId, Span>, LoopPrepassError> {
+) -> Result<HirBindingInfo, LoopPrepassError> {
     let body = tcx.hir_body_owned_by(def_id);
     let mut collector = HirBindingSpanCollector {
-        spans: HashMap::new(),
+        info: HirBindingInfo::default(),
     };
     match intravisit::walk_body(&mut collector, body) {
-        ControlFlow::Continue(()) => Ok(collector.spans),
+        ControlFlow::Continue(()) => Ok(collector.info),
         ControlFlow::Break(err) => Err(err),
     }
 }
@@ -153,8 +155,9 @@ pub fn compute_loops<'tcx>(
     def_id: LocalDefId,
     body: &Body<'tcx>,
 ) -> Result<LoopContracts, LoopPrepassError> {
-    let hir_loop_contracts = collect_hir_loop_contracts(tcx, def_id)?;
-    let hir_locals = compute_hir_locals(tcx, def_id, body);
+    let binding_info = collect_hir_binding_info(tcx, def_id)?;
+    let hir_loop_contracts = collect_hir_loop_contracts(tcx, def_id, &binding_info)?;
+    let hir_locals = compute_hir_locals(tcx, body, &binding_info);
     let preds = body.basic_blocks.predecessors();
     let doms = body.basic_blocks.dominators();
     let mut loops = HashMap::new();
@@ -191,19 +194,34 @@ pub fn compute_loops<'tcx>(
     let headers: Vec<_> = loops.keys().copied().collect();
     for header in headers {
         let loop_info = &loops[&header];
-        let Some((hir_loop_id, invariant_block)) =
-            best_loop_contract_for_header(tcx, body, loop_info, &hir_loop_contracts)?
+        let header_span = body.basic_blocks[header].terminator().source_info.span;
+        let entry_span = loop_entry_anchor_span(body, loop_info).unwrap_or(header_span);
+        let Some(hir_loop_contract) =
+            hir_loop_contracts
+                .by_loop_expr_id
+                .values()
+                .find(|contract| {
+                    span_contains(contract.loop_span, header_span)
+                        || span_contains(contract.body_span, entry_span)
+                })
         else {
             return Err(LoopPrepassError {
-                span: body.basic_blocks[header].terminator().source_info.span,
+                span: header_span,
                 basic_block: Some(header),
                 statement_index: None,
-                message: format!("loop at bb{} requires tsuno::inv!(..)", header.index()),
+                message: format!(
+                    "loop at bb{} requires exactly one //@ inv before the body",
+                    header.index()
+                ),
             });
         };
-        let hir_loop_contract = hir_loop_contracts
-            .contract_by_loop_expr_id(hir_loop_id)
-            .expect("best_loop_contract_for_header returns collected contract");
+        let invariant_block = loop_info
+            .body_blocks
+            .iter()
+            .copied()
+            .filter(|block| *block != header)
+            .min_by_key(|block| (loop_entry_distance(body, loop_info, *block), block.index()))
+            .unwrap_or(header);
         let invariant = lower_hir_spec_expr(
             &hir_loop_contract.invariant,
             &hir_locals,
@@ -212,7 +230,7 @@ pub fn compute_loops<'tcx>(
         loops
             .get_mut(&header)
             .expect("loop info present")
-            .hir_loop_id = hir_loop_id;
+            .hir_loop_id = hir_loop_contract.loop_expr_id;
         loops
             .get_mut(&header)
             .expect("loop info present")
@@ -267,7 +285,7 @@ fn lower_hir_spec_expr(
 }
 
 struct HirBindingSpanCollector {
-    spans: HashMap<HirId, Span>,
+    info: HirBindingInfo,
 }
 
 impl<'tcx> Visitor<'tcx> for HirBindingSpanCollector {
@@ -275,128 +293,16 @@ impl<'tcx> Visitor<'tcx> for HirBindingSpanCollector {
     type Result = ControlFlow<LoopPrepassError>;
 
     fn visit_pat(&mut self, pat: &'tcx Pat<'tcx>) -> Self::Result {
-        if let PatKind::Binding(..) = pat.kind {
-            self.spans.entry(pat.hir_id).or_insert(pat.span);
+        if let PatKind::Binding(_, hir_id, ident, _) = pat.kind {
+            self.info.spans.entry(hir_id).or_insert(pat.span);
+            self.info
+                .by_name
+                .entry(ident.name)
+                .or_default()
+                .push((hir_id, pat.span));
         }
         intravisit::walk_pat(self, pat)
     }
-}
-
-fn resolve_loop_invariant_block<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    body: &Body<'tcx>,
-    loop_info: &LoopContract,
-    hir_loop_contract: &HirLoopContract,
-) -> Result<Option<BasicBlock>, LoopPrepassError> {
-    let mut candidates = Vec::new();
-    for block in &loop_info.body_blocks {
-        let data = &body.basic_blocks[*block];
-        let Some(term) = &data.terminator else {
-            continue;
-        };
-        let TerminatorKind::Call { .. } = &term.kind else {
-            continue;
-        };
-        if !spans_match(tcx, term.source_info.span, hir_loop_contract.invariant_span) {
-            continue;
-        }
-        if let Some((stmt_index, stmt)) = data
-            .statements
-            .iter()
-            .enumerate()
-            .find(|(_, stmt)| !is_loop_prefix_stmt(tcx, term.source_info.span, stmt))
-        {
-            return Err(LoopPrepassError {
-                span: stmt.source_info.span,
-                basic_block: Some(*block),
-                statement_index: Some(stmt_index),
-                message: "tsuno::inv! is only allowed at the start of a loop body".to_owned(),
-            });
-        }
-        candidates.push(*block);
-    }
-
-    let Some(invariant_block) = candidates
-        .iter()
-        .copied()
-        .min_by_key(|block| (loop_entry_distance(body, loop_info, *block), block.index()))
-    else {
-        return Ok(None);
-    };
-
-    Ok(Some(invariant_block))
-}
-
-fn best_loop_contract_for_header<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    body: &Body<'tcx>,
-    loop_info: &LoopContract,
-    hir_loop_contracts: &HirLoopContracts,
-) -> Result<Option<(HirId, BasicBlock)>, LoopPrepassError> {
-    let mut best: Option<(HirId, BasicBlock, usize)> = None;
-    for hir_loop_contract in hir_loop_contracts.by_loop_expr_id.values() {
-        let Some(invariant_block) =
-            resolve_loop_invariant_block(tcx, body, loop_info, hir_loop_contract)?
-        else {
-            continue;
-        };
-        let distance = loop_entry_distance(body, loop_info, invariant_block);
-        match best {
-            None => {
-                best = Some((hir_loop_contract.loop_expr_id, invariant_block, distance));
-            }
-            Some((_, _, best_distance)) if distance < best_distance => {
-                best = Some((hir_loop_contract.loop_expr_id, invariant_block, distance));
-            }
-            _ => {}
-        }
-    }
-    if let Some((hir_loop_id, invariant_block, _)) = best {
-        return Ok(Some((hir_loop_id, invariant_block)));
-    }
-
-    let mut detail = String::new();
-    let _ = std::fmt::Write::write_fmt(
-        &mut detail,
-        format_args!(
-            "header bb{} could not be matched to a loop contract\n",
-            loop_info.header.index()
-        ),
-    );
-    for block in &loop_info.body_blocks {
-        let data = &body.basic_blocks[*block];
-        let _ = std::fmt::Write::write_fmt(
-            &mut detail,
-            format_args!(
-                "  bb{} term={}\n",
-                block.index(),
-                tcx.sess
-                    .source_map()
-                    .span_to_diagnostic_string(data.terminator().source_info.span)
-            ),
-        );
-    }
-    for hir_loop_contract in hir_loop_contracts.by_loop_expr_id.values() {
-        let _ = std::fmt::Write::write_fmt(
-            &mut detail,
-            format_args!(
-                "  contract {:?} inv_span={}\n",
-                hir_loop_contract.loop_expr_id,
-                tcx.sess
-                    .source_map()
-                    .span_to_diagnostic_string(hir_loop_contract.invariant_span)
-            ),
-        );
-    }
-    Err(LoopPrepassError {
-        span: body.basic_blocks[loop_info.header]
-            .terminator()
-            .source_info
-            .span,
-        basic_block: Some(loop_info.header),
-        statement_index: None,
-        message: detail,
-    })
 }
 
 fn loop_entry_distance<'tcx>(
@@ -422,6 +328,42 @@ fn loop_entry_distance<'tcx>(
         }
     }
     distance.get(&target).copied().unwrap_or(usize::MAX)
+}
+
+fn loop_entry_anchor_span<'tcx>(body: &Body<'tcx>, loop_info: &LoopContract) -> Option<Span> {
+    let mut blocks: Vec<_> = loop_info
+        .body_blocks
+        .iter()
+        .copied()
+        .filter(|block| *block != loop_info.header)
+        .collect();
+    blocks.sort_by_key(|block| (loop_entry_distance(body, loop_info, *block), block.index()));
+    for block in blocks {
+        if let Some(span) = block_source_span(body, block)
+            && !span.is_dummy()
+        {
+            return Some(span);
+        }
+    }
+    None
+}
+
+fn block_source_span<'tcx>(body: &Body<'tcx>, block: BasicBlock) -> Option<Span> {
+    let data = &body.basic_blocks[block];
+    for stmt in &data.statements {
+        if !stmt.source_info.span.is_dummy() {
+            return Some(stmt.source_info.span);
+        }
+    }
+    let span = data.terminator().source_info.span;
+    if !span.is_dummy() {
+        return Some(span);
+    }
+    None
+}
+
+fn span_contains(outer: Span, inner: Span) -> bool {
+    outer.lo() <= inner.lo() && inner.hi() <= outer.hi()
 }
 
 fn natural_loop<I, F>(preds: F, latch: BasicBlock, header: BasicBlock) -> BTreeSet<BasicBlock>
@@ -482,26 +424,6 @@ fn written_locals<'tcx>(
         }
     }
     written
-}
-
-fn is_loop_prefix_stmt<'tcx>(tcx: TyCtxt<'tcx>, call_span: Span, stmt: &Statement<'tcx>) -> bool {
-    matches!(
-        stmt.kind,
-        StatementKind::StorageLive(..)
-            | StatementKind::StorageDead(..)
-            | StatementKind::Nop
-            | StatementKind::AscribeUserType(..)
-            | StatementKind::Coverage(..)
-            | StatementKind::FakeRead(..)
-            | StatementKind::PlaceMention(..)
-            | StatementKind::ConstEvalCounter
-            | StatementKind::BackwardIncompatibleDropHint { .. }
-    ) || stmt.source_info.span.from_expansion()
-        || tcx
-            .sess
-            .source_map()
-            .stmt_span(stmt.source_info.span, call_span)
-            == call_span
 }
 
 fn compute_switch_joins_from_successors(successors: &[Vec<usize>]) -> HashMap<usize, usize> {
