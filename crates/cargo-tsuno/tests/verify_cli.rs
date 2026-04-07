@@ -29,26 +29,46 @@ fn fixture_file(kind: FixtureKind, name: &str) -> PathBuf {
     fixture_dir(kind).join(format!("{name}.rs"))
 }
 
-fn fixture_names(kind: FixtureKind) -> Vec<String> {
-    let mut names = Vec::new();
-    for entry in fs::read_dir(fixture_dir(kind)).expect("read fixture dir") {
-        let entry = entry.expect("fixture entry");
-        if !entry.file_type().expect("fixture type").is_file() {
-            continue;
+fn redact_basic_blocks(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut redacted = String::with_capacity(text.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if index + 2 <= bytes.len() && bytes[index] == b'b' && bytes[index + 1] == b'b' {
+            let mut end = index + 2;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > index + 2 {
+                redacted.push_str("bb<N>");
+                index = end;
+                continue;
+            }
         }
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-            continue;
-        }
-        names.push(
-            path.file_stem()
-                .and_then(|stem| stem.to_str())
-                .expect("fixture stem")
-                .to_owned(),
-        );
+        redacted.push(bytes[index] as char);
+        index += 1;
     }
-    names.sort();
-    names
+
+    redacted
+}
+
+fn redact_model_details(text: &str) -> String {
+    let mut redacted = String::with_capacity(text.len());
+    for (index, line) in text.split_terminator('\n').enumerate() {
+        if index > 0 {
+            redacted.push('\n');
+        }
+        if line.starts_with("  model: [(\"model\", ") {
+            redacted.push_str("  model: [(\"model\", \"<redacted>\")]");
+        } else {
+            redacted.push_str(line);
+        }
+    }
+    if text.ends_with('\n') {
+        redacted.push('\n');
+    }
+    redacted
 }
 
 fn run_fixture(kind: FixtureKind, name: &str) -> Output {
@@ -78,11 +98,17 @@ tsuno = {{ path = "{}" }}
 }
 
 fn snapshot_output(output: &Output) -> String {
+    let stdout = redact_model_details(&redact_basic_blocks(&String::from_utf8_lossy(
+        &output.stdout,
+    )));
+    let stderr = redact_model_details(&redact_basic_blocks(&String::from_utf8_lossy(
+        &output.stderr,
+    )));
     format!(
         "status: {:?}\nstdout:\n{}\nstderr:\n{}",
         output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+        stdout,
+        stderr,
     )
 }
 
@@ -95,18 +121,25 @@ fn assert_cli_snapshot(kind: FixtureKind, name: &str, output: &Output) {
     });
 }
 
-#[test]
-fn verify_cli_pass_fixtures() {
-    for name in fixture_names(FixtureKind::Pass) {
-        let output = run_fixture(FixtureKind::Pass, &name);
-        assert_cli_snapshot(FixtureKind::Pass, &name, &output);
-    }
-}
+include!(concat!(env!("OUT_DIR"), "/verify_cli_tests.rs"));
 
-#[test]
-fn verify_cli_fail_fixtures() {
-    for name in fixture_names(FixtureKind::Fail) {
-        let output = run_fixture(FixtureKind::Fail, &name);
-        assert_cli_snapshot(FixtureKind::Fail, &name, &output);
+#[cfg(test)]
+mod tests {
+    use super::{redact_basic_blocks, redact_model_details};
+
+    #[test]
+    fn redacts_basic_block_numbers() {
+        assert_eq!(
+            redact_basic_blocks("bb15\n  bb2\nno change"),
+            "bb<N>\n  bb<N>\nno change"
+        );
+    }
+
+    #[test]
+    fn redacts_model_details() {
+        assert_eq!(
+            redact_model_details("  model: [(\"model\", \"arg_6_2 -> 0\\n\")]"),
+            "  model: [(\"model\", \"<redacted>\")]"
+        );
     }
 }

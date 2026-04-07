@@ -7,7 +7,7 @@ status: Some(1)
 stdout:
 FAIL bad_after_call
   mutable reference close failed
-  bb2
-  model: [("model", "live_5_6 -> 0\nlive_4_5 -> 0\narg_4_2 -> 0\nlive_3_4 -> 0\narg_1_0 -> (- 1)\narg_3_1 -> 0\narg_5_3 -> 0\ncall_mut_7 -> 0\ncall_ret_8 -> 0\n")]
+  bb<N>
+  model: [("model", "<redacted>")]
 
 stderr:

@@ -7,6 +7,6 @@ status: Some(1)
 stdout:
 UNSUPPORTED solver_returns_unknown
   solver returned unknown while checking assertion
-  bb14
+  bb<N>
 
 stderr:

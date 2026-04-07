@@ -6,8 +6,8 @@ expression: snapshot_output(output)
 status: Some(1)
 stdout:
 FAIL bad
-  assertion failed
-  bb1
-  model: [("model", "arg_1_0 -> 369098740\n")]
+  tsuno assertion failed
+  bb<N>
+  model: [("model", "<redacted>")]
 
 stderr:
