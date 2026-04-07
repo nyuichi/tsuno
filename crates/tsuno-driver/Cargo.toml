@@ -4,6 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+test = false
+doctest = false
+
+[[bin]]
+name = "tsuno-driver"
+path = "src/main.rs"
+test = false
+doctest = false
+
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
