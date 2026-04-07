@@ -3,20 +3,17 @@ name = "tsuno-driver"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
-[lib]
-test = false
-doctest = false
+build = "build.rs"
 
 [[bin]]
 name = "tsuno-driver"
 path = "src/main.rs"
-test = false
-doctest = false
 
 [dependencies]
 anyhow.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 syn.workspace = true
 z3.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+tempfile.workspace = true

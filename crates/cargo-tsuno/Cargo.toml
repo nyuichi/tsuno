@@ -3,7 +3,6 @@ name = "cargo-tsuno"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-build = "build.rs"
 
 [dependencies]
 anyhow.workspace = true
@@ -11,9 +10,3 @@ camino.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tempfile.workspace = true
-tsuno-driver = { path = "../tsuno-driver" }
-z3.workspace = true
-
-[dev-dependencies]
-insta.workspace = true

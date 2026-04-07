@@ -90,11 +90,30 @@ tsuno = {{ path = "{}" }}
     fs::create_dir(root.join("src")).expect("src dir");
     fs::copy(fixture_file(kind, name), root.join("src/main.rs")).expect("copy fixture");
 
-    Command::new(env!("CARGO_BIN_EXE_cargo-tsuno"))
-        .args(["verify", "--manifest-path"])
+    let output = Command::new("cargo")
+        .current_dir(root)
+        .args(["check", "--offline", "--manifest-path"])
         .arg(root.join("Cargo.toml"))
+        .env(
+            "RUSTC_WORKSPACE_WRAPPER",
+            env!("CARGO_BIN_EXE_tsuno-driver"),
+        )
         .output()
-        .expect("driver output")
+        .expect("cargo output");
+
+    Output {
+        status: output.status,
+        stdout: output.stdout,
+        stderr: Vec::new(),
+    }
+}
+
+fn snapshot_status(output: &Output) -> Option<i32> {
+    if output.status.success() {
+        Some(0)
+    } else {
+        Some(1)
+    }
 }
 
 fn snapshot_output(output: &Output) -> String {
@@ -106,7 +125,7 @@ fn snapshot_output(output: &Output) -> String {
     )));
     format!(
         "status: {:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status.code(),
+        snapshot_status(output),
         stdout,
         stderr,
     )

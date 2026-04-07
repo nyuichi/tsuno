@@ -55,7 +55,6 @@ pub struct HirLoopContract {
     pub loop_expr_id: HirId,
     pub loop_span: Span,
     pub body_span: Span,
-    pub body_block_id: HirId,
     pub invariant: SpecExpr,
     pub invariant_span: Span,
 }
@@ -75,20 +74,6 @@ pub struct HirAssertionContract {
 #[derive(Debug, Clone)]
 pub struct HirAssertionContracts {
     pub items: Vec<HirAssertionContract>,
-}
-
-impl HirLoopContracts {
-    pub fn empty() -> Self {
-        Self {
-            by_loop_expr_id: HashMap::new(),
-        }
-    }
-}
-
-impl HirAssertionContracts {
-    pub fn empty() -> Self {
-        Self { items: Vec::new() }
-    }
 }
 
 pub fn collect_hir_loop_contracts<'tcx>(
@@ -300,7 +285,6 @@ impl<'a, 'tcx> HirLoopContractCollector<'a, 'tcx> {
             loop_expr_id: loop_expr.hir_id,
             loop_span: loop_expr.span,
             body_span: loop_body.span,
-            body_block_id: loop_body.hir_id,
             invariant,
             invariant_span,
         };

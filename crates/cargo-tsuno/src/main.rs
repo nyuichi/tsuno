@@ -1,16 +1,10 @@
-#![feature(rustc_private)]
-
-extern crate rustc_driver;
-
-use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, bail};
-use cargo_tsuno::cargo_api::CargoInvocation;
+use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
-use tempfile::NamedTempFile;
-use tsuno_driver::report::print_report;
+use serde::Deserialize;
 
 #[derive(Parser)]
 struct Cli {
@@ -39,68 +33,70 @@ fn main() {
 fn try_main() -> anyhow::Result<i32> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Verify { manifest_path } => run_cargo_check(&manifest_path),
+        Commands::Verify { manifest_path } => {
+            let invocation = CargoInvocation::discover(&manifest_path)?;
+            verify(&invocation)
+        }
     }
 }
 
-fn run_cargo_check(manifest_path: &Path) -> anyhow::Result<i32> {
-    let invocation = CargoInvocation::discover(manifest_path)?;
-    let report_file = NamedTempFile::new().context("create report file")?;
-    let wrapper_exe = ensure_wrapper_binary()?;
+#[derive(Debug, Clone)]
+struct CargoInvocation {
+    manifest_path: Utf8PathBuf,
+    workspace_root: Utf8PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct Metadata {
+    workspace_root: String,
+}
+
+impl CargoInvocation {
+    fn discover(manifest_path: &Path) -> anyhow::Result<Self> {
+        let output = Command::new("cargo")
+            .args([
+                "metadata",
+                "--offline",
+                "--format-version",
+                "1",
+                "--no-deps",
+                "--manifest-path",
+            ])
+            .arg(manifest_path)
+            .output()
+            .context("run cargo metadata")?;
+        if !output.status.success() {
+            bail!(
+                "cargo metadata failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let metadata: Metadata =
+            serde_json::from_slice(&output.stdout).context("parse cargo metadata")?;
+        Ok(Self {
+            manifest_path: Utf8PathBuf::from_path_buf(PathBuf::from(manifest_path))
+                .map_err(|path| anyhow::anyhow!("non utf8 manifest path: {}", path.display()))?,
+            workspace_root: Utf8PathBuf::from(metadata.workspace_root),
+        })
+    }
+}
+
+fn verify(invocation: &CargoInvocation) -> anyhow::Result<i32> {
+    let wrapper_exe = std::env::current_exe()
+        .expect("current executable path invalid")
+        .with_file_name(format!("tsuno-driver{}", std::env::consts::EXE_SUFFIX));
+
     // Cargo drives compilation here so rustc can be wrapped and analyzed MIR can be collected.
-    let output = Command::new("cargo")
+    let status = Command::new("cargo")
         .current_dir(&invocation.workspace_root)
-        .args(["check", "--offline", "--manifest-path"])
+        .args(["check", "--offline", "--quiet", "--manifest-path"])
         .arg(&invocation.manifest_path)
-        .env("TSUNO_REPORT_PATH", report_file.path())
         .env("RUSTC_WORKSPACE_WRAPPER", wrapper_exe)
-        .output()
-        .context("run cargo check")?;
-    if !output.status.success() {
-        bail!(
-            "cargo check failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    print_report(report_file.path())
-}
+        .spawn()
+        .context("run cargo check")?
+        .wait()
+        .context("wait for cargo check")?;
 
-fn ensure_wrapper_binary() -> anyhow::Result<PathBuf> {
-    let output = Command::new("cargo")
-        .current_dir(tool_workspace_root())
-        .args([
-            "build",
-            "--offline",
-            "--package",
-            "tsuno-driver",
-            "--bin",
-            "tsuno-driver",
-        ])
-        .env_remove("RUSTC_WORKSPACE_WRAPPER")
-        .env_remove("TSUNO_REPORT_PATH")
-        .output()
-        .context("build tsuno-driver wrapper")?;
-    if !output.status.success() {
-        bail!(
-            "cargo build failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let exe = env::current_exe().context("locate current executable")?;
-    Ok(wrapper_executable(&exe))
-}
-
-fn wrapper_executable(exe: &Path) -> PathBuf {
-    exe.with_file_name(format!("tsuno-driver{}", std::env::consts::EXE_SUFFIX))
-}
-
-fn tool_workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("cargo-tsuno crate parent")
-        .parent()
-        .expect("workspace root")
-        .to_path_buf()
+    Ok(status.code().unwrap_or(1))
 }

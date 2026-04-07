@@ -1,12 +1,11 @@
 ---
-source: crates/cargo-tsuno/tests/verify_cli.rs
-assertion_line: 120
+source: crates/tsuno-driver/tests/verify_cli.rs
 expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
-FAIL bad
-  assertion failed
+FAIL bad_close
+  mutable reference close failed
   bb<N>
   model: [("model", "<redacted>")]
 

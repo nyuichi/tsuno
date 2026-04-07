@@ -1,11 +1,6 @@
 use std::fmt;
-use std::fs;
-use std::path::Path;
 
-use anyhow::Context;
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationResult {
     pub function: String,
     pub status: VerificationStatus,
@@ -17,7 +12,7 @@ pub struct VerificationResult {
     pub model: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationStatus {
     Pass,
     Fail,
@@ -34,19 +29,8 @@ impl fmt::Display for VerificationStatus {
     }
 }
 
-pub fn print_report(path: &Path) -> anyhow::Result<i32> {
-    let results = {
-        let text = match fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(err) => return Err(err).with_context(|| format!("read report {}", path.display())),
-        };
-        text.lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str(line).context("parse verification result"))
-            .collect::<anyhow::Result<Vec<VerificationResult>>>()?
-    };
-    let mut exit_code = 0;
+pub fn print_report(results: &[VerificationResult]) -> bool {
+    let mut success = true;
     for result in results {
         println!("{} {}", result.status, result.function);
         if !result.message.is_empty() {
@@ -59,8 +43,8 @@ pub fn print_report(path: &Path) -> anyhow::Result<i32> {
             println!("  model: {:?}", result.model);
         }
         if !matches!(result.status, VerificationStatus::Pass) {
-            exit_code = 1;
+            success = false;
         }
     }
-    Ok(exit_code)
+    success
 }

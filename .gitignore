@@ -1,2 +1,2 @@
 /target
-/crates/cargo-tsuno/tests/verify_cli_tests.rs
+/crates/tsuno-driver/tests/verify_cli_tests.rs
