@@ -902,7 +902,15 @@ impl<'tcx> Verifier<'tcx> {
         let ty = constant.const_.ty();
         match ty.kind() {
             TyKind::Bool => {
-                let value = constant.const_.try_to_bool().unwrap_or(false);
+                let value = constant.const_.try_to_bool().ok_or_else(|| {
+                    self.unsupported_result(
+                        span,
+                        None,
+                        None,
+                        "failed to evaluate boolean constant".to_owned(),
+                        Vec::new(),
+                    )
+                })?;
                 Ok(SymVal::Scalar(TypedExpr::Bool(Bool::from_bool(value))))
             }
             TyKind::Int(_) | TyKind::Uint(_) => {
