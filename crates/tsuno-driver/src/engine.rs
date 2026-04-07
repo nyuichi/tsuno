@@ -366,7 +366,7 @@ impl<'tcx> Verifier<'tcx> {
                 self.ensure_loop_invariant_on_reentry(&state, target, span)?;
                 continue;
             }
-            let mut next = state.clone().goto(target);
+            let mut next = self.enter_block(state.clone(), target, span)?;
             next.pc.push(cond);
             if self.path_is_feasible(&next, span)? {
                 next_states.push(next);
@@ -377,7 +377,7 @@ impl<'tcx> Verifier<'tcx> {
             self.ensure_loop_invariant_on_reentry(&state, otherwise_target, span)?;
             return Ok(next_states);
         }
-        let mut otherwise = state.goto(otherwise_target);
+        let mut otherwise = self.enter_block(state, otherwise_target, span)?;
         let negated: Vec<_> = explicit.iter().map(|cond| cond.not()).collect();
         otherwise.pc.push(if negated.is_empty() {
             Bool::from_bool(true)
@@ -401,7 +401,7 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<Vec<State>, VerificationResult> {
         if self.is_marker(func, "__tsuno_verify") {
             let target = target.expect("verify marker should return");
-            return Ok(vec![state.goto(target)]);
+            return Ok(vec![self.enter_block(state, target, span)?]);
         }
         if self.is_marker(func, "__tsuno_assert") {
             let cond = self.scalar_from_operand(&state, &args[0].node, span)?;
@@ -414,24 +414,6 @@ impl<'tcx> Verifier<'tcx> {
             let target = target.expect("assert marker should return");
             return self.advance_or_close_loop(state, target, span);
         }
-        if let Some(header) = self
-            .loop_contracts
-            .header_for_invariant_block(state.ctrl.basic_block)
-        {
-            let Some(loop_contract) = self.loop_contracts.contract_by_header(header) else {
-                return Err(self.unsupported_result(
-                    span,
-                    Some(state.ctrl.basic_block.index()),
-                    Some(state.ctrl.statement_index),
-                    "loop body is missing contract metadata".to_owned(),
-                    state.trace.clone(),
-                ));
-            };
-            let target = target.expect("invariant marker should return");
-            self.assume_loop_invariant(&mut state, loop_contract, span)?;
-            return Ok(vec![state.goto(target)]);
-        }
-
         for arg in args {
             if let Operand::Copy(place) | Operand::Move(place) = arg.node
                 && let Some((base_loc, target_loc)) = self.mut_ref_targets(&state, place)
@@ -1040,7 +1022,7 @@ impl<'tcx> Verifier<'tcx> {
             self.ensure_loop_invariant_on_reentry(&state, target, span)?;
             return Ok(vec![state.goto(target)]);
         }
-        Ok(vec![state.goto(target)])
+        Ok(vec![self.enter_block(state, target, span)?])
     }
 
     fn ensure_loop_invariant_on_reentry(
@@ -1208,6 +1190,27 @@ impl<'tcx> Verifier<'tcx> {
                 }
             }
         }
+    }
+
+    fn enter_block(
+        &self,
+        mut state: State,
+        target: BasicBlock,
+        span: Span,
+    ) -> Result<State, VerificationResult> {
+        if let Some(header) = self.loop_contracts.header_for_invariant_block(target) {
+            let Some(loop_contract) = self.loop_contracts.contract_by_header(header) else {
+                return Err(self.unsupported_result(
+                    span,
+                    Some(target.index()),
+                    Some(state.ctrl.statement_index),
+                    "loop body is missing contract metadata".to_owned(),
+                    state.trace.clone(),
+                ));
+            };
+            self.assume_loop_invariant(&mut state, loop_contract, span)?;
+        }
+        Ok(state.goto(target))
     }
 
     fn is_marker(&self, operand: &Operand<'tcx>, suffix: &str) -> bool {
