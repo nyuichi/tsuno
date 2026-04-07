@@ -166,8 +166,8 @@ impl<'a, 'tcx> HirLoopContractCollector<'a, 'tcx> {
             .find('\n')
             .map(|idx| directive_pos + idx)
             .unwrap_or(prefix_source.len());
-        let directive_line = prefix_source[directive_pos..line_end]
-            .trim_end_matches(|c| c == '\r' || c == ' ' || c == '\t');
+        let directive_line =
+            prefix_source[directive_pos..line_end].trim_end_matches(['\r', ' ', '\t']);
         let after_line = &prefix_source[line_end..];
         let Some(after_newline) = after_line.strip_prefix('\n') else {
             return Err(self.invariant_position_error(entry_span));
