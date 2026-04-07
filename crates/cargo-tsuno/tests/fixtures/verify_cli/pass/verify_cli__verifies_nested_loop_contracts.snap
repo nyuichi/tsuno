@@ -3,9 +3,9 @@ source: crates/cargo-tsuno/tests/verify_cli.rs
 assertion_line: 93
 expression: snapshot_output(output)
 ---
-status: Some(1)
+status: Some(0)
 stdout:
-UNSUPPORTED bad_loop
-  tsuno::inv! is only allowed at the start of a loop body
+PASS nested_loops
+  all assertions discharged
 
 stderr:
