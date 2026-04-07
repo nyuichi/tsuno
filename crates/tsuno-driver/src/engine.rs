@@ -1401,7 +1401,12 @@ impl<'tcx> Verifier<'tcx> {
 
     fn initial_state(&self) -> Result<State, VerificationResult> {
         let mut state = State::empty();
-        for local in self.body.local_decls.indices().take(self.body.arg_count + 1) {
+        for local in self
+            .body
+            .local_decls
+            .indices()
+            .take(self.body.arg_count + 1)
+        {
             let ty = self.body.local_decls[local].ty;
             let value =
                 self.fresh_symval_for_ty(&mut state, ty, &format!("arg_{}", local.as_usize()))?;
