@@ -135,7 +135,11 @@ impl<'tcx> Verifier<'tcx> {
         }
         let mut pending: BTreeMap<ControlPoint, Vec<State>> = BTreeMap::new();
         let mut worklist = VecDeque::new();
-        self.enqueue_state(&mut pending, &mut worklist, self.initial_state());
+        let initial_state = match self.initial_state() {
+            Ok(initial_state) => initial_state,
+            Err(result) => return result,
+        };
+        self.enqueue_state(&mut pending, &mut worklist, initial_state);
         while let Some(ctrl) = worklist.pop_front() {
             let Some(mut bucket) = pending.remove(&ctrl) else {
                 continue;
@@ -1395,17 +1399,16 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn initial_state(&self) -> State {
+    fn initial_state(&self) -> Result<State, VerificationResult> {
         let mut state = State::empty();
-        for local in self.body.local_decls.indices() {
+        for local in self.body.local_decls.indices().take(self.body.arg_count + 1) {
             let ty = self.body.local_decls[local].ty;
-            let value = self
-                .fresh_symval_for_ty(&mut state, ty, &format!("arg_{}", local.as_usize()))
-                .unwrap_or(SymVal::Scalar(TypedExpr::Unit));
+            let value =
+                self.fresh_symval_for_ty(&mut state, ty, &format!("arg_{}", local.as_usize()))?;
             let loc = self.alloc(&mut state, value);
             state.env.insert(local, loc);
         }
-        state
+        Ok(state)
     }
 
     fn alloc(&self, state: &mut State, value: SymVal) -> Loc {
