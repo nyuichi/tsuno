@@ -154,13 +154,6 @@ impl<'a, 'tcx> HirLoopContractCollector<'a, 'tcx> {
         let Some(directive_pos) = prefix_source.rfind("//@ inv") else {
             return Err(self.missing_invariant_error(loop_expr, body));
         };
-        let line_start = prefix_source[..directive_pos]
-            .rfind('\n')
-            .map(|idx| idx + 1)
-            .unwrap_or(0);
-        if !prefix_source[line_start..directive_pos].trim().is_empty() {
-            return Err(self.invariant_position_error(entry_span));
-        }
 
         let line_end = prefix_source[directive_pos..]
             .find('\n')
