@@ -2,7 +2,8 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ops::ControlFlow;
 
 use crate::contracts::{
-    SpecBinaryOp, SpecExpr as HirSpecExpr, SpecUnaryOp, collect_hir_loop_contracts,
+    SpecBinaryOp, SpecExpr as HirSpecExpr, SpecUnaryOp, collect_hir_assertions,
+    collect_hir_loop_contracts,
 };
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{HirId, Pat, PatKind};
@@ -59,6 +60,17 @@ pub struct LoopContracts {
     pub by_invariant_block: HashMap<BasicBlock, BasicBlock>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AssertionContract {
+    pub assertion: MirSpecExpr,
+    pub assertion_span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssertionContracts {
+    pub by_control_point: HashMap<(BasicBlock, usize), AssertionContract>,
+}
+
 impl LoopContracts {
     pub fn empty() -> Self {
         Self {
@@ -73,6 +85,22 @@ impl LoopContracts {
 
     pub fn header_for_invariant_block(&self, block: BasicBlock) -> Option<BasicBlock> {
         self.by_invariant_block.get(&block).copied()
+    }
+}
+
+impl AssertionContracts {
+    pub fn empty() -> Self {
+        Self {
+            by_control_point: HashMap::new(),
+        }
+    }
+
+    pub fn assertion_at(
+        &self,
+        block: BasicBlock,
+        statement_index: usize,
+    ) -> Option<&AssertionContract> {
+        self.by_control_point.get(&(block, statement_index))
     }
 }
 
@@ -148,6 +176,35 @@ fn spans_match<'tcx>(tcx: TyCtxt<'tcx>, left: Span, right: Span) -> bool {
     left == right
         || tcx.sess.source_map().stmt_span(left, right) == right
         || tcx.sess.source_map().stmt_span(right, left) == left
+}
+
+fn control_point_after<'tcx>(body: &Body<'tcx>, span: Span) -> Option<(BasicBlock, usize)> {
+    let mut target: Option<(BasicBlock, usize, Span)> = None;
+    for (basic_block, data) in body.basic_blocks.iter_enumerated() {
+        for (statement_index, statement) in data.statements.iter().enumerate() {
+            let candidate_span = statement.source_info.span;
+            if candidate_span.lo() < span.lo() {
+                continue;
+            }
+            if target
+                .as_ref()
+                .is_none_or(|(_, _, best_span)| candidate_span.lo() < best_span.lo())
+            {
+                target = Some((basic_block, statement_index, candidate_span));
+            }
+        }
+        let candidate_span = data.terminator().source_info.span;
+        if candidate_span.lo() < span.lo() {
+            continue;
+        }
+        if target
+            .as_ref()
+            .is_none_or(|(_, _, best_span)| candidate_span.lo() < best_span.lo())
+        {
+            target = Some((basic_block, data.statements.len(), candidate_span));
+        }
+    }
+    target.map(|(basic_block, statement_index, _)| (basic_block, statement_index))
 }
 
 pub fn compute_loops<'tcx>(
@@ -251,6 +308,56 @@ pub fn compute_loops<'tcx>(
         by_header: loops,
         by_invariant_block,
     })
+}
+
+pub fn compute_assertions<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    body: &Body<'tcx>,
+) -> Result<AssertionContracts, LoopPrepassError> {
+    let binding_info = collect_hir_binding_info(tcx, def_id)?;
+    let hir_assertions = collect_hir_assertions(tcx, def_id, &binding_info)?;
+    let hir_locals = compute_hir_locals(tcx, body, &binding_info);
+    let mut by_control_point = HashMap::new();
+    for hir_assertion in hir_assertions.items {
+        let target = control_point_after(body, hir_assertion.stmt_span);
+        let Some((basic_block, statement_index)) = target else {
+            return Err(LoopPrepassError {
+                span: hir_assertion.stmt_span,
+                basic_block: None,
+                statement_index: None,
+                message: format!(
+                    "unable to map //@ assert at {} to MIR",
+                    tcx.sess
+                        .source_map()
+                        .span_to_diagnostic_string(hir_assertion.stmt_span)
+                ),
+            });
+        };
+        let assertion = lower_hir_spec_expr(
+            &hir_assertion.assertion,
+            &hir_locals,
+            hir_assertion.assertion_span,
+        )?;
+        if by_control_point
+            .insert(
+                (basic_block, statement_index),
+                AssertionContract {
+                    assertion,
+                    assertion_span: hir_assertion.assertion_span,
+                },
+            )
+            .is_some()
+        {
+            return Err(LoopPrepassError {
+                span: hir_assertion.stmt_span,
+                basic_block: Some(basic_block),
+                statement_index: Some(statement_index),
+                message: "multiple //@ assert directives map to the same control point".to_owned(),
+            });
+        }
+    }
+    Ok(AssertionContracts { by_control_point })
 }
 
 fn lower_hir_spec_expr(

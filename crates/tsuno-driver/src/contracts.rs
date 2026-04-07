@@ -65,11 +65,29 @@ pub struct HirLoopContracts {
     pub by_loop_expr_id: HashMap<HirId, HirLoopContract>,
 }
 
+#[derive(Debug, Clone)]
+pub struct HirAssertionContract {
+    pub stmt_span: Span,
+    pub assertion: SpecExpr,
+    pub assertion_span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct HirAssertionContracts {
+    pub items: Vec<HirAssertionContract>,
+}
+
 impl HirLoopContracts {
     pub fn empty() -> Self {
         Self {
             by_loop_expr_id: HashMap::new(),
         }
+    }
+}
+
+impl HirAssertionContracts {
+    pub fn empty() -> Self {
+        Self { items: Vec::new() }
     }
 }
 
@@ -80,9 +98,8 @@ pub fn collect_hir_loop_contracts<'tcx>(
 ) -> Result<HirLoopContracts, LoopPrepassError> {
     let body = tcx.hir_body_owned_by(def_id);
     let mut collector = HirLoopContractCollector {
-        tcx,
+        lowerer: SpecExprLowerer { tcx, binding_info },
         contracts: HashMap::new(),
-        binding_info,
     };
     match intravisit::walk_body(&mut collector, body) {
         ControlFlow::Continue(()) => Ok(HirLoopContracts {
@@ -92,10 +109,180 @@ pub fn collect_hir_loop_contracts<'tcx>(
     }
 }
 
-struct HirLoopContractCollector<'a, 'tcx> {
+pub fn collect_hir_assertions<'tcx>(
     tcx: TyCtxt<'tcx>,
-    contracts: HashMap<HirId, HirLoopContract>,
+    def_id: LocalDefId,
+    binding_info: &HirBindingInfo,
+) -> Result<HirAssertionContracts, LoopPrepassError> {
+    let body = tcx.hir_body_owned_by(def_id);
+    let mut collector = HirAssertionCollector {
+        lowerer: SpecExprLowerer { tcx, binding_info },
+        assertions: Vec::new(),
+    };
+    match intravisit::walk_body(&mut collector, body) {
+        ControlFlow::Continue(()) => Ok(HirAssertionContracts {
+            items: collector.assertions,
+        }),
+        ControlFlow::Break(err) => Err(err),
+    }
+}
+
+struct SpecExprLowerer<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
     binding_info: &'a HirBindingInfo,
+}
+
+impl<'a, 'tcx> SpecExprLowerer<'a, 'tcx> {
+    fn lower_syn_spec_expr(
+        &self,
+        expr: &SynExpr,
+        span: Span,
+        anchor_span: Span,
+        kind: &str,
+    ) -> Result<SpecExpr, LoopPrepassError> {
+        match expr {
+            SynExpr::Lit(lit) => match &lit.lit {
+                SynLit::Bool(value) => Ok(SpecExpr::Bool(value.value)),
+                SynLit::Int(value) => {
+                    let value = value.base10_parse::<i64>().map_err(|_| LoopPrepassError {
+                        span,
+                        basic_block: None,
+                        statement_index: None,
+                        message: format!("integer literal in //@ {} is too large", kind),
+                    })?;
+                    Ok(SpecExpr::Int(value))
+                }
+                _ => Err(self.unsupported_syn_spec_expr(
+                    span,
+                    kind,
+                    "unsupported literal in //@ {kind} predicate",
+                )),
+            },
+            SynExpr::Path(path) => {
+                let Some(ident) = path.path.get_ident() else {
+                    return Err(self.unsupported_syn_spec_expr(
+                        span,
+                        kind,
+                        "unsupported path in //@ {kind} predicate",
+                    ));
+                };
+                let name = Symbol::intern(&ident.to_string());
+                let Some(hir_id) = self.resolve_binding_hir_id(name, anchor_span) else {
+                    return Err(LoopPrepassError {
+                        span,
+                        basic_block: None,
+                        statement_index: None,
+                        message: format!("unresolved binding `{ident}` in //@ {}", kind),
+                    });
+                };
+                Ok(SpecExpr::Var { hir_id, name })
+            }
+            SynExpr::Unary(expr) => {
+                let op = match expr.op {
+                    SynUnOp::Not(_) => SpecUnaryOp::Not,
+                    SynUnOp::Neg(_) => SpecUnaryOp::Neg,
+                    _ => {
+                        return Err(self.unsupported_syn_spec_expr(
+                            span,
+                            kind,
+                            "unsupported unary operator in //@ {kind} predicate",
+                        ));
+                    }
+                };
+                Ok(SpecExpr::Unary {
+                    op,
+                    arg: Box::new(self.lower_syn_spec_expr(&expr.expr, span, anchor_span, kind)?),
+                })
+            }
+            SynExpr::Binary(expr) => {
+                let op = match expr.op {
+                    SynBinOp::Add(_) => SpecBinaryOp::Add,
+                    SynBinOp::Sub(_) => SpecBinaryOp::Sub,
+                    SynBinOp::Mul(_) => SpecBinaryOp::Mul,
+                    SynBinOp::Eq(_) => SpecBinaryOp::Eq,
+                    SynBinOp::Ne(_) => SpecBinaryOp::Ne,
+                    SynBinOp::Gt(_) => SpecBinaryOp::Gt,
+                    SynBinOp::Ge(_) => SpecBinaryOp::Ge,
+                    SynBinOp::Lt(_) => SpecBinaryOp::Lt,
+                    SynBinOp::Le(_) => SpecBinaryOp::Le,
+                    SynBinOp::And(_) => SpecBinaryOp::And,
+                    SynBinOp::Or(_) => SpecBinaryOp::Or,
+                    _ => {
+                        return Err(self.unsupported_syn_spec_expr(
+                            span,
+                            kind,
+                            "unsupported binary operator in //@ {kind} predicate",
+                        ));
+                    }
+                };
+                Ok(SpecExpr::Binary {
+                    op,
+                    lhs: Box::new(self.lower_syn_spec_expr(&expr.left, span, anchor_span, kind)?),
+                    rhs: Box::new(self.lower_syn_spec_expr(
+                        &expr.right,
+                        span,
+                        anchor_span,
+                        kind,
+                    )?),
+                })
+            }
+            SynExpr::Paren(expr) => self.lower_syn_spec_expr(&expr.expr, span, anchor_span, kind),
+            SynExpr::Group(expr) => self.lower_syn_spec_expr(&expr.expr, span, anchor_span, kind),
+            SynExpr::Reference(expr) => {
+                self.lower_syn_spec_expr(&expr.expr, span, anchor_span, kind)
+            }
+            SynExpr::Cast(expr) => self.lower_syn_spec_expr(&expr.expr, span, anchor_span, kind),
+            SynExpr::Block(expr) => {
+                let Some(syn::Stmt::Expr(inner, None)) = expr.block.stmts.last() else {
+                    return Err(self.unsupported_syn_spec_expr(
+                        span,
+                        kind,
+                        "block without a trailing expression is unsupported in //@ {kind}",
+                    ));
+                };
+                self.lower_syn_spec_expr(inner, span, anchor_span, kind)
+            }
+            SynExpr::Call(_) | SynExpr::MethodCall(_) => Err(self.unsupported_syn_spec_expr(
+                span,
+                kind,
+                "function calls are unsupported in //@ {kind} predicates",
+            )),
+            _ => Err(self.unsupported_syn_spec_expr(
+                span,
+                kind,
+                "unsupported expression in //@ {kind} predicate",
+            )),
+        }
+    }
+
+    fn resolve_binding_hir_id(&self, name: Symbol, anchor_span: Span) -> Option<HirId> {
+        self.binding_info.by_name.get(&name).and_then(|bindings| {
+            bindings
+                .iter()
+                .filter(|(_, span)| span.lo() < anchor_span.lo())
+                .max_by_key(|(_, span)| span.lo())
+                .map(|(hir_id, _)| *hir_id)
+        })
+    }
+
+    fn unsupported_syn_spec_expr(&self, span: Span, kind: &str, message: &str) -> LoopPrepassError {
+        LoopPrepassError {
+            span,
+            basic_block: None,
+            statement_index: None,
+            message: message.replace("{kind}", kind),
+        }
+    }
+}
+
+struct HirLoopContractCollector<'a, 'tcx> {
+    lowerer: SpecExprLowerer<'a, 'tcx>,
+    contracts: HashMap<HirId, HirLoopContract>,
+}
+
+struct HirAssertionCollector<'a, 'tcx> {
+    lowerer: SpecExprLowerer<'a, 'tcx>,
+    assertions: Vec<HirAssertionContract>,
 }
 
 impl<'a, 'tcx> HirLoopContractCollector<'a, 'tcx> {
@@ -128,12 +315,14 @@ impl<'a, 'tcx> HirLoopContractCollector<'a, 'tcx> {
         entry_span: Span,
     ) -> Result<(SpecExpr, Span), LoopPrepassError> {
         let loop_source = self
+            .lowerer
             .tcx
             .sess
             .source_map()
             .span_to_snippet(loop_expr.span)
             .map_err(|_| self.missing_invariant_error(loop_expr, body))?;
         let body_source = self
+            .lowerer
             .tcx
             .sess
             .source_map()
@@ -143,37 +332,18 @@ impl<'a, 'tcx> HirLoopContractCollector<'a, 'tcx> {
             return Err(self.missing_invariant_error(loop_expr, body));
         };
         let prefix_source = &loop_source[..body_index];
-        let invariant_count = prefix_source.matches("//@ inv").count();
-        if invariant_count == 0 {
-            return Err(self.missing_invariant_error(loop_expr, body));
-        }
-        if invariant_count > 1 {
-            return Err(self.multiple_invariant_error(entry_span));
-        }
-
-        let Some(directive_pos) = prefix_source.rfind("//@ inv") else {
+        let Some(directive_line) = spec_directive_line(
+            prefix_source,
+            "//@ inv",
+            true,
+            false,
+            self.missing_invariant_error(loop_expr, body),
+            self.multiple_invariant_error(entry_span),
+            self.invariant_position_error(entry_span),
+        )?
+        else {
             return Err(self.missing_invariant_error(loop_expr, body));
         };
-
-        let line_end = prefix_source[directive_pos..]
-            .find('\n')
-            .map(|idx| directive_pos + idx)
-            .unwrap_or(prefix_source.len());
-        let directive_line =
-            prefix_source[directive_pos..line_end].trim_end_matches(['\r', ' ', '\t']);
-        let after_line = &prefix_source[line_end..];
-        let Some(after_newline) = after_line.strip_prefix('\n') else {
-            return Err(self.invariant_position_error(entry_span));
-        };
-        if after_newline.contains('\n') {
-            return Err(self.invariant_position_error(entry_span));
-        }
-        if !after_newline
-            .chars()
-            .all(|c| matches!(c, ' ' | '\t' | '\r'))
-        {
-            return Err(self.invariant_position_error(entry_span));
-        }
 
         let predicate_text = directive_line
             .strip_prefix("//@ inv")
@@ -185,13 +355,15 @@ impl<'a, 'tcx> HirLoopContractCollector<'a, 'tcx> {
             statement_index: None,
             message: format!("failed to parse //@ inv predicate: {err}"),
         })?;
-        let expr = parse_inv_template(&lit).map_err(|err| LoopPrepassError {
+        let expr = parse_spec_template("inv", &lit).map_err(|err| LoopPrepassError {
             span: entry_span,
             basic_block: None,
             statement_index: None,
             message: err.to_string(),
         })?;
-        let invariant = self.lower_syn_spec_expr(&expr, entry_span, entry_span)?;
+        let invariant = self
+            .lowerer
+            .lower_syn_spec_expr(&expr, entry_span, entry_span, "inv")?;
         Ok((invariant, entry_span))
     }
 
@@ -254,7 +426,8 @@ impl<'a, 'tcx> HirLoopContractCollector<'a, 'tcx> {
             statement_index: None,
             message: format!(
                 "loop body starting at {} requires exactly one //@ inv \"...\" before the body",
-                self.tcx
+                self.lowerer
+                    .tcx
                     .sess
                     .source_map()
                     .span_to_diagnostic_string(body.span)
@@ -288,132 +461,6 @@ impl<'a, 'tcx> HirLoopContractCollector<'a, 'tcx> {
             message: "unsupported loop desugaring shape for //@ inv".to_owned(),
         }
     }
-
-    fn lower_syn_spec_expr(
-        &self,
-        expr: &SynExpr,
-        span: Span,
-        anchor_span: Span,
-    ) -> Result<SpecExpr, LoopPrepassError> {
-        match expr {
-            SynExpr::Lit(lit) => match &lit.lit {
-                SynLit::Bool(value) => Ok(SpecExpr::Bool(value.value)),
-                SynLit::Int(value) => {
-                    let value = value.base10_parse::<i64>().map_err(|_| LoopPrepassError {
-                        span,
-                        basic_block: None,
-                        statement_index: None,
-                        message: "integer literal in //@ inv is too large".to_owned(),
-                    })?;
-                    Ok(SpecExpr::Int(value))
-                }
-                _ => Err(self
-                    .unsupported_syn_spec_expr(span, "unsupported literal in //@ inv predicate")),
-            },
-            SynExpr::Path(path) => {
-                let Some(ident) = path.path.get_ident() else {
-                    return Err(self
-                        .unsupported_syn_spec_expr(span, "unsupported path in //@ inv predicate"));
-                };
-                let name = Symbol::intern(&ident.to_string());
-                let Some(hir_id) = self.resolve_binding_hir_id(name, anchor_span) else {
-                    return Err(LoopPrepassError {
-                        span,
-                        basic_block: None,
-                        statement_index: None,
-                        message: format!("unresolved binding `{ident}` in //@ inv"),
-                    });
-                };
-                Ok(SpecExpr::Var { hir_id, name })
-            }
-            SynExpr::Unary(expr) => {
-                let op = match expr.op {
-                    SynUnOp::Not(_) => SpecUnaryOp::Not,
-                    SynUnOp::Neg(_) => SpecUnaryOp::Neg,
-                    _ => {
-                        return Err(self.unsupported_syn_spec_expr(
-                            span,
-                            "unsupported unary operator in //@ inv predicate",
-                        ));
-                    }
-                };
-                Ok(SpecExpr::Unary {
-                    op,
-                    arg: Box::new(self.lower_syn_spec_expr(&expr.expr, span, anchor_span)?),
-                })
-            }
-            SynExpr::Binary(expr) => {
-                let op = match expr.op {
-                    SynBinOp::Add(_) => SpecBinaryOp::Add,
-                    SynBinOp::Sub(_) => SpecBinaryOp::Sub,
-                    SynBinOp::Mul(_) => SpecBinaryOp::Mul,
-                    SynBinOp::Eq(_) => SpecBinaryOp::Eq,
-                    SynBinOp::Ne(_) => SpecBinaryOp::Ne,
-                    SynBinOp::Gt(_) => SpecBinaryOp::Gt,
-                    SynBinOp::Ge(_) => SpecBinaryOp::Ge,
-                    SynBinOp::Lt(_) => SpecBinaryOp::Lt,
-                    SynBinOp::Le(_) => SpecBinaryOp::Le,
-                    SynBinOp::And(_) => SpecBinaryOp::And,
-                    SynBinOp::Or(_) => SpecBinaryOp::Or,
-                    _ => {
-                        return Err(self.unsupported_syn_spec_expr(
-                            span,
-                            "unsupported binary operator in //@ inv predicate",
-                        ));
-                    }
-                };
-                Ok(SpecExpr::Binary {
-                    op,
-                    lhs: Box::new(self.lower_syn_spec_expr(&expr.left, span, anchor_span)?),
-                    rhs: Box::new(self.lower_syn_spec_expr(&expr.right, span, anchor_span)?),
-                })
-            }
-            SynExpr::Paren(expr) => self.lower_syn_spec_expr(&expr.expr, span, anchor_span),
-            SynExpr::Group(expr) => self.lower_syn_spec_expr(&expr.expr, span, anchor_span),
-            SynExpr::Reference(expr) => self.lower_syn_spec_expr(&expr.expr, span, anchor_span),
-            SynExpr::Cast(expr) => self.lower_syn_spec_expr(&expr.expr, span, anchor_span),
-            SynExpr::Block(expr) => {
-                let Some(syn::Stmt::Expr(inner, None)) = expr.block.stmts.last() else {
-                    return Err(self.unsupported_syn_spec_expr(
-                        span,
-                        "block without a trailing expression is unsupported in //@ inv",
-                    ));
-                };
-                self.lower_syn_spec_expr(inner, span, anchor_span)
-            }
-            SynExpr::Call(_) | SynExpr::MethodCall(_) => Err(self.unsupported_syn_spec_expr(
-                span,
-                "function calls are unsupported in //@ inv predicates",
-            )),
-            _ => {
-                Err(self
-                    .unsupported_syn_spec_expr(span, "unsupported expression in //@ inv predicate"))
-            }
-        }
-    }
-
-    fn resolve_binding_hir_id(&self, name: Symbol, anchor_span: Span) -> Option<HirId> {
-        self.binding_info.by_name.get(&name).and_then(|bindings| {
-            bindings
-                .iter()
-                .filter(|(_, span)| span.lo() < anchor_span.lo())
-                .max_by_key(|(_, span)| span.lo())
-                .map(|(hir_id, _)| *hir_id)
-        })
-    }
-
-    fn unsupported_syn_spec_expr(
-        &self,
-        span: Span,
-        message: impl Into<String>,
-    ) -> LoopPrepassError {
-        LoopPrepassError {
-            span,
-            basic_block: None,
-            statement_index: None,
-            message: message.into(),
-        }
-    }
 }
 
 impl<'a, 'tcx> Visitor<'tcx> for HirLoopContractCollector<'a, 'tcx> {
@@ -427,6 +474,18 @@ impl<'a, 'tcx> Visitor<'tcx> for HirLoopContractCollector<'a, 'tcx> {
             return ControlFlow::Break(err);
         }
         intravisit::walk_expr(self, expr)
+    }
+}
+
+impl<'a, 'tcx> Visitor<'tcx> for HirAssertionCollector<'a, 'tcx> {
+    type NestedFilter = intravisit::nested_filter::None;
+    type Result = ControlFlow<LoopPrepassError>;
+
+    fn visit_block(&mut self, block: &'tcx Block<'tcx>) -> Self::Result {
+        if let Err(err) = self.collect_block_assertions(block) {
+            return ControlFlow::Break(err);
+        }
+        intravisit::walk_block(self, block)
     }
 }
 
@@ -445,7 +504,202 @@ fn body_entry_span(body: &Block<'_>) -> Span {
         .unwrap_or(body.span)
 }
 
-fn parse_inv_template(lit: &LitStr) -> syn::Result<SynExpr> {
+impl<'a, 'tcx> HirAssertionCollector<'a, 'tcx> {
+    fn collect_block_assertions(
+        &mut self,
+        block: &'tcx Block<'tcx>,
+    ) -> Result<(), LoopPrepassError> {
+        let Ok(block_source) = self
+            .lowerer
+            .tcx
+            .sess
+            .source_map()
+            .span_to_snippet(block.span)
+        else {
+            return Ok(());
+        };
+        let mut cursor = 0;
+        for stmt in block.stmts {
+            let stmt_source = self
+                .lowerer
+                .tcx
+                .sess
+                .source_map()
+                .span_to_snippet(stmt.span)
+                .map_err(|_| self.missing_assertion_error(stmt.span))?;
+            let Some(stmt_offset) = block_source[cursor..].find(&stmt_source) else {
+                continue;
+            };
+            let stmt_start = cursor + stmt_offset;
+            let prefix_source = &block_source[cursor..stmt_start];
+            if let Some(directive_line) = spec_directive_line(
+                prefix_source,
+                "//@ assert",
+                false,
+                false,
+                self.missing_assertion_error(stmt.span),
+                self.multiple_assertion_error(stmt.span),
+                self.assertion_position_error(stmt.span),
+            )? {
+                let predicate_text = directive_line
+                    .strip_prefix("//@ assert")
+                    .expect("directive line starts with //@ assert")
+                    .trim();
+                let lit =
+                    syn::parse_str::<LitStr>(predicate_text).map_err(|err| LoopPrepassError {
+                        span: stmt.span,
+                        basic_block: None,
+                        statement_index: None,
+                        message: format!("failed to parse //@ assert predicate: {err}"),
+                    })?;
+                let expr = parse_spec_template("assert", &lit).map_err(|err| LoopPrepassError {
+                    span: stmt.span,
+                    basic_block: None,
+                    statement_index: None,
+                    message: err.to_string(),
+                })?;
+                let assertion = self
+                    .lowerer
+                    .lower_syn_spec_expr(&expr, stmt.span, stmt.span, "assert")?;
+                self.assertions.push(HirAssertionContract {
+                    stmt_span: stmt.span,
+                    assertion,
+                    assertion_span: stmt.span,
+                });
+            }
+            cursor = stmt_start + stmt_source.len();
+        }
+
+        let tail_source = &block_source[cursor..];
+        if let Some(directive_line) = spec_directive_line(
+            tail_source,
+            "//@ assert",
+            false,
+            true,
+            self.missing_assertion_error(block.span),
+            self.multiple_assertion_error(block.span),
+            self.assertion_position_error(block.span),
+        )? {
+            let predicate_text = directive_line
+                .strip_prefix("//@ assert")
+                .expect("directive line starts with //@ assert")
+                .trim();
+            let lit = syn::parse_str::<LitStr>(predicate_text).map_err(|err| LoopPrepassError {
+                span: block.span,
+                basic_block: None,
+                statement_index: None,
+                message: format!("failed to parse //@ assert predicate: {err}"),
+            })?;
+            let expr = parse_spec_template("assert", &lit).map_err(|err| LoopPrepassError {
+                span: block.span,
+                basic_block: None,
+                statement_index: None,
+                message: err.to_string(),
+            })?;
+            let anchor_span = block.span.shrink_to_hi();
+            let assertion =
+                self.lowerer
+                    .lower_syn_spec_expr(&expr, block.span, anchor_span, "assert")?;
+            self.assertions.push(HirAssertionContract {
+                stmt_span: anchor_span,
+                assertion,
+                assertion_span: anchor_span,
+            });
+        }
+        Ok(())
+    }
+
+    fn missing_assertion_error(&self, span: Span) -> LoopPrepassError {
+        LoopPrepassError {
+            span,
+            basic_block: None,
+            statement_index: None,
+            message: "assertion directive must be attached to a statement".to_owned(),
+        }
+    }
+
+    fn multiple_assertion_error(&self, span: Span) -> LoopPrepassError {
+        LoopPrepassError {
+            span,
+            basic_block: None,
+            statement_index: None,
+            message: "statement may contain exactly one //@ assert before it".to_owned(),
+        }
+    }
+
+    fn assertion_position_error(&self, span: Span) -> LoopPrepassError {
+        LoopPrepassError {
+            span,
+            basic_block: None,
+            statement_index: None,
+            message: "//@ assert must be placed immediately before the statement".to_owned(),
+        }
+    }
+}
+
+fn spec_directive_line<'a>(
+    prefix_source: &'a str,
+    directive: &str,
+    allow_leading_code: bool,
+    allow_terminal: bool,
+    missing_error: LoopPrepassError,
+    multiple_error: LoopPrepassError,
+    position_error: LoopPrepassError,
+) -> Result<Option<&'a str>, LoopPrepassError> {
+    let directive_count = prefix_source.matches(directive).count();
+    if directive_count == 0 {
+        return Ok(None);
+    }
+    if directive_count > 1 {
+        return Err(multiple_error);
+    }
+
+    let Some(directive_pos) = prefix_source.rfind(directive) else {
+        return Err(missing_error);
+    };
+    if !allow_leading_code {
+        let line_start = prefix_source[..directive_pos]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        if !prefix_source[line_start..directive_pos].trim().is_empty() {
+            return Err(position_error);
+        }
+    }
+
+    let line_end = prefix_source[directive_pos..]
+        .find('\n')
+        .map(|idx| directive_pos + idx)
+        .unwrap_or(prefix_source.len());
+    let directive_line = prefix_source[directive_pos..line_end].trim_end_matches(['\r', ' ', '\t']);
+    let after_line = &prefix_source[line_end..];
+    if after_line.is_empty() {
+        return if allow_terminal {
+            Ok(Some(directive_line))
+        } else {
+            Err(position_error)
+        };
+    }
+    if allow_terminal && after_line.chars().all(|c| c.is_whitespace() || c == '}') {
+        return Ok(Some(directive_line));
+    }
+    let Some(after_newline) = after_line.strip_prefix('\n') else {
+        return Err(position_error);
+    };
+    if after_newline.contains('\n') {
+        return Err(position_error);
+    }
+    if !after_newline
+        .chars()
+        .all(|c| matches!(c, ' ' | '\t' | '\r'))
+    {
+        return Err(position_error);
+    }
+
+    Ok(Some(directive_line))
+}
+
+fn parse_spec_template(kind: &str, lit: &LitStr) -> syn::Result<SynExpr> {
     let raw = lit.value();
     let mut output = String::new();
     let mut chars = raw.chars().peekable();
@@ -476,14 +730,14 @@ fn parse_inv_template(lit: &LitStr) -> syn::Result<SynExpr> {
                 if !closed {
                     return Err(syn::Error::new(
                         lit.span(),
-                        "unclosed `{` in //@ inv template",
+                        format!("unclosed `{{` in //@ {} template", kind),
                     ));
                 }
                 let inner = inner.trim();
                 if inner.is_empty() {
                     return Err(syn::Error::new(
                         lit.span(),
-                        "empty interpolation in //@ inv template",
+                        format!("empty interpolation in //@ {} template", kind),
                     ));
                 }
                 output.push('(');
@@ -497,7 +751,7 @@ fn parse_inv_template(lit: &LitStr) -> syn::Result<SynExpr> {
                 } else {
                     return Err(syn::Error::new(
                         lit.span(),
-                        "unmatched `}` in //@ inv template",
+                        format!("unmatched `}}` in //@ {} template", kind),
                     ));
                 }
             }
@@ -508,7 +762,7 @@ fn parse_inv_template(lit: &LitStr) -> syn::Result<SynExpr> {
     syn::parse_str::<SynExpr>(&output).map_err(|err| {
         syn::Error::new(
             lit.span(),
-            format!("failed to parse //@ inv predicate: {err}"),
+            format!("failed to parse //@ {} predicate: {err}", kind),
         )
     })
 }

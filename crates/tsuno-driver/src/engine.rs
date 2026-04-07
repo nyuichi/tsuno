@@ -15,7 +15,8 @@ use z3::ast::{Bool, Int};
 use z3::{SatResult, Solver, set_global_param};
 
 use crate::prepass::{
-    LoopContract, LoopContracts, MirSpecExpr, SwitchJoin, compute_loops, compute_switch_joins,
+    AssertionContracts, LoopContract, LoopContracts, MirSpecExpr, SwitchJoin, compute_assertions,
+    compute_loops, compute_switch_joins,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 
@@ -60,6 +61,7 @@ pub struct Verifier<'tcx> {
     def_id: LocalDefId,
     body: Body<'tcx>,
     loop_contracts: LoopContracts,
+    assertion_contracts: AssertionContracts,
     prepass_error: Option<VerificationResult>,
     switch_joins: HashMap<BasicBlock, SwitchJoin>,
     next_loc: Cell<usize>,
@@ -68,7 +70,7 @@ pub struct Verifier<'tcx> {
 
 impl<'tcx> Verifier<'tcx> {
     pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: Body<'tcx>) -> Self {
-        let (loop_contracts, prepass_error) = match compute_loops(tcx, def_id, &body) {
+        let (loop_contracts, mut prepass_error) = match compute_loops(tcx, def_id, &body) {
             Ok(loop_contracts) => (loop_contracts, None),
             Err(error) => (
                 LoopContracts::empty(),
@@ -84,12 +86,33 @@ impl<'tcx> Verifier<'tcx> {
                 }),
             ),
         };
+        let assertion_contracts = if prepass_error.is_none() {
+            match compute_assertions(tcx, def_id, &body) {
+                Ok(assertion_contracts) => assertion_contracts,
+                Err(error) => {
+                    prepass_error = Some(VerificationResult {
+                        function: tcx.def_path_str(def_id.to_def_id()),
+                        status: VerificationStatus::Unsupported,
+                        span: span_text(tcx, error.span),
+                        basic_block: error.basic_block.map(|bb| bb.index()),
+                        statement_index: error.statement_index,
+                        message: error.message,
+                        trace: Vec::new(),
+                        model: Vec::new(),
+                    });
+                    AssertionContracts::empty()
+                }
+            }
+        } else {
+            AssertionContracts::empty()
+        };
         let switch_joins = compute_switch_joins(&body);
         Self {
             tcx,
             def_id,
             body,
             loop_contracts,
+            assertion_contracts,
             prepass_error,
             switch_joins,
             next_loc: Cell::new(0),
@@ -234,6 +257,19 @@ impl<'tcx> Verifier<'tcx> {
             state.ctrl.basic_block.index(),
             state.ctrl.statement_index
         ));
+        if let Some(assertion) = self
+            .assertion_contracts
+            .assertion_at(state.ctrl.basic_block, state.ctrl.statement_index)
+        {
+            let formula =
+                self.spec_expr_to_bool(&state, &assertion.assertion, stmt.source_info.span)?;
+            self.ensure_formula(
+                &state,
+                formula,
+                assertion.assertion_span,
+                "assertion failed".to_owned(),
+            )?;
+        }
         match &stmt.kind {
             StatementKind::StorageLive(local) => {
                 let value = self.fresh_symval_for_ty(
@@ -281,6 +317,19 @@ impl<'tcx> Verifier<'tcx> {
         state
             .trace
             .push(format!("bb{}:term", state.ctrl.basic_block.index()));
+        if let Some(assertion) = self
+            .assertion_contracts
+            .assertion_at(state.ctrl.basic_block, state.ctrl.statement_index)
+        {
+            let formula =
+                self.spec_expr_to_bool(&state, &assertion.assertion, term.source_info.span)?;
+            self.ensure_formula(
+                &state,
+                formula,
+                assertion.assertion_span,
+                "assertion failed".to_owned(),
+            )?;
+        }
         match &term.kind {
             TerminatorKind::Goto { target } => {
                 self.advance_or_close_loop(state, *target, term.source_info.span)
@@ -402,17 +451,6 @@ impl<'tcx> Verifier<'tcx> {
         if self.is_marker(func, "__tsuno_verify") {
             let target = target.expect("verify marker should return");
             return Ok(vec![self.enter_block(state, target, span)?]);
-        }
-        if self.is_marker(func, "__tsuno_assert") {
-            let cond = self.scalar_from_operand(&state, &args[0].node, span)?;
-            self.ensure_formula(
-                &state,
-                cond.as_bool()?,
-                span,
-                "tsuno assertion failed".to_owned(),
-            )?;
-            let target = target.expect("assert marker should return");
-            return self.advance_or_close_loop(state, target, span);
         }
         for arg in args {
             if let Operand::Copy(place) | Operand::Move(place) = arg.node

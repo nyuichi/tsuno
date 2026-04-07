@@ -74,7 +74,7 @@ fn branch_merge_explosion(
     } else {
         value += 2;
     }
-    tsuno::assert!(value >= 0);
+    //@ assert "value >= 0"
 }
 
 fn main() {}
