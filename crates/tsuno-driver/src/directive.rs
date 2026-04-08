@@ -838,16 +838,14 @@ fn verify_marker_in_source(source: &str, line: usize) -> bool {
         return false;
     }
     let mut current = line.saturating_sub(2);
-    let mut saw_comment_block = false;
     while let Some(text) = source.lines().nth(current) {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return false;
         }
         if !trimmed.starts_with("//@") {
-            return saw_comment_block && false;
+            return false;
         }
-        saw_comment_block = true;
         if trimmed == "//@ verify" {
             return true;
         }

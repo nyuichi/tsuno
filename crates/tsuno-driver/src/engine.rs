@@ -1794,7 +1794,7 @@ impl<'tcx> Verifier<'tcx> {
                         state.trace.clone(),
                     )
                 })?;
-                value.to_typed_current(state, span)
+                value.to_typed_current(state)
             }
             ContractExpr::Prophecy(name) => {
                 let value = env.get(name).ok_or_else(|| {
@@ -1806,7 +1806,7 @@ impl<'tcx> Verifier<'tcx> {
                         state.trace.clone(),
                     )
                 })?;
-                value.to_typed_prophecy(state, span)
+                value.to_typed_prophecy(state)
             }
             ContractExpr::Unary { op, arg } => {
                 let arg = self.contract_expr_to_typed(state, arg, env, span)?;
@@ -2564,13 +2564,13 @@ impl TypedExpr {
 }
 
 impl SymVal {
-    fn to_typed_current(&self, state: &State, span: Span) -> Result<TypedExpr, VerificationResult> {
+    fn to_typed_current(&self, state: &State) -> Result<TypedExpr, VerificationResult> {
         match self {
             SymVal::Scalar(expr) => Ok(expr.clone()),
             SymVal::Tuple(fields) => {
                 let mut typed = Vec::with_capacity(fields.len());
-                for loc in fields.iter().copied() {
-                    let Some(Slot::Live(value)) = state.store.get(&loc) else {
+                for loc in fields {
+                    let Some(Slot::Live(value)) = state.store.get(loc) else {
                         return Err(VerificationResult {
                             function: String::new(),
                             status: VerificationStatus::Unsupported,
@@ -2582,25 +2582,21 @@ impl SymVal {
                             model: Vec::new(),
                         });
                     };
-                    typed.push(value.to_typed_current(state, span)?);
+                    typed.push(value.to_typed_current(state)?);
                 }
                 Ok(TypedExpr::Tuple(typed.into_boxed_slice()))
             }
-            SymVal::MutRef { cur, .. } => cur.to_typed_current(state, span),
+            SymVal::MutRef { cur, .. } => cur.to_typed_current(state),
         }
     }
 
-    fn to_typed_prophecy(
-        &self,
-        state: &State,
-        span: Span,
-    ) -> Result<TypedExpr, VerificationResult> {
+    fn to_typed_prophecy(&self, state: &State) -> Result<TypedExpr, VerificationResult> {
         match self {
             SymVal::Scalar(expr) => Ok(expr.clone()),
             SymVal::Tuple(fields) => {
                 let mut typed = Vec::with_capacity(fields.len());
-                for loc in fields.iter().copied() {
-                    let Some(Slot::Live(value)) = state.store.get(&loc) else {
+                for loc in fields {
+                    let Some(Slot::Live(value)) = state.store.get(loc) else {
                         return Err(VerificationResult {
                             function: String::new(),
                             status: VerificationStatus::Unsupported,
@@ -2612,11 +2608,11 @@ impl SymVal {
                             model: Vec::new(),
                         });
                     };
-                    typed.push(value.to_typed_prophecy(state, span)?);
+                    typed.push(value.to_typed_prophecy(state)?);
                 }
                 Ok(TypedExpr::Tuple(typed.into_boxed_slice()))
             }
-            SymVal::MutRef { fin, .. } => fin.to_typed_prophecy(state, span),
+            SymVal::MutRef { fin, .. } => fin.to_typed_prophecy(state),
         }
     }
 }
