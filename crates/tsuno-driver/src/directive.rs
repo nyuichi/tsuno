@@ -281,8 +281,6 @@ impl<'a, 'tcx> SpecExprLowerer<'a, 'tcx> {
                 SynLit::Int(value) => {
                     let value = value.base10_parse::<i64>().map_err(|_| LoopPrepassError {
                         span,
-                        basic_block: None,
-                        statement_index: None,
                         message: format!("integer literal in //@ {} is too large", kind),
                     })?;
                     Ok(SpecExpr::Int(value))
@@ -312,8 +310,6 @@ impl<'a, 'tcx> SpecExprLowerer<'a, 'tcx> {
                 let Some(hir_id) = self.resolve_binding_hir_id(name, anchor_span) else {
                     return Err(LoopPrepassError {
                         span,
-                        basic_block: None,
-                        statement_index: None,
                         message: format!("unresolved binding `{ident}` in //@ {}", kind),
                     });
                 };
@@ -359,8 +355,6 @@ impl<'a, 'tcx> SpecExprLowerer<'a, 'tcx> {
                 let Some(hir_id) = self.resolve_binding_hir_id(name, anchor_span) else {
                     return Err(LoopPrepassError {
                         span,
-                        basic_block: None,
-                        statement_index: None,
                         message: format!("unresolved binding `{arg_ident}` in //@ {}", kind),
                     });
                 };
@@ -457,8 +451,6 @@ impl<'a, 'tcx> SpecExprLowerer<'a, 'tcx> {
     fn unsupported_syn_spec_expr(&self, span: Span, kind: &str, message: &str) -> LoopPrepassError {
         LoopPrepassError {
             span,
-            basic_block: None,
-            statement_index: None,
             message: message.replace("{kind}", kind),
         }
     }
@@ -566,14 +558,10 @@ impl<'a, 'tcx> HirLoopContractCollector<'a, 'tcx> {
         let line_text = &prefix_source[line_start..line_end];
         let lit = syn::parse_str::<LitStr>(predicate_text).map_err(|err| LoopPrepassError {
             span: entry_span,
-            basic_block: None,
-            statement_index: None,
             message: format!("failed to parse //@ inv predicate: {err}"),
         })?;
         let expr = parse_spec_template("inv", &lit).map_err(|err| LoopPrepassError {
             span: entry_span,
-            basic_block: None,
-            statement_index: None,
             message: err.to_string(),
         })?;
         let invariant = self
@@ -637,8 +625,6 @@ impl<'a, 'tcx> HirLoopContractCollector<'a, 'tcx> {
     ) -> LoopPrepassError {
         LoopPrepassError {
             span: loop_expr.span,
-            basic_block: None,
-            statement_index: None,
             message: format!(
                 "loop body starting at {} requires exactly one //@ inv \"...\" before the body",
                 self.lowerer
@@ -653,8 +639,6 @@ impl<'a, 'tcx> HirLoopContractCollector<'a, 'tcx> {
     fn multiple_invariant_error(&self, span: Span) -> LoopPrepassError {
         LoopPrepassError {
             span,
-            basic_block: None,
-            statement_index: None,
             message: "loop header may contain exactly one //@ inv before the body".to_owned(),
         }
     }
@@ -662,8 +646,6 @@ impl<'a, 'tcx> HirLoopContractCollector<'a, 'tcx> {
     fn invariant_position_error(&self, span: Span) -> LoopPrepassError {
         LoopPrepassError {
             span,
-            basic_block: None,
-            statement_index: None,
             message: "//@ inv must be placed immediately before the loop body".to_owned(),
         }
     }
@@ -671,8 +653,6 @@ impl<'a, 'tcx> HirLoopContractCollector<'a, 'tcx> {
     fn unsupported_loop_shape_error(&self, span: Span) -> LoopPrepassError {
         LoopPrepassError {
             span,
-            basic_block: None,
-            statement_index: None,
             message: "unsupported loop desugaring shape for //@ inv".to_owned(),
         }
     }
@@ -790,14 +770,10 @@ impl<'a, 'tcx> HirAssertionCollector<'a, 'tcx> {
                 let lit =
                     syn::parse_str::<LitStr>(predicate_text).map_err(|err| LoopPrepassError {
                         span: stmt.span,
-                        basic_block: None,
-                        statement_index: None,
                         message: format!("failed to parse //@ assert predicate: {err}"),
                     })?;
                 let expr = parse_spec_template("assert", &lit).map_err(|err| LoopPrepassError {
                     span: stmt.span,
-                    basic_block: None,
-                    statement_index: None,
                     message: err.to_string(),
                 })?;
                 let assertion = self
@@ -855,14 +831,10 @@ impl<'a, 'tcx> HirAssertionCollector<'a, 'tcx> {
             let line_text = &tail_source[line_start..line_end];
             let lit = syn::parse_str::<LitStr>(predicate_text).map_err(|err| LoopPrepassError {
                 span: block.span,
-                basic_block: None,
-                statement_index: None,
                 message: format!("failed to parse //@ assert predicate: {err}"),
             })?;
             let expr = parse_spec_template("assert", &lit).map_err(|err| LoopPrepassError {
                 span: block.span,
-                basic_block: None,
-                statement_index: None,
                 message: err.to_string(),
             })?;
             let anchor_span = block.span.shrink_to_hi();
@@ -881,8 +853,6 @@ impl<'a, 'tcx> HirAssertionCollector<'a, 'tcx> {
     fn missing_assertion_error(&self, span: Span) -> LoopPrepassError {
         LoopPrepassError {
             span,
-            basic_block: None,
-            statement_index: None,
             message: "assertion directive must be attached to a statement".to_owned(),
         }
     }
@@ -890,8 +860,6 @@ impl<'a, 'tcx> HirAssertionCollector<'a, 'tcx> {
     fn multiple_assertion_error(&self, span: Span) -> LoopPrepassError {
         LoopPrepassError {
             span,
-            basic_block: None,
-            statement_index: None,
             message: "statement may contain exactly one //@ assert before it".to_owned(),
         }
     }
@@ -899,8 +867,6 @@ impl<'a, 'tcx> HirAssertionCollector<'a, 'tcx> {
     fn assertion_position_error(&self, span: Span) -> LoopPrepassError {
         LoopPrepassError {
             span,
-            basic_block: None,
-            statement_index: None,
             message: "//@ assert must be placed immediately before the statement".to_owned(),
         }
     }

@@ -201,6 +201,11 @@ pub fn compute_hir_locals<'tcx>(
     locals
 }
 
+pub struct LoopPrepassError {
+    pub span: Span,
+    pub message: String,
+}
+
 pub fn collect_hir_binding_info<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
@@ -309,8 +314,6 @@ pub fn compute_loops<'tcx>(
         else {
             return Err(LoopPrepassError {
                 span: header_span,
-                basic_block: Some(header),
-                statement_index: None,
                 message: format!(
                     "loop at bb{} requires exactly one //@ inv before the body",
                     header.index()
@@ -366,8 +369,6 @@ pub fn compute_assertions<'tcx>(
         let Some((basic_block, statement_index)) = target else {
             return Err(LoopPrepassError {
                 span: hir_assertion.stmt_span,
-                basic_block: None,
-                statement_index: None,
                 message: format!(
                     "unable to map //@ assert at {} to MIR",
                     tcx.sess
@@ -393,8 +394,6 @@ pub fn compute_assertions<'tcx>(
         {
             return Err(LoopPrepassError {
                 span: hir_assertion.stmt_span,
-                basic_block: Some(basic_block),
-                statement_index: Some(statement_index),
                 message: "multiple //@ assert directives map to the same control point".to_owned(),
             });
         }
@@ -592,8 +591,6 @@ fn lower_hir_spec_expr(
             let Some(local) = hir_locals.get(hir_id).copied() else {
                 return Err(LoopPrepassError {
                     span,
-                    basic_block: None,
-                    statement_index: None,
                     message: format!("missing MIR local for HIR id {:?}", hir_id),
                 });
             };
@@ -603,8 +600,6 @@ fn lower_hir_spec_expr(
             let Some(local) = hir_locals.get(hir_id).copied() else {
                 return Err(LoopPrepassError {
                     span,
-                    basic_block: None,
-                    statement_index: None,
                     message: format!("missing MIR local for HIR id {:?}", hir_id),
                 });
             };
