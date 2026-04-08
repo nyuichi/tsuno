@@ -1,11 +1,12 @@
 ---
 source: crates/tsuno-driver/tests/verify_cli.rs
-assertion_line: 131
 expression: snapshot_output(output)
 ---
 status: Some(0)
 stdout:
-PASS close_ok
+PASS allows_mutable_reference_field_splitting
+  all assertions discharged
+PASS allows_mutable_reference_field_splitting_three
   all assertions discharged
 
 stderr:
