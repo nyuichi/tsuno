@@ -1516,7 +1516,7 @@ impl<'tcx> Verifier<'tcx> {
         diagnostic_span: String,
         message: String,
     ) -> Result<(), VerificationResult> {
-        self.assume_constraint(state, constraint);
+        self.assert_constraint(state, constraint);
         match self.check_sat(
             and_expr(vec![state.pc.clone(), state.assertion.clone()]),
             span,
@@ -1537,6 +1537,10 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn assume_constraint(&self, state: &mut State, constraint: BoolExpr) {
+        state.pc = and_expr(vec![state.pc.clone(), constraint]);
+    }
+
+    fn assert_constraint(&self, state: &mut State, constraint: BoolExpr) {
         state.assertion = and_expr(vec![state.assertion.clone(), constraint]);
     }
 
