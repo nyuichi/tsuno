@@ -5,6 +5,6 @@ expression: snapshot_output(output)
 status: Some(1)
 stdout:
 UNSUPPORTED rejects_unsupported_initial_state
-  unsupported type (i32, bool, bool)
+  unsupported type [i32; 3_usize]
 
 stderr:

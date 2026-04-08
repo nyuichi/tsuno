@@ -6,5 +6,7 @@ status: Some(0)
 stdout:
 PASS allows_mutable_reference_field_splitting
   all assertions discharged
+PASS allows_mutable_reference_field_splitting_three
+  all assertions discharged
 
 stderr:

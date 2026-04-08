@@ -48,7 +48,7 @@ pub enum Slot {
 #[derive(Debug, Clone)]
 pub enum SymVal {
     Scalar(TypedExpr),
-    Pair(Loc, Loc),
+    Tuple(Box<[Loc]>),
     MutRef {
         target: Loc,
         cur: Box<SymVal>,
@@ -60,7 +60,7 @@ pub enum SymVal {
 pub enum TypedExpr {
     Bool(Bool),
     Int(Int),
-    Unit,
+    Tuple(Box<[TypedExpr]>),
 }
 
 pub struct Verifier<'tcx> {
@@ -414,12 +414,12 @@ impl<'tcx> Verifier<'tcx> {
             let cond = match &discr {
                 TypedExpr::Bool(expr) => expr.eq(Bool::from_bool(value != 0)),
                 TypedExpr::Int(expr) => expr.eq(Int::from_i64(value as i64)),
-                TypedExpr::Unit => {
+                TypedExpr::Tuple(_) => {
                     return Err(self.unsupported_result(
                         span,
                         Some(state.ctrl.basic_block.index()),
                         None,
-                        "switch on unit is unsupported".to_owned(),
+                        "switch on tuple is unsupported".to_owned(),
                         state.trace,
                     ));
                 }
@@ -527,21 +527,17 @@ impl<'tcx> Verifier<'tcx> {
             }
             Rvalue::Aggregate(kind, operands) => match kind.as_ref() {
                 AggregateKind::Tuple => {
-                    let operands: Vec<_> = operands.iter().collect();
-                    if operands.len() != 2 {
-                        return Err(self.unsupported_result(
-                            span,
-                            Some(state.ctrl.basic_block.index()),
-                            Some(state.ctrl.statement_index),
-                            "unsupported aggregate arity".to_owned(),
-                            state.trace.clone(),
-                        ));
+                    let mut locs = Vec::with_capacity(operands.len());
+                    for operand in operands.iter() {
+                        let value = self.operand_to_symval(state, operand, span)?;
+                        let loc = self.alloc(state, value);
+                        locs.push(loc);
                     }
-                    let first = self.operand_to_symval(state, operands[0], span)?;
-                    let second = self.operand_to_symval(state, operands[1], span)?;
-                    let first = self.alloc(state, first);
-                    let second = self.alloc(state, second);
-                    SymVal::Pair(first, second)
+                    if locs.is_empty() {
+                        SymVal::Scalar(TypedExpr::Tuple(Vec::new().into_boxed_slice()))
+                    } else {
+                        SymVal::Tuple(locs.into_boxed_slice())
+                    }
                 }
                 other => {
                     return Err(self.unsupported_result(
@@ -615,21 +611,21 @@ impl<'tcx> Verifier<'tcx> {
                 let overflow = self.overflow_formula(&result, lhs_ty, span, state)?;
                 let first = self.alloc(state, SymVal::Scalar(TypedExpr::Int(result)));
                 let second = self.alloc(state, SymVal::Scalar(TypedExpr::Bool(overflow)));
-                SymVal::Pair(first, second)
+                SymVal::Tuple(vec![first, second].into_boxed_slice())
             }
             BinOp::SubWithOverflow => {
                 let result = lhs.as_int()? - rhs.as_int()?;
                 let overflow = self.overflow_formula(&result, lhs_ty, span, state)?;
                 let first = self.alloc(state, SymVal::Scalar(TypedExpr::Int(result)));
                 let second = self.alloc(state, SymVal::Scalar(TypedExpr::Bool(overflow)));
-                SymVal::Pair(first, second)
+                SymVal::Tuple(vec![first, second].into_boxed_slice())
             }
             BinOp::MulWithOverflow => {
                 let result = lhs.as_int()? * rhs.as_int()?;
                 let overflow = self.overflow_formula(&result, lhs_ty, span, state)?;
                 let first = self.alloc(state, SymVal::Scalar(TypedExpr::Int(result)));
                 let second = self.alloc(state, SymVal::Scalar(TypedExpr::Bool(overflow)));
-                SymVal::Pair(first, second)
+                SymVal::Tuple(vec![first, second].into_boxed_slice())
             }
             other => {
                 return Err(self.unsupported_result(
@@ -699,7 +695,7 @@ impl<'tcx> Verifier<'tcx> {
                     state.trace.clone(),
                 )),
             },
-            SymVal::Pair(..) => Err(self.unsupported_result(
+            SymVal::Tuple(..) => Err(self.unsupported_result(
                 span,
                 Some(state.ctrl.basic_block.index()),
                 Some(state.ctrl.statement_index),
@@ -727,7 +723,7 @@ impl<'tcx> Verifier<'tcx> {
                     state.trace.clone(),
                 )),
             },
-            SymVal::Pair(..) => Err(self.unsupported_result(
+            SymVal::Tuple(..) => Err(self.unsupported_result(
                 span,
                 Some(state.ctrl.basic_block.index()),
                 Some(state.ctrl.statement_index),
@@ -836,15 +832,14 @@ impl<'tcx> Verifier<'tcx> {
                 let base_place = base.to_place(self.tcx);
                 let base_value = self.read_place(state, base_place, span)?;
                 let field_loc = match base_value {
-                    SymVal::Pair(first, second) => match field.index() {
-                        0 => first,
-                        1 => second,
-                        index => {
+                    SymVal::Tuple(fields) => match fields.get(field.index()) {
+                        Some(loc) => *loc,
+                        None => {
                             return Err(self.unsupported_result(
                                 span,
                                 Some(state.ctrl.basic_block.index()),
                                 Some(state.ctrl.statement_index),
-                                format!("unsupported tuple field {index}"),
+                                format!("unsupported tuple field {}", field.index()),
                                 state.trace.clone(),
                             ));
                         }
@@ -936,15 +931,14 @@ impl<'tcx> Verifier<'tcx> {
                 let base_place = base.to_place(self.tcx);
                 let base_value = self.read_place(state, base_place, span)?;
                 let field_loc = match base_value {
-                    SymVal::Pair(first, second) => match field.index() {
-                        0 => first,
-                        1 => second,
-                        index => {
+                    SymVal::Tuple(fields) => match fields.get(field.index()) {
+                        Some(loc) => *loc,
+                        None => {
                             return Err(self.unsupported_result(
                                 span,
                                 Some(state.ctrl.basic_block.index()),
                                 Some(state.ctrl.statement_index),
-                                format!("unsupported tuple field {index}"),
+                                format!("unsupported tuple field {}", field.index()),
                                 state.trace.clone(),
                             ));
                         }
@@ -1006,7 +1000,10 @@ impl<'tcx> Verifier<'tcx> {
             let loc = if let Some(loc) = state.env.get(&local).copied() {
                 loc
             } else {
-                let loc = self.alloc(state, SymVal::Scalar(TypedExpr::Unit));
+                let loc = self.alloc(
+                    state,
+                    SymVal::Scalar(TypedExpr::Tuple(Vec::new().into_boxed_slice())),
+                );
                 state.env.insert(local, loc);
                 loc
             };
@@ -1054,15 +1051,14 @@ impl<'tcx> Verifier<'tcx> {
                 let base_place = base.to_place(self.tcx);
                 let base_value = self.read_place(state, base_place, span)?;
                 let field_loc = match base_value {
-                    SymVal::Pair(first, second) => match field.index() {
-                        0 => first,
-                        1 => second,
-                        index => {
+                    SymVal::Tuple(fields) => match fields.get(field.index()) {
+                        Some(loc) => *loc,
+                        None => {
                             return Err(self.unsupported_result(
                                 span,
                                 Some(state.ctrl.basic_block.index()),
                                 Some(state.ctrl.statement_index),
-                                format!("unsupported tuple field {index}"),
+                                format!("unsupported tuple field {}", field.index()),
                                 state.trace.clone(),
                             ));
                         }
@@ -1142,14 +1138,13 @@ impl<'tcx> Verifier<'tcx> {
                 let base_place = base.to_place(self.tcx);
                 let base_value = self.read_place(state, base_place, span)?;
                 match base_value {
-                    SymVal::Pair(first, second) => match field.index() {
-                        0 => Ok(first),
-                        1 => Ok(second),
-                        index => Err(self.unsupported_result(
+                    SymVal::Tuple(fields) => match fields.get(field.index()) {
+                        Some(loc) => Ok(*loc),
+                        None => Err(self.unsupported_result(
                             span,
                             Some(state.ctrl.basic_block.index()),
                             Some(state.ctrl.statement_index),
-                            format!("unsupported tuple field {index}"),
+                            format!("unsupported tuple field {}", field.index()),
                             state.trace.clone(),
                         )),
                     },
@@ -1217,7 +1212,9 @@ impl<'tcx> Verifier<'tcx> {
                 };
                 Ok(SymVal::Scalar(TypedExpr::Int(expr)))
             }
-            TyKind::Tuple(fields) if fields.is_empty() => Ok(SymVal::Scalar(TypedExpr::Unit)),
+            TyKind::Tuple(fields) if fields.is_empty() => Ok(SymVal::Scalar(TypedExpr::Tuple(
+                Vec::new().into_boxed_slice(),
+            ))),
             TyKind::FnDef(..) => Err(self.unsupported_result(
                 span,
                 None,
@@ -1250,13 +1247,17 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(SymVal::Scalar(TypedExpr::Int(expr)))
             }
-            TyKind::Tuple(fields) if fields.is_empty() => Ok(SymVal::Scalar(TypedExpr::Unit)),
-            TyKind::Tuple(fields) if fields.len() == 2 => {
-                let first = self.fresh_symval_for_ty(state, fields[0], prefix)?;
-                let second = self.fresh_symval_for_ty(state, fields[1], prefix)?;
-                let first = self.alloc(state, first);
-                let second = self.alloc(state, second);
-                Ok(SymVal::Pair(first, second))
+            TyKind::Tuple(fields) if fields.is_empty() => Ok(SymVal::Scalar(TypedExpr::Tuple(
+                Vec::new().into_boxed_slice(),
+            ))),
+            TyKind::Tuple(fields) => {
+                let mut locs = Vec::with_capacity(fields.len());
+                for field in fields.iter() {
+                    let value = self.fresh_symval_for_ty(state, field, prefix)?;
+                    let loc = self.alloc(state, value);
+                    locs.push(loc);
+                }
+                Ok(SymVal::Tuple(locs.into_boxed_slice()))
             }
             TyKind::Ref(_, inner, rustc_middle::mir::Mutability::Mut) => {
                 let target_value = self.fresh_symval_for_ty(state, *inner, prefix)?;
@@ -1396,7 +1397,14 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<Bool, VerificationResult> {
         match self.spec_expr_to_typed(state, expr, span)? {
             TypedExpr::Bool(expr) => Ok(expr),
-            TypedExpr::Unit => Ok(Bool::from_bool(true)),
+            TypedExpr::Tuple(fields) if fields.is_empty() => Ok(Bool::from_bool(true)),
+            TypedExpr::Tuple(_) => Err(self.unsupported_result(
+                span,
+                Some(state.ctrl.basic_block.index()),
+                Some(state.ctrl.statement_index),
+                "expected boolean expression".to_owned(),
+                state.trace.clone(),
+            )),
             TypedExpr::Int(_) => Err(self.unsupported_result(
                 span,
                 Some(state.ctrl.basic_block.index()),
@@ -1438,7 +1446,7 @@ impl<'tcx> Verifier<'tcx> {
                     Slot::Live(SymVal::Scalar(expr)) => Ok(expr),
                     Slot::Live(SymVal::MutRef { cur, .. }) => match cur.as_ref() {
                         SymVal::Scalar(expr) => Ok(expr.clone()),
-                        SymVal::MutRef { .. } | SymVal::Pair(..) => Err(self.unsupported_result(
+                        SymVal::MutRef { .. } | SymVal::Tuple(..) => Err(self.unsupported_result(
                             span,
                             Some(state.ctrl.basic_block.index()),
                             Some(state.ctrl.statement_index),
@@ -1446,7 +1454,7 @@ impl<'tcx> Verifier<'tcx> {
                             state.trace.clone(),
                         )),
                     },
-                    Slot::Live(SymVal::Pair(..)) => Err(self.unsupported_result(
+                    Slot::Live(SymVal::Tuple(..)) => Err(self.unsupported_result(
                         span,
                         Some(state.ctrl.basic_block.index()),
                         Some(state.ctrl.statement_index),
@@ -1727,12 +1735,13 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 None
             }
-            Some(Slot::Live(SymVal::Pair(first, second))) => Some((*first, *second)),
+            Some(Slot::Live(SymVal::Tuple(fields))) => Some(fields.to_vec()),
             _ => None,
         };
-        if let Some((first, second)) = recurse {
-            Self::update_mutref_aliases_at_loc(state, first, target, cur, fin);
-            Self::update_mutref_aliases_at_loc(state, second, target, cur, fin);
+        if let Some(fields) = recurse {
+            for loc in fields {
+                Self::update_mutref_aliases_at_loc(state, loc, target, cur, fin);
+            }
         }
     }
 
@@ -1776,24 +1785,18 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Option<SymVal> {
         match value {
             SymVal::Scalar(expr) => Some(SymVal::Scalar(expr.clone())),
-            SymVal::Pair(first, second) => Some(SymVal::Pair(
-                {
-                    let first_slot = self.clone_slot_into_state(
+            SymVal::Tuple(fields) => {
+                let mut locs = Vec::with_capacity(fields.len());
+                for loc in fields.iter().copied() {
+                    let slot = self.clone_slot_into_state(
                         state,
                         source_state,
-                        source_state.store.get(first)?,
+                        source_state.store.get(&loc)?,
                     )?;
-                    self.alloc_slot(state, first_slot)
-                },
-                {
-                    let second_slot = self.clone_slot_into_state(
-                        state,
-                        source_state,
-                        source_state.store.get(second)?,
-                    )?;
-                    self.alloc_slot(state, second_slot)
-                },
-            )),
+                    locs.push(self.alloc_slot(state, slot));
+                }
+                Some(SymVal::Tuple(locs.into_boxed_slice()))
+            }
             SymVal::MutRef { target, cur, fin } => Some(SymVal::MutRef {
                 target: *target,
                 cur: Box::new(self.clone_symval_into_state(state, source_state, cur)?),
@@ -1838,27 +1841,27 @@ impl<'tcx> Verifier<'tcx> {
             (SymVal::Scalar(existing), SymVal::Scalar(incoming)) => Some(SymVal::Scalar(
                 self.merge_typed_expr(guard, existing, incoming)?,
             )),
-            (SymVal::Pair(existing_a, existing_b), SymVal::Pair(incoming_a, incoming_b)) => {
-                let left = self.merge_slot(
-                    merged,
-                    guard,
-                    existing_state,
-                    existing_state.store.get(existing_a)?,
-                    incoming_state,
-                    incoming_state.store.get(incoming_a)?,
-                )?;
-                let right = self.merge_slot(
-                    merged,
-                    guard,
-                    existing_state,
-                    existing_state.store.get(existing_b)?,
-                    incoming_state,
-                    incoming_state.store.get(incoming_b)?,
-                )?;
-                Some(SymVal::Pair(
-                    self.alloc_slot(merged, left),
-                    self.alloc_slot(merged, right),
-                ))
+            (SymVal::Tuple(existing_fields), SymVal::Tuple(incoming_fields)) => {
+                if existing_fields.len() != incoming_fields.len() {
+                    return None;
+                }
+                let mut locs = Vec::with_capacity(existing_fields.len());
+                for (existing_loc, incoming_loc) in existing_fields
+                    .iter()
+                    .copied()
+                    .zip(incoming_fields.iter().copied())
+                {
+                    let merged_slot = self.merge_slot(
+                        merged,
+                        guard,
+                        existing_state,
+                        existing_state.store.get(&existing_loc)?,
+                        incoming_state,
+                        incoming_state.store.get(&incoming_loc)?,
+                    )?;
+                    locs.push(self.alloc_slot(merged, merged_slot));
+                }
+                Some(SymVal::Tuple(locs.into_boxed_slice()))
             }
             (
                 SymVal::MutRef {
@@ -1910,7 +1913,16 @@ impl<'tcx> Verifier<'tcx> {
             (TypedExpr::Int(existing), TypedExpr::Int(incoming)) => {
                 Some(TypedExpr::Int(guard.ite(incoming, existing)))
             }
-            (TypedExpr::Unit, TypedExpr::Unit) => Some(TypedExpr::Unit),
+            (TypedExpr::Tuple(existing_fields), TypedExpr::Tuple(incoming_fields)) => {
+                if existing_fields.len() != incoming_fields.len() {
+                    return None;
+                }
+                let mut fields = Vec::with_capacity(existing_fields.len());
+                for (existing, incoming) in existing_fields.iter().zip(incoming_fields.iter()) {
+                    fields.push(self.merge_typed_expr(guard, existing, incoming)?);
+                }
+                Some(TypedExpr::Tuple(fields.into_boxed_slice()))
+            }
             _ => None,
         }
     }
@@ -1983,9 +1995,10 @@ impl<'tcx> Verifier<'tcx> {
                 state.store.insert(*target, Slot::Live((**cur).clone()));
                 Ok(true)
             }
-            SymVal::Pair(first, second) => {
-                self.close_loc(state, *first, span)?;
-                self.close_loc(state, *second, span)?;
+            SymVal::Tuple(fields) => {
+                for loc in fields.iter().copied() {
+                    self.close_loc(state, loc, span)?;
+                }
                 Ok(false)
             }
             SymVal::Scalar(_) => Ok(false),
@@ -2000,46 +2013,38 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<Bool, VerificationResult> {
         match (lhs, rhs) {
             (SymVal::Scalar(lhs), SymVal::Scalar(rhs)) => lhs.eq(rhs),
-            (SymVal::Pair(lhs_first, lhs_second), SymVal::Pair(rhs_first, rhs_second)) => {
-                let lhs_first = state.store.get(lhs_first).ok_or_else(|| {
-                    self.unsupported_result(
-                        self.tcx.def_span(self.def_id),
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
-                        "missing pair field".to_owned(),
-                        state.trace.clone(),
-                    )
-                })?;
-                let rhs_first = state.store.get(rhs_first).ok_or_else(|| {
-                    self.unsupported_result(
-                        self.tcx.def_span(self.def_id),
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
-                        "missing pair field".to_owned(),
-                        state.trace.clone(),
-                    )
-                })?;
-                let lhs_second = state.store.get(lhs_second).ok_or_else(|| {
-                    self.unsupported_result(
-                        self.tcx.def_span(self.def_id),
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
-                        "missing pair field".to_owned(),
-                        state.trace.clone(),
-                    )
-                })?;
-                let rhs_second = state.store.get(rhs_second).ok_or_else(|| {
-                    self.unsupported_result(
-                        self.tcx.def_span(self.def_id),
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
-                        "missing pair field".to_owned(),
-                        state.trace.clone(),
-                    )
-                })?;
-                let first = self.slot_eq(state, lhs_first, rhs_first)?;
-                let second = self.slot_eq(state, lhs_second, rhs_second)?;
-                Ok(Bool::and(&[&first, &second]))
+            (SymVal::Tuple(lhs_fields), SymVal::Tuple(rhs_fields)) => {
+                if lhs_fields.len() != rhs_fields.len() {
+                    return Ok(Bool::from_bool(false));
+                }
+                if lhs_fields.is_empty() {
+                    return Ok(Bool::from_bool(true));
+                }
+                let mut terms = Vec::with_capacity(lhs_fields.len());
+                for (lhs_loc, rhs_loc) in lhs_fields.iter().copied().zip(rhs_fields.iter().copied())
+                {
+                    let lhs_slot = state.store.get(&lhs_loc).ok_or_else(|| {
+                        self.unsupported_result(
+                            self.tcx.def_span(self.def_id),
+                            Some(state.ctrl.basic_block.index()),
+                            Some(state.ctrl.statement_index),
+                            "missing tuple field".to_owned(),
+                            state.trace.clone(),
+                        )
+                    })?;
+                    let rhs_slot = state.store.get(&rhs_loc).ok_or_else(|| {
+                        self.unsupported_result(
+                            self.tcx.def_span(self.def_id),
+                            Some(state.ctrl.basic_block.index()),
+                            Some(state.ctrl.statement_index),
+                            "missing tuple field".to_owned(),
+                            state.trace.clone(),
+                        )
+                    })?;
+                    terms.push(self.slot_eq(state, lhs_slot, rhs_slot)?);
+                }
+                let refs: Vec<_> = terms.iter().collect();
+                Ok(Bool::and(&refs))
             }
             (
                 SymVal::MutRef {
@@ -2097,7 +2102,17 @@ impl TypedExpr {
     fn as_bool(&self) -> Result<Bool, VerificationResult> {
         match self {
             TypedExpr::Bool(expr) => Ok(expr.clone()),
-            TypedExpr::Unit => Ok(Bool::from_bool(true)),
+            TypedExpr::Tuple(fields) if fields.is_empty() => Ok(Bool::from_bool(true)),
+            TypedExpr::Tuple(_) => Err(VerificationResult {
+                function: String::new(),
+                status: VerificationStatus::Unsupported,
+                span: String::new(),
+                basic_block: None,
+                statement_index: None,
+                message: "expected boolean expression".to_owned(),
+                trace: Vec::new(),
+                model: Vec::new(),
+            }),
             TypedExpr::Int(_) => Err(VerificationResult {
                 function: String::new(),
                 status: VerificationStatus::Unsupported,
@@ -2131,7 +2146,20 @@ impl TypedExpr {
         match (self, rhs) {
             (TypedExpr::Bool(lhs), TypedExpr::Bool(rhs)) => Ok(lhs.eq(rhs)),
             (TypedExpr::Int(lhs), TypedExpr::Int(rhs)) => Ok(lhs.eq(rhs)),
-            (TypedExpr::Unit, TypedExpr::Unit) => Ok(Bool::from_bool(true)),
+            (TypedExpr::Tuple(lhs_fields), TypedExpr::Tuple(rhs_fields)) => {
+                if lhs_fields.len() != rhs_fields.len() {
+                    return Ok(Bool::from_bool(false));
+                }
+                if lhs_fields.is_empty() {
+                    return Ok(Bool::from_bool(true));
+                }
+                let mut terms = Vec::with_capacity(lhs_fields.len());
+                for (lhs, rhs) in lhs_fields.iter().zip(rhs_fields.iter()) {
+                    terms.push(lhs.eq(rhs)?);
+                }
+                let refs: Vec<_> = terms.iter().collect();
+                Ok(Bool::and(&refs))
+            }
             _ => Err(VerificationResult {
                 function: String::new(),
                 status: VerificationStatus::Unsupported,
@@ -2238,7 +2266,13 @@ fn same_typed_expr(left: &TypedExpr, right: &TypedExpr) -> bool {
     match (left, right) {
         (TypedExpr::Bool(left), TypedExpr::Bool(right)) => left.to_string() == right.to_string(),
         (TypedExpr::Int(left), TypedExpr::Int(right)) => left.to_string() == right.to_string(),
-        (TypedExpr::Unit, TypedExpr::Unit) => true,
+        (TypedExpr::Tuple(left), TypedExpr::Tuple(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| same_typed_expr(left, right))
+        }
         _ => false,
     }
 }

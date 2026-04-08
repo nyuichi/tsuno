@@ -7,5 +7,7 @@ status: Some(0)
 stdout:
 PASS partial_move_then_remaining_field_write
   all assertions discharged
+PASS partial_move_then_remaining_field_write_three
+  all assertions discharged
 
 stderr:
