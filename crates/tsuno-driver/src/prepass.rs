@@ -30,7 +30,10 @@ pub struct LoopPrepassError {
 pub enum MirSpecExpr {
     Bool(bool),
     Int(i64),
+    Result,
     Var(Local),
+    #[allow(dead_code)]
+    Prophecy(Local),
     Unary {
         op: SpecUnaryOp,
         arg: Box<MirSpecExpr>,
@@ -368,6 +371,7 @@ fn lower_hir_spec_expr(
     match expr {
         HirSpecExpr::Bool(value) => Ok(MirSpecExpr::Bool(*value)),
         HirSpecExpr::Int(value) => Ok(MirSpecExpr::Int(*value)),
+        HirSpecExpr::Result => Ok(MirSpecExpr::Result),
         HirSpecExpr::Var { hir_id, .. } => {
             let Some(local) = hir_locals.get(hir_id).copied() else {
                 return Err(LoopPrepassError {
@@ -378,6 +382,17 @@ fn lower_hir_spec_expr(
                 });
             };
             Ok(MirSpecExpr::Var(local))
+        }
+        HirSpecExpr::Prophecy { hir_id, .. } => {
+            let Some(local) = hir_locals.get(hir_id).copied() else {
+                return Err(LoopPrepassError {
+                    span,
+                    basic_block: None,
+                    statement_index: None,
+                    message: format!("missing MIR local for HIR id {:?}", hir_id),
+                });
+            };
+            Ok(MirSpecExpr::Prophecy(local))
         }
         HirSpecExpr::Unary { op, arg } => Ok(MirSpecExpr::Unary {
             op: *op,

@@ -4,6 +4,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use rustc_hir::def_id::LocalDefId;
+use rustc_hir::{ItemKind, PatKind};
 use rustc_middle::mir::{
     AggregateKind, BasicBlock, BinOp, Body, BorrowKind, ConstOperand, Local, Operand, Place,
     PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnOp,
@@ -11,10 +12,11 @@ use rustc_middle::mir::{
 use rustc_middle::ty::{IntTy, TyCtxt, TyKind, UintTy};
 use rustc_span::Span;
 use rustc_span::source_map::Spanned;
+use syn::{Expr as SynExpr, Lit, LitStr};
 use z3::ast::{Bool, Int};
 use z3::{SatResult, Solver, set_global_param};
 
-use crate::directive::{SpecBinaryOp, SpecUnaryOp};
+use crate::directive::{SpecBinaryOp, SpecUnaryOp, parse_spec_template};
 use crate::prepass::{
     AssertionContracts, LoopContract, LoopContracts, MirSpecExpr, SwitchJoin, compute_assertions,
     compute_loops, compute_switch_joins,
@@ -29,6 +31,8 @@ pub struct State {
     env: BTreeMap<Local, Loc>,
     store: BTreeMap<Loc, Slot>,
     pc: Vec<Bool>,
+    assertion: Vec<Bool>,
+    live: BTreeMap<Local, bool>,
     ctrl: ControlPoint,
     trace: Vec<String>,
 }
@@ -63,11 +67,36 @@ pub enum TypedExpr {
     Tuple(Box<[TypedExpr]>),
 }
 
+#[derive(Debug, Clone)]
+struct FunctionContract {
+    params: Vec<String>,
+    req: ContractExpr,
+    ens: ContractExpr,
+}
+
+#[derive(Debug, Clone)]
+enum ContractExpr {
+    Bool(bool),
+    Int(i64),
+    Var(String),
+    Prophecy(String),
+    Unary {
+        op: SpecUnaryOp,
+        arg: Box<ContractExpr>,
+    },
+    Binary {
+        op: SpecBinaryOp,
+        lhs: Box<ContractExpr>,
+        rhs: Box<ContractExpr>,
+    },
+}
+
 pub struct Verifier<'tcx> {
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     body: Body<'tcx>,
     solver: Solver,
+    contracts: HashMap<LocalDefId, FunctionContract>,
     loop_contracts: LoopContracts,
     assertion_contracts: AssertionContracts,
     prepass_error: Option<VerificationResult>,
@@ -115,6 +144,13 @@ impl<'tcx> Verifier<'tcx> {
             AssertionContracts::empty()
         };
         let switch_joins = compute_switch_joins(&body);
+        let contracts = match collect_function_contracts(tcx) {
+            Ok(contracts) => contracts,
+            Err(error) => {
+                prepass_error.get_or_insert(error);
+                HashMap::new()
+            }
+        };
         Self {
             tcx,
             def_id,
@@ -126,6 +162,7 @@ impl<'tcx> Verifier<'tcx> {
                 solver.set_params(&params);
                 solver
             },
+            contracts,
             loop_contracts,
             assertion_contracts,
             prepass_error,
@@ -180,6 +217,8 @@ impl<'tcx> Verifier<'tcx> {
                 merged.pc = first.pc[..common_len].to_vec();
                 merged.env.clear();
                 merged.store.clear();
+                merged.assertion.clear();
+                merged.live = first.live.clone();
                 for state in &bucket {
                     let guard = state.pc.get(common_len).cloned().expect(
                         "join bucket must have a branch guard at the first divergent pc element",
@@ -187,6 +226,19 @@ impl<'tcx> Verifier<'tcx> {
                     for cond in &state.pc[common_len + 1..] {
                         merged.pc.push(guard.implies(cond));
                     }
+                    let state_assertion = if state.assertion.is_empty() {
+                        Bool::from_bool(true)
+                    } else {
+                        let refs: Vec<_> = state.assertion.iter().collect();
+                        Bool::and(&refs)
+                    };
+                    let state_pc = if state.pc.is_empty() {
+                        Bool::from_bool(true)
+                    } else {
+                        let refs: Vec<_> = state.pc.iter().collect();
+                        Bool::and(&refs)
+                    };
+                    merged.assertion.push(state_pc.implies(&state_assertion));
                     merged.trace = common_prefix(&merged.trace, &state.trace);
                 }
 
@@ -286,13 +338,18 @@ impl<'tcx> Verifier<'tcx> {
                 self.spec_expr_to_bool(&state, &assertion.assertion, stmt.source_info.span)?;
             self.ensure_formula(
                 &state,
-                formula,
+                formula.clone(),
                 assertion.assertion_span,
                 "assertion failed".to_owned(),
             )?;
+            state.assertion.push(formula);
         }
         match &stmt.kind {
             StatementKind::StorageLive(local) => {
+                if state.live.get(local).copied().unwrap_or(false) {
+                    self.close_local(&mut state, *local, stmt.source_info.span)?;
+                    state.env.remove(local);
+                }
                 let value = self.fresh_symval_for_ty(
                     &mut state,
                     self.body.local_decls[*local].ty,
@@ -300,9 +357,15 @@ impl<'tcx> Verifier<'tcx> {
                 )?;
                 let loc = self.alloc(&mut state, value);
                 state.env.insert(*local, loc);
+                state.live.insert(*local, true);
             }
             StatementKind::StorageDead(local) => {
-                self.close_local(&mut state, *local, stmt.source_info.span)?;
+                if !state.live.get(local).copied().unwrap_or(false) {
+                    // already unallocated
+                } else {
+                    self.close_local(&mut state, *local, stmt.source_info.span)?;
+                    state.live.insert(*local, false);
+                }
             }
             StatementKind::Assign(assign) => {
                 let (place, rvalue) = &**assign;
@@ -346,16 +409,79 @@ impl<'tcx> Verifier<'tcx> {
                 self.spec_expr_to_bool(&state, &assertion.assertion, term.source_info.span)?;
             self.ensure_formula(
                 &state,
-                formula,
+                formula.clone(),
                 assertion.assertion_span,
                 "assertion failed".to_owned(),
             )?;
+            state.assertion.push(formula);
         }
         match &term.kind {
             TerminatorKind::Goto { target } => {
                 self.advance_or_close_loop(state, *target, term.source_info.span)
             }
             TerminatorKind::Return => {
+                if let Some(contract) = self.contracts.get(&self.def_id) {
+                    let mut env = HashMap::new();
+                    for (name, local) in contract
+                        .params
+                        .iter()
+                        .cloned()
+                        .zip(self.body.local_decls.indices().skip(1))
+                    {
+                        let Some(loc) = state.env.get(&local).copied() else {
+                            return Err(self.unsupported_result(
+                                term.source_info.span,
+                                Some(state.ctrl.basic_block.index()),
+                                Some(state.ctrl.statement_index),
+                                format!("missing env for local {}", local.as_usize()),
+                                state.trace.clone(),
+                            ));
+                        };
+                        let Some(Slot::Live(value)) = state.store.get(&loc).cloned() else {
+                            return Err(self.unsupported_result(
+                                term.source_info.span,
+                                Some(state.ctrl.basic_block.index()),
+                                Some(state.ctrl.statement_index),
+                                format!("missing store for local {}", local.as_usize()),
+                                state.trace.clone(),
+                            ));
+                        };
+                        env.insert(name, value);
+                    }
+                    let result_local = Local::from_usize(0);
+                    let Some(result_loc) = state.env.get(&result_local).copied() else {
+                        return Err(self.unsupported_result(
+                            term.source_info.span,
+                            Some(state.ctrl.basic_block.index()),
+                            Some(state.ctrl.statement_index),
+                            "missing return local".to_owned(),
+                            state.trace.clone(),
+                        ));
+                    };
+                    let Some(Slot::Live(result_value)) = state.store.get(&result_loc).cloned()
+                    else {
+                        return Err(self.unsupported_result(
+                            term.source_info.span,
+                            Some(state.ctrl.basic_block.index()),
+                            Some(state.ctrl.statement_index),
+                            "missing return value".to_owned(),
+                            state.trace.clone(),
+                        ));
+                    };
+                    env.insert("result".to_owned(), result_value);
+                    let ens = self.contract_expr_to_bool(
+                        &state,
+                        &contract.ens,
+                        &env,
+                        term.source_info.span,
+                    )?;
+                    self.ensure_formula(
+                        &state,
+                        ens,
+                        term.source_info.span,
+                        "postcondition failed".to_owned(),
+                    )?;
+                }
                 self.close_live_mut_refs(&mut state, term.source_info.span)?;
                 Ok(Vec::new())
             }
@@ -384,12 +510,19 @@ impl<'tcx> Verifier<'tcx> {
                 self.advance_or_close_loop(state, *target, term.source_info.span)
             }
             TerminatorKind::Call {
-                func: _,
+                func,
                 args,
                 destination,
                 target,
                 ..
-            } => self.step_call(state, args, *destination, *target, term.source_info.span),
+            } => self.step_call(
+                state,
+                func,
+                args,
+                *destination,
+                *target,
+                term.source_info.span,
+            ),
             other => Err(self.unsupported_result(
                 term.source_info.span,
                 Some(state.ctrl.basic_block.index()),
@@ -456,11 +589,44 @@ impl<'tcx> Verifier<'tcx> {
     fn step_call(
         &self,
         mut state: State,
+        func: &Operand<'tcx>,
         args: &[Spanned<Operand<'tcx>>],
         destination: Place<'tcx>,
         target: Option<BasicBlock>,
         span: Span,
     ) -> Result<Vec<State>, VerificationResult> {
+        let callee_def_id = self.called_def_id(func);
+        let contract = callee_def_id.and_then(|def_id| self.contracts.get(&def_id));
+        let pre_call_args = if let Some(contract) = contract {
+            let mut env = HashMap::new();
+            if contract.params.len() != args.len() {
+                return Err(self.unsupported_result(
+                    span,
+                    Some(state.ctrl.basic_block.index()),
+                    None,
+                    format!(
+                        "call contract parameter count mismatch: expected {}, found {}",
+                        contract.params.len(),
+                        args.len()
+                    ),
+                    state.trace.clone(),
+                ));
+            }
+            for (name, arg) in contract.params.iter().cloned().zip(args.iter()) {
+                let value = self.operand_to_contract_symval(&state, &arg.node, span)?;
+                env.insert(name, value);
+            }
+            Some(env)
+        } else {
+            None
+        };
+        if let (Some(contract), Some(env)) = (contract, pre_call_args.as_ref()) {
+            let req = self.contract_expr_to_bool(&state, &contract.req, env, span)?;
+            state.pc.push(req);
+            if !self.path_is_feasible(&state, span)? {
+                return Ok(Vec::new());
+            }
+        }
         for arg in args {
             if let Operand::Copy(place) | Operand::Move(place) = arg.node
                 && let Some((base_loc, target_loc)) = self.mut_ref_targets(&state, place)
@@ -497,6 +663,17 @@ impl<'tcx> Verifier<'tcx> {
         }
         let value = self.fresh_symval_for_ty(&mut state, self.place_ty(destination), "call_ret")?;
         self.write_place(&mut state, destination, value, span)?;
+        if let Some(contract) = contract {
+            let mut env = HashMap::new();
+            for (name, arg) in contract.params.iter().cloned().zip(args.iter()) {
+                let value = self.operand_to_contract_symval(&state, &arg.node, span)?;
+                env.insert(name, value);
+            }
+            let result_value = self.read_place(&state, destination, span)?;
+            env.insert("result".to_owned(), result_value);
+            let ens = self.contract_expr_to_bool(&state, &contract.ens, &env, span)?;
+            state.assertion.push(ens);
+        }
         let target = target.ok_or_else(|| {
             self.unsupported_result(
                 span,
@@ -507,6 +684,28 @@ impl<'tcx> Verifier<'tcx> {
             )
         })?;
         self.advance_or_close_loop(state, target, span)
+    }
+
+    fn called_def_id(&self, func: &Operand<'tcx>) -> Option<LocalDefId> {
+        let Operand::Constant(constant) = func else {
+            return None;
+        };
+        let TyKind::FnDef(def_id, _) = constant.const_.ty().kind() else {
+            return None;
+        };
+        def_id.as_local()
+    }
+
+    fn operand_to_contract_symval(
+        &self,
+        state: &State,
+        operand: &Operand<'tcx>,
+        span: Span,
+    ) -> Result<SymVal, VerificationResult> {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => self.read_place(state, *place, span),
+            Operand::Constant(constant) => self.constant_to_symval(constant, span),
+        }
     }
 
     fn assign(
@@ -749,6 +948,15 @@ impl<'tcx> Verifier<'tcx> {
                     state.trace.clone(),
                 )
             })?;
+            if !state.live.get(&local).copied().unwrap_or(false) {
+                return Err(self.unsupported_result(
+                    span,
+                    Some(state.ctrl.basic_block.index()),
+                    Some(state.ctrl.statement_index),
+                    format!("use of dead value {}", local.as_usize()),
+                    state.trace.clone(),
+                ));
+            }
             return match state.store.get(&loc).cloned() {
                 Some(Slot::Moved) => Err(self.unsupported_result(
                     span,
@@ -898,6 +1106,15 @@ impl<'tcx> Verifier<'tcx> {
                     state.trace.clone(),
                 )
             })?;
+            if !state.live.get(&local).copied().unwrap_or(false) {
+                return Err(self.unsupported_result(
+                    span,
+                    Some(state.ctrl.basic_block.index()),
+                    Some(state.ctrl.statement_index),
+                    format!("use of dead value {}", local.as_usize()),
+                    state.trace.clone(),
+                ));
+            }
             let Some(slot) = state.store.get_mut(&loc) else {
                 return Err(self.unsupported_result(
                     span,
@@ -998,6 +1215,15 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<(), VerificationResult> {
         if let Some(local) = place.as_local() {
             let loc = if let Some(loc) = state.env.get(&local).copied() {
+                if !state.live.get(&local).copied().unwrap_or(false) {
+                    return Err(self.unsupported_result(
+                        span,
+                        Some(state.ctrl.basic_block.index()),
+                        Some(state.ctrl.statement_index),
+                        format!("write to dead value {}", local.as_usize()),
+                        state.trace.clone(),
+                    ));
+                }
                 loc
             } else {
                 let loc = self.alloc(
@@ -1005,6 +1231,7 @@ impl<'tcx> Verifier<'tcx> {
                     SymVal::Scalar(TypedExpr::Tuple(Vec::new().into_boxed_slice())),
                 );
                 state.env.insert(local, loc);
+                state.live.insert(local, true);
                 loc
             };
             state.store.insert(loc, Slot::Live(value));
@@ -1093,6 +1320,15 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Loc, VerificationResult> {
         if let Some(local) = place.as_local() {
+            if !state.live.get(&local).copied().unwrap_or(false) {
+                return Err(self.unsupported_result(
+                    span,
+                    Some(state.ctrl.basic_block.index()),
+                    Some(state.ctrl.statement_index),
+                    format!("use of dead value {}", local.as_usize()),
+                    state.trace.clone(),
+                ));
+            }
             return state.env.get(&local).copied().ok_or_else(|| {
                 self.unsupported_result(
                     span,
@@ -1169,6 +1405,9 @@ impl<'tcx> Verifier<'tcx> {
 
     fn mut_ref_targets(&self, state: &State, place: Place<'tcx>) -> Option<(Loc, Loc)> {
         let local = place.as_local()?;
+        if !state.live.get(&local).copied().unwrap_or(false) {
+            return None;
+        }
         let base_loc = state.env.get(&local).copied()?;
         match state.store.get(&base_loc) {
             Some(Slot::Live(SymVal::MutRef { target, .. })) => Some((base_loc, *target)),
@@ -1293,6 +1532,9 @@ impl<'tcx> Verifier<'tcx> {
     fn path_is_feasible(&self, state: &State, span: Span) -> Result<bool, VerificationResult> {
         self.solver.push();
         for cond in &state.pc {
+            self.solver.assert(cond);
+        }
+        for cond in &state.assertion {
             self.solver.assert(cond);
         }
         let result = match self.solver.check() {
@@ -1424,6 +1666,13 @@ impl<'tcx> Verifier<'tcx> {
         match expr {
             MirSpecExpr::Bool(value) => Ok(TypedExpr::Bool(Bool::from_bool(*value))),
             MirSpecExpr::Int(value) => Ok(TypedExpr::Int(Int::from_i64(*value))),
+            MirSpecExpr::Result | MirSpecExpr::Prophecy(_) => Err(self.unsupported_result(
+                span,
+                Some(state.ctrl.basic_block.index()),
+                Some(state.ctrl.statement_index),
+                "contract-only expression used in MIR assertion".to_owned(),
+                state.trace.clone(),
+            )),
             MirSpecExpr::Var(local) => {
                 let loc = state.env.get(local).copied().ok_or_else(|| {
                     self.unsupported_result(
@@ -1505,6 +1754,95 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
+    fn contract_expr_to_bool(
+        &self,
+        state: &State,
+        expr: &ContractExpr,
+        env: &HashMap<String, SymVal>,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        match self.contract_expr_to_typed(state, expr, env, span)? {
+            TypedExpr::Bool(expr) => Ok(expr),
+            TypedExpr::Tuple(fields) if fields.is_empty() => Ok(Bool::from_bool(true)),
+            TypedExpr::Tuple(_) | TypedExpr::Int(_) => Err(self.unsupported_result(
+                span,
+                Some(state.ctrl.basic_block.index()),
+                Some(state.ctrl.statement_index),
+                "expected boolean expression".to_owned(),
+                state.trace.clone(),
+            )),
+        }
+    }
+
+    fn contract_expr_to_typed(
+        &self,
+        state: &State,
+        expr: &ContractExpr,
+        env: &HashMap<String, SymVal>,
+        span: Span,
+    ) -> Result<TypedExpr, VerificationResult> {
+        match expr {
+            ContractExpr::Bool(value) => Ok(TypedExpr::Bool(Bool::from_bool(*value))),
+            ContractExpr::Int(value) => Ok(TypedExpr::Int(Int::from_i64(*value))),
+            ContractExpr::Var(name) => {
+                let value = env.get(name).ok_or_else(|| {
+                    self.unsupported_result(
+                        span,
+                        Some(state.ctrl.basic_block.index()),
+                        Some(state.ctrl.statement_index),
+                        format!("missing contract binding `{name}`"),
+                        state.trace.clone(),
+                    )
+                })?;
+                value.to_typed_current(state, span)
+            }
+            ContractExpr::Prophecy(name) => {
+                let value = env.get(name).ok_or_else(|| {
+                    self.unsupported_result(
+                        span,
+                        Some(state.ctrl.basic_block.index()),
+                        Some(state.ctrl.statement_index),
+                        format!("missing contract binding `{name}`"),
+                        state.trace.clone(),
+                    )
+                })?;
+                value.to_typed_prophecy(state, span)
+            }
+            ContractExpr::Unary { op, arg } => {
+                let arg = self.contract_expr_to_typed(state, arg, env, span)?;
+                match op {
+                    SpecUnaryOp::Not => Ok(TypedExpr::Bool(arg.as_bool()?.not())),
+                    SpecUnaryOp::Neg => Ok(TypedExpr::Int(-arg.as_int()?)),
+                }
+            }
+            ContractExpr::Binary { op, lhs, rhs } => {
+                let lhs = self.contract_expr_to_typed(state, lhs, env, span)?;
+                let rhs = self.contract_expr_to_typed(state, rhs, env, span)?;
+                match op {
+                    SpecBinaryOp::Add => Ok(TypedExpr::Int(lhs.as_int()? + rhs.as_int()?)),
+                    SpecBinaryOp::Sub => Ok(TypedExpr::Int(lhs.as_int()? - rhs.as_int()?)),
+                    SpecBinaryOp::Mul => Ok(TypedExpr::Int(lhs.as_int()? * rhs.as_int()?)),
+                    SpecBinaryOp::Eq => Ok(TypedExpr::Bool(lhs.eq(&rhs)?)),
+                    SpecBinaryOp::Ne => Ok(TypedExpr::Bool(lhs.eq(&rhs)?.not())),
+                    SpecBinaryOp::Gt => Ok(TypedExpr::Bool(lhs.as_int()?.gt(&rhs.as_int()?))),
+                    SpecBinaryOp::Ge => Ok(TypedExpr::Bool(lhs.as_int()?.ge(&rhs.as_int()?))),
+                    SpecBinaryOp::Lt => Ok(TypedExpr::Bool(lhs.as_int()?.lt(&rhs.as_int()?))),
+                    SpecBinaryOp::Le => Ok(TypedExpr::Bool(lhs.as_int()?.le(&rhs.as_int()?))),
+                    SpecBinaryOp::And => {
+                        let lhs = lhs.as_bool()?;
+                        let rhs = rhs.as_bool()?;
+                        Ok(TypedExpr::Bool(Bool::and(&[&lhs, &rhs])))
+                    }
+                    SpecBinaryOp::Or => {
+                        let lhs = lhs.as_bool()?;
+                        let rhs = rhs.as_bool()?;
+                        Ok(TypedExpr::Bool(Bool::or(&[&lhs, &rhs])))
+                    }
+                }
+            }
+        }
+    }
+
     fn enter_block(
         &self,
         mut state: State,
@@ -1535,6 +1873,9 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<(), VerificationResult> {
         self.solver.push();
         for cond in &state.pc {
+            self.solver.assert(cond);
+        }
+        for cond in &state.assertion {
             self.solver.assert(cond);
         }
         self.solver.assert(formula.not());
@@ -1686,6 +2027,50 @@ impl<'tcx> Verifier<'tcx> {
                 self.fresh_symval_for_ty(&mut state, ty, &format!("arg_{}", local.as_usize()))?;
             let loc = self.alloc(&mut state, value);
             state.env.insert(local, loc);
+            state.live.insert(local, true);
+        }
+
+        if let Some(contract) = self.contracts.get(&self.def_id) {
+            if contract.params.len() != self.body.arg_count {
+                return Err(function_contract_error(
+                    self.tcx,
+                    self.def_id,
+                    self.tcx.def_span(self.def_id),
+                    format!(
+                        "function contract parameter count mismatch: expected {}, found {}",
+                        self.body.arg_count,
+                        contract.params.len()
+                    ),
+                ));
+            }
+            let mut env = HashMap::new();
+            for (name, local) in contract
+                .params
+                .iter()
+                .cloned()
+                .zip(self.body.local_decls.indices().skip(1))
+            {
+                let loc = state.env[&local];
+                let value = state.store.get(&loc).cloned().ok_or_else(|| {
+                    self.unsupported_result(
+                        self.tcx.def_span(self.def_id),
+                        None,
+                        None,
+                        format!("missing store for local {}", local.as_usize()),
+                        Vec::new(),
+                    )
+                })?;
+                if let Slot::Live(value) = value {
+                    env.insert(name, value);
+                }
+            }
+            let req = self.contract_expr_to_bool(
+                &state,
+                &contract.req,
+                &env,
+                self.tcx.def_span(self.def_id),
+            )?;
+            state.pc.push(req);
         }
         Ok(state)
     }
@@ -1930,9 +2315,9 @@ impl<'tcx> Verifier<'tcx> {
     fn close_live_mut_refs(&self, state: &mut State, span: Span) -> Result<(), VerificationResult> {
         let return_local = Local::from_usize(0);
         let locals: Vec<_> = state
-            .env
+            .live
             .iter()
-            .filter_map(|(local, _)| (*local != return_local).then_some(*local))
+            .filter_map(|(local, live)| (*live && *local != return_local).then_some(*local))
             .collect();
         for local in locals {
             self.close_local(state, local, span)?;
@@ -1986,12 +2371,14 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<bool, VerificationResult> {
         match value {
             SymVal::MutRef { target, cur, fin } => {
+                let formula = self.symval_eq(state, cur.as_ref(), fin.as_ref())?;
                 self.ensure_formula(
                     state,
-                    self.symval_eq(state, cur.as_ref(), fin.as_ref())?,
+                    formula.clone(),
                     span,
                     "mutable reference close failed".to_owned(),
                 )?;
+                state.assertion.push(formula);
                 state.store.insert(*target, Slot::Live((**cur).clone()));
                 Ok(true)
             }
@@ -2081,6 +2468,8 @@ impl State {
             env: BTreeMap::new(),
             store: BTreeMap::new(),
             pc: Vec::new(),
+            assertion: Vec::new(),
+            live: BTreeMap::new(),
             ctrl: ControlPoint {
                 basic_block: BasicBlock::from_usize(0),
                 statement_index: 0,
@@ -2174,6 +2563,64 @@ impl TypedExpr {
     }
 }
 
+impl SymVal {
+    fn to_typed_current(&self, state: &State, span: Span) -> Result<TypedExpr, VerificationResult> {
+        match self {
+            SymVal::Scalar(expr) => Ok(expr.clone()),
+            SymVal::Tuple(fields) => {
+                let mut typed = Vec::with_capacity(fields.len());
+                for loc in fields.iter().copied() {
+                    let Some(Slot::Live(value)) = state.store.get(&loc) else {
+                        return Err(VerificationResult {
+                            function: String::new(),
+                            status: VerificationStatus::Unsupported,
+                            span: String::new(),
+                            basic_block: None,
+                            statement_index: None,
+                            message: format!("missing tuple field {loc:?}"),
+                            trace: Vec::new(),
+                            model: Vec::new(),
+                        });
+                    };
+                    typed.push(value.to_typed_current(state, span)?);
+                }
+                Ok(TypedExpr::Tuple(typed.into_boxed_slice()))
+            }
+            SymVal::MutRef { cur, .. } => cur.to_typed_current(state, span),
+        }
+    }
+
+    fn to_typed_prophecy(
+        &self,
+        state: &State,
+        span: Span,
+    ) -> Result<TypedExpr, VerificationResult> {
+        match self {
+            SymVal::Scalar(expr) => Ok(expr.clone()),
+            SymVal::Tuple(fields) => {
+                let mut typed = Vec::with_capacity(fields.len());
+                for loc in fields.iter().copied() {
+                    let Some(Slot::Live(value)) = state.store.get(&loc) else {
+                        return Err(VerificationResult {
+                            function: String::new(),
+                            status: VerificationStatus::Unsupported,
+                            span: String::new(),
+                            basic_block: None,
+                            statement_index: None,
+                            message: format!("missing tuple field {loc:?}"),
+                            trace: Vec::new(),
+                            model: Vec::new(),
+                        });
+                    };
+                    typed.push(value.to_typed_prophecy(state, span)?);
+                }
+                Ok(TypedExpr::Tuple(typed.into_boxed_slice()))
+            }
+            SymVal::MutRef { fin, .. } => fin.to_typed_prophecy(state, span),
+        }
+    }
+}
+
 impl Slot {
     fn take(&mut self) -> Option<SymVal> {
         match std::mem::replace(self, Slot::Moved) {
@@ -2236,6 +2683,326 @@ fn int_bounds(tcx: TyCtxt<'_>, ty: rustc_middle::ty::Ty<'_>) -> Option<IntBounds
             Some(IntBounds::Unsigned { max })
         }
         _ => None,
+    }
+}
+
+fn collect_function_contracts<'tcx>(
+    tcx: TyCtxt<'tcx>,
+) -> Result<HashMap<LocalDefId, FunctionContract>, VerificationResult> {
+    let mut contracts = HashMap::new();
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
+        let ItemKind::Fn { .. } = item.kind else {
+            continue;
+        };
+        let def_id = item.owner_id.def_id;
+        if let Some(contract) = parse_function_contract(tcx, def_id, item.span)? {
+            contracts.insert(def_id, contract);
+        }
+    }
+    Ok(contracts)
+}
+
+fn parse_function_contract<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    item_span: Span,
+) -> Result<Option<FunctionContract>, VerificationResult> {
+    let loc = tcx.sess.source_map().lookup_char_pos(item_span.lo());
+    let Some(source) = loc.file.src.as_deref() else {
+        return Ok(None);
+    };
+    let lines: Vec<_> = source.lines().collect();
+    if loc.line <= 1 {
+        return Ok(None);
+    }
+    let mut idx = loc.line - 2;
+    let mut block = Vec::new();
+    while let Some(line) = lines.get(idx) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if !trimmed.starts_with("//@") {
+            break;
+        }
+        block.push(trimmed.to_owned());
+        if idx == 0 {
+            break;
+        }
+        idx -= 1;
+    }
+    block.reverse();
+
+    let mut req = None;
+    let mut ens = None;
+    let mut saw_contract = false;
+    for line in block {
+        if let Some(rest) = line.strip_prefix("//@ req") {
+            if req.is_some() {
+                return Err(function_contract_error(
+                    tcx,
+                    def_id,
+                    item_span,
+                    "multiple //@ req directives for a function".to_owned(),
+                ));
+            }
+            saw_contract = true;
+            req = Some(parse_function_contract_expr(
+                tcx,
+                def_id,
+                item_span,
+                "req",
+                rest.trim(),
+            )?);
+        } else if let Some(rest) = line.strip_prefix("//@ ens") {
+            if ens.is_some() {
+                return Err(function_contract_error(
+                    tcx,
+                    def_id,
+                    item_span,
+                    "multiple //@ ens directives for a function".to_owned(),
+                ));
+            }
+            saw_contract = true;
+            ens = Some(parse_function_contract_expr(
+                tcx,
+                def_id,
+                item_span,
+                "ens",
+                rest.trim(),
+            )?);
+        }
+    }
+
+    if !saw_contract {
+        return Ok(None);
+    }
+
+    let req = req.ok_or_else(|| {
+        function_contract_error(
+            tcx,
+            def_id,
+            item_span,
+            "function contract requires exactly one //@ req and one //@ ens".to_owned(),
+        )
+    })?;
+    let ens = ens.ok_or_else(|| {
+        function_contract_error(
+            tcx,
+            def_id,
+            item_span,
+            "function contract requires exactly one //@ req and one //@ ens".to_owned(),
+        )
+    })?;
+    Ok(Some(FunctionContract {
+        params: function_param_names(tcx, def_id)?,
+        req,
+        ens,
+    }))
+}
+
+fn parse_function_contract_expr<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    span: Span,
+    kind: &str,
+    text: &str,
+) -> Result<ContractExpr, VerificationResult> {
+    let lit = syn::parse_str::<LitStr>(text).map_err(|err| {
+        function_contract_error(
+            tcx,
+            def_id,
+            span,
+            format!("failed to parse //@ {kind} predicate: {err}"),
+        )
+    })?;
+    let expr = parse_spec_template(kind, &lit)
+        .map_err(|err| function_contract_error(tcx, def_id, span, err.to_string()))?;
+    lower_contract_expr(tcx, def_id, span, kind, &expr)
+}
+
+fn lower_contract_expr<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    span: Span,
+    kind: &str,
+    expr: &SynExpr,
+) -> Result<ContractExpr, VerificationResult> {
+    match expr {
+        SynExpr::Lit(lit) => match &lit.lit {
+            Lit::Bool(value) => Ok(ContractExpr::Bool(value.value)),
+            Lit::Int(value) => Ok(ContractExpr::Int(value.base10_parse::<i64>().map_err(
+                |err| {
+                    function_contract_error(
+                        tcx,
+                        def_id,
+                        span,
+                        format!("integer literal in //@ {kind} is too large: {err}"),
+                    )
+                },
+            )?)),
+            _ => Err(function_contract_error(
+                tcx,
+                def_id,
+                span,
+                format!("unsupported literal in //@ {kind} predicate"),
+            )),
+        },
+        SynExpr::Path(path) => {
+            let Some(ident) = path.path.get_ident() else {
+                return Err(function_contract_error(
+                    tcx,
+                    def_id,
+                    span,
+                    format!("unsupported path in //@ {kind} predicate"),
+                ));
+            };
+            let name = ident.to_string();
+            if name == "result" {
+                return Ok(ContractExpr::Var(name));
+            }
+            Ok(ContractExpr::Var(name))
+        }
+        SynExpr::Call(expr) => {
+            let SynExpr::Path(path) = expr.func.as_ref() else {
+                return Err(function_contract_error(
+                    tcx,
+                    def_id,
+                    span,
+                    format!("unsupported call in //@ {kind} predicate"),
+                ));
+            };
+            let Some(ident) = path.path.get_ident() else {
+                return Err(function_contract_error(
+                    tcx,
+                    def_id,
+                    span,
+                    format!("unsupported call in //@ {kind} predicate"),
+                ));
+            };
+            if ident != "__prophecy" || expr.args.len() != 1 {
+                return Err(function_contract_error(
+                    tcx,
+                    def_id,
+                    span,
+                    format!("unsupported call in //@ {kind} predicate"),
+                ));
+            }
+            let Some(SynExpr::Path(arg_path)) = expr.args.first() else {
+                return Err(function_contract_error(
+                    tcx,
+                    def_id,
+                    span,
+                    format!("unsupported prophecy argument in //@ {kind} predicate"),
+                ));
+            };
+            let Some(arg_ident) = arg_path.path.get_ident() else {
+                return Err(function_contract_error(
+                    tcx,
+                    def_id,
+                    span,
+                    format!("unsupported prophecy argument in //@ {kind} predicate"),
+                ));
+            };
+            Ok(ContractExpr::Prophecy(arg_ident.to_string()))
+        }
+        SynExpr::Unary(expr) => {
+            let op = match expr.op {
+                syn::UnOp::Not(_) => SpecUnaryOp::Not,
+                syn::UnOp::Neg(_) => SpecUnaryOp::Neg,
+                _ => {
+                    return Err(function_contract_error(
+                        tcx,
+                        def_id,
+                        span,
+                        format!("unsupported unary operator in //@ {kind} predicate"),
+                    ));
+                }
+            };
+            Ok(ContractExpr::Unary {
+                op,
+                arg: Box::new(lower_contract_expr(tcx, def_id, span, kind, &expr.expr)?),
+            })
+        }
+        SynExpr::Binary(expr) => {
+            let op = match expr.op {
+                syn::BinOp::Add(_) => SpecBinaryOp::Add,
+                syn::BinOp::Sub(_) => SpecBinaryOp::Sub,
+                syn::BinOp::Mul(_) => SpecBinaryOp::Mul,
+                syn::BinOp::Eq(_) => SpecBinaryOp::Eq,
+                syn::BinOp::Ne(_) => SpecBinaryOp::Ne,
+                syn::BinOp::Gt(_) => SpecBinaryOp::Gt,
+                syn::BinOp::Ge(_) => SpecBinaryOp::Ge,
+                syn::BinOp::Lt(_) => SpecBinaryOp::Lt,
+                syn::BinOp::Le(_) => SpecBinaryOp::Le,
+                syn::BinOp::And(_) => SpecBinaryOp::And,
+                syn::BinOp::Or(_) => SpecBinaryOp::Or,
+                _ => {
+                    return Err(function_contract_error(
+                        tcx,
+                        def_id,
+                        span,
+                        format!("unsupported binary operator in //@ {kind} predicate"),
+                    ));
+                }
+            };
+            Ok(ContractExpr::Binary {
+                op,
+                lhs: Box::new(lower_contract_expr(tcx, def_id, span, kind, &expr.left)?),
+                rhs: Box::new(lower_contract_expr(tcx, def_id, span, kind, &expr.right)?),
+            })
+        }
+        SynExpr::Paren(expr) => lower_contract_expr(tcx, def_id, span, kind, &expr.expr),
+        SynExpr::Group(expr) => lower_contract_expr(tcx, def_id, span, kind, &expr.expr),
+        SynExpr::Reference(expr) => lower_contract_expr(tcx, def_id, span, kind, &expr.expr),
+        SynExpr::Cast(expr) => lower_contract_expr(tcx, def_id, span, kind, &expr.expr),
+        _ => Err(function_contract_error(
+            tcx,
+            def_id,
+            span,
+            format!("unsupported expression in //@ {kind} predicate"),
+        )),
+    }
+}
+
+fn function_param_names<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+) -> Result<Vec<String>, VerificationResult> {
+    let body = tcx.hir_body_owned_by(def_id);
+    let mut names = Vec::with_capacity(body.params.len());
+    for (index, param) in body.params.iter().enumerate() {
+        match param.pat.kind {
+            PatKind::Binding(_, _, ident, _) => names.push(ident.name.to_string()),
+            _ => {
+                return Err(function_contract_error(
+                    tcx,
+                    def_id,
+                    param.pat.span,
+                    format!("unsupported function parameter pattern #{index}"),
+                ));
+            }
+        }
+    }
+    Ok(names)
+}
+
+fn function_contract_error<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    span: Span,
+    message: String,
+) -> VerificationResult {
+    VerificationResult {
+        function: tcx.def_path_str(def_id.to_def_id()),
+        status: VerificationStatus::Unsupported,
+        span: span_text(tcx, span),
+        basic_block: None,
+        statement_index: None,
+        message,
+        trace: Vec::new(),
+        model: Vec::new(),
     }
 }
 
