@@ -2,10 +2,9 @@
 source: crates/tsuno-driver/tests/verify_cli.rs
 expression: snapshot_output(output)
 ---
-status: Some(1)
+status: Some(0)
 stdout:
-UNSUPPORTED solver_returns_unknown
-  solver returned unknown while checking assertion
-  src/main.rs:11:6: 11:6
+PASS solver_returns_unknown
+  all assertions discharged
 
 stderr:
