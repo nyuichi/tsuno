@@ -1641,13 +1641,6 @@ impl<'tcx> Verifier<'tcx> {
         match expr {
             MirSpecExpr::Bool(value) => Ok(TypedExpr::Bool(Bool::from_bool(*value))),
             MirSpecExpr::Int(value) => Ok(TypedExpr::Int(Int::from_i64(*value))),
-            MirSpecExpr::Result | MirSpecExpr::Prophecy(_) => Err(self.unsupported_result(
-                span,
-                Some(state.ctrl.basic_block.index()),
-                Some(state.ctrl.statement_index),
-                "contract-only expression used in MIR assertion".to_owned(),
-                state.trace.clone(),
-            )),
             MirSpecExpr::Var(local) => {
                 let loc = state.env.get(local).copied().ok_or_else(|| {
                     self.unsupported_result(
@@ -1685,6 +1678,35 @@ impl<'tcx> Verifier<'tcx> {
                         "tuple value used where scalar was expected".to_owned(),
                         state.trace.clone(),
                     )),
+                    Slot::Moved => Err(self.unsupported_result(
+                        span,
+                        Some(state.ctrl.basic_block.index()),
+                        Some(state.ctrl.statement_index),
+                        "use of moved value".to_owned(),
+                        state.trace.clone(),
+                    )),
+                }
+            }
+            MirSpecExpr::Prophecy(local) => {
+                let loc = state.env.get(local).copied().ok_or_else(|| {
+                    self.unsupported_result(
+                        span,
+                        Some(state.ctrl.basic_block.index()),
+                        Some(state.ctrl.statement_index),
+                        format!("missing env for local {}", local.as_usize()),
+                        state.trace.clone(),
+                    )
+                })?;
+                match state.store.get(&loc).cloned().ok_or_else(|| {
+                    self.unsupported_result(
+                        span,
+                        Some(state.ctrl.basic_block.index()),
+                        Some(state.ctrl.statement_index),
+                        format!("missing store for local {}", local.as_usize()),
+                        state.trace.clone(),
+                    )
+                })? {
+                    Slot::Live(value) => value.to_typed_prophecy(state),
                     Slot::Moved => Err(self.unsupported_result(
                         span,
                         Some(state.ctrl.basic_block.index()),

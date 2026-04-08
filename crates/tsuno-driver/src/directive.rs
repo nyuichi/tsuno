@@ -15,7 +15,6 @@ use crate::report::{VerificationResult, VerificationStatus};
 pub enum SpecExpr {
     Bool(bool),
     Int(i64),
-    Result,
     Var {
         hir_id: HirId,
         name: rustc_span::Symbol,
@@ -283,7 +282,11 @@ impl<'a, 'tcx> SpecExprLowerer<'a, 'tcx> {
                     ));
                 };
                 if ident == "result" {
-                    return Ok(SpecExpr::Result);
+                    return Err(self.unsupported_syn_spec_expr(
+                        span,
+                        kind,
+                        "`result` is only supported in //@ ens predicates",
+                    ));
                 }
                 let name = Symbol::intern(&ident.to_string());
                 let Some(hir_id) = self.resolve_binding_hir_id(name, anchor_span) else {

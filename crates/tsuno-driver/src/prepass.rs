@@ -32,7 +32,6 @@ pub struct LoopPrepassError {
 pub enum MirSpecExpr {
     Bool(bool),
     Int(i64),
-    Result,
     Var(Local),
     #[allow(dead_code)]
     Prophecy(Local),
@@ -459,6 +458,14 @@ fn lower_function_contract_expr<'tcx>(
             };
             let name = ident.to_string();
             if name == "result" {
+                if kind != "ens" {
+                    return Err(function_contract_error(
+                        tcx,
+                        def_id,
+                        span,
+                        "`result` is only supported in //@ ens predicates".to_owned(),
+                    ));
+                }
                 return Ok(ContractExpr::Var(name));
             }
             Ok(ContractExpr::Var(name))
@@ -585,7 +592,6 @@ fn lower_hir_spec_expr(
     match expr {
         HirSpecExpr::Bool(value) => Ok(MirSpecExpr::Bool(*value)),
         HirSpecExpr::Int(value) => Ok(MirSpecExpr::Int(*value)),
-        HirSpecExpr::Result => Ok(MirSpecExpr::Result),
         HirSpecExpr::Var { hir_id, .. } => {
             let Some(local) = hir_locals.get(hir_id).copied() else {
                 return Err(LoopPrepassError {

@@ -2,7 +2,7 @@
 fn caller() {
     let y = callee();
     let z = y + 1;
-    //@ assert "z == 4"
+    //@ assert "{z} == 4"
     let _sink = z;
 }
 
