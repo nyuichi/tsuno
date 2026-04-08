@@ -147,36 +147,6 @@ pub fn compute_function_contracts<'tcx>(
     Ok(contracts)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SwitchJoin {
-    pub join_block: BasicBlock,
-}
-
-pub fn compute_switch_joins<'tcx>(body: &Body<'tcx>) -> HashMap<BasicBlock, SwitchJoin> {
-    let successors: Vec<Vec<usize>> = body
-        .basic_blocks
-        .iter_enumerated()
-        .map(|(_, data)| {
-            data.terminator()
-                .successors()
-                .map(|bb| bb.index())
-                .collect()
-        })
-        .collect();
-    let joins = compute_switch_joins_from_successors(&successors);
-    joins
-        .into_iter()
-        .map(|(bb, join)| {
-            (
-                BasicBlock::from_usize(bb),
-                SwitchJoin {
-                    join_block: BasicBlock::from_usize(join),
-                },
-            )
-        })
-        .collect()
-}
-
 pub fn compute_hir_locals<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
@@ -795,61 +765,4 @@ fn written_locals<'tcx>(
         }
     }
     written
-}
-
-fn compute_switch_joins_from_successors(successors: &[Vec<usize>]) -> HashMap<usize, usize> {
-    let ipostdom = compute_immediate_postdominators(successors);
-    let mut joins = HashMap::new();
-    for (bb, targets) in successors.iter().enumerate() {
-        if targets.len() > 1
-            && let Some(join) = ipostdom[bb]
-        {
-            joins.insert(bb, join);
-        }
-    }
-    joins
-}
-
-fn compute_immediate_postdominators(successors: &[Vec<usize>]) -> Vec<Option<usize>> {
-    let exit = successors.len();
-    let universe: BTreeSet<usize> = (0..=exit).collect();
-    let mut postdoms = vec![universe.clone(); successors.len() + 1];
-    postdoms[exit] = BTreeSet::from([exit]);
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for bb in (0..successors.len()).rev() {
-            let mut targets = successors[bb].clone();
-            if targets.is_empty() {
-                targets.push(exit);
-            }
-            let mut next = universe.clone();
-            for succ in targets {
-                next = next.intersection(&postdoms[succ]).copied().collect();
-            }
-            next.insert(bb);
-            if next != postdoms[bb] {
-                postdoms[bb] = next;
-                changed = true;
-            }
-        }
-    }
-
-    (0..successors.len())
-        .map(|bb| {
-            let candidates: Vec<_> = postdoms[bb]
-                .iter()
-                .copied()
-                .filter(|id| *id != bb)
-                .collect();
-            candidates.iter().copied().find(|candidate| {
-                candidates
-                    .iter()
-                    .copied()
-                    .filter(|other| other != candidate)
-                    .all(|other| postdoms[*candidate].contains(&other))
-            })
-        })
-        .collect()
 }

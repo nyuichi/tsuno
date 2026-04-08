@@ -50,14 +50,14 @@ pub struct State {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SymTy {
+pub(crate) enum SymTy {
     Bool,
     Int,
     Tuple(Box<[SymTy]>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SymVar {
+pub(crate) struct SymVar {
     name: String,
     ty: SymTy,
 }
@@ -87,7 +87,6 @@ enum IntExpr {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CmpOp {
     Eq,
-    Ne,
     Lt,
     Le,
     Gt,
@@ -1570,7 +1569,6 @@ impl<'tcx> Verifier<'tcx> {
                 let rhs = self.int_expr_to_z3(rhs, span)?;
                 Ok(match op {
                     CmpOp::Eq => lhs.eq(&rhs),
-                    CmpOp::Ne => lhs.eq(&rhs).not(),
                     CmpOp::Lt => lhs.lt(&rhs),
                     CmpOp::Le => lhs.le(&rhs),
                     CmpOp::Gt => lhs.gt(&rhs),
@@ -1707,18 +1705,6 @@ impl<'tcx> Verifier<'tcx> {
                 self.tcx.def_span(self.def_id),
                 "expected integer symbolic value".to_owned(),
             )),
-        }
-    }
-
-    fn bool_to_symval(&self, expr: BoolExpr) -> Result<SymVal, VerificationResult> {
-        match expr {
-            BoolExpr::Const(value) => Ok(SymVal::Bool(value)),
-            BoolExpr::Value(value) => Ok(value),
-            other => {
-                let fresh = self.fresh_bool("bool");
-                let _ = other;
-                Ok(fresh)
-            }
         }
     }
 
