@@ -1624,7 +1624,11 @@ impl<'tcx> Verifier<'tcx> {
             SymVal::Var(var) if matches!(var.ty, SymTy::Bool) => {
                 Ok(Bool::new_const(var.name.clone()))
             }
-            SymVal::Proj { base, index, ty } if matches!(ty, SymTy::Bool) => {
+            SymVal::Proj {
+                base,
+                index,
+                ty: SymTy::Bool,
+            } => {
                 let base_name = self.symval_name(base, span)?;
                 Ok(Bool::new_const(format!("{base_name}.{index}")))
             }
@@ -1638,7 +1642,11 @@ impl<'tcx> Verifier<'tcx> {
             SymVal::Var(var) if matches!(var.ty, SymTy::Int) => {
                 Ok(Int::new_const(var.name.clone()))
             }
-            SymVal::Proj { base, index, ty } if matches!(ty, SymTy::Int) => {
+            SymVal::Proj {
+                base,
+                index,
+                ty: SymTy::Int,
+            } => {
                 let base_name = self.symval_name(base, span)?;
                 Ok(Int::new_const(format!("{base_name}.{index}")))
             }
@@ -1851,12 +1859,12 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn fresh_for_rust_ty(&self, ty: Ty<'tcx>, hint: &str) -> Result<SymVal, VerificationResult> {
-        if let TyKind::Ref(_, inner, mutability) = ty.kind() {
-            if mutability.is_mut() {
-                let current = self.fresh_for_rust_ty(*inner, &format!("{hint}_cur"))?;
-                let final_value = self.fresh_for_rust_ty(*inner, &format!("{hint}_fin"))?;
-                return Ok(SymVal::Tuple(vec![current, final_value].into_boxed_slice()));
-            }
+        if let TyKind::Ref(_, inner, mutability) = ty.kind()
+            && mutability.is_mut()
+        {
+            let current = self.fresh_for_rust_ty(*inner, &format!("{hint}_cur"))?;
+            let final_value = self.fresh_for_rust_ty(*inner, &format!("{hint}_fin"))?;
+            return Ok(SymVal::Tuple(vec![current, final_value].into_boxed_slice()));
         }
         let sym_ty = self.sym_ty_from_rust_ty(ty, self.tcx.def_span(self.def_id))?;
         self.fresh_for_symty(&sym_ty, hint)
