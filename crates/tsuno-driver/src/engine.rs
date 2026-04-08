@@ -1728,10 +1728,10 @@ impl<'tcx> Verifier<'tcx> {
                 fin: slot_fin,
             })) if *slot_target == target => {
                 if let Some(cur) = cur {
-                    *slot_cur = Box::new(cur.clone());
+                    **slot_cur = cur.clone();
                 }
                 if let Some(fin) = fin {
-                    *slot_fin = Box::new(fin.clone());
+                    **slot_fin = fin.clone();
                 }
                 None
             }
@@ -1787,11 +1787,11 @@ impl<'tcx> Verifier<'tcx> {
             SymVal::Scalar(expr) => Some(SymVal::Scalar(expr.clone())),
             SymVal::Tuple(fields) => {
                 let mut locs = Vec::with_capacity(fields.len());
-                for loc in fields.iter().copied() {
+                for loc in fields.iter() {
                     let slot = self.clone_slot_into_state(
                         state,
                         source_state,
-                        source_state.store.get(&loc)?,
+                        source_state.store.get(loc)?,
                     )?;
                     locs.push(self.alloc_slot(state, slot));
                 }
