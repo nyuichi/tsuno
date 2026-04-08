@@ -14,7 +14,12 @@ use crate::prepass::{HirBindingInfo, LoopPrepassError};
 pub enum SpecExpr {
     Bool(bool),
     Int(i64),
+    Result,
     Var {
+        hir_id: HirId,
+        name: rustc_span::Symbol,
+    },
+    Prophecy {
         hir_id: HirId,
         name: rustc_span::Symbol,
     },
@@ -159,6 +164,9 @@ impl<'a, 'tcx> SpecExprLowerer<'a, 'tcx> {
                         "unsupported path in //@ {kind} predicate",
                     ));
                 };
+                if ident == "result" {
+                    return Ok(SpecExpr::Result);
+                }
                 let name = Symbol::intern(&ident.to_string());
                 let Some(hir_id) = self.resolve_binding_hir_id(name, anchor_span) else {
                     return Err(LoopPrepassError {
@@ -169,6 +177,53 @@ impl<'a, 'tcx> SpecExprLowerer<'a, 'tcx> {
                     });
                 };
                 Ok(SpecExpr::Var { hir_id, name })
+            }
+            SynExpr::Call(expr) => {
+                let SynExpr::Path(path) = expr.func.as_ref() else {
+                    return Err(self.unsupported_syn_spec_expr(
+                        span,
+                        kind,
+                        "unsupported call in //@ {kind} predicate",
+                    ));
+                };
+                let Some(ident) = path.path.get_ident() else {
+                    return Err(self.unsupported_syn_spec_expr(
+                        span,
+                        kind,
+                        "unsupported call in //@ {kind} predicate",
+                    ));
+                };
+                if ident != "__prophecy" || expr.args.len() != 1 {
+                    return Err(self.unsupported_syn_spec_expr(
+                        span,
+                        kind,
+                        "unsupported call in //@ {kind} predicate",
+                    ));
+                }
+                let Some(SynExpr::Path(arg_path)) = expr.args.first() else {
+                    return Err(self.unsupported_syn_spec_expr(
+                        span,
+                        kind,
+                        "unsupported prophecy argument in //@ {kind} predicate",
+                    ));
+                };
+                let Some(arg_ident) = arg_path.path.get_ident() else {
+                    return Err(self.unsupported_syn_spec_expr(
+                        span,
+                        kind,
+                        "unsupported prophecy argument in //@ {kind} predicate",
+                    ));
+                };
+                let name = Symbol::intern(&arg_ident.to_string());
+                let Some(hir_id) = self.resolve_binding_hir_id(name, anchor_span) else {
+                    return Err(LoopPrepassError {
+                        span,
+                        basic_block: None,
+                        statement_index: None,
+                        message: format!("unresolved binding `{arg_ident}` in //@ {}", kind),
+                    });
+                };
+                Ok(SpecExpr::Prophecy { hir_id, name })
             }
             SynExpr::Unary(expr) => {
                 let op = match expr.op {
@@ -235,7 +290,7 @@ impl<'a, 'tcx> SpecExprLowerer<'a, 'tcx> {
                 };
                 self.lower_syn_spec_expr(inner, span, anchor_span, kind)
             }
-            SynExpr::Call(_) | SynExpr::MethodCall(_) => Err(self.unsupported_syn_spec_expr(
+            SynExpr::MethodCall(_) => Err(self.unsupported_syn_spec_expr(
                 span,
                 kind,
                 "function calls are unsupported in //@ {kind} predicates",
@@ -691,7 +746,7 @@ fn spec_directive_line<'a>(
     Ok(Some(directive_line))
 }
 
-fn parse_spec_template(kind: &str, lit: &LitStr) -> syn::Result<SynExpr> {
+pub(crate) fn parse_spec_template(kind: &str, lit: &LitStr) -> syn::Result<SynExpr> {
     let raw = lit.value();
     let mut output = String::new();
     let mut chars = raw.chars().peekable();
@@ -732,6 +787,25 @@ fn parse_spec_template(kind: &str, lit: &LitStr) -> syn::Result<SynExpr> {
                         format!("empty interpolation in //@ {} template", kind),
                     ));
                 }
+                if let Some(rest) = inner.strip_prefix("^:") {
+                    let ident = rest.trim();
+                    if ident.is_empty()
+                        || !ident
+                            .chars()
+                            .next()
+                            .is_some_and(|ch| ch.is_alphabetic() || ch == '_')
+                        || !ident.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+                    {
+                        return Err(syn::Error::new(
+                            lit.span(),
+                            format!("invalid prophecy interpolation in //@ {} template", kind),
+                        ));
+                    }
+                    output.push_str("(__prophecy(");
+                    output.push_str(ident);
+                    output.push_str("))");
+                    continue;
+                }
                 output.push('(');
                 output.push_str(inner);
                 output.push(')');
@@ -763,10 +837,24 @@ fn verify_marker_in_source(source: &str, line: usize) -> bool {
     if line <= 1 {
         return false;
     }
-    source
-        .lines()
-        .nth(line - 2)
-        .is_some_and(|line| line.trim() == "//@ verify")
+    let mut current = line.saturating_sub(2);
+    while let Some(text) = source.lines().nth(current) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if !trimmed.starts_with("//@") {
+            return false;
+        }
+        if trimmed == "//@ verify" {
+            return true;
+        }
+        if current == 0 {
+            break;
+        }
+        current -= 1;
+    }
+    false
 }
 
 #[cfg(test)]

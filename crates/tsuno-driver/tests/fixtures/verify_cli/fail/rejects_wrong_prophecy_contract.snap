@@ -1,0 +1,12 @@
+---
+source: crates/tsuno-driver/tests/verify_cli.rs
+expression: snapshot_output(output)
+---
+status: Some(1)
+stdout:
+FAIL set_to_two
+  postcondition failed
+  bb<N>
+  model: [("model", "<redacted>")]
+
+stderr:
