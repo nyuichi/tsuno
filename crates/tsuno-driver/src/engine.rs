@@ -4,7 +4,6 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use rustc_hir::def_id::LocalDefId;
-use rustc_hir::{ItemKind, PatKind};
 use rustc_middle::mir::{
     AggregateKind, BasicBlock, BinOp, Body, BorrowKind, ConstOperand, Local, Operand, Place,
     PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnOp,
@@ -12,14 +11,14 @@ use rustc_middle::mir::{
 use rustc_middle::ty::{IntTy, TyCtxt, TyKind, UintTy};
 use rustc_span::Span;
 use rustc_span::source_map::Spanned;
-use syn::{Expr as SynExpr, Lit, LitStr};
 use z3::ast::{Bool, Int};
 use z3::{SatResult, Solver, set_global_param};
 
-use crate::directive::{SpecBinaryOp, SpecUnaryOp, parse_spec_template};
+use crate::directive::{SpecBinaryOp, SpecUnaryOp};
 use crate::prepass::{
-    AssertionContracts, LoopContract, LoopContracts, MirSpecExpr, SwitchJoin, compute_assertions,
-    compute_loops, compute_switch_joins,
+    AssertionContracts, ContractExpr, FunctionContract, LoopContract, LoopContracts, MirSpecExpr,
+    SwitchJoin, compute_assertions, compute_function_contracts, compute_loops,
+    compute_switch_joins,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 
@@ -65,30 +64,6 @@ pub enum TypedExpr {
     Bool(Bool),
     Int(Int),
     Tuple(Box<[TypedExpr]>),
-}
-
-#[derive(Debug, Clone)]
-struct FunctionContract {
-    params: Vec<String>,
-    req: ContractExpr,
-    ens: ContractExpr,
-}
-
-#[derive(Debug, Clone)]
-enum ContractExpr {
-    Bool(bool),
-    Int(i64),
-    Var(String),
-    Prophecy(String),
-    Unary {
-        op: SpecUnaryOp,
-        arg: Box<ContractExpr>,
-    },
-    Binary {
-        op: SpecBinaryOp,
-        lhs: Box<ContractExpr>,
-        rhs: Box<ContractExpr>,
-    },
 }
 
 pub struct Verifier<'tcx> {
@@ -144,7 +119,7 @@ impl<'tcx> Verifier<'tcx> {
             AssertionContracts::empty()
         };
         let switch_joins = compute_switch_joins(&body);
-        let contracts = match collect_function_contracts(tcx) {
+        let contracts = match compute_function_contracts(tcx) {
             Ok(contracts) => contracts,
             Err(error) => {
                 prepass_error.get_or_insert(error);
@@ -2032,15 +2007,16 @@ impl<'tcx> Verifier<'tcx> {
 
         if let Some(contract) = self.contracts.get(&self.def_id) {
             if contract.params.len() != self.body.arg_count {
-                return Err(function_contract_error(
-                    self.tcx,
-                    self.def_id,
+                return Err(self.unsupported_result(
                     self.tcx.def_span(self.def_id),
+                    None,
+                    None,
                     format!(
                         "function contract parameter count mismatch: expected {}, found {}",
                         self.body.arg_count,
                         contract.params.len()
                     ),
+                    Vec::new(),
                 ));
             }
             let mut env = HashMap::new();
@@ -2679,326 +2655,6 @@ fn int_bounds(tcx: TyCtxt<'_>, ty: rustc_middle::ty::Ty<'_>) -> Option<IntBounds
             Some(IntBounds::Unsigned { max })
         }
         _ => None,
-    }
-}
-
-fn collect_function_contracts<'tcx>(
-    tcx: TyCtxt<'tcx>,
-) -> Result<HashMap<LocalDefId, FunctionContract>, VerificationResult> {
-    let mut contracts = HashMap::new();
-    for item_id in tcx.hir_free_items() {
-        let item = tcx.hir_item(item_id);
-        let ItemKind::Fn { .. } = item.kind else {
-            continue;
-        };
-        let def_id = item.owner_id.def_id;
-        if let Some(contract) = parse_function_contract(tcx, def_id, item.span)? {
-            contracts.insert(def_id, contract);
-        }
-    }
-    Ok(contracts)
-}
-
-fn parse_function_contract<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-    item_span: Span,
-) -> Result<Option<FunctionContract>, VerificationResult> {
-    let loc = tcx.sess.source_map().lookup_char_pos(item_span.lo());
-    let Some(source) = loc.file.src.as_deref() else {
-        return Ok(None);
-    };
-    let lines: Vec<_> = source.lines().collect();
-    if loc.line <= 1 {
-        return Ok(None);
-    }
-    let mut idx = loc.line - 2;
-    let mut block = Vec::new();
-    while let Some(line) = lines.get(idx) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            break;
-        }
-        if !trimmed.starts_with("//@") {
-            break;
-        }
-        block.push(trimmed.to_owned());
-        if idx == 0 {
-            break;
-        }
-        idx -= 1;
-    }
-    block.reverse();
-
-    let mut req = None;
-    let mut ens = None;
-    let mut saw_contract = false;
-    for line in block {
-        if let Some(rest) = line.strip_prefix("//@ req") {
-            if req.is_some() {
-                return Err(function_contract_error(
-                    tcx,
-                    def_id,
-                    item_span,
-                    "multiple //@ req directives for a function".to_owned(),
-                ));
-            }
-            saw_contract = true;
-            req = Some(parse_function_contract_expr(
-                tcx,
-                def_id,
-                item_span,
-                "req",
-                rest.trim(),
-            )?);
-        } else if let Some(rest) = line.strip_prefix("//@ ens") {
-            if ens.is_some() {
-                return Err(function_contract_error(
-                    tcx,
-                    def_id,
-                    item_span,
-                    "multiple //@ ens directives for a function".to_owned(),
-                ));
-            }
-            saw_contract = true;
-            ens = Some(parse_function_contract_expr(
-                tcx,
-                def_id,
-                item_span,
-                "ens",
-                rest.trim(),
-            )?);
-        }
-    }
-
-    if !saw_contract {
-        return Ok(None);
-    }
-
-    let req = req.ok_or_else(|| {
-        function_contract_error(
-            tcx,
-            def_id,
-            item_span,
-            "function contract requires exactly one //@ req and one //@ ens".to_owned(),
-        )
-    })?;
-    let ens = ens.ok_or_else(|| {
-        function_contract_error(
-            tcx,
-            def_id,
-            item_span,
-            "function contract requires exactly one //@ req and one //@ ens".to_owned(),
-        )
-    })?;
-    Ok(Some(FunctionContract {
-        params: function_param_names(tcx, def_id)?,
-        req,
-        ens,
-    }))
-}
-
-fn parse_function_contract_expr<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-    span: Span,
-    kind: &str,
-    text: &str,
-) -> Result<ContractExpr, VerificationResult> {
-    let lit = syn::parse_str::<LitStr>(text).map_err(|err| {
-        function_contract_error(
-            tcx,
-            def_id,
-            span,
-            format!("failed to parse //@ {kind} predicate: {err}"),
-        )
-    })?;
-    let expr = parse_spec_template(kind, &lit)
-        .map_err(|err| function_contract_error(tcx, def_id, span, err.to_string()))?;
-    lower_contract_expr(tcx, def_id, span, kind, &expr)
-}
-
-fn lower_contract_expr<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-    span: Span,
-    kind: &str,
-    expr: &SynExpr,
-) -> Result<ContractExpr, VerificationResult> {
-    match expr {
-        SynExpr::Lit(lit) => match &lit.lit {
-            Lit::Bool(value) => Ok(ContractExpr::Bool(value.value)),
-            Lit::Int(value) => Ok(ContractExpr::Int(value.base10_parse::<i64>().map_err(
-                |err| {
-                    function_contract_error(
-                        tcx,
-                        def_id,
-                        span,
-                        format!("integer literal in //@ {kind} is too large: {err}"),
-                    )
-                },
-            )?)),
-            _ => Err(function_contract_error(
-                tcx,
-                def_id,
-                span,
-                format!("unsupported literal in //@ {kind} predicate"),
-            )),
-        },
-        SynExpr::Path(path) => {
-            let Some(ident) = path.path.get_ident() else {
-                return Err(function_contract_error(
-                    tcx,
-                    def_id,
-                    span,
-                    format!("unsupported path in //@ {kind} predicate"),
-                ));
-            };
-            let name = ident.to_string();
-            if name == "result" {
-                return Ok(ContractExpr::Var(name));
-            }
-            Ok(ContractExpr::Var(name))
-        }
-        SynExpr::Call(expr) => {
-            let SynExpr::Path(path) = expr.func.as_ref() else {
-                return Err(function_contract_error(
-                    tcx,
-                    def_id,
-                    span,
-                    format!("unsupported call in //@ {kind} predicate"),
-                ));
-            };
-            let Some(ident) = path.path.get_ident() else {
-                return Err(function_contract_error(
-                    tcx,
-                    def_id,
-                    span,
-                    format!("unsupported call in //@ {kind} predicate"),
-                ));
-            };
-            if ident != "__prophecy" || expr.args.len() != 1 {
-                return Err(function_contract_error(
-                    tcx,
-                    def_id,
-                    span,
-                    format!("unsupported call in //@ {kind} predicate"),
-                ));
-            }
-            let Some(SynExpr::Path(arg_path)) = expr.args.first() else {
-                return Err(function_contract_error(
-                    tcx,
-                    def_id,
-                    span,
-                    format!("unsupported prophecy argument in //@ {kind} predicate"),
-                ));
-            };
-            let Some(arg_ident) = arg_path.path.get_ident() else {
-                return Err(function_contract_error(
-                    tcx,
-                    def_id,
-                    span,
-                    format!("unsupported prophecy argument in //@ {kind} predicate"),
-                ));
-            };
-            Ok(ContractExpr::Prophecy(arg_ident.to_string()))
-        }
-        SynExpr::Unary(expr) => {
-            let op = match expr.op {
-                syn::UnOp::Not(_) => SpecUnaryOp::Not,
-                syn::UnOp::Neg(_) => SpecUnaryOp::Neg,
-                _ => {
-                    return Err(function_contract_error(
-                        tcx,
-                        def_id,
-                        span,
-                        format!("unsupported unary operator in //@ {kind} predicate"),
-                    ));
-                }
-            };
-            Ok(ContractExpr::Unary {
-                op,
-                arg: Box::new(lower_contract_expr(tcx, def_id, span, kind, &expr.expr)?),
-            })
-        }
-        SynExpr::Binary(expr) => {
-            let op = match expr.op {
-                syn::BinOp::Add(_) => SpecBinaryOp::Add,
-                syn::BinOp::Sub(_) => SpecBinaryOp::Sub,
-                syn::BinOp::Mul(_) => SpecBinaryOp::Mul,
-                syn::BinOp::Eq(_) => SpecBinaryOp::Eq,
-                syn::BinOp::Ne(_) => SpecBinaryOp::Ne,
-                syn::BinOp::Gt(_) => SpecBinaryOp::Gt,
-                syn::BinOp::Ge(_) => SpecBinaryOp::Ge,
-                syn::BinOp::Lt(_) => SpecBinaryOp::Lt,
-                syn::BinOp::Le(_) => SpecBinaryOp::Le,
-                syn::BinOp::And(_) => SpecBinaryOp::And,
-                syn::BinOp::Or(_) => SpecBinaryOp::Or,
-                _ => {
-                    return Err(function_contract_error(
-                        tcx,
-                        def_id,
-                        span,
-                        format!("unsupported binary operator in //@ {kind} predicate"),
-                    ));
-                }
-            };
-            Ok(ContractExpr::Binary {
-                op,
-                lhs: Box::new(lower_contract_expr(tcx, def_id, span, kind, &expr.left)?),
-                rhs: Box::new(lower_contract_expr(tcx, def_id, span, kind, &expr.right)?),
-            })
-        }
-        SynExpr::Paren(expr) => lower_contract_expr(tcx, def_id, span, kind, &expr.expr),
-        SynExpr::Group(expr) => lower_contract_expr(tcx, def_id, span, kind, &expr.expr),
-        SynExpr::Reference(expr) => lower_contract_expr(tcx, def_id, span, kind, &expr.expr),
-        SynExpr::Cast(expr) => lower_contract_expr(tcx, def_id, span, kind, &expr.expr),
-        _ => Err(function_contract_error(
-            tcx,
-            def_id,
-            span,
-            format!("unsupported expression in //@ {kind} predicate"),
-        )),
-    }
-}
-
-fn function_param_names<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-) -> Result<Vec<String>, VerificationResult> {
-    let body = tcx.hir_body_owned_by(def_id);
-    let mut names = Vec::with_capacity(body.params.len());
-    for (index, param) in body.params.iter().enumerate() {
-        match param.pat.kind {
-            PatKind::Binding(_, _, ident, _) => names.push(ident.name.to_string()),
-            _ => {
-                return Err(function_contract_error(
-                    tcx,
-                    def_id,
-                    param.pat.span,
-                    format!("unsupported function parameter pattern #{index}"),
-                ));
-            }
-        }
-    }
-    Ok(names)
-}
-
-fn function_contract_error<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-    span: Span,
-    message: String,
-) -> VerificationResult {
-    VerificationResult {
-        function: tcx.def_path_str(def_id.to_def_id()),
-        status: VerificationStatus::Unsupported,
-        span: span_text(tcx, span),
-        basic_block: None,
-        statement_index: None,
-        message,
-        trace: Vec::new(),
-        model: Vec::new(),
     }
 }
 

@@ -9,6 +9,7 @@ use rustc_span::{Span, Symbol};
 use syn::{BinOp as SynBinOp, Expr as SynExpr, Lit as SynLit, LitStr, UnOp as SynUnOp};
 
 use crate::prepass::{HirBindingInfo, LoopPrepassError};
+use crate::report::{VerificationResult, VerificationStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpecExpr {
@@ -81,6 +82,13 @@ pub struct HirAssertionContracts {
     pub items: Vec<HirAssertionContract>,
 }
 
+#[derive(Clone)]
+pub(crate) struct FunctionContractSource {
+    pub(crate) span: Span,
+    pub(crate) req: SynExpr,
+    pub(crate) ens: SynExpr,
+}
+
 pub fn collect_hir_loop_contracts<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
@@ -123,6 +131,116 @@ pub fn has_verify_marker(tcx: TyCtxt<'_>, span: Span) -> bool {
         return false;
     };
     verify_marker_in_source(source, loc.line)
+}
+
+pub(crate) fn collect_function_contract_source<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    item_span: Span,
+) -> Result<Option<FunctionContractSource>, VerificationResult> {
+    let loc = tcx.sess.source_map().lookup_char_pos(item_span.lo());
+    let Some(source) = loc.file.src.as_deref() else {
+        return Ok(None);
+    };
+    let Some(lines) = function_contract_lines_before_item(source, loc.line) else {
+        return Ok(None);
+    };
+
+    let mut req = None;
+    let mut ens = None;
+    let mut saw_contract = false;
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("//@ req") {
+            if req.is_some() {
+                return Err(function_contract_error(
+                    tcx,
+                    def_id,
+                    item_span,
+                    "multiple //@ req directives for a function".to_owned(),
+                ));
+            }
+            saw_contract = true;
+            req = Some(parse_function_contract_expr(
+                tcx,
+                def_id,
+                item_span,
+                "req",
+                rest.trim(),
+            )?);
+        } else if let Some(rest) = line.strip_prefix("//@ ens") {
+            if ens.is_some() {
+                return Err(function_contract_error(
+                    tcx,
+                    def_id,
+                    item_span,
+                    "multiple //@ ens directives for a function".to_owned(),
+                ));
+            }
+            saw_contract = true;
+            ens = Some(parse_function_contract_expr(
+                tcx,
+                def_id,
+                item_span,
+                "ens",
+                rest.trim(),
+            )?);
+        }
+    }
+
+    if !saw_contract {
+        return Ok(None);
+    }
+
+    let req = req.ok_or_else(|| {
+        function_contract_error(
+            tcx,
+            def_id,
+            item_span,
+            "function contract requires exactly one //@ req and one //@ ens".to_owned(),
+        )
+    })?;
+    let ens = ens.ok_or_else(|| {
+        function_contract_error(
+            tcx,
+            def_id,
+            item_span,
+            "function contract requires exactly one //@ req and one //@ ens".to_owned(),
+        )
+    })?;
+    Ok(Some(FunctionContractSource {
+        span: item_span,
+        req,
+        ens,
+    }))
+}
+
+pub(crate) fn function_contract_lines_before_item(
+    source: &str,
+    item_line: usize,
+) -> Option<Vec<String>> {
+    if item_line <= 1 {
+        return None;
+    }
+
+    let lines: Vec<_> = source.lines().collect();
+    let mut idx = item_line.saturating_sub(2);
+    let mut block = Vec::new();
+    while let Some(line) = lines.get(idx) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if !trimmed.starts_with("//@") {
+            break;
+        }
+        block.push(trimmed.to_owned());
+        if idx == 0 {
+            break;
+        }
+        idx -= 1;
+    }
+    block.reverse();
+    if block.is_empty() { None } else { Some(block) }
 }
 
 struct SpecExprLowerer<'a, 'tcx> {
@@ -857,9 +975,46 @@ fn verify_marker_in_source(source: &str, line: usize) -> bool {
     false
 }
 
+fn parse_function_contract_expr<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    span: Span,
+    kind: &str,
+    text: &str,
+) -> Result<SynExpr, VerificationResult> {
+    let lit = syn::parse_str::<LitStr>(text).map_err(|err| {
+        function_contract_error(
+            tcx,
+            def_id,
+            span,
+            format!("failed to parse //@ {kind} predicate: {err}"),
+        )
+    })?;
+    parse_spec_template(kind, &lit)
+        .map_err(|err| function_contract_error(tcx, def_id, span, err.to_string()))
+}
+
+fn function_contract_error<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    span: Span,
+    message: String,
+) -> VerificationResult {
+    VerificationResult {
+        function: tcx.def_path_str(def_id.to_def_id()),
+        status: VerificationStatus::Unsupported,
+        span: tcx.sess.source_map().span_to_diagnostic_string(span),
+        basic_block: None,
+        statement_index: None,
+        message,
+        trace: Vec::new(),
+        model: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::verify_marker_in_source;
+    use super::{function_contract_lines_before_item, verify_marker_in_source};
 
     #[test]
     fn detects_verify_marker_on_previous_line() {
@@ -871,5 +1026,19 @@ mod tests {
     fn ignores_non_adjacent_marker() {
         let source = "//@ verify\n\nfn marked() {}\n";
         assert!(!verify_marker_in_source(source, 3));
+    }
+
+    #[test]
+    fn collects_function_contract_lines_before_item() {
+        let source =
+            "\n//@ req \"true\"\n//@ ens \"{result} == 3\"\nfn callee() -> i32 {\n    2\n}\n";
+        let lines = function_contract_lines_before_item(source, 4).unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "//@ req \"true\"".to_owned(),
+                "//@ ens \"{result} == 3\"".to_owned()
+            ]
+        );
     }
 }
