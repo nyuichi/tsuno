@@ -3,22 +3,11 @@ use std::process::Command;
 
 use anyhow::{Context, bail};
 use camino::Utf8PathBuf;
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use serde::Deserialize;
 
 #[derive(Parser)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    Verify {
-        #[arg(long)]
-        manifest_path: PathBuf,
-    },
-}
+struct Cli {}
 
 fn main() {
     match try_main() {
@@ -31,13 +20,11 @@ fn main() {
 }
 
 fn try_main() -> anyhow::Result<i32> {
-    let cli = Cli::parse();
-    match cli.command {
-        Commands::Verify { manifest_path } => {
-            let invocation = CargoInvocation::discover(&manifest_path)?;
-            verify(&invocation)
-        }
-    }
+    Cli::parse();
+    let manifest_path = find_manifest_path_from_current_dir()?;
+    let manifest_path = std::fs::canonicalize(manifest_path).context("resolve manifest path")?;
+    let invocation = CargoInvocation::discover(&manifest_path)?;
+    verify(&invocation)
 }
 
 #[derive(Debug, Clone)]
@@ -99,4 +86,74 @@ fn verify(invocation: &CargoInvocation) -> anyhow::Result<i32> {
         .context("wait for cargo check")?;
 
     Ok(status.code().unwrap_or(1))
+}
+
+fn find_manifest_path_from_current_dir() -> anyhow::Result<PathBuf> {
+    let current_dir = std::env::current_dir().context("get current dir")?;
+    for dir in current_dir.ancestors() {
+        let manifest_path = dir.join("Cargo.toml");
+        if manifest_path.is_file() {
+            return Ok(manifest_path);
+        }
+    }
+    bail!("could not find Cargo.toml in current directory or ancestors");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, find_manifest_path_from_current_dir};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use clap::Parser;
+    use tempfile::tempdir;
+
+    struct CurrentDirGuard {
+        previous_dir: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn set_to(path: &Path) -> Self {
+            let previous_dir = std::env::current_dir().expect("current dir");
+            std::env::set_current_dir(path).expect("set current dir");
+            Self { previous_dir }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.previous_dir).expect("restore current dir");
+        }
+    }
+
+    #[test]
+    fn parses_without_subcommand() {
+        Cli::try_parse_from(["cargo-tsuno"]).expect("parse cli");
+    }
+
+    #[test]
+    fn rejects_verify_subcommand() {
+        assert!(Cli::try_parse_from(["cargo-tsuno", "verify"]).is_err());
+    }
+
+    #[test]
+    fn finds_manifest_in_current_dir_ancestor_chain() {
+        let temp_dir = tempdir().expect("tempdir");
+        let manifest_path = temp_dir.path().join("Cargo.toml");
+        fs::write(
+            &manifest_path,
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("write manifest");
+        let nested_dir = temp_dir.path().join("nested").join("deeper");
+        fs::create_dir_all(&nested_dir).expect("create nested dir");
+        let _guard = CurrentDirGuard::set_to(&nested_dir);
+
+        let found_manifest_path = find_manifest_path_from_current_dir().expect("find manifest");
+
+        assert_eq!(
+            fs::canonicalize(found_manifest_path).expect("canonicalize found manifest"),
+            fs::canonicalize(manifest_path).expect("canonicalize expected manifest")
+        );
+    }
 }
