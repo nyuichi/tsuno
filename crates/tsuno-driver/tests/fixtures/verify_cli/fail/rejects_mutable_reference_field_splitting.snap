@@ -3,9 +3,9 @@ source: crates/tsuno-driver/tests/verify_cli.rs
 assertion_line: 131
 expression: snapshot_output(output)
 ---
-status: Some(0)
+status: Some(1)
 stdout:
-PASS close_ok
-  all assertions discharged
+UNSUPPORTED rejects_mutable_reference_field_splitting
+  mutable references to non-scalars are unsupported
 
 stderr:

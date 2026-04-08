@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::mir::{
-    BasicBlock, BinOp, Body, BorrowKind, ConstOperand, Local, Operand, Place, PlaceElem, Rvalue,
-    Statement, StatementKind, Terminator, TerminatorKind, UnOp,
+    AggregateKind, BasicBlock, BinOp, Body, BorrowKind, ConstOperand, Local, Operand, Place,
+    PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnOp,
 };
 use rustc_middle::ty::{IntTy, TyCtxt, TyKind, UintTy};
 use rustc_span::Span;
@@ -27,7 +27,7 @@ pub struct Loc(pub usize);
 #[derive(Debug, Clone)]
 pub struct State {
     env: BTreeMap<Local, Loc>,
-    store: BTreeMap<Loc, SymVal>,
+    store: BTreeMap<Loc, Slot>,
     pc: Vec<Bool>,
     ctrl: ControlPoint,
     trace: Vec<String>,
@@ -40,9 +40,15 @@ pub struct ControlPoint {
 }
 
 #[derive(Debug, Clone)]
+pub enum Slot {
+    Live(SymVal),
+    Moved,
+}
+
+#[derive(Debug, Clone)]
 pub enum SymVal {
     Scalar(TypedExpr),
-    Pair(TypedExpr, TypedExpr),
+    Pair(Box<Slot>, Box<Slot>),
     MutRef {
         target: Loc,
         cur: TypedExpr,
@@ -220,10 +226,10 @@ impl<'tcx> Verifier<'tcx> {
                             .cloned()
                             .expect("shared local missing from incoming branch store");
                         merged_value = self
-                            .merge_symval(&guard, &merged_value, &incoming_value)
+                            .merge_slot(&guard, &merged_value, &incoming_value)
                             .expect("join bucket value shape mismatch");
                     }
-                    let loc = self.alloc(&mut merged, merged_value);
+                    let loc = self.alloc_slot(&mut merged, merged_value);
                     merged.env.insert(local, loc);
                 }
                 bucket = vec![merged];
@@ -352,7 +358,7 @@ impl<'tcx> Verifier<'tcx> {
                 msg,
                 ..
             } => {
-                let cond = self.scalar_from_operand(&state, cond, term.source_info.span)?;
+                let cond = self.scalar_from_operand(&mut state, cond, term.source_info.span)?;
                 let formula = if *expected {
                     cond.as_bool()?
                 } else {
@@ -385,12 +391,12 @@ impl<'tcx> Verifier<'tcx> {
 
     fn step_switch(
         &self,
-        state: State,
+        mut state: State,
         discr: &Operand<'tcx>,
         targets: &rustc_middle::mir::SwitchTargets,
         span: Span,
     ) -> Result<Vec<State>, VerificationResult> {
-        let discr = self.scalar_from_operand(&state, discr, span)?;
+        let discr = self.scalar_from_operand(&mut state, discr, span)?;
         let mut explicit = Vec::new();
         let mut next_states = Vec::new();
         for (value, target) in targets.iter() {
@@ -454,27 +460,30 @@ impl<'tcx> Verifier<'tcx> {
                     _ => self.body.local_decls[place.local].ty,
                 };
                 let fresh = self.fresh_scalar_for_ty(&mut state, target_ty, "call_mut")?;
-                let fin = match state.store.get(&base_loc).cloned() {
-                    Some(SymVal::MutRef { fin, .. }) => fin,
-                    _ => {
-                        return Err(self.unsupported_result(
-                            span,
-                            Some(state.ctrl.basic_block.index()),
-                            None,
-                            "missing mutable reference argument".to_owned(),
-                            state.trace.clone(),
-                        ));
-                    }
+                let Some(Slot::Live(SymVal::MutRef { target, cur, .. })) =
+                    state.store.get(&base_loc).cloned()
+                else {
+                    return Err(self.unsupported_result(
+                        span,
+                        Some(state.ctrl.basic_block.index()),
+                        None,
+                        "missing mutable reference argument".to_owned(),
+                        state.trace.clone(),
+                    ));
                 };
                 state.store.insert(
                     base_loc,
-                    SymVal::MutRef {
+                    Slot::Live(SymVal::MutRef {
                         target: target_loc,
-                        cur: fresh.clone(),
-                        fin,
-                    },
+                        cur,
+                        fin: fresh.clone(),
+                    }),
                 );
-                state.store.insert(target_loc, SymVal::Scalar(fresh));
+                state
+                    .store
+                    .insert(target_loc, Slot::Live(SymVal::Scalar(fresh.clone())));
+                self.update_mutref_aliases(&mut state, target, None, Some(&fresh));
+                state.store.insert(base_loc, Slot::Moved);
             }
         }
         let value = self.fresh_symval_for_ty(&mut state, self.place_ty(destination), "call_ret")?;
@@ -507,6 +516,32 @@ impl<'tcx> Verifier<'tcx> {
             Rvalue::UnaryOp(op, operand) => {
                 SymVal::Scalar(self.unary_value(state, *op, operand, span)?)
             }
+            Rvalue::Aggregate(kind, operands) => match kind.as_ref() {
+                AggregateKind::Tuple => {
+                    let operands: Vec<_> = operands.iter().collect();
+                    if operands.len() != 2 {
+                        return Err(self.unsupported_result(
+                            span,
+                            Some(state.ctrl.basic_block.index()),
+                            Some(state.ctrl.statement_index),
+                            "unsupported aggregate arity".to_owned(),
+                            state.trace.clone(),
+                        ));
+                    }
+                    let first = self.operand_to_symval(state, operands[0], span)?;
+                    let second = self.operand_to_symval(state, operands[1], span)?;
+                    SymVal::Pair(Box::new(Slot::Live(first)), Box::new(Slot::Live(second)))
+                }
+                other => {
+                    return Err(self.unsupported_result(
+                        span,
+                        Some(state.ctrl.basic_block.index()),
+                        Some(state.ctrl.statement_index),
+                        format!("unsupported aggregate kind {other:?}"),
+                        state.trace.clone(),
+                    ));
+                }
+            },
             Rvalue::Ref(_, borrow_kind, borrowed_place) => match borrow_kind {
                 BorrowKind::Mut { .. } => {
                     let target = self.place_loc(state, *borrowed_place, span)?;
@@ -545,7 +580,7 @@ impl<'tcx> Verifier<'tcx> {
 
     fn binary_value(
         &self,
-        state: &State,
+        state: &mut State,
         op: BinOp,
         lhs_operand: &Operand<'tcx>,
         rhs_operand: &Operand<'tcx>,
@@ -567,17 +602,26 @@ impl<'tcx> Verifier<'tcx> {
             BinOp::AddWithOverflow => {
                 let result = lhs.as_int()? + rhs.as_int()?;
                 let overflow = self.overflow_formula(&result, lhs_ty, span, state)?;
-                SymVal::Pair(TypedExpr::Int(result), TypedExpr::Bool(overflow))
+                SymVal::Pair(
+                    Box::new(Slot::Live(SymVal::Scalar(TypedExpr::Int(result)))),
+                    Box::new(Slot::Live(SymVal::Scalar(TypedExpr::Bool(overflow)))),
+                )
             }
             BinOp::SubWithOverflow => {
                 let result = lhs.as_int()? - rhs.as_int()?;
                 let overflow = self.overflow_formula(&result, lhs_ty, span, state)?;
-                SymVal::Pair(TypedExpr::Int(result), TypedExpr::Bool(overflow))
+                SymVal::Pair(
+                    Box::new(Slot::Live(SymVal::Scalar(TypedExpr::Int(result)))),
+                    Box::new(Slot::Live(SymVal::Scalar(TypedExpr::Bool(overflow)))),
+                )
             }
             BinOp::MulWithOverflow => {
                 let result = lhs.as_int()? * rhs.as_int()?;
                 let overflow = self.overflow_formula(&result, lhs_ty, span, state)?;
-                SymVal::Pair(TypedExpr::Int(result), TypedExpr::Bool(overflow))
+                SymVal::Pair(
+                    Box::new(Slot::Live(SymVal::Scalar(TypedExpr::Int(result)))),
+                    Box::new(Slot::Live(SymVal::Scalar(TypedExpr::Bool(overflow)))),
+                )
             }
             other => {
                 return Err(self.unsupported_result(
@@ -594,7 +638,7 @@ impl<'tcx> Verifier<'tcx> {
 
     fn unary_value(
         &self,
-        state: &State,
+        state: &mut State,
         op: UnOp,
         operand: &Operand<'tcx>,
         span: Span,
@@ -615,19 +659,23 @@ impl<'tcx> Verifier<'tcx> {
 
     fn operand_to_symval(
         &self,
-        state: &State,
+        state: &mut State,
         operand: &Operand<'tcx>,
         span: Span,
     ) -> Result<SymVal, VerificationResult> {
         match operand {
-            Operand::Copy(place) | Operand::Move(place) => self.read_place(state, *place, span),
+            Operand::Copy(place) => self.read_place(state, *place, span),
+            Operand::Move(place) if self.place_is_copy(*place) => {
+                self.read_place(state, *place, span)
+            }
+            Operand::Move(place) => self.take_place(state, *place, span),
             Operand::Constant(constant) => self.constant_to_symval(constant, span),
         }
     }
 
     fn scalar_from_operand(
         &self,
-        state: &State,
+        state: &mut State,
         operand: &Operand<'tcx>,
         span: Span,
     ) -> Result<TypedExpr, VerificationResult> {
@@ -679,15 +727,23 @@ impl<'tcx> Verifier<'tcx> {
                     state.trace.clone(),
                 )
             })?;
-            return state.store.get(&loc).cloned().ok_or_else(|| {
-                self.unsupported_result(
+            return match state.store.get(&loc).cloned() {
+                Some(Slot::Moved) => Err(self.unsupported_result(
+                    span,
+                    Some(state.ctrl.basic_block.index()),
+                    Some(state.ctrl.statement_index),
+                    format!("use of moved value {}", local.as_usize()),
+                    state.trace.clone(),
+                )),
+                Some(Slot::Live(value)) => Ok(value),
+                None => Err(self.unsupported_result(
                     span,
                     Some(state.ctrl.basic_block.index()),
                     Some(state.ctrl.statement_index),
                     format!("missing store for local {}", local.as_usize()),
                     state.trace.clone(),
-                )
-            });
+                )),
+            };
         }
         let Some((base, elem)) = place.as_ref().last_projection() else {
             return Err(self.unsupported_result(
@@ -702,41 +758,76 @@ impl<'tcx> Verifier<'tcx> {
             PlaceElem::Deref => {
                 let base_place = base.to_place(self.tcx);
                 let loc = self.place_loc(state, base_place, span)?;
-                let SymVal::MutRef { target, .. } =
-                    state.store.get(&loc).cloned().ok_or_else(|| {
-                        self.unsupported_result(
+                let target = match state.store.get(&loc).cloned() {
+                    Some(Slot::Live(SymVal::MutRef { target, .. })) => target,
+                    Some(Slot::Moved) => {
+                        return Err(self.unsupported_result(
+                            span,
+                            Some(state.ctrl.basic_block.index()),
+                            Some(state.ctrl.statement_index),
+                            "use of moved value".to_owned(),
+                            state.trace.clone(),
+                        ));
+                    }
+                    Some(Slot::Live(_)) => {
+                        return Err(self.unsupported_result(
+                            span,
+                            Some(state.ctrl.basic_block.index()),
+                            Some(state.ctrl.statement_index),
+                            "deref of non-mutable reference".to_owned(),
+                            state.trace.clone(),
+                        ));
+                    }
+                    None => {
+                        return Err(self.unsupported_result(
                             span,
                             Some(state.ctrl.basic_block.index()),
                             Some(state.ctrl.statement_index),
                             "missing mutable reference".to_owned(),
                             state.trace.clone(),
-                        )
-                    })?
-                else {
-                    return Err(self.unsupported_result(
+                        ));
+                    }
+                };
+                match state.store.get(&target).cloned() {
+                    Some(Slot::Moved) => Err(self.unsupported_result(
                         span,
                         Some(state.ctrl.basic_block.index()),
                         Some(state.ctrl.statement_index),
-                        "deref of non-mutable reference".to_owned(),
+                        "use of moved value".to_owned(),
                         state.trace.clone(),
-                    ));
-                };
-                state.store.get(&target).cloned().ok_or_else(|| {
-                    self.unsupported_result(
+                    )),
+                    Some(Slot::Live(value)) => Ok(value),
+                    None => Err(self.unsupported_result(
                         span,
                         Some(state.ctrl.basic_block.index()),
                         Some(state.ctrl.statement_index),
                         "missing deref target".to_owned(),
                         state.trace.clone(),
-                    )
-                })
+                    )),
+                }
             }
             PlaceElem::Field(field, _) => {
                 let base_place = base.to_place(self.tcx);
                 match self.read_place(state, base_place, span)? {
                     SymVal::Pair(first, second) => match field.index() {
-                        0 => Ok(SymVal::Scalar(first)),
-                        1 => Ok(SymVal::Scalar(second)),
+                        0 => first.as_ref().as_live().cloned().ok_or_else(|| {
+                            self.unsupported_result(
+                                span,
+                                Some(state.ctrl.basic_block.index()),
+                                Some(state.ctrl.statement_index),
+                                "use of moved value".to_owned(),
+                                state.trace.clone(),
+                            )
+                        }),
+                        1 => second.as_ref().as_live().cloned().ok_or_else(|| {
+                            self.unsupported_result(
+                                span,
+                                Some(state.ctrl.basic_block.index()),
+                                Some(state.ctrl.statement_index),
+                                "use of moved value".to_owned(),
+                                state.trace.clone(),
+                            )
+                        }),
                         index => Err(self.unsupported_result(
                             span,
                             Some(state.ctrl.basic_block.index()),
@@ -764,6 +855,83 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
+    fn take_place(
+        &self,
+        state: &mut State,
+        place: Place<'tcx>,
+        span: Span,
+    ) -> Result<SymVal, VerificationResult> {
+        if let Some(local) = place.as_local() {
+            let loc = state.env.get(&local).copied().ok_or_else(|| {
+                self.unsupported_result(
+                    span,
+                    Some(state.ctrl.basic_block.index()),
+                    Some(state.ctrl.statement_index),
+                    format!("missing env for local {}", local.as_usize()),
+                    state.trace.clone(),
+                )
+            })?;
+            let Some(slot) = state.store.get_mut(&loc) else {
+                return Err(self.unsupported_result(
+                    span,
+                    Some(state.ctrl.basic_block.index()),
+                    Some(state.ctrl.statement_index),
+                    format!("missing store for local {}", local.as_usize()),
+                    state.trace.clone(),
+                ));
+            };
+            return slot.take().ok_or_else(|| {
+                self.unsupported_result(
+                    span,
+                    Some(state.ctrl.basic_block.index()),
+                    Some(state.ctrl.statement_index),
+                    format!("use of moved value {}", local.as_usize()),
+                    state.trace.clone(),
+                )
+            });
+        }
+        let Some((base, elem)) = place.as_ref().last_projection() else {
+            return Err(self.unsupported_result(
+                span,
+                Some(state.ctrl.basic_block.index()),
+                Some(state.ctrl.statement_index),
+                "unsupported place".to_owned(),
+                state.trace.clone(),
+            ));
+        };
+        match elem {
+            PlaceElem::Field(field, _) => {
+                let base_place = base.to_place(self.tcx);
+                let base_value = self.read_place(state, base_place, span)?;
+                let Some((taken, updated)) = base_value.take_pair_field(field.index()) else {
+                    return Err(self.unsupported_result(
+                        span,
+                        Some(state.ctrl.basic_block.index()),
+                        Some(state.ctrl.statement_index),
+                        "field projection on unsupported value".to_owned(),
+                        state.trace.clone(),
+                    ));
+                };
+                self.write_place(state, base_place, updated, span)?;
+                Ok(taken)
+            }
+            PlaceElem::Deref => Err(self.unsupported_result(
+                span,
+                Some(state.ctrl.basic_block.index()),
+                Some(state.ctrl.statement_index),
+                "move through deref is unsupported".to_owned(),
+                state.trace.clone(),
+            )),
+            other => Err(self.unsupported_result(
+                span,
+                Some(state.ctrl.basic_block.index()),
+                Some(state.ctrl.statement_index),
+                format!("unsupported place projection {other:?}"),
+                state.trace.clone(),
+            )),
+        }
+    }
+
     fn write_place(
         &self,
         state: &mut State,
@@ -779,7 +947,7 @@ impl<'tcx> Verifier<'tcx> {
                 state.env.insert(local, loc);
                 loc
             };
-            state.store.insert(loc, value);
+            state.store.insert(loc, Slot::Live(value));
             return Ok(());
         }
         let Some((base, elem)) = place.as_ref().last_projection() else {
@@ -796,7 +964,7 @@ impl<'tcx> Verifier<'tcx> {
                 let base_place = base.to_place(self.tcx);
                 let base_loc = self.place_loc(state, base_place, span)?;
                 let target = match state.store.get(&base_loc) {
-                    Some(SymVal::MutRef { target, .. }) => *target,
+                    Some(Slot::Live(SymVal::MutRef { target, .. })) => *target,
                     _ => {
                         return Err(self.unsupported_result(
                             span,
@@ -818,14 +986,31 @@ impl<'tcx> Verifier<'tcx> {
                 };
                 state.store.insert(
                     base_loc,
-                    SymVal::MutRef {
+                    Slot::Live(SymVal::MutRef {
                         target,
                         cur: expr.clone(),
                         fin: expr.clone(),
-                    },
+                    }),
                 );
-                state.store.insert(target, SymVal::Scalar(expr));
+                state
+                    .store
+                    .insert(target, Slot::Live(SymVal::Scalar(expr.clone())));
+                self.update_mutref_aliases(state, target, Some(&expr), Some(&expr));
                 Ok(())
+            }
+            PlaceElem::Field(field, _) => {
+                let base_place = base.to_place(self.tcx);
+                let base_value = self.read_place(state, base_place, span)?;
+                let Some(updated) = base_value.replace_pair_field(field.index(), value) else {
+                    return Err(self.unsupported_result(
+                        span,
+                        Some(state.ctrl.basic_block.index()),
+                        Some(state.ctrl.statement_index),
+                        "field write on unsupported value".to_owned(),
+                        state.trace.clone(),
+                    ));
+                };
+                self.write_place(state, base_place, updated, span)
             }
             other => Err(self.unsupported_result(
                 span,
@@ -866,7 +1051,14 @@ impl<'tcx> Verifier<'tcx> {
         let base_place = base.to_place(self.tcx);
         let base_loc = self.place_loc(state, base_place, span)?;
         match state.store.get(&base_loc) {
-            Some(SymVal::MutRef { target, .. }) => Ok(*target),
+            Some(Slot::Live(SymVal::MutRef { target, .. })) => Ok(*target),
+            Some(Slot::Moved) => Err(self.unsupported_result(
+                span,
+                Some(state.ctrl.basic_block.index()),
+                Some(state.ctrl.statement_index),
+                "use of moved value".to_owned(),
+                state.trace.clone(),
+            )),
             _ => Err(self.unsupported_result(
                 span,
                 Some(state.ctrl.basic_block.index()),
@@ -881,7 +1073,7 @@ impl<'tcx> Verifier<'tcx> {
         let local = place.as_local()?;
         let base_loc = state.env.get(&local).copied()?;
         match state.store.get(&base_loc) {
-            Some(SymVal::MutRef { target, .. }) => Some((base_loc, *target)),
+            Some(Slot::Live(SymVal::MutRef { target, .. })) => Some((base_loc, *target)),
             _ => None,
         }
     }
@@ -960,12 +1152,10 @@ impl<'tcx> Verifier<'tcx> {
                 if fields.len() == 2 && matches!(fields[1].kind(), TyKind::Bool) =>
             {
                 let first = self.fresh_symval_for_ty(state, fields[0], prefix)?;
-                let SymVal::Scalar(first) = first else {
-                    unreachable!();
-                };
+                let second = SymVal::Scalar(TypedExpr::Bool(self.fresh_bool(prefix)));
                 Ok(SymVal::Pair(
-                    first,
-                    TypedExpr::Bool(self.fresh_bool(prefix)),
+                    Box::new(Slot::Live(first)),
+                    Box::new(Slot::Live(second)),
                 ))
             }
             TyKind::Ref(_, inner, rustc_middle::mir::Mutability::Mut) => {
@@ -1172,13 +1362,20 @@ impl<'tcx> Verifier<'tcx> {
                         state.trace.clone(),
                     )
                 })? {
-                    SymVal::Scalar(expr) => Ok(expr),
-                    SymVal::MutRef { cur, .. } => Ok(cur),
-                    SymVal::Pair(..) => Err(self.unsupported_result(
+                    Slot::Live(SymVal::Scalar(expr)) => Ok(expr),
+                    Slot::Live(SymVal::MutRef { cur, .. }) => Ok(cur),
+                    Slot::Live(SymVal::Pair(..)) => Err(self.unsupported_result(
                         span,
                         Some(state.ctrl.basic_block.index()),
                         Some(state.ctrl.statement_index),
                         "tuple value used where scalar was expected".to_owned(),
+                        state.trace.clone(),
+                    )),
+                    Slot::Moved => Err(self.unsupported_result(
+                        span,
+                        Some(state.ctrl.basic_block.index()),
+                        Some(state.ctrl.statement_index),
+                        "use of moved value".to_owned(),
                         state.trace.clone(),
                     )),
                 }
@@ -1286,6 +1483,21 @@ impl<'tcx> Verifier<'tcx> {
         place.ty(&self.body, self.tcx).ty
     }
 
+    fn place_is_copy(&self, place: Place<'tcx>) -> bool {
+        self.ty_is_copy(self.place_ty(place))
+    }
+
+    fn ty_is_copy(&self, ty: rustc_middle::ty::Ty<'tcx>) -> bool {
+        match ty.kind() {
+            TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) => true,
+            TyKind::Tuple(fields) if fields.is_empty() => true,
+            TyKind::Tuple(fields) => fields.iter().all(|field| self.ty_is_copy(field)),
+            TyKind::Ref(_, _, rustc_middle::mir::Mutability::Not) => true,
+            TyKind::Ref(_, _, rustc_middle::mir::Mutability::Mut) => false,
+            _ => false,
+        }
+    }
+
     fn operand_ty(
         &self,
         operand: &Operand<'tcx>,
@@ -1389,10 +1601,53 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn alloc(&self, state: &mut State, value: SymVal) -> Loc {
+        self.alloc_slot(state, Slot::Live(value))
+    }
+
+    fn alloc_slot(&self, state: &mut State, value: Slot) -> Loc {
         let loc = Loc(self.next_loc.get());
         self.next_loc.set(self.next_loc.get() + 1);
         state.store.insert(loc, value);
         loc
+    }
+
+    fn update_mutref_aliases(
+        &self,
+        state: &mut State,
+        target: Loc,
+        cur: Option<&TypedExpr>,
+        fin: Option<&TypedExpr>,
+    ) {
+        for slot in state.store.values_mut() {
+            Self::update_mutref_aliases_in_slot(slot, target, cur, fin);
+        }
+    }
+
+    fn update_mutref_aliases_in_slot(
+        slot: &mut Slot,
+        target: Loc,
+        cur: Option<&TypedExpr>,
+        fin: Option<&TypedExpr>,
+    ) {
+        match slot {
+            Slot::Live(SymVal::MutRef {
+                target: slot_target,
+                cur: slot_cur,
+                fin: slot_fin,
+            }) if *slot_target == target => {
+                if let Some(cur) = cur {
+                    *slot_cur = cur.clone();
+                }
+                if let Some(fin) = fin {
+                    *slot_fin = fin.clone();
+                }
+            }
+            Slot::Live(SymVal::Pair(first, second)) => {
+                Self::update_mutref_aliases_in_slot(first.as_mut(), target, cur, fin);
+                Self::update_mutref_aliases_in_slot(second.as_mut(), target, cur, fin);
+            }
+            _ => {}
+        }
     }
 
     fn enqueue_state(
@@ -1411,6 +1666,16 @@ impl<'tcx> Verifier<'tcx> {
         bucket.push(state);
     }
 
+    fn merge_slot(&self, guard: &Bool, existing: &Slot, incoming: &Slot) -> Option<Slot> {
+        match (existing, incoming) {
+            (Slot::Live(existing), Slot::Live(incoming)) => {
+                Some(Slot::Live(self.merge_symval(guard, existing, incoming)?))
+            }
+            (Slot::Moved, Slot::Moved) => Some(Slot::Moved),
+            _ => None,
+        }
+    }
+
     fn merge_symval(&self, guard: &Bool, existing: &SymVal, incoming: &SymVal) -> Option<SymVal> {
         match (existing, incoming) {
             (SymVal::Scalar(existing), SymVal::Scalar(incoming)) => Some(SymVal::Scalar(
@@ -1418,8 +1683,8 @@ impl<'tcx> Verifier<'tcx> {
             )),
             (SymVal::Pair(existing_a, existing_b), SymVal::Pair(incoming_a, incoming_b)) => {
                 Some(SymVal::Pair(
-                    self.merge_typed_expr(guard, existing_a, incoming_a)?,
-                    self.merge_typed_expr(guard, existing_b, incoming_b)?,
+                    Box::new(self.merge_slot(guard, existing_a, incoming_a)?),
+                    Box::new(self.merge_slot(guard, existing_b, incoming_b)?),
                 ))
             }
             (
@@ -1468,10 +1733,7 @@ impl<'tcx> Verifier<'tcx> {
         let locals: Vec<_> = state
             .env
             .iter()
-            .filter_map(|(local, loc)| match state.store.get(loc) {
-                Some(SymVal::MutRef { .. }) if *local != return_local => Some(*local),
-                _ => None,
-            })
+            .filter_map(|(local, _)| (*local != return_local).then_some(*local))
             .collect();
         for local in locals {
             self.close_local(state, local, span)?;
@@ -1488,21 +1750,57 @@ impl<'tcx> Verifier<'tcx> {
         let Some(loc) = state.env.get(&local).copied() else {
             return Ok(());
         };
-        let Some(value) = state.store.get(&loc).cloned() else {
+        let Some(mut value) = state.store.get(&loc).cloned() else {
             return Ok(());
         };
-        let SymVal::MutRef { target, cur, fin } = value else {
-            return Ok(());
-        };
-        self.ensure_formula(
-            state,
-            cur.eq(&fin)?,
-            span,
-            "mutable reference close failed".to_owned(),
-        )?;
-        state.store.insert(target, SymVal::Scalar(cur));
-        state.store.insert(loc, SymVal::Scalar(TypedExpr::Unit));
+        self.close_slot(state, &mut value, span)?;
+        state.store.insert(loc, value);
         Ok(())
+    }
+
+    fn close_slot(
+        &self,
+        state: &mut State,
+        slot: &mut Slot,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        match slot {
+            Slot::Moved => Ok(()),
+            Slot::Live(value) => {
+                if self.close_symval(state, value, span)? {
+                    *slot = Slot::Moved;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn close_symval(
+        &self,
+        state: &mut State,
+        value: &mut SymVal,
+        span: Span,
+    ) -> Result<bool, VerificationResult> {
+        match value {
+            SymVal::MutRef { target, cur, fin } => {
+                self.ensure_formula(
+                    state,
+                    cur.eq(fin)?,
+                    span,
+                    "mutable reference close failed".to_owned(),
+                )?;
+                state
+                    .store
+                    .insert(*target, Slot::Live(SymVal::Scalar(cur.clone())));
+                Ok(true)
+            }
+            SymVal::Pair(first, second) => {
+                self.close_slot(state, first.as_mut(), span)?;
+                self.close_slot(state, second.as_mut(), span)?;
+                Ok(false)
+            }
+            SymVal::Scalar(_) => Ok(false),
+        }
     }
 }
 
@@ -1579,6 +1877,58 @@ impl TypedExpr {
                 model: Vec::new(),
             }),
         }
+    }
+}
+
+impl SymVal {
+    fn take_pair_field(self, index: usize) -> Option<(SymVal, SymVal)> {
+        let SymVal::Pair(mut first, mut second) = self else {
+            return None;
+        };
+        match index {
+            0 => Some((first.take()?, SymVal::Pair(Box::new(Slot::Moved), second))),
+            1 => Some((second.take()?, SymVal::Pair(first, Box::new(Slot::Moved)))),
+            _ => None,
+        }
+    }
+
+    fn replace_pair_field(self, index: usize, value: SymVal) -> Option<SymVal> {
+        let SymVal::Pair(first, second) = self else {
+            return None;
+        };
+        match index {
+            0 => {
+                let mut first = first;
+                first.replace(value);
+                Some(SymVal::Pair(first, second))
+            }
+            1 => {
+                let mut second = second;
+                second.replace(value);
+                Some(SymVal::Pair(first, second))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Slot {
+    fn as_live(&self) -> Option<&SymVal> {
+        match self {
+            Slot::Live(value) => Some(value),
+            Slot::Moved => None,
+        }
+    }
+
+    fn take(&mut self) -> Option<SymVal> {
+        match std::mem::replace(self, Slot::Moved) {
+            Slot::Live(value) => Some(value),
+            Slot::Moved => None,
+        }
+    }
+
+    fn replace(&mut self, value: SymVal) {
+        *self = Slot::Live(value);
     }
 }
 

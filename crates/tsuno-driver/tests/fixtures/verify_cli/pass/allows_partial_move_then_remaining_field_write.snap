@@ -5,7 +5,7 @@ expression: snapshot_output(output)
 ---
 status: Some(0)
 stdout:
-PASS close_ok
+PASS partial_move_then_remaining_field_write
   all assertions discharged
 
 stderr:
