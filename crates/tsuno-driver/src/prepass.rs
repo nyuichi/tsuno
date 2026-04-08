@@ -2,15 +2,17 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ops::ControlFlow;
 
 use crate::directive::{
-    SpecBinaryOp, SpecExpr as HirSpecExpr, SpecUnaryOp, collect_hir_assertions,
-    collect_hir_loop_contracts,
+    FunctionContractSource, SpecBinaryOp, SpecExpr as HirSpecExpr, SpecUnaryOp,
+    collect_function_contract_source, collect_hir_assertions, collect_hir_loop_contracts,
 };
+use crate::report::{VerificationResult, VerificationStatus};
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::{HirId, Pat, PatKind};
+use rustc_hir::{HirId, ItemKind, Pat, PatKind};
 use rustc_middle::mir::{BasicBlock, Body, Local, PlaceElem, StatementKind, TerminatorKind};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{Span, Symbol};
+use syn::{Expr as SynExpr, Lit};
 
 #[derive(Debug, Clone, Default)]
 pub struct HirBindingInfo {
@@ -19,18 +21,9 @@ pub struct HirBindingInfo {
 }
 
 #[derive(Debug, Clone)]
-pub struct LoopPrepassError {
-    pub span: Span,
-    pub basic_block: Option<BasicBlock>,
-    pub statement_index: Option<usize>,
-    pub message: String,
-}
-
-#[derive(Debug, Clone)]
 pub enum MirSpecExpr {
     Bool(bool),
     Int(i64),
-    Result,
     Var(Local),
     #[allow(dead_code)]
     Prophecy(Local),
@@ -51,7 +44,7 @@ pub struct LoopContract {
     pub hir_loop_id: HirId,
     pub invariant_block: BasicBlock,
     pub invariant: MirSpecExpr,
-    pub invariant_span: Span,
+    pub invariant_span: String,
     pub body_blocks: BTreeSet<BasicBlock>,
     pub exit_blocks: BTreeSet<BasicBlock>,
     pub written_locals: BTreeSet<rustc_middle::mir::Local>,
@@ -66,12 +59,39 @@ pub struct LoopContracts {
 #[derive(Debug, Clone)]
 pub struct AssertionContract {
     pub assertion: MirSpecExpr,
-    pub assertion_span: Span,
+    pub assertion_span: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct AssertionContracts {
     pub by_control_point: HashMap<(BasicBlock, usize), AssertionContract>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionContract {
+    pub params: Vec<String>,
+    pub req: ContractExpr,
+    #[allow(dead_code)]
+    pub req_span: String,
+    pub ens: ContractExpr,
+    pub ens_span: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum ContractExpr {
+    Bool(bool),
+    Int(i64),
+    Var(String),
+    Prophecy(String),
+    Unary {
+        op: SpecUnaryOp,
+        arg: Box<ContractExpr>,
+    },
+    Binary {
+        op: SpecBinaryOp,
+        lhs: Box<ContractExpr>,
+        rhs: Box<ContractExpr>,
+    },
 }
 
 impl LoopContracts {
@@ -105,6 +125,26 @@ impl AssertionContracts {
     ) -> Option<&AssertionContract> {
         self.by_control_point.get(&(block, statement_index))
     }
+}
+
+pub fn compute_function_contracts<'tcx>(
+    tcx: TyCtxt<'tcx>,
+) -> Result<HashMap<LocalDefId, FunctionContract>, VerificationResult> {
+    let mut contracts = HashMap::new();
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
+        let ItemKind::Fn { .. } = item.kind else {
+            continue;
+        };
+        let def_id = item.owner_id.def_id;
+        let Some(source_contract) = collect_function_contract_source(tcx, def_id, item.span)?
+        else {
+            continue;
+        };
+        let contract = lower_function_contract(tcx, def_id, source_contract)?;
+        contracts.insert(def_id, contract);
+    }
+    Ok(contracts)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +199,11 @@ pub fn compute_hir_locals<'tcx>(
         }
     }
     locals
+}
+
+pub struct LoopPrepassError {
+    pub span: Span,
+    pub message: String,
 }
 
 pub fn collect_hir_binding_info<'tcx>(
@@ -242,7 +287,9 @@ pub fn compute_loops<'tcx>(
                         hir_loop_id: HirId::INVALID,
                         invariant_block: header,
                         invariant: MirSpecExpr::Bool(true),
-                        invariant_span: body.basic_blocks[header].terminator().source_info.span,
+                        invariant_span: tcx.sess.source_map().span_to_diagnostic_string(
+                            body.basic_blocks[header].terminator().source_info.span,
+                        ),
                         body_blocks,
                         exit_blocks,
                         written_locals,
@@ -267,8 +314,6 @@ pub fn compute_loops<'tcx>(
         else {
             return Err(LoopPrepassError {
                 span: header_span,
-                basic_block: Some(header),
-                statement_index: None,
                 message: format!(
                     "loop at bb{} requires exactly one //@ inv before the body",
                     header.index()
@@ -282,11 +327,8 @@ pub fn compute_loops<'tcx>(
             .filter(|block| *block != header)
             .min_by_key(|block| (loop_entry_distance(body, loop_info, *block), block.index()))
             .unwrap_or(header);
-        let invariant = lower_hir_spec_expr(
-            &hir_loop_contract.invariant,
-            &hir_locals,
-            hir_loop_contract.invariant_span,
-        )?;
+        let invariant =
+            lower_hir_spec_expr(&hir_loop_contract.invariant, &hir_locals, header_span)?;
         loops
             .get_mut(&header)
             .expect("loop info present")
@@ -299,7 +341,7 @@ pub fn compute_loops<'tcx>(
         loops
             .get_mut(&header)
             .expect("loop info present")
-            .invariant_span = hir_loop_contract.invariant_span;
+            .invariant_span = hir_loop_contract.invariant_span.clone();
     }
 
     let by_invariant_block = loops
@@ -327,8 +369,6 @@ pub fn compute_assertions<'tcx>(
         let Some((basic_block, statement_index)) = target else {
             return Err(LoopPrepassError {
                 span: hir_assertion.stmt_span,
-                basic_block: None,
-                statement_index: None,
                 message: format!(
                     "unable to map //@ assert at {} to MIR",
                     tcx.sess
@@ -340,7 +380,7 @@ pub fn compute_assertions<'tcx>(
         let assertion = lower_hir_spec_expr(
             &hir_assertion.assertion,
             &hir_locals,
-            hir_assertion.assertion_span,
+            hir_assertion.stmt_span,
         )?;
         if by_control_point
             .insert(
@@ -354,13 +394,189 @@ pub fn compute_assertions<'tcx>(
         {
             return Err(LoopPrepassError {
                 span: hir_assertion.stmt_span,
-                basic_block: Some(basic_block),
-                statement_index: Some(statement_index),
                 message: "multiple //@ assert directives map to the same control point".to_owned(),
             });
         }
     }
     Ok(AssertionContracts { by_control_point })
+}
+
+fn lower_function_contract<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    source: FunctionContractSource,
+) -> Result<FunctionContract, VerificationResult> {
+    Ok(FunctionContract {
+        params: function_param_names(tcx, def_id)?,
+        req: lower_function_contract_expr(tcx, def_id, &source.req_span, "req", &source.req)?,
+        ens: lower_function_contract_expr(tcx, def_id, &source.ens_span, "ens", &source.ens)?,
+        req_span: source.req_span,
+        ens_span: source.ens_span,
+    })
+}
+
+fn lower_function_contract_expr<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    span: &str,
+    kind: &str,
+    expr: &SynExpr,
+) -> Result<ContractExpr, VerificationResult> {
+    match expr {
+        SynExpr::Lit(lit) => match &lit.lit {
+            Lit::Bool(value) => Ok(ContractExpr::Bool(value.value)),
+            Lit::Int(value) => Ok(ContractExpr::Int(value.base10_parse::<i64>().map_err(
+                |err| {
+                    function_contract_error(
+                        tcx,
+                        def_id,
+                        span,
+                        format!("integer literal in //@ {kind} is too large: {err}"),
+                    )
+                },
+            )?)),
+            _ => Err(function_contract_error(
+                tcx,
+                def_id,
+                span,
+                format!("unsupported literal in //@ {kind} predicate"),
+            )),
+        },
+        SynExpr::Path(path) => {
+            let Some(ident) = path.path.get_ident() else {
+                return Err(function_contract_error(
+                    tcx,
+                    def_id,
+                    span,
+                    format!("unsupported path in //@ {kind} predicate"),
+                ));
+            };
+            let name = ident.to_string();
+            if name == "result" {
+                if kind != "ens" {
+                    return Err(function_contract_error(
+                        tcx,
+                        def_id,
+                        span,
+                        "`result` is only supported in //@ ens predicates".to_owned(),
+                    ));
+                }
+                return Ok(ContractExpr::Var(name));
+            }
+            Ok(ContractExpr::Var(name))
+        }
+        SynExpr::Call(expr) => {
+            let SynExpr::Path(path) = expr.func.as_ref() else {
+                return Err(function_contract_error(
+                    tcx,
+                    def_id,
+                    span,
+                    format!("unsupported call in //@ {kind} predicate"),
+                ));
+            };
+            let Some(ident) = path.path.get_ident() else {
+                return Err(function_contract_error(
+                    tcx,
+                    def_id,
+                    span,
+                    format!("unsupported call in //@ {kind} predicate"),
+                ));
+            };
+            if ident != "__prophecy" || expr.args.len() != 1 {
+                return Err(function_contract_error(
+                    tcx,
+                    def_id,
+                    span,
+                    format!("unsupported call in //@ {kind} predicate"),
+                ));
+            }
+            let Some(SynExpr::Path(arg_path)) = expr.args.first() else {
+                return Err(function_contract_error(
+                    tcx,
+                    def_id,
+                    span,
+                    format!("unsupported prophecy argument in //@ {kind} predicate"),
+                ));
+            };
+            let Some(arg_ident) = arg_path.path.get_ident() else {
+                return Err(function_contract_error(
+                    tcx,
+                    def_id,
+                    span,
+                    format!("unsupported prophecy argument in //@ {kind} predicate"),
+                ));
+            };
+            Ok(ContractExpr::Prophecy(arg_ident.to_string()))
+        }
+        SynExpr::Unary(expr) => {
+            let op = match expr.op {
+                syn::UnOp::Not(_) => SpecUnaryOp::Not,
+                syn::UnOp::Neg(_) => SpecUnaryOp::Neg,
+                _ => {
+                    return Err(function_contract_error(
+                        tcx,
+                        def_id,
+                        span,
+                        format!("unsupported unary operator in //@ {kind} predicate"),
+                    ));
+                }
+            };
+            Ok(ContractExpr::Unary {
+                op,
+                arg: Box::new(lower_function_contract_expr(
+                    tcx, def_id, span, kind, &expr.expr,
+                )?),
+            })
+        }
+        SynExpr::Binary(expr) => {
+            let op = match expr.op {
+                syn::BinOp::Add(_) => SpecBinaryOp::Add,
+                syn::BinOp::Sub(_) => SpecBinaryOp::Sub,
+                syn::BinOp::Mul(_) => SpecBinaryOp::Mul,
+                syn::BinOp::Eq(_) => SpecBinaryOp::Eq,
+                syn::BinOp::Ne(_) => SpecBinaryOp::Ne,
+                syn::BinOp::Gt(_) => SpecBinaryOp::Gt,
+                syn::BinOp::Ge(_) => SpecBinaryOp::Ge,
+                syn::BinOp::Lt(_) => SpecBinaryOp::Lt,
+                syn::BinOp::Le(_) => SpecBinaryOp::Le,
+                syn::BinOp::And(_) => SpecBinaryOp::And,
+                syn::BinOp::Or(_) => SpecBinaryOp::Or,
+                _ => {
+                    return Err(function_contract_error(
+                        tcx,
+                        def_id,
+                        span,
+                        format!("unsupported binary operator in //@ {kind} predicate"),
+                    ));
+                }
+            };
+            Ok(ContractExpr::Binary {
+                op,
+                lhs: Box::new(lower_function_contract_expr(
+                    tcx, def_id, span, kind, &expr.left,
+                )?),
+                rhs: Box::new(lower_function_contract_expr(
+                    tcx,
+                    def_id,
+                    span,
+                    kind,
+                    &expr.right,
+                )?),
+            })
+        }
+        SynExpr::Paren(expr) => lower_function_contract_expr(tcx, def_id, span, kind, &expr.expr),
+        SynExpr::Group(expr) => lower_function_contract_expr(tcx, def_id, span, kind, &expr.expr),
+        SynExpr::Reference(expr) => {
+            lower_function_contract_expr(tcx, def_id, span, kind, &expr.expr)
+        }
+        SynExpr::Cast(expr) => lower_function_contract_expr(tcx, def_id, span, kind, &expr.expr),
+        _ => Err(function_contract_error(
+            tcx,
+            def_id,
+            span,
+            format!("unsupported expression in //@ {kind} predicate"),
+        )),
+    }
 }
 
 fn lower_hir_spec_expr(
@@ -371,13 +587,10 @@ fn lower_hir_spec_expr(
     match expr {
         HirSpecExpr::Bool(value) => Ok(MirSpecExpr::Bool(*value)),
         HirSpecExpr::Int(value) => Ok(MirSpecExpr::Int(*value)),
-        HirSpecExpr::Result => Ok(MirSpecExpr::Result),
         HirSpecExpr::Var { hir_id, .. } => {
             let Some(local) = hir_locals.get(hir_id).copied() else {
                 return Err(LoopPrepassError {
                     span,
-                    basic_block: None,
-                    statement_index: None,
                     message: format!("missing MIR local for HIR id {:?}", hir_id),
                 });
             };
@@ -387,8 +600,6 @@ fn lower_hir_spec_expr(
             let Some(local) = hir_locals.get(hir_id).copied() else {
                 return Err(LoopPrepassError {
                     span,
-                    basic_block: None,
-                    statement_index: None,
                     message: format!("missing MIR local for HIR id {:?}", hir_id),
                 });
             };
@@ -519,6 +730,44 @@ fn loop_exits<'tcx>(body: &Body<'tcx>, body_blocks: &BTreeSet<BasicBlock>) -> BT
         }
     }
     exits
+}
+
+fn function_param_names<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+) -> Result<Vec<String>, VerificationResult> {
+    let body = tcx.hir_body_owned_by(def_id);
+    let mut names = Vec::with_capacity(body.params.len());
+    for (index, param) in body.params.iter().enumerate() {
+        match param.pat.kind {
+            PatKind::Binding(_, _, ident, _) => names.push(ident.name.to_string()),
+            _ => {
+                return Err(function_contract_error(
+                    tcx,
+                    def_id,
+                    &tcx.sess
+                        .source_map()
+                        .span_to_diagnostic_string(param.pat.span),
+                    format!("unsupported function parameter pattern #{index}"),
+                ));
+            }
+        }
+    }
+    Ok(names)
+}
+
+fn function_contract_error<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    span: &str,
+    message: String,
+) -> VerificationResult {
+    VerificationResult {
+        function: tcx.def_path_str(def_id.to_def_id()),
+        status: VerificationStatus::Unsupported,
+        span: span.to_owned(),
+        message,
+    }
 }
 
 fn written_locals<'tcx>(

@@ -6,7 +6,6 @@ status: Some(1)
 stdout:
 FAIL bad_close
   mutable reference close failed
-  bb<N>
-  model: [("model", "<redacted>")]
+  src/main.rs:7:1: 7:2
 
 stderr:

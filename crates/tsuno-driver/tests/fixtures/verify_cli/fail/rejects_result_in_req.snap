@@ -4,8 +4,8 @@ expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
-FAIL bad_after_call
-  mutable reference close failed
-  src/main.rs:11:1: 11:2
+UNSUPPORTED bad
+  `result` is only supported in //@ ens predicates
+  src/main.rs:2:1: 2:24
 
 stderr:

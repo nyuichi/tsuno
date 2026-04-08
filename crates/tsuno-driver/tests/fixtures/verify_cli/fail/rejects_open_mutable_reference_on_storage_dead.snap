@@ -6,7 +6,6 @@ status: Some(1)
 stdout:
 FAIL bad_scope
   mutable reference close failed
-  bb<N>
-  model: [("model", "<redacted>")]
+  src/main.rs:8:5: 8:6
 
 stderr:

@@ -1,13 +1,11 @@
 ---
 source: crates/tsuno-driver/tests/verify_cli.rs
-assertion_line: 93
 expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
 FAIL bad_loop
-  loop invariant does not hold for bb<N> at src/main.rs:9:9: 9:15
-  bb<N>
-  model: [("model", "<redacted>")]
+  loop invariant does not hold
+  src/main.rs:7:7: 7:31
 
 stderr:

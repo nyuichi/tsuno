@@ -1,11 +1,11 @@
 ---
 source: crates/tsuno-driver/tests/verify_cli.rs
-assertion_line: 94
 expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
 UNSUPPORTED rejects_unevaluated_bool_const
   failed to evaluate boolean constant
+  src/main.rs:3:8: 3:9
 
 stderr:
