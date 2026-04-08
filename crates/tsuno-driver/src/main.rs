@@ -15,7 +15,7 @@ mod report;
 use std::env;
 
 use crate::directive::has_verify_marker;
-use crate::engine::{Verifier, default_z3};
+use crate::engine::Verifier;
 use crate::report::{VerificationResult, print_report};
 use rustc_driver::{Callbacks, Compilation, run_compiler};
 use rustc_hir::ItemKind;
@@ -53,7 +53,6 @@ impl Callbacks for VerifyCallbacks {
             return Compilation::Continue;
         }
         self.done = true;
-        default_z3();
         for item_id in tcx.hir_free_items() {
             let item = tcx.hir_item(item_id);
             if !matches!(item.kind, ItemKind::Fn { .. }) {

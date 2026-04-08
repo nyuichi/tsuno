@@ -2,6 +2,7 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::Once;
 
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::mir::{
@@ -12,7 +13,7 @@ use rustc_middle::ty::{IntTy, TyCtxt, TyKind, UintTy};
 use rustc_span::Span;
 use rustc_span::source_map::Spanned;
 use z3::ast::{Bool, Int};
-use z3::{SatResult, Solver, set_global_param};
+use z3::{SatResult, Solver};
 
 use crate::directive::{SpecBinaryOp, SpecUnaryOp};
 use crate::prepass::{
@@ -80,8 +81,11 @@ pub struct Verifier<'tcx> {
     next_sym: Cell<usize>,
 }
 
+static Z3_INIT: Once = Once::new();
+
 impl<'tcx> Verifier<'tcx> {
     pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: Body<'tcx>) -> Self {
+        init_z3();
         let (loop_contracts, mut prepass_error) = match compute_loops(tcx, def_id, &body) {
             Ok(loop_contracts) => (loop_contracts, None),
             Err(error) => (
@@ -90,11 +94,7 @@ impl<'tcx> Verifier<'tcx> {
                     function: tcx.def_path_str(def_id.to_def_id()),
                     status: VerificationStatus::Unsupported,
                     span: span_text(tcx, error.span),
-                    basic_block: error.basic_block.map(|bb| bb.index()),
-                    statement_index: error.statement_index,
                     message: error.message,
-                    trace: Vec::new(),
-                    model: Vec::new(),
                 }),
             ),
         };
@@ -106,11 +106,7 @@ impl<'tcx> Verifier<'tcx> {
                         function: tcx.def_path_str(def_id.to_def_id()),
                         status: VerificationStatus::Unsupported,
                         span: span_text(tcx, error.span),
-                        basic_block: error.basic_block.map(|bb| bb.index()),
-                        statement_index: error.statement_index,
                         message: error.message,
-                        trace: Vec::new(),
-                        model: Vec::new(),
                     });
                     AssertionContracts::empty()
                 }
@@ -214,7 +210,6 @@ impl<'tcx> Verifier<'tcx> {
                         Bool::and(&refs)
                     };
                     merged.assertion.push(state_pc.implies(&state_assertion));
-                    merged.trace = common_prefix(&merged.trace, &state.trace);
                 }
 
                 let shared_locals: Vec<_> = first
@@ -300,11 +295,6 @@ impl<'tcx> Verifier<'tcx> {
         mut state: State,
         stmt: &Statement<'tcx>,
     ) -> Result<State, VerificationResult> {
-        state.trace.push(format!(
-            "bb{}:stmt{}",
-            state.ctrl.basic_block.index(),
-            state.ctrl.statement_index
-        ));
         if let Some(assertion) = self
             .assertion_contracts
             .assertion_at(state.ctrl.basic_block, state.ctrl.statement_index)
@@ -314,7 +304,8 @@ impl<'tcx> Verifier<'tcx> {
             self.ensure_formula(
                 &state,
                 formula.clone(),
-                assertion.assertion_span,
+                stmt.source_info.span,
+                assertion.assertion_span.clone(),
                 "assertion failed".to_owned(),
             )?;
             state.assertion.push(formula);
@@ -373,9 +364,6 @@ impl<'tcx> Verifier<'tcx> {
         term: &Terminator<'tcx>,
     ) -> Result<Vec<State>, VerificationResult> {
         let mut state = state;
-        state
-            .trace
-            .push(format!("bb{}:term", state.ctrl.basic_block.index()));
         if let Some(assertion) = self
             .assertion_contracts
             .assertion_at(state.ctrl.basic_block, state.ctrl.statement_index)
@@ -385,7 +373,8 @@ impl<'tcx> Verifier<'tcx> {
             self.ensure_formula(
                 &state,
                 formula.clone(),
-                assertion.assertion_span,
+                term.source_info.span,
+                assertion.assertion_span.clone(),
                 "assertion failed".to_owned(),
             )?;
             state.assertion.push(formula);
@@ -454,6 +443,7 @@ impl<'tcx> Verifier<'tcx> {
                         &state,
                         ens,
                         term.source_info.span,
+                        contract.ens_span.clone(),
                         "postcondition failed".to_owned(),
                     )?;
                 }
@@ -480,6 +470,7 @@ impl<'tcx> Verifier<'tcx> {
                     &state,
                     formula,
                     term.source_info.span,
+                    span_text(self.tcx, term.source_info.span),
                     format!("assertion failed: {msg:?}"),
                 )?;
                 self.advance_or_close_loop(state, *target, term.source_info.span)
@@ -1575,14 +1566,8 @@ impl<'tcx> Verifier<'tcx> {
             state,
             invariant,
             span,
-            format!(
-                "loop invariant does not hold for bb{} at {}",
-                loop_contract.header.index(),
-                self.tcx
-                    .sess
-                    .source_map()
-                    .span_to_diagnostic_string(loop_contract.invariant_span)
-            ),
+            loop_contract.invariant_span.clone(),
+            "loop invariant does not hold".to_owned(),
         )
     }
 
@@ -1865,7 +1850,8 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         state: &State,
         formula: Bool,
-        span: Span,
+        exec_span: Span,
+        result_span: String,
         message: String,
     ) -> Result<(), VerificationResult> {
         self.solver.push();
@@ -1877,26 +1863,15 @@ impl<'tcx> Verifier<'tcx> {
         }
         self.solver.assert(formula.not());
         let result = match self.solver.check() {
-            SatResult::Sat => {
-                let model = self
-                    .solver
-                    .get_model()
-                    .map(|model| vec![("model".to_owned(), model.to_string())])
-                    .unwrap_or_default();
-                Err(VerificationResult {
-                    function: self.tcx.def_path_str(self.def_id.to_def_id()),
-                    status: VerificationStatus::Fail,
-                    span: span_text(self.tcx, span),
-                    basic_block: Some(state.ctrl.basic_block.index()),
-                    statement_index: Some(state.ctrl.statement_index),
-                    message,
-                    trace: state.trace.clone(),
-                    model,
-                })
-            }
+            SatResult::Sat => Err(VerificationResult {
+                function: self.tcx.def_path_str(self.def_id.to_def_id()),
+                status: VerificationStatus::Fail,
+                span: result_span,
+                message,
+            }),
             SatResult::Unsat => Ok(()),
             SatResult::Unknown => Err(self.unsupported_result(
-                span,
+                exec_span,
                 Some(state.ctrl.basic_block.index()),
                 Some(state.ctrl.statement_index),
                 "solver returned unknown while checking assertion".to_owned(),
@@ -1986,15 +1961,12 @@ impl<'tcx> Verifier<'tcx> {
         message: String,
         trace: Vec<String>,
     ) -> VerificationResult {
+        let _ = (basic_block, statement_index, trace);
         VerificationResult {
             function: self.tcx.def_path_str(self.def_id.to_def_id()),
             status: VerificationStatus::Unsupported,
             span: span_text(self.tcx, span),
-            basic_block,
-            statement_index,
             message,
-            trace,
-            model: Vec::new(),
         }
     }
 
@@ -2003,11 +1975,7 @@ impl<'tcx> Verifier<'tcx> {
             function: self.tcx.def_path_str(self.def_id.to_def_id()),
             status: VerificationStatus::Pass,
             span: span_text(self.tcx, self.tcx.def_span(self.def_id)),
-            basic_block: None,
-            statement_index: None,
             message: message.to_owned(),
-            trace: Vec::new(),
-            model: Vec::new(),
         }
     }
 
@@ -2374,6 +2342,7 @@ impl<'tcx> Verifier<'tcx> {
                     state,
                     formula.clone(),
                     span,
+                    span_text(self.tcx, span),
                     "mutable reference close failed".to_owned(),
                 )?;
                 state.assertion.push(formula);
@@ -2494,21 +2463,13 @@ impl TypedExpr {
                 function: String::new(),
                 status: VerificationStatus::Unsupported,
                 span: String::new(),
-                basic_block: None,
-                statement_index: None,
                 message: "expected boolean expression".to_owned(),
-                trace: Vec::new(),
-                model: Vec::new(),
             }),
             TypedExpr::Int(_) => Err(VerificationResult {
                 function: String::new(),
                 status: VerificationStatus::Unsupported,
                 span: String::new(),
-                basic_block: None,
-                statement_index: None,
                 message: "expected boolean expression".to_owned(),
-                trace: Vec::new(),
-                model: Vec::new(),
             }),
         }
     }
@@ -2520,11 +2481,7 @@ impl TypedExpr {
                 function: String::new(),
                 status: VerificationStatus::Unsupported,
                 span: String::new(),
-                basic_block: None,
-                statement_index: None,
                 message: "expected integer expression".to_owned(),
-                trace: Vec::new(),
-                model: Vec::new(),
             }),
         }
     }
@@ -2551,11 +2508,7 @@ impl TypedExpr {
                 function: String::new(),
                 status: VerificationStatus::Unsupported,
                 span: String::new(),
-                basic_block: None,
-                statement_index: None,
                 message: "incompatible equality operands".to_owned(),
-                trace: Vec::new(),
-                model: Vec::new(),
             }),
         }
     }
@@ -2573,11 +2526,7 @@ impl SymVal {
                             function: String::new(),
                             status: VerificationStatus::Unsupported,
                             span: String::new(),
-                            basic_block: None,
-                            statement_index: None,
                             message: format!("missing tuple field {loc:?}"),
-                            trace: Vec::new(),
-                            model: Vec::new(),
                         });
                     };
                     typed.push(value.to_typed_current(state)?);
@@ -2599,11 +2548,7 @@ impl SymVal {
                             function: String::new(),
                             status: VerificationStatus::Unsupported,
                             span: String::new(),
-                            basic_block: None,
-                            statement_index: None,
                             message: format!("missing tuple field {loc:?}"),
-                            trace: Vec::new(),
-                            model: Vec::new(),
                         });
                     };
                     typed.push(value.to_typed_prophecy(state)?);
@@ -2628,8 +2573,10 @@ fn span_text(tcx: TyCtxt<'_>, span: Span) -> String {
     tcx.sess.source_map().span_to_diagnostic_string(span)
 }
 
-pub fn default_z3() {
-    set_global_param("model", "true");
+fn init_z3() {
+    Z3_INIT.call_once(|| {
+        z3::set_global_param("model", "true");
+    });
 }
 
 enum IntBounds {
@@ -2693,14 +2640,6 @@ fn int_range_constraint(expr: &Int, tcx: TyCtxt<'_>, ty: rustc_middle::ty::Ty<'_
             Some(Bool::and(&[&low, &high]))
         }
     }
-}
-
-fn common_prefix(left: &[String], right: &[String]) -> Vec<String> {
-    left.iter()
-        .zip(right.iter())
-        .take_while(|(l, r)| l == r)
-        .map(|(item, _)| item.clone())
-        .collect()
 }
 
 fn same_typed_expr(left: &TypedExpr, right: &TypedExpr) -> bool {

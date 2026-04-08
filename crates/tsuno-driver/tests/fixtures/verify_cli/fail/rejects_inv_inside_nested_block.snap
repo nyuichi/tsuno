@@ -1,11 +1,11 @@
 ---
 source: crates/tsuno-driver/tests/verify_cli.rs
-assertion_line: 93
 expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
 UNSUPPORTED bad_loop
   loop body starting at src/main.rs:3:17: 9:6 requires exactly one //@ inv "..." before the body
+  src/main.rs:3:5: 9:6
 
 stderr:

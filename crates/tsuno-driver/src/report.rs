@@ -5,11 +5,7 @@ pub struct VerificationResult {
     pub function: String,
     pub status: VerificationStatus,
     pub span: String,
-    pub basic_block: Option<usize>,
-    pub statement_index: Option<usize>,
     pub message: String,
-    pub trace: Vec<String>,
-    pub model: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,11 +32,8 @@ pub fn print_report(results: &[VerificationResult]) -> bool {
         if !result.message.is_empty() {
             println!("  {}", result.message);
         }
-        if let Some(bb) = result.basic_block {
-            println!("  bb{bb}");
-        }
-        if !result.model.is_empty() {
-            println!("  model: {:?}", result.model);
+        if !matches!(result.status, VerificationStatus::Pass) && !result.span.is_empty() {
+            println!("  {}", result.span);
         }
         if !matches!(result.status, VerificationStatus::Pass) {
             success = false;

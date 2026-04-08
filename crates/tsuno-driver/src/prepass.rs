@@ -21,14 +21,6 @@ pub struct HirBindingInfo {
 }
 
 #[derive(Debug, Clone)]
-pub struct LoopPrepassError {
-    pub span: Span,
-    pub basic_block: Option<BasicBlock>,
-    pub statement_index: Option<usize>,
-    pub message: String,
-}
-
-#[derive(Debug, Clone)]
 pub enum MirSpecExpr {
     Bool(bool),
     Int(i64),
@@ -52,7 +44,7 @@ pub struct LoopContract {
     pub hir_loop_id: HirId,
     pub invariant_block: BasicBlock,
     pub invariant: MirSpecExpr,
-    pub invariant_span: Span,
+    pub invariant_span: String,
     pub body_blocks: BTreeSet<BasicBlock>,
     pub exit_blocks: BTreeSet<BasicBlock>,
     pub written_locals: BTreeSet<rustc_middle::mir::Local>,
@@ -67,7 +59,7 @@ pub struct LoopContracts {
 #[derive(Debug, Clone)]
 pub struct AssertionContract {
     pub assertion: MirSpecExpr,
-    pub assertion_span: Span,
+    pub assertion_span: String,
 }
 
 #[derive(Debug, Clone)]
@@ -79,7 +71,10 @@ pub struct AssertionContracts {
 pub struct FunctionContract {
     pub params: Vec<String>,
     pub req: ContractExpr,
+    #[allow(dead_code)]
+    pub req_span: String,
     pub ens: ContractExpr,
+    pub ens_span: String,
 }
 
 #[derive(Debug, Clone)]
@@ -287,7 +282,9 @@ pub fn compute_loops<'tcx>(
                         hir_loop_id: HirId::INVALID,
                         invariant_block: header,
                         invariant: MirSpecExpr::Bool(true),
-                        invariant_span: body.basic_blocks[header].terminator().source_info.span,
+                        invariant_span: tcx.sess.source_map().span_to_diagnostic_string(
+                            body.basic_blocks[header].terminator().source_info.span,
+                        ),
                         body_blocks,
                         exit_blocks,
                         written_locals,
@@ -327,11 +324,8 @@ pub fn compute_loops<'tcx>(
             .filter(|block| *block != header)
             .min_by_key(|block| (loop_entry_distance(body, loop_info, *block), block.index()))
             .unwrap_or(header);
-        let invariant = lower_hir_spec_expr(
-            &hir_loop_contract.invariant,
-            &hir_locals,
-            hir_loop_contract.invariant_span,
-        )?;
+        let invariant =
+            lower_hir_spec_expr(&hir_loop_contract.invariant, &hir_locals, header_span)?;
         loops
             .get_mut(&header)
             .expect("loop info present")
@@ -344,7 +338,7 @@ pub fn compute_loops<'tcx>(
         loops
             .get_mut(&header)
             .expect("loop info present")
-            .invariant_span = hir_loop_contract.invariant_span;
+            .invariant_span = hir_loop_contract.invariant_span.clone();
     }
 
     let by_invariant_block = loops
@@ -385,7 +379,7 @@ pub fn compute_assertions<'tcx>(
         let assertion = lower_hir_spec_expr(
             &hir_assertion.assertion,
             &hir_locals,
-            hir_assertion.assertion_span,
+            hir_assertion.stmt_span,
         )?;
         if by_control_point
             .insert(
@@ -415,15 +409,17 @@ fn lower_function_contract<'tcx>(
 ) -> Result<FunctionContract, VerificationResult> {
     Ok(FunctionContract {
         params: function_param_names(tcx, def_id)?,
-        req: lower_function_contract_expr(tcx, def_id, source.span, "req", &source.req)?,
-        ens: lower_function_contract_expr(tcx, def_id, source.span, "ens", &source.ens)?,
+        req: lower_function_contract_expr(tcx, def_id, &source.req_span, "req", &source.req)?,
+        ens: lower_function_contract_expr(tcx, def_id, &source.ens_span, "ens", &source.ens)?,
+        req_span: source.req_span,
+        ens_span: source.ens_span,
     })
 }
 
 fn lower_function_contract_expr<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
-    span: Span,
+    span: &str,
     kind: &str,
     expr: &SynExpr,
 ) -> Result<ContractExpr, VerificationResult> {
@@ -754,7 +750,9 @@ fn function_param_names<'tcx>(
                 return Err(function_contract_error(
                     tcx,
                     def_id,
-                    param.pat.span,
+                    &tcx.sess
+                        .source_map()
+                        .span_to_diagnostic_string(param.pat.span),
                     format!("unsupported function parameter pattern #{index}"),
                 ));
             }
@@ -766,18 +764,14 @@ fn function_param_names<'tcx>(
 fn function_contract_error<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
-    span: Span,
+    span: &str,
     message: String,
 ) -> VerificationResult {
     VerificationResult {
         function: tcx.def_path_str(def_id.to_def_id()),
         status: VerificationStatus::Unsupported,
-        span: tcx.sess.source_map().span_to_diagnostic_string(span),
-        basic_block: None,
-        statement_index: None,
+        span: span.to_owned(),
         message,
-        trace: Vec::new(),
-        model: Vec::new(),
     }
 }
 

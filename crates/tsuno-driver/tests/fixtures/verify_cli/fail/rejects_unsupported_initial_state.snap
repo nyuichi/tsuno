@@ -6,5 +6,6 @@ status: Some(1)
 stdout:
 UNSUPPORTED rejects_unsupported_initial_state
   unsupported type [i32; 3_usize]
+  src/main.rs:2:1: 2:50
 
 stderr:
