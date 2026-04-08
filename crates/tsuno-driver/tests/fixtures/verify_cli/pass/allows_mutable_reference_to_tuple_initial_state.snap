@@ -2,9 +2,9 @@
 source: crates/tsuno-driver/tests/verify_cli.rs
 expression: snapshot_output(output)
 ---
-status: Some(1)
+status: Some(0)
 stdout:
-UNSUPPORTED rejects_unsupported_initial_state
-  unsupported type (i32, bool, bool)
+PASS allows_mutable_reference_to_tuple_initial_state
+  all assertions discharged
 
 stderr:
