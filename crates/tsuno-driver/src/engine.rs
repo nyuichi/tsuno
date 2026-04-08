@@ -34,7 +34,6 @@ pub struct State {
     assertion: Vec<Bool>,
     live: BTreeMap<Local, bool>,
     ctrl: ControlPoint,
-    trace: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -347,10 +346,7 @@ impl<'tcx> Verifier<'tcx> {
             other => {
                 return Err(self.unsupported_result(
                     stmt.source_info.span,
-                    Some(state.ctrl.basic_block.index()),
-                    Some(state.ctrl.statement_index),
                     format!("unsupported MIR statement {other:?}"),
-                    state.trace,
                 ));
             }
         }
@@ -395,19 +391,13 @@ impl<'tcx> Verifier<'tcx> {
                         let Some(loc) = state.env.get(&local).copied() else {
                             return Err(self.unsupported_result(
                                 term.source_info.span,
-                                Some(state.ctrl.basic_block.index()),
-                                Some(state.ctrl.statement_index),
                                 format!("missing env for local {}", local.as_usize()),
-                                state.trace.clone(),
                             ));
                         };
                         let Some(Slot::Live(value)) = state.store.get(&loc).cloned() else {
                             return Err(self.unsupported_result(
                                 term.source_info.span,
-                                Some(state.ctrl.basic_block.index()),
-                                Some(state.ctrl.statement_index),
                                 format!("missing store for local {}", local.as_usize()),
-                                state.trace.clone(),
                             ));
                         };
                         env.insert(name, value);
@@ -416,20 +406,14 @@ impl<'tcx> Verifier<'tcx> {
                     let Some(result_loc) = state.env.get(&result_local).copied() else {
                         return Err(self.unsupported_result(
                             term.source_info.span,
-                            Some(state.ctrl.basic_block.index()),
-                            Some(state.ctrl.statement_index),
                             "missing return local".to_owned(),
-                            state.trace.clone(),
                         ));
                     };
                     let Some(Slot::Live(result_value)) = state.store.get(&result_loc).cloned()
                     else {
                         return Err(self.unsupported_result(
                             term.source_info.span,
-                            Some(state.ctrl.basic_block.index()),
-                            Some(state.ctrl.statement_index),
                             "missing return value".to_owned(),
-                            state.trace.clone(),
                         ));
                     };
                     env.insert("result".to_owned(), result_value);
@@ -491,10 +475,7 @@ impl<'tcx> Verifier<'tcx> {
             ),
             other => Err(self.unsupported_result(
                 term.source_info.span,
-                Some(state.ctrl.basic_block.index()),
-                None,
                 format!("unsupported MIR terminator {other:?}"),
-                state.trace,
             )),
         }
     }
@@ -514,13 +495,9 @@ impl<'tcx> Verifier<'tcx> {
                 TypedExpr::Bool(expr) => expr.eq(Bool::from_bool(value != 0)),
                 TypedExpr::Int(expr) => expr.eq(Int::from_i64(value as i64)),
                 TypedExpr::Tuple(_) => {
-                    return Err(self.unsupported_result(
-                        span,
-                        Some(state.ctrl.basic_block.index()),
-                        None,
-                        "switch on tuple is unsupported".to_owned(),
-                        state.trace,
-                    ));
+                    return Err(
+                        self.unsupported_result(span, "switch on tuple is unsupported".to_owned())
+                    );
                 }
             };
             explicit.push(cond.clone());
@@ -568,14 +545,11 @@ impl<'tcx> Verifier<'tcx> {
             if contract.params.len() != args.len() {
                 return Err(self.unsupported_result(
                     span,
-                    Some(state.ctrl.basic_block.index()),
-                    None,
                     format!(
                         "call contract parameter count mismatch: expected {}, found {}",
                         contract.params.len(),
                         args.len()
                     ),
-                    state.trace.clone(),
                 ));
             }
             for (name, arg) in contract.params.iter().cloned().zip(args.iter()) {
@@ -608,10 +582,7 @@ impl<'tcx> Verifier<'tcx> {
                 else {
                     return Err(self.unsupported_result(
                         span,
-                        Some(state.ctrl.basic_block.index()),
-                        None,
                         "missing mutable reference argument".to_owned(),
-                        state.trace.clone(),
                     ));
                 };
                 state.store.insert(
@@ -641,13 +612,7 @@ impl<'tcx> Verifier<'tcx> {
             state.assertion.push(ens);
         }
         let target = target.ok_or_else(|| {
-            self.unsupported_result(
-                span,
-                Some(state.ctrl.basic_block.index()),
-                None,
-                "call without return target".to_owned(),
-                state.trace.clone(),
-            )
+            self.unsupported_result(span, "call without return target".to_owned())
         })?;
         self.advance_or_close_loop(state, target, span)
     }
@@ -707,10 +672,7 @@ impl<'tcx> Verifier<'tcx> {
                 other => {
                     return Err(self.unsupported_result(
                         span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
                         format!("unsupported aggregate kind {other:?}"),
-                        state.trace.clone(),
                     ));
                 }
             },
@@ -728,23 +690,15 @@ impl<'tcx> Verifier<'tcx> {
                     SymVal::Scalar(self.scalar_from_place(state, *borrowed_place, span)?)
                 }
                 other => {
-                    return Err(self.unsupported_result(
-                        span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
-                        format!("unsupported borrow kind {other:?}"),
-                        state.trace.clone(),
-                    ));
+                    return Err(
+                        self.unsupported_result(span, format!("unsupported borrow kind {other:?}"))
+                    );
                 }
             },
             other => {
-                return Err(self.unsupported_result(
-                    span,
-                    Some(state.ctrl.basic_block.index()),
-                    Some(state.ctrl.statement_index),
-                    format!("unsupported MIR rvalue {other:?}"),
-                    state.trace.clone(),
-                ));
+                return Err(
+                    self.unsupported_result(span, format!("unsupported MIR rvalue {other:?}"))
+                );
             }
         };
         self.write_place(state, place, value, span)
@@ -793,13 +747,9 @@ impl<'tcx> Verifier<'tcx> {
                 SymVal::Tuple(vec![first, second].into_boxed_slice())
             }
             other => {
-                return Err(self.unsupported_result(
-                    span,
-                    Some(state.ctrl.basic_block.index()),
-                    Some(state.ctrl.statement_index),
-                    format!("unsupported binary op {other:?}"),
-                    state.trace.clone(),
-                ));
+                return Err(
+                    self.unsupported_result(span, format!("unsupported binary op {other:?}"))
+                );
             }
         };
         Ok(value)
@@ -816,13 +766,7 @@ impl<'tcx> Verifier<'tcx> {
         match op {
             UnOp::Not => Ok(TypedExpr::Bool(value.as_bool()?.not())),
             UnOp::Neg => Ok(TypedExpr::Int(-value.as_int()?)),
-            other => Err(self.unsupported_result(
-                span,
-                Some(state.ctrl.basic_block.index()),
-                Some(state.ctrl.statement_index),
-                format!("unsupported unary op {other:?}"),
-                state.trace.clone(),
-            )),
+            other => Err(self.unsupported_result(span, format!("unsupported unary op {other:?}"))),
         }
     }
 
@@ -854,18 +798,12 @@ impl<'tcx> Verifier<'tcx> {
                 SymVal::Scalar(expr) => Ok(expr.clone()),
                 _ => Err(self.unsupported_result(
                     span,
-                    Some(state.ctrl.basic_block.index()),
-                    Some(state.ctrl.statement_index),
                     "tuple value used where scalar was expected".to_owned(),
-                    state.trace.clone(),
                 )),
             },
             SymVal::Tuple(..) => Err(self.unsupported_result(
                 span,
-                Some(state.ctrl.basic_block.index()),
-                Some(state.ctrl.statement_index),
                 "tuple value used where scalar was expected".to_owned(),
-                state.trace.clone(),
             )),
         }
     }
@@ -882,18 +820,12 @@ impl<'tcx> Verifier<'tcx> {
                 SymVal::Scalar(expr) => Ok(expr.clone()),
                 _ => Err(self.unsupported_result(
                     span,
-                    Some(state.ctrl.basic_block.index()),
-                    Some(state.ctrl.statement_index),
                     "tuple value used where scalar was expected".to_owned(),
-                    state.trace.clone(),
                 )),
             },
             SymVal::Tuple(..) => Err(self.unsupported_result(
                 span,
-                Some(state.ctrl.basic_block.index()),
-                Some(state.ctrl.statement_index),
                 "tuple value used where scalar was expected".to_owned(),
-                state.trace.clone(),
             )),
         }
     }
@@ -906,49 +838,24 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<SymVal, VerificationResult> {
         if let Some(local) = place.as_local() {
             let loc = state.env.get(&local).copied().ok_or_else(|| {
-                self.unsupported_result(
-                    span,
-                    Some(state.ctrl.basic_block.index()),
-                    Some(state.ctrl.statement_index),
-                    format!("missing env for local {}", local.as_usize()),
-                    state.trace.clone(),
-                )
+                self.unsupported_result(span, format!("missing env for local {}", local.as_usize()))
             })?;
             if !state.live.get(&local).copied().unwrap_or(false) {
-                return Err(self.unsupported_result(
-                    span,
-                    Some(state.ctrl.basic_block.index()),
-                    Some(state.ctrl.statement_index),
-                    format!("use of dead value {}", local.as_usize()),
-                    state.trace.clone(),
-                ));
+                return Err(self
+                    .unsupported_result(span, format!("use of dead value {}", local.as_usize())));
             }
             return match state.store.get(&loc).cloned() {
-                Some(Slot::Moved) => Err(self.unsupported_result(
-                    span,
-                    Some(state.ctrl.basic_block.index()),
-                    Some(state.ctrl.statement_index),
-                    format!("use of moved value {}", local.as_usize()),
-                    state.trace.clone(),
-                )),
+                Some(Slot::Moved) => Err(self
+                    .unsupported_result(span, format!("use of moved value {}", local.as_usize()))),
                 Some(Slot::Live(value)) => Ok(value),
                 None => Err(self.unsupported_result(
                     span,
-                    Some(state.ctrl.basic_block.index()),
-                    Some(state.ctrl.statement_index),
                     format!("missing store for local {}", local.as_usize()),
-                    state.trace.clone(),
                 )),
             };
         }
         let Some((base, elem)) = place.as_ref().last_projection() else {
-            return Err(self.unsupported_result(
-                span,
-                Some(state.ctrl.basic_block.index()),
-                Some(state.ctrl.statement_index),
-                "unsupported place".to_owned(),
-                state.trace.clone(),
-            ));
+            return Err(self.unsupported_result(span, "unsupported place".to_owned()));
         };
         match elem {
             PlaceElem::Deref => {
@@ -957,49 +864,26 @@ impl<'tcx> Verifier<'tcx> {
                 let target = match state.store.get(&loc).cloned() {
                     Some(Slot::Live(SymVal::MutRef { target, .. })) => target,
                     Some(Slot::Moved) => {
-                        return Err(self.unsupported_result(
-                            span,
-                            Some(state.ctrl.basic_block.index()),
-                            Some(state.ctrl.statement_index),
-                            "use of moved value".to_owned(),
-                            state.trace.clone(),
-                        ));
+                        return Err(self.unsupported_result(span, "use of moved value".to_owned()));
                     }
                     Some(Slot::Live(_)) => {
                         return Err(self.unsupported_result(
                             span,
-                            Some(state.ctrl.basic_block.index()),
-                            Some(state.ctrl.statement_index),
                             "deref of non-mutable reference".to_owned(),
-                            state.trace.clone(),
                         ));
                     }
                     None => {
-                        return Err(self.unsupported_result(
-                            span,
-                            Some(state.ctrl.basic_block.index()),
-                            Some(state.ctrl.statement_index),
-                            "missing mutable reference".to_owned(),
-                            state.trace.clone(),
-                        ));
+                        return Err(
+                            self.unsupported_result(span, "missing mutable reference".to_owned())
+                        );
                     }
                 };
                 match state.store.get(&target).cloned() {
-                    Some(Slot::Moved) => Err(self.unsupported_result(
-                        span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
-                        "use of moved value".to_owned(),
-                        state.trace.clone(),
-                    )),
+                    Some(Slot::Moved) => {
+                        Err(self.unsupported_result(span, "use of moved value".to_owned()))
+                    }
                     Some(Slot::Live(value)) => Ok(value),
-                    None => Err(self.unsupported_result(
-                        span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
-                        "missing deref target".to_owned(),
-                        state.trace.clone(),
-                    )),
+                    None => Err(self.unsupported_result(span, "missing deref target".to_owned())),
                 }
             }
             PlaceElem::Field(field, _) => {
@@ -1011,48 +895,29 @@ impl<'tcx> Verifier<'tcx> {
                         None => {
                             return Err(self.unsupported_result(
                                 span,
-                                Some(state.ctrl.basic_block.index()),
-                                Some(state.ctrl.statement_index),
                                 format!("unsupported tuple field {}", field.index()),
-                                state.trace.clone(),
                             ));
                         }
                     },
                     other => {
                         return Err(self.unsupported_result(
                             span,
-                            Some(state.ctrl.basic_block.index()),
-                            Some(state.ctrl.statement_index),
                             format!("field projection on unsupported value {other:?}"),
-                            state.trace.clone(),
                         ));
                     }
                 };
                 match state.store.get(&field_loc).cloned() {
-                    Some(Slot::Moved) => Err(self.unsupported_result(
-                        span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
-                        "use of moved value".to_owned(),
-                        state.trace.clone(),
-                    )),
+                    Some(Slot::Moved) => {
+                        Err(self.unsupported_result(span, "use of moved value".to_owned()))
+                    }
                     Some(Slot::Live(value)) => Ok(value),
-                    None => Err(self.unsupported_result(
-                        span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
-                        "missing tuple field".to_owned(),
-                        state.trace.clone(),
-                    )),
+                    None => Err(self.unsupported_result(span, "missing tuple field".to_owned())),
                 }
             }
-            other => Err(self.unsupported_result(
-                span,
-                Some(state.ctrl.basic_block.index()),
-                Some(state.ctrl.statement_index),
-                format!("unsupported place projection {other:?}"),
-                state.trace.clone(),
-            )),
+            other => {
+                Err(self
+                    .unsupported_result(span, format!("unsupported place projection {other:?}")))
+            }
         }
     }
 
@@ -1064,50 +929,24 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<SymVal, VerificationResult> {
         if let Some(local) = place.as_local() {
             let loc = state.env.get(&local).copied().ok_or_else(|| {
-                self.unsupported_result(
-                    span,
-                    Some(state.ctrl.basic_block.index()),
-                    Some(state.ctrl.statement_index),
-                    format!("missing env for local {}", local.as_usize()),
-                    state.trace.clone(),
-                )
+                self.unsupported_result(span, format!("missing env for local {}", local.as_usize()))
             })?;
             if !state.live.get(&local).copied().unwrap_or(false) {
-                return Err(self.unsupported_result(
-                    span,
-                    Some(state.ctrl.basic_block.index()),
-                    Some(state.ctrl.statement_index),
-                    format!("use of dead value {}", local.as_usize()),
-                    state.trace.clone(),
-                ));
+                return Err(self
+                    .unsupported_result(span, format!("use of dead value {}", local.as_usize())));
             }
             let Some(slot) = state.store.get_mut(&loc) else {
                 return Err(self.unsupported_result(
                     span,
-                    Some(state.ctrl.basic_block.index()),
-                    Some(state.ctrl.statement_index),
                     format!("missing store for local {}", local.as_usize()),
-                    state.trace.clone(),
                 ));
             };
             return slot.take().ok_or_else(|| {
-                self.unsupported_result(
-                    span,
-                    Some(state.ctrl.basic_block.index()),
-                    Some(state.ctrl.statement_index),
-                    format!("use of moved value {}", local.as_usize()),
-                    state.trace.clone(),
-                )
+                self.unsupported_result(span, format!("use of moved value {}", local.as_usize()))
             });
         }
         let Some((base, elem)) = place.as_ref().last_projection() else {
-            return Err(self.unsupported_result(
-                span,
-                Some(state.ctrl.basic_block.index()),
-                Some(state.ctrl.statement_index),
-                "unsupported place".to_owned(),
-                state.trace.clone(),
-            ));
+            return Err(self.unsupported_result(span, "unsupported place".to_owned()));
         };
         match elem {
             PlaceElem::Field(field, _) => {
@@ -1119,56 +958,30 @@ impl<'tcx> Verifier<'tcx> {
                         None => {
                             return Err(self.unsupported_result(
                                 span,
-                                Some(state.ctrl.basic_block.index()),
-                                Some(state.ctrl.statement_index),
                                 format!("unsupported tuple field {}", field.index()),
-                                state.trace.clone(),
                             ));
                         }
                     },
                     other => {
                         return Err(self.unsupported_result(
                             span,
-                            Some(state.ctrl.basic_block.index()),
-                            Some(state.ctrl.statement_index),
                             format!("field projection on unsupported value {other:?}"),
-                            state.trace.clone(),
                         ));
                     }
                 };
                 let Some(slot) = state.store.get_mut(&field_loc) else {
-                    return Err(self.unsupported_result(
-                        span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
-                        "missing tuple field".to_owned(),
-                        state.trace.clone(),
-                    ));
+                    return Err(self.unsupported_result(span, "missing tuple field".to_owned()));
                 };
-                slot.take().ok_or_else(|| {
-                    self.unsupported_result(
-                        span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
-                        "use of moved value".to_owned(),
-                        state.trace.clone(),
-                    )
-                })
+                slot.take()
+                    .ok_or_else(|| self.unsupported_result(span, "use of moved value".to_owned()))
             }
-            PlaceElem::Deref => Err(self.unsupported_result(
-                span,
-                Some(state.ctrl.basic_block.index()),
-                Some(state.ctrl.statement_index),
-                "move through deref is unsupported".to_owned(),
-                state.trace.clone(),
-            )),
-            other => Err(self.unsupported_result(
-                span,
-                Some(state.ctrl.basic_block.index()),
-                Some(state.ctrl.statement_index),
-                format!("unsupported place projection {other:?}"),
-                state.trace.clone(),
-            )),
+            PlaceElem::Deref => {
+                Err(self.unsupported_result(span, "move through deref is unsupported".to_owned()))
+            }
+            other => {
+                Err(self
+                    .unsupported_result(span, format!("unsupported place projection {other:?}")))
+            }
         }
     }
 
@@ -1184,10 +997,7 @@ impl<'tcx> Verifier<'tcx> {
                 if !state.live.get(&local).copied().unwrap_or(false) {
                     return Err(self.unsupported_result(
                         span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
                         format!("write to dead value {}", local.as_usize()),
-                        state.trace.clone(),
                     ));
                 }
                 loc
@@ -1204,13 +1014,7 @@ impl<'tcx> Verifier<'tcx> {
             return Ok(());
         }
         let Some((base, elem)) = place.as_ref().last_projection() else {
-            return Err(self.unsupported_result(
-                span,
-                Some(state.ctrl.basic_block.index()),
-                Some(state.ctrl.statement_index),
-                "unsupported place write".to_owned(),
-                state.trace.clone(),
-            ));
+            return Err(self.unsupported_result(span, "unsupported place write".to_owned()));
         };
         match elem {
             PlaceElem::Deref => {
@@ -1221,10 +1025,7 @@ impl<'tcx> Verifier<'tcx> {
                     _ => {
                         return Err(self.unsupported_result(
                             span,
-                            Some(state.ctrl.basic_block.index()),
-                            Some(state.ctrl.statement_index),
                             "deref write through non-mutable reference".to_owned(),
-                            state.trace.clone(),
                         ));
                     }
                 };
@@ -1249,33 +1050,24 @@ impl<'tcx> Verifier<'tcx> {
                         None => {
                             return Err(self.unsupported_result(
                                 span,
-                                Some(state.ctrl.basic_block.index()),
-                                Some(state.ctrl.statement_index),
                                 format!("unsupported tuple field {}", field.index()),
-                                state.trace.clone(),
                             ));
                         }
                     },
                     other => {
                         return Err(self.unsupported_result(
                             span,
-                            Some(state.ctrl.basic_block.index()),
-                            Some(state.ctrl.statement_index),
                             format!("field write on unsupported value {other:?}"),
-                            state.trace.clone(),
                         ));
                     }
                 };
                 state.store.insert(field_loc, Slot::Live(value));
                 Ok(())
             }
-            other => Err(self.unsupported_result(
-                span,
-                Some(state.ctrl.basic_block.index()),
-                Some(state.ctrl.statement_index),
-                format!("unsupported write projection {other:?}"),
-                state.trace.clone(),
-            )),
+            other => {
+                Err(self
+                    .unsupported_result(span, format!("unsupported write projection {other:?}")))
+            }
         }
     }
 
@@ -1287,32 +1079,15 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<Loc, VerificationResult> {
         if let Some(local) = place.as_local() {
             if !state.live.get(&local).copied().unwrap_or(false) {
-                return Err(self.unsupported_result(
-                    span,
-                    Some(state.ctrl.basic_block.index()),
-                    Some(state.ctrl.statement_index),
-                    format!("use of dead value {}", local.as_usize()),
-                    state.trace.clone(),
-                ));
+                return Err(self
+                    .unsupported_result(span, format!("use of dead value {}", local.as_usize())));
             }
             return state.env.get(&local).copied().ok_or_else(|| {
-                self.unsupported_result(
-                    span,
-                    Some(state.ctrl.basic_block.index()),
-                    Some(state.ctrl.statement_index),
-                    format!("missing env for local {}", local.as_usize()),
-                    state.trace.clone(),
-                )
+                self.unsupported_result(span, format!("missing env for local {}", local.as_usize()))
             });
         }
         let Some((base, elem)) = place.as_ref().last_projection() else {
-            return Err(self.unsupported_result(
-                span,
-                Some(state.ctrl.basic_block.index()),
-                Some(state.ctrl.statement_index),
-                "unsupported place loc".to_owned(),
-                state.trace.clone(),
-            ));
+            return Err(self.unsupported_result(span, "unsupported place loc".to_owned()));
         };
         match elem {
             PlaceElem::Deref => {
@@ -1320,19 +1095,12 @@ impl<'tcx> Verifier<'tcx> {
                 let base_loc = self.place_loc(state, base_place, span)?;
                 match state.store.get(&base_loc) {
                     Some(Slot::Live(SymVal::MutRef { target, .. })) => Ok(*target),
-                    Some(Slot::Moved) => Err(self.unsupported_result(
-                        span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
-                        "use of moved value".to_owned(),
-                        state.trace.clone(),
-                    )),
+                    Some(Slot::Moved) => {
+                        Err(self.unsupported_result(span, "use of moved value".to_owned()))
+                    }
                     _ => Err(self.unsupported_result(
                         span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
                         "deref loc through non-mutable reference".to_owned(),
-                        state.trace.clone(),
                     )),
                 }
             }
@@ -1344,28 +1112,19 @@ impl<'tcx> Verifier<'tcx> {
                         Some(loc) => Ok(*loc),
                         None => Err(self.unsupported_result(
                             span,
-                            Some(state.ctrl.basic_block.index()),
-                            Some(state.ctrl.statement_index),
                             format!("unsupported tuple field {}", field.index()),
-                            state.trace.clone(),
                         )),
                     },
                     other => Err(self.unsupported_result(
                         span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
                         format!("field projection on unsupported value {other:?}"),
-                        state.trace.clone(),
                     )),
                 }
             }
-            other => Err(self.unsupported_result(
-                span,
-                Some(state.ctrl.basic_block.index()),
-                Some(state.ctrl.statement_index),
-                format!("unsupported place projection {other:?}"),
-                state.trace.clone(),
-            )),
+            other => {
+                Err(self
+                    .unsupported_result(span, format!("unsupported place projection {other:?}")))
+            }
         }
     }
 
@@ -1390,25 +1149,13 @@ impl<'tcx> Verifier<'tcx> {
         match ty.kind() {
             TyKind::Bool => {
                 let value = constant.const_.try_to_bool().ok_or_else(|| {
-                    self.unsupported_result(
-                        span,
-                        None,
-                        None,
-                        "failed to evaluate boolean constant".to_owned(),
-                        Vec::new(),
-                    )
+                    self.unsupported_result(span, "failed to evaluate boolean constant".to_owned())
                 })?;
                 Ok(SymVal::Scalar(TypedExpr::Bool(Bool::from_bool(value))))
             }
             TyKind::Int(_) | TyKind::Uint(_) => {
                 let scalar = constant.const_.try_to_scalar_int().ok_or_else(|| {
-                    self.unsupported_result(
-                        span,
-                        None,
-                        None,
-                        "failed to evaluate integer constant".to_owned(),
-                        Vec::new(),
-                    )
+                    self.unsupported_result(span, "failed to evaluate integer constant".to_owned())
                 })?;
                 let expr = if matches!(ty.kind(), TyKind::Int(_)) {
                     Int::from_i64(scalar.to_int(scalar.size()) as i64)
@@ -1422,18 +1169,11 @@ impl<'tcx> Verifier<'tcx> {
             ))),
             TyKind::FnDef(..) => Err(self.unsupported_result(
                 span,
-                None,
-                None,
                 "function constants are only supported in call position".to_owned(),
-                Vec::new(),
             )),
-            other => Err(self.unsupported_result(
-                span,
-                None,
-                None,
-                format!("unsupported constant type {other:?}"),
-                Vec::new(),
-            )),
+            other => {
+                Err(self.unsupported_result(span, format!("unsupported constant type {other:?}")))
+            }
         }
     }
 
@@ -1475,10 +1215,7 @@ impl<'tcx> Verifier<'tcx> {
             }
             other => Err(self.unsupported_result(
                 self.tcx.def_span(self.def_id),
-                None,
-                None,
                 format!("unsupported type {other:?}"),
-                Vec::new(),
             )),
         }
     }
@@ -1506,13 +1243,10 @@ impl<'tcx> Verifier<'tcx> {
         let result = match self.solver.check() {
             SatResult::Sat => Ok(true),
             SatResult::Unsat => Ok(false),
-            SatResult::Unknown => Err(self.unsupported_result(
-                span,
-                Some(state.ctrl.basic_block.index()),
-                None,
-                "path feasibility check returned unknown".to_owned(),
-                state.trace.clone(),
-            )),
+            SatResult::Unknown => {
+                Err(self
+                    .unsupported_result(span, "path feasibility check returned unknown".to_owned()))
+            }
         };
         self.solver.pop(1);
         result
@@ -1544,13 +1278,9 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<(), VerificationResult> {
         let Some(loop_contract) = self.loop_contracts.contract_by_header(header) else {
-            return Err(self.unsupported_result(
-                span,
-                Some(header.index()),
-                None,
-                "loop backedge without loop metadata".to_owned(),
-                state.trace.clone(),
-            ));
+            return Err(
+                self.unsupported_result(span, "loop backedge without loop metadata".to_owned())
+            );
         };
         self.ensure_loop_invariant(state, loop_contract, span)
     }
@@ -1600,20 +1330,12 @@ impl<'tcx> Verifier<'tcx> {
         match self.spec_expr_to_typed(state, expr, span)? {
             TypedExpr::Bool(expr) => Ok(expr),
             TypedExpr::Tuple(fields) if fields.is_empty() => Ok(Bool::from_bool(true)),
-            TypedExpr::Tuple(_) => Err(self.unsupported_result(
-                span,
-                Some(state.ctrl.basic_block.index()),
-                Some(state.ctrl.statement_index),
-                "expected boolean expression".to_owned(),
-                state.trace.clone(),
-            )),
-            TypedExpr::Int(_) => Err(self.unsupported_result(
-                span,
-                Some(state.ctrl.basic_block.index()),
-                Some(state.ctrl.statement_index),
-                "expected boolean expression".to_owned(),
-                state.trace.clone(),
-            )),
+            TypedExpr::Tuple(_) => {
+                Err(self.unsupported_result(span, "expected boolean expression".to_owned()))
+            }
+            TypedExpr::Int(_) => {
+                Err(self.unsupported_result(span, "expected boolean expression".to_owned()))
+            }
         }
     }
 
@@ -1630,19 +1352,13 @@ impl<'tcx> Verifier<'tcx> {
                 let loc = state.env.get(local).copied().ok_or_else(|| {
                     self.unsupported_result(
                         span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
                         format!("missing env for local {}", local.as_usize()),
-                        state.trace.clone(),
                     )
                 })?;
                 match state.store.get(&loc).cloned().ok_or_else(|| {
                     self.unsupported_result(
                         span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
                         format!("missing store for local {}", local.as_usize()),
-                        state.trace.clone(),
                     )
                 })? {
                     Slot::Live(SymVal::Scalar(expr)) => Ok(expr),
@@ -1650,55 +1366,35 @@ impl<'tcx> Verifier<'tcx> {
                         SymVal::Scalar(expr) => Ok(expr.clone()),
                         SymVal::MutRef { .. } | SymVal::Tuple(..) => Err(self.unsupported_result(
                             span,
-                            Some(state.ctrl.basic_block.index()),
-                            Some(state.ctrl.statement_index),
                             "tuple value used where scalar was expected".to_owned(),
-                            state.trace.clone(),
                         )),
                     },
                     Slot::Live(SymVal::Tuple(..)) => Err(self.unsupported_result(
                         span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
                         "tuple value used where scalar was expected".to_owned(),
-                        state.trace.clone(),
                     )),
-                    Slot::Moved => Err(self.unsupported_result(
-                        span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
-                        "use of moved value".to_owned(),
-                        state.trace.clone(),
-                    )),
+                    Slot::Moved => {
+                        Err(self.unsupported_result(span, "use of moved value".to_owned()))
+                    }
                 }
             }
             MirSpecExpr::Prophecy(local) => {
                 let loc = state.env.get(local).copied().ok_or_else(|| {
                     self.unsupported_result(
                         span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
                         format!("missing env for local {}", local.as_usize()),
-                        state.trace.clone(),
                     )
                 })?;
                 match state.store.get(&loc).cloned().ok_or_else(|| {
                     self.unsupported_result(
                         span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
                         format!("missing store for local {}", local.as_usize()),
-                        state.trace.clone(),
                     )
                 })? {
                     Slot::Live(value) => value.to_typed_prophecy(state),
-                    Slot::Moved => Err(self.unsupported_result(
-                        span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
-                        "use of moved value".to_owned(),
-                        state.trace.clone(),
-                    )),
+                    Slot::Moved => {
+                        Err(self.unsupported_result(span, "use of moved value".to_owned()))
+                    }
                 }
             }
             MirSpecExpr::Unary { op, arg } => {
@@ -1746,13 +1442,9 @@ impl<'tcx> Verifier<'tcx> {
         match self.contract_expr_to_typed(state, expr, env, span)? {
             TypedExpr::Bool(expr) => Ok(expr),
             TypedExpr::Tuple(fields) if fields.is_empty() => Ok(Bool::from_bool(true)),
-            TypedExpr::Tuple(_) | TypedExpr::Int(_) => Err(self.unsupported_result(
-                span,
-                Some(state.ctrl.basic_block.index()),
-                Some(state.ctrl.statement_index),
-                "expected boolean expression".to_owned(),
-                state.trace.clone(),
-            )),
+            TypedExpr::Tuple(_) | TypedExpr::Int(_) => {
+                Err(self.unsupported_result(span, "expected boolean expression".to_owned()))
+            }
         }
     }
 
@@ -1768,25 +1460,13 @@ impl<'tcx> Verifier<'tcx> {
             ContractExpr::Int(value) => Ok(TypedExpr::Int(Int::from_i64(*value))),
             ContractExpr::Var(name) => {
                 let value = env.get(name).ok_or_else(|| {
-                    self.unsupported_result(
-                        span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
-                        format!("missing contract binding `{name}`"),
-                        state.trace.clone(),
-                    )
+                    self.unsupported_result(span, format!("missing contract binding `{name}`"))
                 })?;
                 value.to_typed_current(state)
             }
             ContractExpr::Prophecy(name) => {
                 let value = env.get(name).ok_or_else(|| {
-                    self.unsupported_result(
-                        span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
-                        format!("missing contract binding `{name}`"),
-                        state.trace.clone(),
-                    )
+                    self.unsupported_result(span, format!("missing contract binding `{name}`"))
                 })?;
                 value.to_typed_prophecy(state)
             }
@@ -1835,10 +1515,7 @@ impl<'tcx> Verifier<'tcx> {
             let Some(loop_contract) = self.loop_contracts.contract_by_header(header) else {
                 return Err(self.unsupported_result(
                     span,
-                    Some(target.index()),
-                    Some(state.ctrl.statement_index),
                     "loop body is missing contract metadata".to_owned(),
-                    state.trace.clone(),
                 ));
             };
             self.assume_loop_invariant(&mut state, loop_contract, span)?;
@@ -1872,10 +1549,7 @@ impl<'tcx> Verifier<'tcx> {
             SatResult::Unsat => Ok(()),
             SatResult::Unknown => Err(self.unsupported_result(
                 exec_span,
-                Some(state.ctrl.basic_block.index()),
-                Some(state.ctrl.statement_index),
                 "solver returned unknown while checking assertion".to_owned(),
-                state.trace.clone(),
             )),
         };
         self.solver.pop(1);
@@ -1905,7 +1579,7 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         operand: &Operand<'tcx>,
         span: Span,
-        state: &State,
+        _state: &State,
     ) -> Result<rustc_middle::ty::Ty<'tcx>, VerificationResult> {
         match operand {
             Operand::Copy(place) | Operand::Move(place) => Ok(self.place_ty(*place)),
@@ -1915,10 +1589,7 @@ impl<'tcx> Verifier<'tcx> {
                     TyKind::Int(_) | TyKind::Uint(_) => Ok(ty),
                     _ => Err(self.unsupported_result(
                         span,
-                        Some(state.ctrl.basic_block.index()),
-                        Some(state.ctrl.statement_index),
                         format!("unsupported operand type for arithmetic {:?}", ty.kind()),
-                        state.trace.clone(),
                     )),
                 }
             }
@@ -1930,7 +1601,7 @@ impl<'tcx> Verifier<'tcx> {
         result: &Int,
         ty: rustc_middle::ty::Ty<'tcx>,
         span: Span,
-        state: &State,
+        _state: &State,
     ) -> Result<Bool, VerificationResult> {
         match int_bounds(self.tcx, ty) {
             Some(IntBounds::Signed { min, max }) => {
@@ -1943,25 +1614,14 @@ impl<'tcx> Verifier<'tcx> {
                 let high = result.gt(Int::from_u64(max));
                 Ok(Bool::or(&[&low, &high]))
             }
-            None => Err(self.unsupported_result(
-                span,
-                Some(state.ctrl.basic_block.index()),
-                Some(state.ctrl.statement_index),
-                format!("unsupported integer type {:?}", ty.kind()),
-                state.trace.clone(),
-            )),
+            None => {
+                Err(self
+                    .unsupported_result(span, format!("unsupported integer type {:?}", ty.kind())))
+            }
         }
     }
 
-    fn unsupported_result(
-        &self,
-        span: Span,
-        basic_block: Option<usize>,
-        statement_index: Option<usize>,
-        message: String,
-        trace: Vec<String>,
-    ) -> VerificationResult {
-        let _ = (basic_block, statement_index, trace);
+    fn unsupported_result(&self, span: Span, message: String) -> VerificationResult {
         VerificationResult {
             function: self.tcx.def_path_str(self.def_id.to_def_id()),
             status: VerificationStatus::Unsupported,
@@ -1999,14 +1659,11 @@ impl<'tcx> Verifier<'tcx> {
             if contract.params.len() != self.body.arg_count {
                 return Err(self.unsupported_result(
                     self.tcx.def_span(self.def_id),
-                    None,
-                    None,
                     format!(
                         "function contract parameter count mismatch: expected {}, found {}",
                         self.body.arg_count,
                         contract.params.len()
                     ),
-                    Vec::new(),
                 ));
             }
             let mut env = HashMap::new();
@@ -2020,10 +1677,7 @@ impl<'tcx> Verifier<'tcx> {
                 let value = state.store.get(&loc).cloned().ok_or_else(|| {
                     self.unsupported_result(
                         self.tcx.def_span(self.def_id),
-                        None,
-                        None,
                         format!("missing store for local {}", local.as_usize()),
-                        Vec::new(),
                     )
                 })?;
                 if let Slot::Live(value) = value {
@@ -2380,19 +2034,13 @@ impl<'tcx> Verifier<'tcx> {
                     let lhs_slot = state.store.get(&lhs_loc).ok_or_else(|| {
                         self.unsupported_result(
                             self.tcx.def_span(self.def_id),
-                            Some(state.ctrl.basic_block.index()),
-                            Some(state.ctrl.statement_index),
                             "missing tuple field".to_owned(),
-                            state.trace.clone(),
                         )
                     })?;
                     let rhs_slot = state.store.get(&rhs_loc).ok_or_else(|| {
                         self.unsupported_result(
                             self.tcx.def_span(self.def_id),
-                            Some(state.ctrl.basic_block.index()),
-                            Some(state.ctrl.statement_index),
                             "missing tuple field".to_owned(),
-                            state.trace.clone(),
                         )
                     })?;
                     terms.push(self.slot_eq(state, lhs_slot, rhs_slot)?);
@@ -2441,7 +2089,6 @@ impl State {
                 basic_block: BasicBlock::from_usize(0),
                 statement_index: 0,
             },
-            trace: Vec::new(),
         }
     }
 
