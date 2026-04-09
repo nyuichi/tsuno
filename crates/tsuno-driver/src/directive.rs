@@ -6,7 +6,7 @@ use rustc_hir::{Block, Expr, ExprKind, HirId, LoopSource, MatchSource, Stmt, Stm
 use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{Span, Symbol};
-use syn::{BinOp as SynBinOp, Expr as SynExpr, Lit as SynLit, LitStr, UnOp as SynUnOp};
+use syn::{BinOp as SynBinOp, Expr as SynExpr, Lit as SynLit, LitStr, Member, UnOp as SynUnOp};
 
 use crate::prepass::{HirBindingInfo, LoopPrepassError};
 use crate::report::{VerificationResult, VerificationStatus};
@@ -22,6 +22,10 @@ pub enum SpecExpr {
     Prophecy {
         hir_id: HirId,
         name: rustc_span::Symbol,
+    },
+    Field {
+        base: Box<SpecExpr>,
+        index: usize,
     },
     Unary {
         op: SpecUnaryOp,
@@ -388,6 +392,31 @@ impl<'a, 'tcx> SpecExprLowerer<'a, 'tcx> {
                     });
                 };
                 Ok(SpecExpr::Prophecy { hir_id, name })
+            }
+            SynExpr::Field(expr) => {
+                let index = match &expr.member {
+                    Member::Unnamed(index) => index.index as usize,
+                    Member::Named(ident) => match ident.to_string().as_str() {
+                        "cur" => 0,
+                        "fin" => 1,
+                        _ => {
+                            return Err(self.unsupported_syn_spec_expr(
+                                span,
+                                kind,
+                                "unsupported field access in //@ {kind} predicate",
+                            ));
+                        }
+                    },
+                };
+                Ok(SpecExpr::Field {
+                    base: Box::new(self.lower_syn_spec_expr(
+                        &expr.base,
+                        span,
+                        anchor_span,
+                        kind,
+                    )?),
+                    index,
+                })
             }
             SynExpr::Unary(expr) => {
                 let op = match expr.op {
@@ -1138,24 +1167,14 @@ pub(crate) fn parse_spec_template(kind: &str, lit: &LitStr) -> syn::Result<SynEx
                         format!("empty interpolation in //@ {} template", kind),
                     ));
                 }
-                if let Some(rest) = inner.strip_prefix("^:") {
-                    let ident = rest.trim();
-                    if ident.is_empty()
-                        || !ident
-                            .chars()
-                            .next()
-                            .is_some_and(|ch| ch.is_alphabetic() || ch == '_')
-                        || !ident.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
-                    {
-                        return Err(syn::Error::new(
-                            lit.span(),
-                            format!("invalid prophecy interpolation in //@ {} template", kind),
-                        ));
-                    }
-                    output.push_str("(__prophecy(");
-                    output.push_str(ident);
-                    output.push_str("))");
-                    continue;
+                if inner.strip_prefix("^:").is_some() {
+                    return Err(syn::Error::new(
+                        lit.span(),
+                        format!(
+                            "prophecy interpolation is unsupported in //@ {} templates; use `.cur` / `.fin`",
+                            kind
+                        ),
+                    ));
                 }
                 output.push('(');
                 output.push_str(inner);
@@ -1243,7 +1262,10 @@ fn function_contract_error<'tcx>(
 
 #[cfg(test)]
 mod tests {
-    use super::{function_contract_lines_before_item, verify_marker_in_source};
+    use super::{
+        function_contract_lines_before_item, parse_spec_template, verify_marker_in_source,
+    };
+    use syn::{Expr as SynExpr, LitStr, Member};
 
     #[test]
     fn detects_verify_marker_on_previous_line() {
@@ -1269,5 +1291,38 @@ mod tests {
                 "//@ ens \"{result} == 3\"".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn parses_cur_and_fin_field_access() {
+        let lit = syn::parse_str::<LitStr>(r#""{x}.0.cur""#).expect("lit");
+        let expr = parse_spec_template("req", &lit).expect("expr");
+        let SynExpr::Field(cur) = expr else {
+            panic!("expected outer field access");
+        };
+        assert!(matches!(&cur.member, Member::Named(ident) if ident.to_string() == "cur"));
+        let SynExpr::Field(tuple_field) = *cur.base else {
+            panic!("expected nested field access");
+        };
+        assert!(matches!(&tuple_field.member, Member::Unnamed(index) if index.index == 0));
+        let base = match *tuple_field.base {
+            SynExpr::Paren(expr) => *expr.expr,
+            SynExpr::Group(expr) => *expr.expr,
+            other => other,
+        };
+        let SynExpr::Path(path) = base else {
+            panic!("expected path base");
+        };
+        assert_eq!(path.path.get_ident().expect("ident").to_string(), "x");
+    }
+
+    #[test]
+    fn rejects_prophecy_interpolation() {
+        let lit = syn::parse_str::<LitStr>(r#""{^:x}""#).expect("lit");
+        let err = match parse_spec_template("req", &lit) {
+            Ok(_) => panic!("expected failure"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("prophecy interpolation"));
     }
 }

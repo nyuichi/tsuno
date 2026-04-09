@@ -4,7 +4,7 @@ expression: snapshot_output(output)
 ---
 status: Some(0)
 stdout:
-PASS prophecy_everywhere
+PASS mut_ref_model_everywhere
   all assertions discharged
 
 stderr:
