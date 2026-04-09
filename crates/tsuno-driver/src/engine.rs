@@ -460,7 +460,7 @@ impl<'tcx> Verifier<'tcx> {
         if let Some(def_id) = callee
             && let Some(contract) = self.contracts.get(&def_id)
         {
-            let env = self.call_env(&mut state, args, contract, span)?;
+            let env = self.call_env(&state, args, contract, span)?;
             let req = self.contract_expr_to_bool(&env.current, &env.prophecy, &contract.req)?;
             let req = self.bool_expr_to_z3(&req, span)?;
             self.require_constraint(
@@ -474,7 +474,8 @@ impl<'tcx> Verifier<'tcx> {
             let result_value = self.fresh_for_rust_ty(result_ty, "call_result")?;
             self.write_place(&mut state, destination, result_value.clone(), span)?;
             self.abstract_call_mut_args(&mut state, args, span)?;
-            let mut env = self.call_env(&mut state, args, contract, span)?;
+            let mut env = self.call_env(&state, args, contract, span)?;
+            self.consume_call_move_args(&mut state, args, span)?;
             env.current.insert("result".to_owned(), result_value);
             let ens = self.contract_expr_to_bool(&env.current, &env.prophecy, &contract.ens)?;
             let ens = self.bool_expr_to_z3(&ens, span)?;
@@ -484,6 +485,7 @@ impl<'tcx> Verifier<'tcx> {
             let result_value = self.fresh_for_rust_ty(result_ty, "opaque_result")?;
             self.write_place(&mut state, destination, result_value, span)?;
             self.abstract_call_mut_args(&mut state, args, span)?;
+            self.consume_call_move_args(&mut state, args, span)?;
         }
         let Some(target) = target else {
             return Ok(Vec::new());
@@ -993,18 +995,44 @@ impl<'tcx> Verifier<'tcx> {
         operand: &Operand<'tcx>,
         span: Span,
     ) -> Result<SymVal, VerificationResult> {
+        let value = self.read_operand(state, operand, span)?;
+        if matches!(operand, Operand::Move(_)) {
+            self.consume_operand(state, operand, span)?;
+        }
+        Ok(value)
+    }
+
+    fn read_operand(
+        &self,
+        state: &State,
+        operand: &Operand<'tcx>,
+        span: Span,
+    ) -> Result<SymVal, VerificationResult> {
         match operand {
-            Operand::Copy(place) => self.read_place(state, *place, ReadMode::Current, span),
+            Operand::Copy(place) | Operand::Move(place) => {
+                self.read_place(state, *place, ReadMode::Current, span)
+            }
+            Operand::Constant(constant) => self.eval_const_operand(constant, span),
+        }
+    }
+
+    fn consume_operand(
+        &self,
+        state: &mut State,
+        operand: &Operand<'tcx>,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        match operand {
+            Operand::Copy(_) => Ok(()),
             Operand::Move(place) => {
-                let value = self.read_place(state, *place, ReadMode::Current, span)?;
                 if place.projection.is_empty() {
                     state.model.remove(&place.local);
                 } else {
                     self.dangle_place(state, *place, span)?;
                 }
-                Ok(value)
+                Ok(())
             }
-            Operand::Constant(constant) => self.eval_const_operand(constant, span),
+            Operand::Constant(_) => Ok(()),
         }
     }
 
@@ -1888,6 +1916,18 @@ impl<'tcx> Verifier<'tcx> {
         Ok(())
     }
 
+    fn consume_call_move_args(
+        &self,
+        state: &mut State,
+        args: &[Spanned<Operand<'tcx>>],
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        for arg in args {
+            self.consume_operand(state, &arg.node, span)?;
+        }
+        Ok(())
+    }
+
     fn abstract_mut_ref(&self, value: &SymVal, span: Span) -> Result<SymVal, VerificationResult> {
         let SymVal::Tuple(parts) = value else {
             return Err(
@@ -2238,7 +2278,7 @@ impl<'tcx> Verifier<'tcx> {
 
     fn call_env(
         &self,
-        state: &mut State,
+        state: &State,
         args: &[Spanned<Operand<'tcx>>],
         contract: &FunctionContract,
         span: Span,
@@ -2256,7 +2296,7 @@ impl<'tcx> Verifier<'tcx> {
             ));
         }
         for (name, arg) in contract.params.iter().zip(args.iter()) {
-            let value = self.eval_operand(state, &arg.node, span)?;
+            let value = self.read_operand(state, &arg.node, span)?;
             let ty = arg.node.ty(&self.body.local_decls, self.tcx);
             current.insert(name.clone(), value.clone());
             prophecy.insert(
