@@ -753,6 +753,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(vec![BoolExpr::Eq(cur, fin)])
             }
+            TyKind::Ref(_, _, _) => Ok(Vec::new()),
             TyKind::Bool | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Never => Ok(Vec::new()),
             other => Err(self.unsupported_result(span, format!("unsupported type {other:?}"))),
         }
@@ -773,6 +774,7 @@ impl<'tcx> Verifier<'tcx> {
                 BorrowKind::Mut {
                     kind: MutBorrowKind::Default | MutBorrowKind::TwoPhaseBorrow,
                 } => self.create_mut_borrow(state, *place, span),
+                BorrowKind::Shared => self.create_shared_borrow(state, *place, span),
                 _ => Err(self
                     .unsupported_result(span, format!("unsupported borrow kind {borrow_kind:?}"))),
             },
@@ -813,6 +815,18 @@ impl<'tcx> Verifier<'tcx> {
         self.write_place(state, place, final_value.clone(), span)?;
         Ok(EvaluatedRvalue {
             value: SymVal::Tuple(vec![current, final_value].into_boxed_slice()),
+            constraints: Vec::new(),
+        })
+    }
+
+    fn create_shared_borrow(
+        &self,
+        state: &State,
+        place: Place<'tcx>,
+        span: Span,
+    ) -> Result<EvaluatedRvalue, VerificationResult> {
+        Ok(EvaluatedRvalue {
+            value: self.read_place(state, place, ReadMode::Current, span)?,
             constraints: Vec::new(),
         })
     }
@@ -1044,12 +1058,14 @@ impl<'tcx> Verifier<'tcx> {
                 self.unsupported_result(span, format!("missing local {}", place.local.as_usize()))
             );
         };
-        self.read_projection(root, place.as_ref().projection, mode, span)
+        let root_ty = self.body.local_decls[place.local].ty;
+        self.read_projection(root, root_ty, place.as_ref().projection, mode, span)
     }
 
     fn read_projection(
         &self,
         value: SymVal,
+        ty: Ty<'tcx>,
         projection: &[PlaceElem<'tcx>],
         mode: ReadMode,
         span: Span,
@@ -1059,25 +1075,45 @@ impl<'tcx> Verifier<'tcx> {
         }
         match projection[0] {
             PlaceElem::Deref => {
-                let SymVal::Tuple(parts) = value else {
-                    return Err(self.unsupported_result(
-                        span,
-                        "deref of non-reference symbolic value".to_owned(),
-                    ));
+                let TyKind::Ref(_, inner, mutability) = ty.kind() else {
+                    return Err(
+                        self.unsupported_result(span, "deref of non-reference place".to_owned())
+                    );
                 };
-                if parts.len() != 2 {
-                    return Err(self
-                        .unsupported_result(span, "mutable reference shape mismatch".to_owned()));
-                }
-                let next = match mode {
-                    ReadMode::Current => parts[0].clone(),
-                    ReadMode::Final => parts[1].clone(),
+                let next = if mutability.is_mut() {
+                    let SymVal::Tuple(parts) = value else {
+                        return Err(self.unsupported_result(
+                            span,
+                            "deref of non-reference symbolic value".to_owned(),
+                        ));
+                    };
+                    if parts.len() != 2 {
+                        return Err(self.unsupported_result(
+                            span,
+                            "mutable reference shape mismatch".to_owned(),
+                        ));
+                    }
+                    match mode {
+                        ReadMode::Current => parts[0].clone(),
+                        ReadMode::Final => parts[1].clone(),
+                    }
+                } else {
+                    value
                 };
-                self.read_projection(next, &projection[1..], mode, span)
+                self.read_projection(next, *inner, &projection[1..], mode, span)
             }
             PlaceElem::Field(field, _) => {
                 let next = self.project_tuple_field(value, field.index(), span)?;
-                self.read_projection(next.clone(), &projection[1..], mode, span)
+                let TyKind::Tuple(fields) = ty.kind() else {
+                    return Err(self.unsupported_result(
+                        span,
+                        "field projection on non-tuple place".to_owned(),
+                    ));
+                };
+                let field_ty = fields.get(field.index()).ok_or_else(|| {
+                    self.unsupported_result(span, "tuple field out of range".to_owned())
+                })?;
+                self.read_projection(next, *field_ty, &projection[1..], mode, span)
             }
             other => {
                 Err(self
@@ -1098,7 +1134,9 @@ impl<'tcx> Verifier<'tcx> {
             .get(&place.local)
             .cloned()
             .unwrap_or_else(|| value.clone());
-        let updated = self.write_projection(root, place.as_ref().projection, value, span)?;
+        let root_ty = self.body.local_decls[place.local].ty;
+        let updated =
+            self.write_projection(root, root_ty, place.as_ref().projection, value, span)?;
         state.model.insert(place.local, updated);
         Ok(())
     }
@@ -1106,6 +1144,7 @@ impl<'tcx> Verifier<'tcx> {
     fn write_projection(
         &self,
         value: SymVal,
+        ty: Ty<'tcx>,
         projection: &[PlaceElem<'tcx>],
         replacement: SymVal,
         span: Span,
@@ -1115,6 +1154,18 @@ impl<'tcx> Verifier<'tcx> {
         }
         match projection[0] {
             PlaceElem::Deref => {
+                let TyKind::Ref(_, inner, mutability) = ty.kind() else {
+                    return Err(self.unsupported_result(
+                        span,
+                        "deref assignment on non-reference place".to_owned(),
+                    ));
+                };
+                if !mutability.is_mut() {
+                    return Err(self.unsupported_result(
+                        span,
+                        "assignment through shared reference is unsupported".to_owned(),
+                    ));
+                }
                 let SymVal::Tuple(parts) = value else {
                     return Err(self.unsupported_result(
                         span,
@@ -1126,8 +1177,13 @@ impl<'tcx> Verifier<'tcx> {
                         .unsupported_result(span, "mutable reference shape mismatch".to_owned()));
                 }
                 let mut items = parts.into_vec();
-                items[0] =
-                    self.write_projection(items[0].clone(), &projection[1..], replacement, span)?;
+                items[0] = self.write_projection(
+                    items[0].clone(),
+                    *inner,
+                    &projection[1..],
+                    replacement,
+                    span,
+                )?;
                 Ok(SymVal::Tuple(items.into_boxed_slice()))
             }
             PlaceElem::Field(field, _) => {
@@ -1141,6 +1197,15 @@ impl<'tcx> Verifier<'tcx> {
                     }
                 };
                 let index = field.index();
+                let TyKind::Tuple(fields) = ty.kind() else {
+                    return Err(self.unsupported_result(
+                        span,
+                        "field assignment on non-tuple place".to_owned(),
+                    ));
+                };
+                let rust_field_ty = fields.get(index).ok_or_else(|| {
+                    self.unsupported_result(span, "tuple field out of range".to_owned())
+                })?;
                 if index >= field_types.len() {
                     return Err(
                         self.unsupported_result(span, "tuple field out of range".to_owned())
@@ -1153,6 +1218,7 @@ impl<'tcx> Verifier<'tcx> {
                     if current_index == index {
                         items.push(self.write_projection(
                             field_value,
+                            *rust_field_ty,
                             &projection[1..],
                             replacement.clone(),
                             span,
@@ -1212,6 +1278,7 @@ impl<'tcx> Verifier<'tcx> {
                     vec![fresh, parts[1].clone()].into_boxed_slice(),
                 ))
             }
+            TyKind::Ref(_, _, _) => Ok(value.clone()),
             TyKind::Bool | TyKind::Int(_) | TyKind::Uint(_) => Ok(value.clone()),
             other => {
                 Err(self
@@ -1916,9 +1983,23 @@ impl<'tcx> Verifier<'tcx> {
         if let TyKind::Ref(_, inner, mutability) = ty.kind()
             && mutability.is_mut()
         {
+            if self.ty_contains_ref(*inner) {
+                return Err(self.unsupported_result(
+                    self.tcx.def_span(self.def_id),
+                    "nested reference types are unsupported".to_owned(),
+                ));
+            }
             let current = self.fresh_for_rust_ty(*inner, &format!("{hint}_cur"))?;
             let final_value = self.fresh_for_rust_ty(*inner, &format!("{hint}_fin"))?;
             return Ok(SymVal::Tuple(vec![current, final_value].into_boxed_slice()));
+        } else if let TyKind::Ref(_, inner, _) = ty.kind() {
+            if self.ty_contains_ref(*inner) {
+                return Err(self.unsupported_result(
+                    self.tcx.def_span(self.def_id),
+                    "nested reference types are unsupported".to_owned(),
+                ));
+            }
+            return self.fresh_for_rust_ty(*inner, hint);
         }
         let sym_ty = self.sym_ty_from_rust_ty(ty, self.tcx.def_span(self.def_id))?;
         self.fresh_for_symty(&sym_ty, hint)
@@ -2006,10 +2087,33 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(SymTy::Tuple(items.into_boxed_slice()))
             }
             TyKind::Ref(_, inner, mutability) if mutability.is_mut() => {
+                if self.ty_contains_ref(*inner) {
+                    return Err(self.unsupported_result(
+                        span,
+                        "nested reference types are unsupported".to_owned(),
+                    ));
+                }
                 let inner = self.sym_ty_from_rust_ty(*inner, span)?;
                 Ok(SymTy::Tuple(vec![inner.clone(), inner].into_boxed_slice()))
             }
+            TyKind::Ref(_, inner, _) => {
+                if self.ty_contains_ref(*inner) {
+                    return Err(self.unsupported_result(
+                        span,
+                        "nested reference types are unsupported".to_owned(),
+                    ));
+                }
+                self.sym_ty_from_rust_ty(*inner, span)
+            }
             other => Err(self.unsupported_result(span, format!("unsupported type {other:?}"))),
+        }
+    }
+
+    fn ty_contains_ref(&self, ty: Ty<'tcx>) -> bool {
+        match ty.kind() {
+            TyKind::Ref(..) => true,
+            TyKind::Tuple(fields) => fields.iter().any(|field| self.ty_contains_ref(field)),
+            _ => false,
         }
     }
 
