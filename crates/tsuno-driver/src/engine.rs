@@ -12,8 +12,8 @@ use rustc_middle::mir::{
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::Span;
 use rustc_span::source_map::Spanned;
-use z3::ast::{Bool, Int};
-use z3::{SatResult, Solver};
+use z3::ast::{Ast, Bool, Int};
+use z3::{SatResult, Solver, SortKind};
 
 use crate::directive::{SpecBinaryOp, SpecUnaryOp};
 use crate::prepass::{
@@ -43,8 +43,8 @@ pub struct ControlPoint {
 
 #[derive(Debug, Clone)]
 pub struct State {
-    pc: BoolExpr,
-    assertion: BoolExpr,
+    pc: Bool,
+    assertion: Bool,
     model: BTreeMap<Local, SymVal>,
     ctrl: ControlPoint,
 }
@@ -208,6 +208,10 @@ impl<'tcx> Verifier<'tcx> {
                     Ok(formula) => formula,
                     Err(err) => return err,
                 };
+                let formula = match self.bool_expr_to_z3(&formula, self.control_span(ctrl)) {
+                    Ok(formula) => formula,
+                    Err(err) => return err,
+                };
                 if let Err(err) = self.require_constraint(
                     &mut state,
                     formula,
@@ -268,6 +272,7 @@ impl<'tcx> Verifier<'tcx> {
                 let eval = self.eval_rvalue(&mut state, rvalue, stmt.source_info.span)?;
                 self.write_place(&mut state, *place, eval.value, stmt.source_info.span)?;
                 for constraint in eval.constraints {
+                    let constraint = self.bool_expr_to_z3(&constraint, stmt.source_info.span)?;
                     self.assume_constraint(&mut state, constraint);
                 }
             }
@@ -301,6 +306,7 @@ impl<'tcx> Verifier<'tcx> {
             TerminatorKind::Return => {
                 if let Some(contract) = self.contracts.get(&self.def_id) {
                     let formula = self.contract_to_bool(&state, contract, true)?;
+                    let formula = self.bool_expr_to_z3(&formula, term.source_info.span)?;
                     self.require_constraint(
                         &mut state,
                         formula,
@@ -336,9 +342,10 @@ impl<'tcx> Verifier<'tcx> {
                             rhs: IntExpr::Value(SymVal::Int(value as i64)),
                         },
                     };
+                    let branch = self.bool_expr_to_z3(&branch, term.source_info.span)?;
                     seen_conditions.push(branch.clone());
                     let mut next = state.clone();
-                    next.pc = and_expr(vec![next.pc, branch]);
+                    next.pc = bool_and(vec![next.pc, branch]);
                     if let Some(loop_state) =
                         self.transition_to_block(next, target, term.source_info.span)?
                     {
@@ -346,7 +353,7 @@ impl<'tcx> Verifier<'tcx> {
                     }
                 }
                 let mut otherwise = state;
-                otherwise.pc = and_expr(vec![otherwise.pc, not_expr(or_expr(seen_conditions))]);
+                otherwise.pc = bool_and(vec![otherwise.pc, bool_not(bool_or(seen_conditions))]);
                 if let Some(loop_state) =
                     self.transition_to_block(otherwise, targets.otherwise(), term.source_info.span)?
                 {
@@ -366,6 +373,7 @@ impl<'tcx> Verifier<'tcx> {
                 if !*expected {
                     formula = not_expr(formula);
                 }
+                let formula = self.bool_expr_to_z3(&formula, term.source_info.span)?;
                 self.require_constraint(
                     &mut state,
                     formula,
@@ -411,6 +419,7 @@ impl<'tcx> Verifier<'tcx> {
         {
             let env = self.call_env(&mut state, args, contract, span)?;
             let req = self.contract_expr_to_bool(&env.current, &env.prophecy, &contract.req)?;
+            let req = self.bool_expr_to_z3(&req, span)?;
             self.require_constraint(
                 &mut state,
                 req,
@@ -425,6 +434,7 @@ impl<'tcx> Verifier<'tcx> {
             let mut env = self.call_env(&mut state, args, contract, span)?;
             env.current.insert("result".to_owned(), result_value);
             let ens = self.contract_expr_to_bool(&env.current, &env.prophecy, &contract.ens)?;
+            let ens = self.bool_expr_to_z3(&ens, span)?;
             self.assume_constraint(&mut state, ens);
         } else {
             let result_ty = self.place_ty(destination);
@@ -458,6 +468,7 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<Option<State>, VerificationResult> {
         if let Some(loop_contract) = self.loop_contracts.contract_by_header(target) {
             let invariant = self.mir_spec_to_bool(&state, &loop_contract.invariant)?;
+            let invariant = self.bool_expr_to_z3(&invariant, span)?;
             self.require_constraint(
                 &mut state,
                 invariant.clone(),
@@ -472,10 +483,7 @@ impl<'tcx> Verifier<'tcx> {
                 let mut abstract_state = state;
                 self.havoc_loop_written_locals(&mut abstract_state, loop_contract)?;
                 self.assume_constraint(&mut abstract_state, invariant);
-                abstract_state.pc = and_expr(vec![
-                    abstract_state.pc,
-                    BoolExpr::Value(self.loop_marker(target)),
-                ]);
+                abstract_state.pc = bool_and(vec![abstract_state.pc, self.loop_marker(target)]);
                 abstract_state.ctrl = ControlPoint {
                     basic_block: target,
                     statement_index: 0,
@@ -489,6 +497,7 @@ impl<'tcx> Verifier<'tcx> {
             && let Some(loop_contract) = self.loop_contracts.contract_by_header(header)
         {
             let invariant = self.mir_spec_to_bool(&state, &loop_contract.invariant)?;
+            let invariant = self.bool_expr_to_z3(&invariant, span)?;
             self.assume_constraint(&mut state, invariant);
         }
 
@@ -524,35 +533,63 @@ impl<'tcx> Verifier<'tcx> {
 
         let ctrl = states[0].ctrl;
         let mut merged = State {
-            pc: BoolExpr::Const(false),
-            assertion: and_expr(
-                states
-                    .iter()
-                    .map(|state| implies_expr(state.pc.clone(), state.assertion.clone()))
-                    .collect(),
-            ),
+            pc: Bool::from_bool(false),
+            assertion: Bool::from_bool(true),
             model: BTreeMap::new(),
             ctrl,
         };
-        merged.pc = or_expr(states.iter().map(|state| state.pc.clone()).collect());
+        let pcs = states
+            .iter()
+            .map(|state| state.pc.clone())
+            .collect::<Vec<_>>();
+        merged.pc = Bool::or(&pcs);
+
+        let first_assertion = states
+            .first()
+            .map(|state| state.assertion.clone())
+            .expect("non-empty states");
+        if states
+            .iter()
+            .all(|state| state.assertion == first_assertion)
+        {
+            merged.assertion = first_assertion;
+        } else {
+            merged.assertion = bool_and(
+                states
+                    .iter()
+                    .map(|state| state.pc.clone().implies(state.assertion.clone()))
+                    .collect(),
+            );
+        }
 
         for local in shared {
             let ty = self.body.local_decls[local].ty;
+            let mut incoming_values = states
+                .iter()
+                .map(|state| {
+                    state
+                        .model
+                        .get(&local)
+                        .cloned()
+                        .expect("shared local present")
+                })
+                .collect::<Vec<_>>();
+            let first_value = incoming_values
+                .first()
+                .cloned()
+                .expect("shared local present");
+            if incoming_values.iter().all(|value| *value == first_value) {
+                merged.model.insert(local, first_value);
+                continue;
+            }
+
             let merged_value =
                 self.fresh_for_rust_ty(ty, &format!("merge_{}", local.as_usize()))?;
-            for state in &states {
-                let incoming = state
-                    .model
-                    .get(&local)
-                    .cloned()
-                    .expect("shared local present");
-                merged.assertion = and_expr(vec![
-                    merged.assertion,
-                    implies_expr(
-                        state.pc.clone(),
-                        BoolExpr::Eq(merged_value.clone(), incoming),
-                    ),
-                ]);
+            for (state, incoming) in states.iter().zip(incoming_values.drain(..)) {
+                let equality =
+                    self.sym_eq_to_z3(&merged_value, &incoming, self.control_span(ctrl))?;
+                merged.assertion =
+                    bool_and(vec![merged.assertion, state.pc.clone().implies(equality)]);
             }
             merged.model.insert(local, merged_value);
         }
@@ -567,7 +604,7 @@ impl<'tcx> Verifier<'tcx> {
         state: State,
     ) -> Option<VerificationResult> {
         match self.check_sat(
-            and_expr(vec![state.pc.clone(), state.assertion.clone()]),
+            std::slice::from_ref(&state.pc),
             self.control_span(state.ctrl),
             "solver returned unknown while checking path feasibility",
         ) {
@@ -591,8 +628,8 @@ impl<'tcx> Verifier<'tcx> {
 
     fn initial_state(&self) -> Result<State, VerificationResult> {
         let mut state = State {
-            pc: BoolExpr::Const(true),
-            assertion: BoolExpr::Const(true),
+            pc: Bool::from_bool(true),
+            assertion: Bool::from_bool(true),
             model: BTreeMap::new(),
             ctrl: ControlPoint {
                 basic_block: BasicBlock::from_usize(0),
@@ -612,6 +649,7 @@ impl<'tcx> Verifier<'tcx> {
         if let Some(contract) = self.contracts.get(&self.def_id) {
             let env = CallEnv::for_function(self, &state, contract)?;
             let req = self.contract_expr_to_bool(&env.current, &env.prophecy, &contract.req)?;
+            let req = self.bool_expr_to_z3(&req, self.tcx.def_span(self.def_id))?;
             self.assume_constraint(&mut state, req);
         }
         Ok(state)
@@ -629,6 +667,7 @@ impl<'tcx> Verifier<'tcx> {
         let ty = self.body.local_decls[local].ty;
         let formulas = self.resolve_formulas(ty, &value, span)?;
         for formula in formulas {
+            let formula = self.bool_expr_to_z3(&formula, span)?;
             self.require_constraint(
                 state,
                 formula,
@@ -1511,14 +1550,14 @@ impl<'tcx> Verifier<'tcx> {
     fn require_constraint(
         &self,
         state: &mut State,
-        constraint: BoolExpr,
+        constraint: Bool,
         span: Span,
         diagnostic_span: String,
         message: String,
     ) -> Result<(), VerificationResult> {
         self.assert_constraint(state, constraint);
         match self.check_sat(
-            and_expr(vec![state.pc.clone(), state.assertion.clone()]),
+            &[state.pc.clone(), state.assertion.clone()],
             span,
             "solver returned unknown while checking assertion",
         )? {
@@ -1536,26 +1575,22 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn assume_constraint(&self, state: &mut State, constraint: BoolExpr) {
-        state.pc = and_expr(vec![state.pc.clone(), constraint]);
+    fn assume_constraint(&self, state: &mut State, constraint: Bool) {
+        state.pc = bool_and(vec![state.pc.clone(), constraint]);
     }
 
-    fn assert_constraint(&self, state: &mut State, constraint: BoolExpr) {
-        state.assertion = and_expr(vec![state.assertion.clone(), constraint]);
+    fn assert_constraint(&self, state: &mut State, constraint: Bool) {
+        state.assertion = bool_and(vec![state.assertion.clone(), constraint]);
     }
 
     fn check_sat(
         &self,
-        formula: BoolExpr,
+        assumptions: &[Bool],
         span: Span,
         unknown_message: &str,
     ) -> Result<SatResult, VerificationResult> {
         with_solver(|solver| {
-            solver.push();
-            let z3_formula = self.bool_expr_to_z3(&formula, span)?;
-            solver.assert(&z3_formula);
-            let result = solver.check();
-            solver.pop(1);
+            let result = solver.check_assumptions(assumptions);
             if matches!(result, SatResult::Unknown) {
                 return Err(self.unsupported_result(span, unknown_message.to_owned()));
             }
@@ -1805,26 +1840,22 @@ impl<'tcx> Verifier<'tcx> {
         target == loop_contract.header && loop_contract.body_blocks.contains(&source)
     }
 
-    fn loop_marker(&self, header: BasicBlock) -> SymVal {
-        SymVal::Var(SymVar {
-            name: format!("loop_{}", header.index()),
-            ty: SymTy::Bool,
-        })
+    fn loop_marker(&self, header: BasicBlock) -> Bool {
+        Bool::new_const(format!("loop_{}", header.index()))
     }
 
-    fn has_loop_marker(&self, expr: &BoolExpr, header: BasicBlock) -> bool {
+    fn has_loop_marker(&self, expr: &Bool, header: BasicBlock) -> bool {
         let marker = format!("loop_{}", header.index());
-        match expr {
-            BoolExpr::Value(SymVal::Var(var)) => var.name == marker,
-            BoolExpr::Not(arg) => self.has_loop_marker(arg, header),
-            BoolExpr::And(args) | BoolExpr::Or(args) => {
-                args.iter().any(|arg| self.has_loop_marker(arg, header))
-            }
-            BoolExpr::Implies(lhs, rhs) => {
-                self.has_loop_marker(lhs, header) || self.has_loop_marker(rhs, header)
-            }
-            _ => false,
+        if expr.is_const() {
+            return expr.decl().name() == marker;
         }
+        expr.children().into_iter().any(|child| {
+            child
+                .as_bool()
+                .filter(|_| child.sort_kind() == SortKind::Bool)
+                .map(|child| self.has_loop_marker(&child, header))
+                .unwrap_or(false)
+        })
     }
 
     fn called_def_id(&self, func: &Operand<'tcx>) -> Option<LocalDefId> {
@@ -2238,6 +2269,26 @@ fn or_expr(exprs: Vec<BoolExpr>) -> BoolExpr {
         1 => flat.pop().unwrap(),
         _ => BoolExpr::Or(flat),
     }
+}
+
+fn bool_and(exprs: Vec<Bool>) -> Bool {
+    match exprs.len() {
+        0 => Bool::from_bool(true),
+        1 => exprs.into_iter().next().unwrap(),
+        _ => Bool::and(&exprs),
+    }
+}
+
+fn bool_or(exprs: Vec<Bool>) -> Bool {
+    match exprs.len() {
+        0 => Bool::from_bool(false),
+        1 => exprs.into_iter().next().unwrap(),
+        _ => Bool::or(&exprs),
+    }
+}
+
+fn bool_not(expr: Bool) -> Bool {
+    expr.not()
 }
 
 fn not_expr(expr: BoolExpr) -> BoolExpr {
