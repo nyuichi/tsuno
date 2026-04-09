@@ -1300,7 +1300,7 @@ mod tests {
         let SynExpr::Field(cur) = expr else {
             panic!("expected outer field access");
         };
-        assert!(matches!(&cur.member, Member::Named(ident) if ident.to_string() == "cur"));
+        assert!(matches!(&cur.member, Member::Named(ident) if *ident == "cur"));
         let SynExpr::Field(tuple_field) = *cur.base else {
             panic!("expected nested field access");
         };
