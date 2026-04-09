@@ -12,6 +12,7 @@ pub struct VerificationResult {
 pub enum VerificationStatus {
     Pass,
     Fail,
+    Unknown,
     Unsupported,
 }
 
@@ -20,6 +21,7 @@ impl fmt::Display for VerificationStatus {
         match self {
             VerificationStatus::Pass => write!(f, "PASS"),
             VerificationStatus::Fail => write!(f, "FAIL"),
+            VerificationStatus::Unknown => write!(f, "UNKNOWN"),
             VerificationStatus::Unsupported => write!(f, "UNSUPPORTED"),
         }
     }
