@@ -1,0 +1,10 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+expression: snapshot_output(output)
+---
+status: Some(0)
+stdout:
+PASS reborrow_after_opaque_move_call
+  all assertions discharged
+
+stderr:
