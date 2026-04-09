@@ -1,5 +1,5 @@
 ---
-source: crates/tsuno-driver/tests/verify_cli.rs
+source: crates/tsuno-driver/tests/snapshot_tests.rs
 assertion_line: 93
 expression: snapshot_output(output)
 ---
