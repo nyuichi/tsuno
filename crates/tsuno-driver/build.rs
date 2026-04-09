@@ -54,5 +54,6 @@ fn snapshot_{kind}_{name}() {{
     }
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
-    fs::write(out_dir.join("snapshot_tests.rs"), generated).expect("write generated tests");
+    fs::write(out_dir.join("generated_snapshot_tests.rs"), generated)
+        .expect("write generated tests");
 }

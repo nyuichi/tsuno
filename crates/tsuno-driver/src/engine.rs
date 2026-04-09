@@ -17,8 +17,9 @@ use z3::{SatResult, Solver, SortKind};
 
 use crate::directive::{SpecBinaryOp, SpecUnaryOp};
 use crate::prepass::{
-    AssertionContracts, ContractExpr, FunctionContract, LoopContract, LoopContracts, MirSpecExpr,
-    compute_assertions, compute_function_contracts, compute_loops,
+    AssertionContracts, AssumptionContracts, ContractExpr, FunctionContract, LoopContract,
+    LoopContracts, MirSpecExpr, compute_assertions, compute_assumptions,
+    compute_function_contracts, compute_loops,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 
@@ -122,6 +123,7 @@ pub struct Verifier<'tcx> {
     contracts: HashMap<LocalDefId, FunctionContract>,
     loop_contracts: LoopContracts,
     assertion_contracts: AssertionContracts,
+    assumption_contracts: AssumptionContracts,
     prepass_error: Option<VerificationResult>,
     next_sym: Cell<usize>,
 }
@@ -156,6 +158,22 @@ impl<'tcx> Verifier<'tcx> {
         } else {
             AssertionContracts::empty()
         };
+        let assumption_contracts = if prepass_error.is_none() {
+            match compute_assumptions(tcx, def_id, &body) {
+                Ok(assumption_contracts) => assumption_contracts,
+                Err(error) => {
+                    prepass_error = Some(VerificationResult {
+                        function: tcx.def_path_str(def_id.to_def_id()),
+                        status: VerificationStatus::Unsupported,
+                        span: span_text(tcx, error.span),
+                        message: error.message,
+                    });
+                    AssumptionContracts::empty()
+                }
+            }
+        } else {
+            AssumptionContracts::empty()
+        };
         let contracts = match compute_function_contracts(tcx) {
             Ok(contracts) => contracts,
             Err(error) => {
@@ -170,6 +188,7 @@ impl<'tcx> Verifier<'tcx> {
             contracts,
             loop_contracts,
             assertion_contracts,
+            assumption_contracts,
             prepass_error,
             next_sym: Cell::new(0),
         }
@@ -220,6 +239,30 @@ impl<'tcx> Verifier<'tcx> {
                     "assertion failed".to_owned(),
                 ) {
                     return err;
+                }
+            }
+            if let Some(assumption) = self
+                .assumption_contracts
+                .assumption_at(ctrl.basic_block, ctrl.statement_index)
+            {
+                let formula = match self.mir_spec_to_bool(&state, &assumption.assumption) {
+                    Ok(formula) => formula,
+                    Err(err) => return err,
+                };
+                let formula = match self.bool_expr_to_z3(&formula, self.control_span(ctrl)) {
+                    Ok(formula) => formula,
+                    Err(err) => return err,
+                };
+                self.assume_constraint(&mut state, formula);
+            }
+            match self.check_sat(std::slice::from_ref(&state.pc)) {
+                SatResult::Sat => {}
+                SatResult::Unsat => continue,
+                SatResult::Unknown => {
+                    return self.unknown_result(
+                        self.control_span(ctrl),
+                        "solver returned unknown while checking assumption".to_owned(),
+                    );
                 }
             }
 

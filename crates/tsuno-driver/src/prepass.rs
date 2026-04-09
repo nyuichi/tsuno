@@ -3,7 +3,8 @@ use std::ops::ControlFlow;
 
 use crate::directive::{
     FunctionContractSource, SpecBinaryOp, SpecExpr as HirSpecExpr, SpecUnaryOp,
-    collect_function_contract_source, collect_hir_assertions, collect_hir_loop_contracts,
+    collect_function_contract_source, collect_hir_assertions, collect_hir_assumptions,
+    collect_hir_loop_contracts,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use rustc_hir::intravisit::{self, Visitor};
@@ -68,6 +69,16 @@ pub struct AssertionContracts {
 }
 
 #[derive(Debug, Clone)]
+pub struct AssumptionContract {
+    pub assumption: MirSpecExpr,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssumptionContracts {
+    pub by_control_point: HashMap<(BasicBlock, usize), AssumptionContract>,
+}
+
+#[derive(Debug, Clone)]
 pub struct FunctionContract {
     pub params: Vec<String>,
     pub req: ContractExpr,
@@ -123,6 +134,22 @@ impl AssertionContracts {
         block: BasicBlock,
         statement_index: usize,
     ) -> Option<&AssertionContract> {
+        self.by_control_point.get(&(block, statement_index))
+    }
+}
+
+impl AssumptionContracts {
+    pub fn empty() -> Self {
+        Self {
+            by_control_point: HashMap::new(),
+        }
+    }
+
+    pub fn assumption_at(
+        &self,
+        block: BasicBlock,
+        statement_index: usize,
+    ) -> Option<&AssumptionContract> {
         self.by_control_point.get(&(block, statement_index))
     }
 }
@@ -369,6 +396,49 @@ pub fn compute_assertions<'tcx>(
         }
     }
     Ok(AssertionContracts { by_control_point })
+}
+
+pub fn compute_assumptions<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    body: &Body<'tcx>,
+) -> Result<AssumptionContracts, LoopPrepassError> {
+    let binding_info = collect_hir_binding_info(tcx, def_id)?;
+    let hir_assumptions = collect_hir_assumptions(tcx, def_id, &binding_info)?;
+    let hir_locals = compute_hir_locals(tcx, body, &binding_info);
+    let mut by_control_point = HashMap::new();
+    for hir_assumption in hir_assumptions.items {
+        let target = control_point_after(body, hir_assumption.stmt_span);
+        let Some((basic_block, statement_index)) = target else {
+            return Err(LoopPrepassError {
+                span: hir_assumption.stmt_span,
+                message: format!(
+                    "unable to map //@ assume at {} to MIR",
+                    tcx.sess
+                        .source_map()
+                        .span_to_diagnostic_string(hir_assumption.stmt_span)
+                ),
+            });
+        };
+        let assumption = lower_hir_spec_expr(
+            &hir_assumption.assumption,
+            &hir_locals,
+            hir_assumption.stmt_span,
+        )?;
+        if by_control_point
+            .insert(
+                (basic_block, statement_index),
+                AssumptionContract { assumption },
+            )
+            .is_some()
+        {
+            return Err(LoopPrepassError {
+                span: hir_assumption.stmt_span,
+                message: "multiple //@ assume directives map to the same control point".to_owned(),
+            });
+        }
+    }
+    Ok(AssumptionContracts { by_control_point })
 }
 
 fn lower_function_contract<'tcx>(

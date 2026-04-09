@@ -81,6 +81,17 @@ pub struct HirAssertionContracts {
     pub items: Vec<HirAssertionContract>,
 }
 
+#[derive(Debug, Clone)]
+pub struct HirAssumptionContract {
+    pub stmt_span: Span,
+    pub assumption: SpecExpr,
+}
+
+#[derive(Debug, Clone)]
+pub struct HirAssumptionContracts {
+    pub items: Vec<HirAssumptionContract>,
+}
+
 #[derive(Clone)]
 pub(crate) struct FunctionContractSource {
     pub(crate) req: SynExpr,
@@ -120,6 +131,24 @@ pub fn collect_hir_assertions<'tcx>(
     match intravisit::walk_body(&mut collector, body) {
         ControlFlow::Continue(()) => Ok(HirAssertionContracts {
             items: collector.assertions,
+        }),
+        ControlFlow::Break(err) => Err(err),
+    }
+}
+
+pub fn collect_hir_assumptions<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    binding_info: &HirBindingInfo,
+) -> Result<HirAssumptionContracts, LoopPrepassError> {
+    let body = tcx.hir_body_owned_by(def_id);
+    let mut collector = HirAssumptionCollector {
+        lowerer: SpecExprLowerer { tcx, binding_info },
+        assumptions: Vec::new(),
+    };
+    match intravisit::walk_body(&mut collector, body) {
+        ControlFlow::Continue(()) => Ok(HirAssumptionContracts {
+            items: collector.assumptions,
         }),
         ControlFlow::Break(err) => Err(err),
     }
@@ -466,6 +495,11 @@ struct HirAssertionCollector<'a, 'tcx> {
     assertions: Vec<HirAssertionContract>,
 }
 
+struct HirAssumptionCollector<'a, 'tcx> {
+    lowerer: SpecExprLowerer<'a, 'tcx>,
+    assumptions: Vec<HirAssumptionContract>,
+}
+
 impl<'a, 'tcx> HirLoopContractCollector<'a, 'tcx> {
     fn collect_loop_contract(
         &mut self,
@@ -684,6 +718,18 @@ impl<'a, 'tcx> Visitor<'tcx> for HirAssertionCollector<'a, 'tcx> {
     }
 }
 
+impl<'a, 'tcx> Visitor<'tcx> for HirAssumptionCollector<'a, 'tcx> {
+    type NestedFilter = intravisit::nested_filter::None;
+    type Result = ControlFlow<LoopPrepassError>;
+
+    fn visit_block(&mut self, block: &'tcx Block<'tcx>) -> Self::Result {
+        if let Err(err) = self.collect_block_assumptions(block) {
+            return ControlFlow::Break(err);
+        }
+        intravisit::walk_block(self, block)
+    }
+}
+
 fn stmt_expr<'tcx>(stmt: &'tcx Stmt<'tcx>) -> Option<&'tcx Expr<'tcx>> {
     match stmt.kind {
         StmtKind::Expr(expr) | StmtKind::Semi(expr) => Some(expr),
@@ -868,6 +914,123 @@ impl<'a, 'tcx> HirAssertionCollector<'a, 'tcx> {
         LoopPrepassError {
             span,
             message: "//@ assert must be placed immediately before the statement".to_owned(),
+        }
+    }
+}
+
+impl<'a, 'tcx> HirAssumptionCollector<'a, 'tcx> {
+    fn collect_block_assumptions(
+        &mut self,
+        block: &'tcx Block<'tcx>,
+    ) -> Result<(), LoopPrepassError> {
+        let Ok(block_source) = self
+            .lowerer
+            .tcx
+            .sess
+            .source_map()
+            .span_to_snippet(block.span)
+        else {
+            return Ok(());
+        };
+        let mut cursor = 0;
+        for stmt in block.stmts {
+            let stmt_source = self
+                .lowerer
+                .tcx
+                .sess
+                .source_map()
+                .span_to_snippet(stmt.span)
+                .map_err(|_| self.missing_assumption_error(stmt.span))?;
+            let Some(stmt_offset) = block_source[cursor..].find(&stmt_source) else {
+                continue;
+            };
+            let stmt_start = cursor + stmt_offset;
+            let prefix_source = &block_source[cursor..stmt_start];
+            if let Some((_, directive_line)) = spec_directive_line(
+                prefix_source,
+                "//@ assume",
+                false,
+                false,
+                self.missing_assumption_error(stmt.span),
+                self.multiple_assumption_error(stmt.span),
+                self.assumption_position_error(stmt.span),
+            )? {
+                let predicate_text = directive_line
+                    .strip_prefix("//@ assume")
+                    .expect("directive line starts with //@ assume")
+                    .trim();
+                let lit =
+                    syn::parse_str::<LitStr>(predicate_text).map_err(|err| LoopPrepassError {
+                        span: stmt.span,
+                        message: format!("failed to parse //@ assume predicate: {err}"),
+                    })?;
+                let expr = parse_spec_template("assume", &lit).map_err(|err| LoopPrepassError {
+                    span: stmt.span,
+                    message: err.to_string(),
+                })?;
+                let assumption = self
+                    .lowerer
+                    .lower_syn_spec_expr(&expr, stmt.span, stmt.span, "assume")?;
+                self.assumptions.push(HirAssumptionContract {
+                    stmt_span: stmt.span,
+                    assumption,
+                });
+            }
+            cursor = stmt_start + stmt_source.len();
+        }
+
+        let tail_source = &block_source[cursor..];
+        if let Some((_, directive_line)) = spec_directive_line(
+            tail_source,
+            "//@ assume",
+            false,
+            true,
+            self.missing_assumption_error(block.span),
+            self.multiple_assumption_error(block.span),
+            self.assumption_position_error(block.span),
+        )? {
+            let predicate_text = directive_line
+                .strip_prefix("//@ assume")
+                .expect("directive line starts with //@ assume")
+                .trim();
+            let lit = syn::parse_str::<LitStr>(predicate_text).map_err(|err| LoopPrepassError {
+                span: block.span,
+                message: format!("failed to parse //@ assume predicate: {err}"),
+            })?;
+            let expr = parse_spec_template("assume", &lit).map_err(|err| LoopPrepassError {
+                span: block.span,
+                message: err.to_string(),
+            })?;
+            let anchor_span = block.span.shrink_to_hi();
+            let assumption =
+                self.lowerer
+                    .lower_syn_spec_expr(&expr, block.span, anchor_span, "assume")?;
+            self.assumptions.push(HirAssumptionContract {
+                stmt_span: anchor_span,
+                assumption,
+            });
+        }
+        Ok(())
+    }
+
+    fn missing_assumption_error(&self, span: Span) -> LoopPrepassError {
+        LoopPrepassError {
+            span,
+            message: "assumption directive must be attached to a statement".to_owned(),
+        }
+    }
+
+    fn multiple_assumption_error(&self, span: Span) -> LoopPrepassError {
+        LoopPrepassError {
+            span,
+            message: "statement may contain exactly one //@ assume before it".to_owned(),
+        }
+    }
+
+    fn assumption_position_error(&self, span: Span) -> LoopPrepassError {
+        LoopPrepassError {
+            span,
+            message: "//@ assume must be placed immediately before the statement".to_owned(),
         }
     }
 }

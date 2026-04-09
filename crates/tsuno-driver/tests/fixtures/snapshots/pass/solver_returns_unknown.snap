@@ -2,9 +2,10 @@
 source: crates/tsuno-driver/tests/snapshot_tests.rs
 expression: snapshot_output(output)
 ---
-status: Some(0)
+status: Some(1)
 stdout:
 UNKNOWN solver_returns_unknown
-  all assertions discharged
+  solver returned unknown while checking assertion
+  src/main.rs:11:6: 11:6
 
 stderr:
