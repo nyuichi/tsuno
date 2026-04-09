@@ -603,13 +603,9 @@ impl<'tcx> Verifier<'tcx> {
         worklist: &mut VecDeque<ControlPoint>,
         state: State,
     ) -> Option<VerificationResult> {
-        match self.check_sat(
-            std::slice::from_ref(&state.pc),
-            self.control_span(state.ctrl),
-            "solver returned unknown while checking path feasibility",
-        ) {
-            Ok(SatResult::Unsat) => None,
-            Ok(SatResult::Sat) => {
+        match self.check_sat(std::slice::from_ref(&state.pc)) {
+            SatResult::Unsat => None,
+            SatResult::Sat => {
                 let ctrl = state.ctrl;
                 let bucket = pending.entry(ctrl).or_default();
                 if bucket.is_empty() {
@@ -618,11 +614,10 @@ impl<'tcx> Verifier<'tcx> {
                 bucket.push(state);
                 None
             }
-            Ok(SatResult::Unknown) => Some(self.unsupported_result(
+            SatResult::Unknown => Some(self.unknown_result(
                 self.control_span(state.ctrl),
                 "solver returned unknown while checking path feasibility".to_owned(),
             )),
-            Err(err) => Some(err),
         }
     }
 
@@ -1556,11 +1551,7 @@ impl<'tcx> Verifier<'tcx> {
         message: String,
     ) -> Result<(), VerificationResult> {
         self.assert_constraint(state, constraint);
-        match self.check_sat(
-            &[state.pc.clone(), state.assertion.clone()],
-            span,
-            "solver returned unknown while checking assertion",
-        )? {
+        match self.check_sat(&[state.pc.clone(), state.assertion.clone()]) {
             SatResult::Sat => Ok(()),
             SatResult::Unsat => Err(VerificationResult {
                 function: self.tcx.def_path_str(self.def_id.to_def_id()),
@@ -1568,7 +1559,7 @@ impl<'tcx> Verifier<'tcx> {
                 span: diagnostic_span,
                 message,
             }),
-            SatResult::Unknown => Err(self.unsupported_result(
+            SatResult::Unknown => Err(self.unknown_result(
                 span,
                 "solver returned unknown while checking assertion".to_owned(),
             )),
@@ -1583,19 +1574,8 @@ impl<'tcx> Verifier<'tcx> {
         state.assertion = bool_and(vec![state.assertion.clone(), constraint]);
     }
 
-    fn check_sat(
-        &self,
-        assumptions: &[Bool],
-        span: Span,
-        unknown_message: &str,
-    ) -> Result<SatResult, VerificationResult> {
-        with_solver(|solver| {
-            let result = solver.check_assumptions(assumptions);
-            if matches!(result, SatResult::Unknown) {
-                return Err(self.unsupported_result(span, unknown_message.to_owned()));
-            }
-            Ok(result)
-        })
+    fn check_sat(&self, assumptions: &[Bool]) -> SatResult {
+        with_solver(|solver| solver.check_assumptions(assumptions))
     }
 
     fn bool_expr_to_z3(&self, expr: &BoolExpr, span: Span) -> Result<Bool, VerificationResult> {
@@ -2086,6 +2066,15 @@ impl<'tcx> Verifier<'tcx> {
         VerificationResult {
             function: self.tcx.def_path_str(self.def_id.to_def_id()),
             status: VerificationStatus::Unsupported,
+            span: span_text(self.tcx, span),
+            message,
+        }
+    }
+
+    fn unknown_result(&self, span: Span, message: String) -> VerificationResult {
+        VerificationResult {
+            function: self.tcx.def_path_str(self.def_id.to_def_id()),
+            status: VerificationStatus::Unknown,
             span: span_text(self.tcx, span),
             message,
         }
