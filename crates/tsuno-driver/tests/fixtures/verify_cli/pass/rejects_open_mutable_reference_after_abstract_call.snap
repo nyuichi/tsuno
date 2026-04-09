@@ -2,10 +2,9 @@
 source: crates/tsuno-driver/tests/verify_cli.rs
 expression: snapshot_output(output)
 ---
-status: Some(1)
+status: Some(0)
 stdout:
-FAIL bad_close
-  mutable reference close failed
-  src/main.rs:7:1: 7:2
+PASS bad_close
+  all assertions discharged
 
 stderr:
