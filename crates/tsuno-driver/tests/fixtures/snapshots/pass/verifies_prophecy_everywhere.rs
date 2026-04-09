@@ -1,20 +1,22 @@
 //@ verify
-fn prophecy_everywhere(x: i32) {
-    //@ assert "{^:x} == {^:x}"
-    let mut y = x;
-    while y < 1
-      //@ inv "{^:x} == {^:x}"
+fn mut_ref_model_everywhere(mut x: i32) {
     {
-        break;
+        let r = &mut x;
+        while *r < 1
+          //@ inv "{r}.cur == {r}.cur && {r}.fin == {r}.fin"
+        {
+            break;
+        }
     }
-
-    let _sink = y;
+    let s = &mut x;
+    //@ assert "{s}.cur == {s}.cur && {s}.fin == {s}.fin"
+    let _sink = helper(s);
 }
 
-//@ req "{^:x} == {^:x}"
-//@ ens "{^:x} == {^:x}"
-fn id(x: i32) -> i32 {
-    x
+//@ req "{x}.cur == {x}.cur && {x}.fin == {x}.fin"
+//@ ens "{x}.cur == {x}.cur && {x}.fin == {x}.fin"
+fn helper(x: &mut i32) -> i32 {
+    *x
 }
 
 fn main() {}

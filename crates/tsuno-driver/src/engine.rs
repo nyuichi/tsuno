@@ -1338,6 +1338,10 @@ impl<'tcx> Verifier<'tcx> {
                 let value = self.local_prophecy(state, *local, self.control_span(state.ctrl))?;
                 self.symval_to_bool_expr(&value)
             }
+            MirSpecExpr::Field { .. } => {
+                let value = self.mir_spec_to_value(state, expr)?;
+                self.symval_to_bool_expr(&value)
+            }
             MirSpecExpr::Unary { op, arg } => match op {
                 SpecUnaryOp::Not => Ok(not_expr(self.mir_spec_to_bool(state, arg)?)),
                 SpecUnaryOp::Neg => Err(self.unsupported_result(
@@ -1407,6 +1411,10 @@ impl<'tcx> Verifier<'tcx> {
                 let value = self.local_prophecy(state, *local, self.control_span(state.ctrl))?;
                 self.symval_to_int_expr(&value)
             }
+            MirSpecExpr::Field { .. } => {
+                let value = self.mir_spec_to_value(state, expr)?;
+                self.symval_to_int_expr(&value)
+            }
             MirSpecExpr::Unary { op, arg } => match op {
                 SpecUnaryOp::Neg => Ok(IntExpr::Neg(Box::new(self.mir_spec_to_int(state, arg)?))),
                 SpecUnaryOp::Not => Err(self.unsupported_result(
@@ -1455,6 +1463,10 @@ impl<'tcx> Verifier<'tcx> {
             }),
             MirSpecExpr::Prophecy(local) => {
                 self.local_prophecy(state, *local, self.control_span(state.ctrl))
+            }
+            MirSpecExpr::Field { base, index } => {
+                let value = self.mir_spec_to_value(state, base)?;
+                self.project_tuple_field(value, *index, self.control_span(state.ctrl))
             }
             MirSpecExpr::Unary { .. } | MirSpecExpr::Binary { .. } => Err(self.unsupported_result(
                 self.control_span(state.ctrl),
@@ -1512,6 +1524,10 @@ impl<'tcx> Verifier<'tcx> {
                         format!("missing prophecy binding `{name}`"),
                     )
                 })?)
+            }
+            ContractExpr::Field { .. } => {
+                let value = self.contract_expr_to_value(current, prophecy, expr)?;
+                self.symval_to_bool_expr(&value)
             }
             ContractExpr::Unary { op, arg } => match op {
                 SpecUnaryOp::Not => Ok(not_expr(
@@ -1581,6 +1597,10 @@ impl<'tcx> Verifier<'tcx> {
                     )
                 })?)
             }
+            ContractExpr::Field { .. } => {
+                let value = self.contract_expr_to_value(current, prophecy, expr)?;
+                self.symval_to_int_expr(&value)
+            }
             ContractExpr::Unary { op, arg } => match op {
                 SpecUnaryOp::Neg => Ok(IntExpr::Neg(Box::new(
                     self.contract_expr_to_int(current, prophecy, arg)?,
@@ -1636,6 +1656,10 @@ impl<'tcx> Verifier<'tcx> {
                     format!("missing prophecy binding `{name}`"),
                 )
             }),
+            ContractExpr::Field { base, index } => {
+                let value = self.contract_expr_to_value(current, prophecy, base)?;
+                self.project_tuple_field(value, *index, self.tcx.def_span(self.def_id))
+            }
             _ => Err(self.unsupported_result(
                 self.tcx.def_span(self.def_id),
                 "complex contract values are unsupported outside comparisons".to_owned(),

@@ -13,7 +13,7 @@ use rustc_middle::mir::{BasicBlock, Body, Local, PlaceElem, StatementKind, Termi
 use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{Span, Symbol};
-use syn::{Expr as SynExpr, Lit};
+use syn::{Expr as SynExpr, Lit, Member};
 
 #[derive(Debug, Clone, Default)]
 pub struct HirBindingInfo {
@@ -28,6 +28,10 @@ pub enum MirSpecExpr {
     Var(Local),
     #[allow(dead_code)]
     Prophecy(Local),
+    Field {
+        base: Box<MirSpecExpr>,
+        index: usize,
+    },
     Unary {
         op: SpecUnaryOp,
         arg: Box<MirSpecExpr>,
@@ -94,6 +98,10 @@ pub enum ContractExpr {
     Int(i64),
     Var(String),
     Prophecy(String),
+    Field {
+        base: Box<ContractExpr>,
+        index: usize,
+    },
     Unary {
         op: SpecUnaryOp,
         arg: Box<ContractExpr>,
@@ -548,6 +556,29 @@ fn lower_function_contract_expr<'tcx>(
             };
             Ok(ContractExpr::Prophecy(arg_ident.to_string()))
         }
+        SynExpr::Field(expr) => {
+            let index = match &expr.member {
+                Member::Unnamed(index) => index.index as usize,
+                Member::Named(ident) => match ident.to_string().as_str() {
+                    "cur" => 0,
+                    "fin" => 1,
+                    _ => {
+                        return Err(function_contract_error(
+                            tcx,
+                            def_id,
+                            span,
+                            format!("unsupported field access in //@ {kind} predicate"),
+                        ));
+                    }
+                },
+            };
+            Ok(ContractExpr::Field {
+                base: Box::new(lower_function_contract_expr(
+                    tcx, def_id, span, kind, &expr.base,
+                )?),
+                index,
+            })
+        }
         SynExpr::Unary(expr) => {
             let op = match expr.op {
                 syn::UnOp::Not(_) => SpecUnaryOp::Not,
@@ -645,6 +676,10 @@ fn lower_hir_spec_expr(
             };
             Ok(MirSpecExpr::Prophecy(local))
         }
+        HirSpecExpr::Field { base, index } => Ok(MirSpecExpr::Field {
+            base: Box::new(lower_hir_spec_expr(base, hir_locals, span)?),
+            index: *index,
+        }),
         HirSpecExpr::Unary { op, arg } => Ok(MirSpecExpr::Unary {
             op: *op,
             arg: Box::new(lower_hir_spec_expr(arg, hir_locals, span)?),
