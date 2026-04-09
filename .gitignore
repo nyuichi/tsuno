@@ -1,4 +1,4 @@
 /target
-/crates/tsuno-driver/tests/snapshot_tests.rs
+/crates/tsuno-driver/tests/generated_snapshot_tests.rs
 /crates/tsuno-driver/libfixture.rmeta
 *.snap.new

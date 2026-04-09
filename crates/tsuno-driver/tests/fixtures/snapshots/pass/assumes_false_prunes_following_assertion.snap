@@ -1,0 +1,10 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+expression: snapshot_output(output)
+---
+status: Some(0)
+stdout:
+PASS assumes_false_prunes_following_assertion
+  all assertions discharged
+
+stderr:
