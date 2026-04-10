@@ -18,8 +18,9 @@ use z3::{
 };
 
 use crate::prepass::{
-    AssertionContracts, AssumptionContracts, FunctionContract, LoopContract, LoopContracts,
-    ResolvedExprEnv, compute_directives, compute_function_contracts,
+    AssertionContracts, AssumptionContracts, AutoInvariantKind, ContractParam, ContractValueOrigin,
+    ContractValueSpec, FunctionContract, LoopContract, LoopContracts, ResolvedExprEnv,
+    compute_directives, compute_function_contracts,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{BinaryOp, Expr, UnaryOp};
@@ -679,8 +680,7 @@ impl<'tcx> Verifier<'tcx> {
             }
             TerminatorKind::Return => {
                 if let Some(contract) = self.contracts.get(&self.def_id) {
-                    let formula = self.contract_to_bool(&state, contract, true)?;
-                    let formula = self.bool_expr_to_z3(&formula)?;
+                    let formula = self.function_postcondition_to_z3(&state, contract)?;
                     self.require_constraint(
                         &mut state,
                         formula,
@@ -791,9 +791,7 @@ impl<'tcx> Verifier<'tcx> {
         {
             let spec = self.instantiate_contract_spec_vars(&contract.spec_vars);
             let env = self.call_env(&state, args, contract, span, spec.clone())?;
-            let req =
-                self.contract_expr_to_bool(&env.current, &env.prophecy, &env.spec, &contract.req)?;
-            let req = self.bool_expr_to_z3(&req)?;
+            let req = self.contract_req_to_z3(contract, &env, span)?;
             self.require_constraint(
                 &mut state,
                 req,
@@ -808,13 +806,18 @@ impl<'tcx> Verifier<'tcx> {
             let mut env = self.call_env(&state, args, contract, span, spec)?;
             self.consume_call_move_args(&mut state, args, span)?;
             env.current.insert("result".to_owned(), result_value);
-            let ens =
-                self.contract_expr_to_bool(&env.current, &env.prophecy, &env.spec, &contract.ens)?;
-            let ens = self.bool_expr_to_z3(&ens)?;
+            let ens = self.contract_ens_to_z3(contract, &env, span)?;
             self.assume_constraint(&mut state, ens);
         } else {
             let result_ty = self.place_ty(destination);
             let result_value = self.fresh_for_rust_ty(result_ty, "opaque_result")?;
+            self.require_type_invariant(
+                &mut state,
+                result_ty,
+                &result_value,
+                span,
+                "type invariant does not hold".to_owned(),
+            )?;
             self.write_place(&mut state, destination, result_value, span)?;
             self.abstract_call_mut_args(&mut state, args, span)?;
             self.consume_call_move_args(&mut state, args, span)?;
@@ -1028,9 +1031,7 @@ impl<'tcx> Verifier<'tcx> {
         if let Some(contract) = self.contracts.get(&self.def_id) {
             let env =
                 CallEnv::for_function(self, &state, contract, self.function_spec_vars.clone())?;
-            let req =
-                self.contract_expr_to_bool(&env.current, &env.prophecy, &env.spec, &contract.req)?;
-            let req = self.bool_expr_to_z3(&req)?;
+            let req = self.contract_req_to_z3(contract, &env, self.tcx.def_span(self.def_id))?;
             self.assume_constraint(&mut state, req);
         }
         Ok(state)
@@ -1160,23 +1161,71 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<Datatype, VerificationResult> {
         let lhs_value = self.eval_operand(state, lhs, span)?;
         let rhs_value = self.eval_operand(state, rhs, span)?;
-        match op {
+        let lhs_ty = lhs.ty(&self.body.local_decls, self.tcx);
+        let result = match op {
             BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow => {
                 self.eval_checked_binary_op(state, op, lhs, rhs, span)
             }
-            BinOp::Add => Ok(self.value_add(&lhs_value, &rhs_value)),
-            BinOp::Sub => Ok(self.value_sub(&lhs_value, &rhs_value)),
-            BinOp::Mul => Ok(self.value_mul(&lhs_value, &rhs_value)),
+            BinOp::Add => {
+                let int_value = self.value_int_data(&lhs_value) + self.value_int_data(&rhs_value);
+                self.require_int_invariant(
+                    state,
+                    lhs_ty,
+                    &int_value,
+                    span,
+                    "type invariant does not hold".to_owned(),
+                )?;
+                Ok(self.value_wrap_int(&int_value))
+            }
+            BinOp::Sub => {
+                let int_value = self.value_int_data(&lhs_value) - self.value_int_data(&rhs_value);
+                self.require_int_invariant(
+                    state,
+                    lhs_ty,
+                    &int_value,
+                    span,
+                    "type invariant does not hold".to_owned(),
+                )?;
+                Ok(self.value_wrap_int(&int_value))
+            }
+            BinOp::Mul => {
+                let int_value = self.value_int_data(&lhs_value) * self.value_int_data(&rhs_value);
+                self.require_int_invariant(
+                    state,
+                    lhs_ty,
+                    &int_value,
+                    span,
+                    "type invariant does not hold".to_owned(),
+                )?;
+                Ok(self.value_wrap_int(&int_value))
+            }
             BinOp::Eq => Ok(self.value_eqv(&lhs_value, &rhs_value)),
             BinOp::Ne => Ok(self.value_not(&self.value_eqv(&lhs_value, &rhs_value))),
-            BinOp::Lt => Ok(self.value_lt(&lhs_value, &rhs_value)),
-            BinOp::Le => Ok(self.value_le(&lhs_value, &rhs_value)),
-            BinOp::Gt => Ok(self.value_gt(&lhs_value, &rhs_value)),
-            BinOp::Ge => Ok(self.value_ge(&lhs_value, &rhs_value)),
+            BinOp::Lt => Ok(self.value_wrap_bool(
+                &self
+                    .value_int_data(&lhs_value)
+                    .lt(self.value_int_data(&rhs_value)),
+            )),
+            BinOp::Le => Ok(self.value_wrap_bool(
+                &self
+                    .value_int_data(&lhs_value)
+                    .le(self.value_int_data(&rhs_value)),
+            )),
+            BinOp::Gt => Ok(self.value_wrap_bool(
+                &self
+                    .value_int_data(&lhs_value)
+                    .gt(self.value_int_data(&rhs_value)),
+            )),
+            BinOp::Ge => Ok(self.value_wrap_bool(
+                &self
+                    .value_int_data(&lhs_value)
+                    .ge(self.value_int_data(&rhs_value)),
+            )),
             other => {
                 Err(self.unsupported_result(span, format!("unsupported binary operator {other:?}")))
             }
-        }
+        }?;
+        Ok(result)
     }
 
     fn eval_checked_binary_op(
@@ -1191,9 +1240,39 @@ impl<'tcx> Verifier<'tcx> {
         let rhs_value = self.eval_operand(state, rhs, span)?;
         let result_ty = lhs.ty(&self.body.local_decls, self.tcx);
         let result_value = match op {
-            BinOp::Add | BinOp::AddWithOverflow => self.value_add(&lhs_value, &rhs_value),
-            BinOp::Sub | BinOp::SubWithOverflow => self.value_sub(&lhs_value, &rhs_value),
-            BinOp::Mul | BinOp::MulWithOverflow => self.value_mul(&lhs_value, &rhs_value),
+            BinOp::Add | BinOp::AddWithOverflow => {
+                let int_value = self.value_int_data(&lhs_value) + self.value_int_data(&rhs_value);
+                self.require_int_invariant(
+                    state,
+                    result_ty,
+                    &int_value,
+                    span,
+                    "type invariant does not hold".to_owned(),
+                )?;
+                self.value_wrap_int(&int_value)
+            }
+            BinOp::Sub | BinOp::SubWithOverflow => {
+                let int_value = self.value_int_data(&lhs_value) - self.value_int_data(&rhs_value);
+                self.require_int_invariant(
+                    state,
+                    result_ty,
+                    &int_value,
+                    span,
+                    "type invariant does not hold".to_owned(),
+                )?;
+                self.value_wrap_int(&int_value)
+            }
+            BinOp::Mul | BinOp::MulWithOverflow => {
+                let int_value = self.value_int_data(&lhs_value) * self.value_int_data(&rhs_value);
+                self.require_int_invariant(
+                    state,
+                    result_ty,
+                    &int_value,
+                    span,
+                    "type invariant does not hold".to_owned(),
+                )?;
+                self.value_wrap_int(&int_value)
+            }
             other => {
                 return Err(self.unsupported_result(
                     span,
@@ -1213,13 +1292,28 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Datatype, VerificationResult> {
         let value = self.eval_operand(state, operand, span)?;
-        match op {
-            UnOp::Not => Ok(self.value_not(&value)),
-            UnOp::Neg => Ok(self.value_neg(&value)),
+        let operand_ty = operand.ty(&self.body.local_decls, self.tcx);
+        let result = match op {
+            UnOp::Not => match operand_ty.kind() {
+                TyKind::Bool => Ok(self.value_wrap_bool(&self.value_bool_data(&value).not())),
+                _ => Ok(self.value_not(&value)),
+            },
+            UnOp::Neg => {
+                let int_value = Int::from_i64(0) - self.value_int_data(&value);
+                self.require_int_invariant(
+                    state,
+                    operand_ty,
+                    &int_value,
+                    span,
+                    "type invariant does not hold".to_owned(),
+                )?;
+                Ok(self.value_wrap_int(&int_value))
+            }
             other => {
                 Err(self.unsupported_result(span, format!("unsupported unary operator {other:?}")))
             }
-        }
+        }?;
+        Ok(result)
     }
 
     fn eval_operand(
@@ -1229,6 +1323,15 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Datatype, VerificationResult> {
         let value = self.read_operand(state, operand, span)?;
+        if let Operand::Constant(constant) = operand {
+            self.require_type_invariant(
+                state,
+                constant.const_.ty(),
+                &value,
+                span,
+                "type invariant does not hold".to_owned(),
+            )?;
+        }
         if matches!(operand, Operand::Move(_)) {
             self.consume_operand(state, operand, span)?;
         }
@@ -1670,18 +1773,13 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn contract_to_bool(
+    fn function_postcondition_to_z3(
         &self,
         state: &State,
         contract: &FunctionContract,
-        include_result: bool,
-    ) -> Result<BoolExpr, VerificationResult> {
+    ) -> Result<Bool, VerificationResult> {
         let env = CallEnv::for_function(self, state, contract, self.function_spec_vars.clone())?;
-        if include_result {
-            self.contract_expr_to_bool(&env.current, &env.prophecy, &env.spec, &contract.ens)
-        } else {
-            self.contract_expr_to_bool(&env.current, &env.prophecy, &env.spec, &contract.req)
-        }
+        self.contract_ens_to_z3(contract, &env, self.tcx.def_span(self.def_id))
     }
 
     fn require_constraint(
@@ -1897,7 +1995,8 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn value_eqv(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
-        with_value_encoding(|encoding| encoding.eqv(lhs, rhs))
+        bool_or(vec![self.value_is_error(lhs), self.value_is_error(rhs)])
+            .ite(&self.value_error(), &self.value_wrap_bool(&lhs.eq(rhs)))
     }
 
     fn value_add(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
@@ -1958,6 +2057,10 @@ impl<'tcx> Verifier<'tcx> {
 
     fn value_int_data(&self, value: &Datatype) -> Int {
         with_value_encoding(|encoding| encoding.int_data(value))
+    }
+
+    fn value_bool_data(&self, value: &Datatype) -> Bool {
+        with_value_encoding(|encoding| encoding.bool_data(value))
     }
 
     fn value_nth(&self, value: &Datatype, index: usize) -> Datatype {
@@ -2136,6 +2239,101 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
+    fn invariant_formula(
+        &self,
+        invariant: AutoInvariantKind,
+        value: &Datatype,
+        span: Span,
+    ) -> Result<Option<Bool>, VerificationResult> {
+        match invariant {
+            AutoInvariantKind::Trivial => Ok(None),
+            AutoInvariantKind::I32Range => Ok(Some(self.int_range_formula(
+                self.tcx.types.i32,
+                value,
+                span,
+            )?)),
+        }
+    }
+
+    fn contract_spec_formula(
+        &self,
+        spec: ContractValueSpec,
+        value: &Datatype,
+        span: Span,
+    ) -> Result<Option<Bool>, VerificationResult> {
+        let target = match spec.origin {
+            ContractValueOrigin::Direct => value.clone(),
+            ContractValueOrigin::Current => self.value_pair_first(value),
+        };
+        self.invariant_formula(spec.invariant, &target, span)
+    }
+
+    fn contract_value_spec_for_ty(&self, ty: Ty<'tcx>) -> ContractValueSpec {
+        match ty.kind() {
+            TyKind::Ref(_, inner, mutability) => ContractValueSpec {
+                invariant: self.type_invariant_kind(*inner),
+                origin: if mutability.is_mut() {
+                    ContractValueOrigin::Current
+                } else {
+                    ContractValueOrigin::Direct
+                },
+            },
+            _ => ContractValueSpec {
+                invariant: self.type_invariant_kind(ty),
+                origin: ContractValueOrigin::Direct,
+            },
+        }
+    }
+
+    fn type_invariant_kind(&self, ty: Ty<'tcx>) -> AutoInvariantKind {
+        match ty.kind() {
+            TyKind::Int(ty::IntTy::I32) => AutoInvariantKind::I32Range,
+            _ => AutoInvariantKind::Trivial,
+        }
+    }
+
+    fn require_type_invariant(
+        &self,
+        state: &mut State,
+        ty: Ty<'tcx>,
+        value: &Datatype,
+        span: Span,
+        message: String,
+    ) -> Result<(), VerificationResult> {
+        let spec = self.contract_value_spec_for_ty(ty);
+        let Some(formula) = self.contract_spec_formula(spec, value, span)? else {
+            return Ok(());
+        };
+        self.require_constraint(state, formula, span, span_text(self.tcx, span), message)
+    }
+
+    fn require_int_invariant(
+        &self,
+        state: &mut State,
+        ty: Ty<'tcx>,
+        value: &Int,
+        span: Span,
+        message: String,
+    ) -> Result<(), VerificationResult> {
+        let Some((lower, upper)) = self.invariant_int_bounds(ty) else {
+            return Ok(());
+        };
+        self.require_constraint(
+            state,
+            bool_and(vec![value.ge(lower), value.le(upper)]),
+            span,
+            span_text(self.tcx, span),
+            message,
+        )
+    }
+
+    fn invariant_int_bounds(&self, ty: Ty<'tcx>) -> Option<(i64, i64)> {
+        match ty.kind() {
+            TyKind::Int(ty::IntTy::I32) => Some((i32::MIN as i64, i32::MAX as i64)),
+            _ => None,
+        }
+    }
+
     fn unsupported_result(&self, span: Span, message: String) -> VerificationResult {
         VerificationResult {
             function: self.tcx.def_path_str(self.def_id.to_def_id()),
@@ -2183,12 +2381,12 @@ impl<'tcx> Verifier<'tcx> {
                 ),
             ));
         }
-        for (name, arg) in contract.params.iter().zip(args.iter()) {
+        for (param, arg) in contract.params.iter().zip(args.iter()) {
             let value = self.read_operand(state, &arg.node, span)?;
             let ty = arg.node.ty(&self.body.local_decls, self.tcx);
-            current.insert(name.clone(), value.clone());
+            current.insert(param.name.clone(), value.clone());
             prophecy.insert(
-                name.clone(),
+                param.name.clone(),
                 self.prophecy_from_typed_value(ty, &value, span)?,
             );
         }
@@ -2221,6 +2419,69 @@ impl<'tcx> Verifier<'tcx> {
             _ => Ok(value.clone()),
         }
     }
+
+    fn contract_req_to_z3(
+        &self,
+        contract: &FunctionContract,
+        env: &CallEnv,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        self.contract_side_to_z3(contract, env, span, false)
+    }
+
+    fn contract_ens_to_z3(
+        &self,
+        contract: &FunctionContract,
+        env: &CallEnv,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        self.contract_side_to_z3(contract, env, span, true)
+    }
+
+    fn contract_side_to_z3(
+        &self,
+        contract: &FunctionContract,
+        env: &CallEnv,
+        span: Span,
+        is_post: bool,
+    ) -> Result<Bool, VerificationResult> {
+        let manual = if is_post {
+            self.contract_expr_to_bool(&env.current, &env.prophecy, &env.spec, &contract.ens)?
+        } else {
+            self.contract_expr_to_bool(&env.current, &env.prophecy, &env.spec, &contract.req)?
+        };
+        let mut formulas = vec![self.bool_expr_to_z3(&manual)?];
+        formulas.extend(self.auto_contract_formulas(contract, env, span, is_post)?);
+        Ok(bool_and(formulas))
+    }
+
+    fn auto_contract_formulas(
+        &self,
+        contract: &FunctionContract,
+        env: &CallEnv,
+        span: Span,
+        is_post: bool,
+    ) -> Result<Vec<Bool>, VerificationResult> {
+        if is_post {
+            let Some(result) = env.current.get("result") else {
+                return Ok(Vec::new());
+            };
+            let Some(formula) = self.contract_spec_formula(contract.result, result, span)? else {
+                return Ok(Vec::new());
+            };
+            return Ok(vec![formula]);
+        }
+        let mut formulas = Vec::new();
+        for ContractParam { name, spec } in &contract.params {
+            let value = env.current.get(name).cloned().ok_or_else(|| {
+                self.unsupported_result(span, format!("missing contract binding `{name}`"))
+            })?;
+            if let Some(formula) = self.contract_spec_formula(*spec, &value, span)? {
+                formulas.push(formula);
+            }
+        }
+        Ok(formulas)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2245,10 +2506,9 @@ impl CallEnv {
     ) -> Result<Self, VerificationResult> {
         let mut current = HashMap::new();
         let mut prophecy = HashMap::new();
-        for (name, local) in contract
+        for (param, local) in contract
             .params
             .iter()
-            .cloned()
             .zip(verifier.body.local_decls.indices().skip(1))
         {
             let value = state.model.get(&local).cloned().ok_or_else(|| {
@@ -2258,14 +2518,14 @@ impl CallEnv {
                 )
             })?;
             prophecy.insert(
-                name.clone(),
+                param.name.clone(),
                 verifier.prophecy_from_typed_value(
                     verifier.body.local_decls[local].ty,
                     &value,
                     verifier.control_span(state.ctrl),
                 )?,
             );
-            current.insert(name, value);
+            current.insert(param.name.clone(), value);
         }
         if let Some(result) = state.model.get(&Local::from_usize(0)).cloned() {
             current.insert("result".to_owned(), result);

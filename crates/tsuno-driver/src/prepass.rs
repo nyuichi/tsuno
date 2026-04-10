@@ -10,7 +10,7 @@ use crate::spec::Expr;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{HirId, ItemKind, Pat, PatKind};
 use rustc_middle::mir::{BasicBlock, Body, Local, PlaceElem, StatementKind, TerminatorKind};
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{Span, Symbol};
 
@@ -69,15 +69,40 @@ pub struct AssumptionContracts {
     pub by_control_point: HashMap<(BasicBlock, usize), AssumptionContract>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoInvariantKind {
+    Trivial,
+    I32Range,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContractValueOrigin {
+    Direct,
+    Current,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContractValueSpec {
+    pub invariant: AutoInvariantKind,
+    pub origin: ContractValueOrigin,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContractParam {
+    pub name: String,
+    pub spec: ContractValueSpec,
+}
+
 #[derive(Debug, Clone)]
 pub struct FunctionContract {
-    pub params: Vec<String>,
+    pub params: Vec<ContractParam>,
     pub req: Expr,
     #[allow(dead_code)]
     pub req_span: String,
     pub ens: Expr,
     pub ens_span: String,
     pub spec_vars: Vec<String>,
+    pub result: ContractValueSpec,
 }
 
 #[allow(dead_code)]
@@ -300,21 +325,28 @@ pub fn compute_directives<'tcx>(
             _ => {}
         }
     }
-    let params = if req_directive.is_some() || ens_directive.is_some() {
+    let param_names = if req_directive.is_some() || ens_directive.is_some() {
         function_param_names(tcx, def_id).map_err(|err| LoopPrepassError {
             span: tcx.def_span(def_id.to_def_id()),
             display_span: None,
             message: err.message,
         })?
     } else {
-        Vec::new()
+        function_param_names_relaxed(tcx, def_id)
     };
+    let (params, result) = function_contract_signature_with_names(tcx, def_id, param_names.clone())
+        .map_err(|err| LoopPrepassError {
+            span: tcx.def_span(def_id.to_def_id()),
+            display_span: None,
+            message: err.message,
+        })?;
+    let has_auto_contract = has_auto_contract(&params, result);
     if let Some(directive) = req_directive {
         validate_function_contract_expr_prepass(
             directive.span,
             &directive.span_text,
             &directive.expr,
-            &params,
+            &param_names,
             false,
             &mut contract_scope,
         )?;
@@ -343,13 +375,26 @@ pub fn compute_directives<'tcx>(
             directive.span,
             &directive.span_text,
             &directive.expr,
-            &params,
+            &param_names,
             true,
             &mut contract_scope,
         )?;
     }
+    let def_span = tcx
+        .sess
+        .source_map()
+        .span_to_diagnostic_string(tcx.def_span(def_id.to_def_id()));
     let function_contract = match (req_directive, ens_directive) {
-        (None, None) => None,
+        (None, None) if !has_auto_contract => None,
+        (None, None) => Some(FunctionContract {
+            params: params.clone(),
+            req: Expr::Bool(true),
+            req_span: def_span.clone(),
+            ens: Expr::Bool(true),
+            ens_span: def_span,
+            spec_vars: contract_scope.ordered.clone(),
+            result,
+        }),
         (Some(req), Some(ens)) => Some(FunctionContract {
             params: params.clone(),
             req: req.expr.clone(),
@@ -357,6 +402,7 @@ pub fn compute_directives<'tcx>(
             ens: ens.expr.clone(),
             ens_span: ens.span_text.clone(),
             spec_vars: contract_scope.ordered.clone(),
+            result,
         }),
         _ => {
             return Err(LoopPrepassError {
@@ -702,14 +748,17 @@ fn build_function_contract<'tcx>(
     def_id: LocalDefId,
     directives: &[FunctionDirective],
 ) -> Result<Option<FunctionContract>, VerificationResult> {
-    let has_contract = directives
+    let has_manual_contract = directives
         .iter()
         .any(|directive| matches!(directive.kind, DirectiveKind::Req | DirectiveKind::Ens));
-    let params = if has_contract {
+    let param_names = if has_manual_contract {
         function_param_names(tcx, def_id)?
     } else {
-        Vec::new()
+        function_param_names_relaxed(tcx, def_id)
     };
+    let (params, result) =
+        function_contract_signature_with_names(tcx, def_id, param_names.clone())?;
+    let has_auto_contract = has_auto_contract(&params, result);
     let mut req = None;
     let mut ens = None;
     let mut spec_scope = SpecScope::default();
@@ -729,7 +778,7 @@ fn build_function_contract<'tcx>(
                     def_id,
                     &directive.expr,
                     &directive.span_text,
-                    &params,
+                    &param_names,
                     false,
                     &mut spec_scope,
                 )?;
@@ -749,7 +798,7 @@ fn build_function_contract<'tcx>(
                     def_id,
                     &directive.expr,
                     &directive.span_text,
-                    &params,
+                    &param_names,
                     true,
                     &mut spec_scope,
                 )?;
@@ -758,8 +807,21 @@ fn build_function_contract<'tcx>(
             _ => {}
         }
     }
+    let def_span = tcx
+        .sess
+        .source_map()
+        .span_to_diagnostic_string(tcx.def_span(def_id.to_def_id()));
     match (req, ens) {
-        (None, None) => Ok(None),
+        (None, None) if !has_auto_contract => Ok(None),
+        (None, None) => Ok(Some(FunctionContract {
+            params,
+            req: Expr::Bool(true),
+            req_span: def_span.clone(),
+            ens: Expr::Bool(true),
+            ens_span: def_span,
+            spec_vars: spec_scope.ordered,
+            result,
+        })),
         (Some((req, req_span)), Some((ens, ens_span))) => Ok(Some(FunctionContract {
             params,
             req,
@@ -767,8 +829,9 @@ fn build_function_contract<'tcx>(
             ens,
             ens_span,
             spec_vars: spec_scope.ordered,
+            result,
         })),
-        _ => Err(function_contract_error(
+        _ if has_manual_contract => Err(function_contract_error(
             tcx,
             def_id,
             &tcx.sess
@@ -776,6 +839,7 @@ fn build_function_contract<'tcx>(
                 .span_to_diagnostic_string(tcx.def_span(def_id.to_def_id())),
             "function contract requires exactly one //@ req and one //@ ens".to_owned(),
         )),
+        _ => Ok(None),
     }
 }
 
@@ -1106,6 +1170,81 @@ fn function_param_names<'tcx>(
         }
     }
     Ok(names)
+}
+
+fn function_param_names_relaxed<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Vec<String> {
+    let body = tcx.hir_body_owned_by(def_id);
+    body.params
+        .iter()
+        .enumerate()
+        .map(|(index, param)| match param.pat.kind {
+            PatKind::Binding(_, _, ident, _) => ident.name.to_string(),
+            _ => format!("arg{index}"),
+        })
+        .collect()
+}
+
+fn function_contract_signature_with_names<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    names: Vec<String>,
+) -> Result<(Vec<ContractParam>, ContractValueSpec), VerificationResult> {
+    let sig = tcx.fn_sig(def_id).instantiate_identity();
+    let inputs = sig.inputs().skip_binder();
+    if inputs.len() != names.len() {
+        return Err(function_contract_error(
+            tcx,
+            def_id,
+            &tcx.sess
+                .source_map()
+                .span_to_diagnostic_string(tcx.def_span(def_id.to_def_id())),
+            format!(
+                "function signature arity mismatch: names={}, inputs={}",
+                names.len(),
+                inputs.len()
+            ),
+        ));
+    }
+    let params = names
+        .into_iter()
+        .zip(inputs.iter().copied())
+        .map(|(name, ty)| ContractParam {
+            name,
+            spec: contract_value_spec(ty),
+        })
+        .collect();
+    Ok((params, contract_value_spec(sig.output().skip_binder())))
+}
+
+fn contract_value_spec<'tcx>(ty: Ty<'tcx>) -> ContractValueSpec {
+    match ty.kind() {
+        TyKind::Ref(_, inner, mutability) => ContractValueSpec {
+            invariant: type_invariant_kind(*inner),
+            origin: if mutability.is_mut() {
+                ContractValueOrigin::Current
+            } else {
+                ContractValueOrigin::Direct
+            },
+        },
+        _ => ContractValueSpec {
+            invariant: type_invariant_kind(ty),
+            origin: ContractValueOrigin::Direct,
+        },
+    }
+}
+
+fn type_invariant_kind<'tcx>(ty: Ty<'tcx>) -> AutoInvariantKind {
+    match ty.kind() {
+        TyKind::Int(ty::IntTy::I32) => AutoInvariantKind::I32Range,
+        _ => AutoInvariantKind::Trivial,
+    }
+}
+
+fn has_auto_contract(params: &[ContractParam], result: ContractValueSpec) -> bool {
+    params
+        .iter()
+        .any(|param| !matches!(param.spec.invariant, AutoInvariantKind::Trivial))
+        || !matches!(result.invariant, AutoInvariantKind::Trivial)
 }
 
 fn function_contract_error<'tcx>(
