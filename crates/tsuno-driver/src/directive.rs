@@ -6,7 +6,7 @@ use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;
 use rustc_span::def_id::LocalDefId;
 
-use crate::spec::{Expr, ParseError, parse_expr};
+use crate::spec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectiveKind {
@@ -49,7 +49,7 @@ pub struct FunctionDirective {
     pub span: Span,
     pub span_text: String,
     pub attach: DirectiveAttach,
-    pub expr: Expr,
+    pub expr: spec::Expr,
 }
 
 #[derive(Debug, Clone)]
@@ -134,14 +134,14 @@ fn parse_directive_expr(
     kind: DirectiveKind,
     text: &str,
     span: Span,
-) -> Result<Expr, DirectiveError> {
-    parse_expr(kind.keyword(), text).map_err(|err| DirectiveError {
+) -> Result<spec::Expr, DirectiveError> {
+    spec::parse_expr(kind.keyword(), text).map_err(|err| DirectiveError {
         span,
         message: render_parse_error(kind, err),
     })
 }
 
-fn render_parse_error(kind: DirectiveKind, err: ParseError) -> String {
+fn render_parse_error(kind: DirectiveKind, err: spec::ParseError) -> String {
     err.to_string().replace(
         "spec expression",
         &format!("//@ {} predicate", kind.keyword()),
