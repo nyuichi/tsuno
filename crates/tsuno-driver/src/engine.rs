@@ -469,7 +469,7 @@ impl<'tcx> Verifier<'tcx> {
             assumption_contracts,
             function_contract,
             spec_var_names,
-            mut prepass_error,
+            prepass_error,
         ) = match compute_directives(tcx, def_id, item_span, &body) {
             Ok(prepass) => (
                 prepass.loop_contracts,
@@ -495,13 +495,7 @@ impl<'tcx> Verifier<'tcx> {
                 }),
             ),
         };
-        let contracts = match compute_function_contracts(tcx, Some(def_id)) {
-            Ok(contracts) => contracts,
-            Err(error) => {
-                prepass_error.get_or_insert(error);
-                HashMap::new()
-            }
-        };
+        let contracts = compute_function_contracts(tcx, Some(def_id));
         let next_sym = Cell::new(0);
         let function_spec_vars = instantiate_spec_vars(&next_sym, &spec_var_names);
         let mut contracts = contracts;
@@ -786,9 +780,13 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Vec<State>, VerificationResult> {
         let callee = self.called_def_id(func);
-        if let Some(def_id) = callee
-            && let Some(contract) = self.contracts.get(&def_id)
-        {
+        if let Some(def_id) = callee {
+            let contract = self.contracts.get(&def_id).ok_or_else(|| {
+                self.unsupported_result(
+                    span,
+                    format!("missing local function contract for `{def_id:?}`"),
+                )
+            })?;
             let spec = self.instantiate_contract_spec_vars(&contract.spec_vars);
             let env = self.call_env(&state, args, contract, span, spec.clone())?;
             let req = self.contract_req_to_z3(contract, &env, span)?;

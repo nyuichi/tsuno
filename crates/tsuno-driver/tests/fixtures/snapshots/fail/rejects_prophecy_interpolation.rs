@@ -1,4 +1,3 @@
-//@ verify
 //@ req "true"
 //@ ens "{^:x} == 2"
 fn set_to_two(x: &mut i32) {

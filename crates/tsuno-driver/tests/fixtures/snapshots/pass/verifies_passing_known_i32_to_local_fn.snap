@@ -6,5 +6,9 @@ status: Some(0)
 stdout:
 PASS caller
   all assertions discharged
+PASS sink
+  all assertions discharged
+PASS main
+  all assertions discharged
 
 stderr:

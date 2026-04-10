@@ -1,4 +1,3 @@
-//@ verify
 fn mut_ref_model_everywhere(mut x: i32) {
     {
         let r = &mut x;

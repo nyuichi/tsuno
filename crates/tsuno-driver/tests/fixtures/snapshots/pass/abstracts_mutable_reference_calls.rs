@@ -3,7 +3,6 @@ fn bump(x: &mut i32) -> i32 {
     *x
 }
 
-//@ verify
 fn bad_after_call(mut x: i32) {
     let r = &mut x;
     let _ = bump(r);

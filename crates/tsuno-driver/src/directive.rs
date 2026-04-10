@@ -84,14 +84,6 @@ pub fn collect_function_directives<'tcx>(
     }
 }
 
-pub fn has_verify_marker(tcx: TyCtxt<'_>, span: Span) -> bool {
-    let loc = tcx.sess.source_map().lookup_char_pos(span.lo());
-    let Some(source) = loc.file.src.as_deref() else {
-        return false;
-    };
-    verify_marker_in_source(source, loc.line)
-}
-
 fn collect_contract_directives<'tcx>(
     tcx: TyCtxt<'tcx>,
     _def_id: LocalDefId,
@@ -630,45 +622,9 @@ fn spec_directive_line<'a>(
     Ok(Some((directive_pos, directive_line)))
 }
 
-fn verify_marker_in_source(source: &str, line: usize) -> bool {
-    if line <= 1 {
-        return false;
-    }
-    let mut current = line.saturating_sub(2);
-    while let Some(text) = source.lines().nth(current) {
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return false;
-        }
-        if !trimmed.starts_with("//@") {
-            return false;
-        }
-        if trimmed == "//@ verify" {
-            return true;
-        }
-        if current == 0 {
-            break;
-        }
-        current -= 1;
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{function_contract_lines_before_item, verify_marker_in_source};
-
-    #[test]
-    fn detects_verify_marker_on_previous_line() {
-        let source = "fn ignored() {}\n//@ verify\nfn marked() {}\n";
-        assert!(verify_marker_in_source(source, 3));
-    }
-
-    #[test]
-    fn ignores_non_adjacent_marker() {
-        let source = "//@ verify\n\nfn marked() {}\n";
-        assert!(!verify_marker_in_source(source, 3));
-    }
+    use super::function_contract_lines_before_item;
 
     #[test]
     fn collects_function_contract_lines_before_item() {

@@ -6,6 +6,8 @@ status: Some(1)
 stdout:
 UNSUPPORTED rejects_unevaluated_bool_const
   failed to evaluate boolean constant
-  src/main.rs:3:8: 3:9
+  src/main.rs:2:8: 2:9
+PASS main
+  all assertions discharged
 
 stderr:

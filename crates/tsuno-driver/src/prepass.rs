@@ -190,7 +190,7 @@ impl AssumptionContracts {
 pub fn compute_function_contracts<'tcx>(
     tcx: TyCtxt<'tcx>,
     skip_def_id: Option<LocalDefId>,
-) -> Result<HashMap<LocalDefId, FunctionContract>, VerificationResult> {
+) -> HashMap<LocalDefId, FunctionContract> {
     let mut contracts = HashMap::new();
     for item_id in tcx.hir_free_items() {
         let item = tcx.hir_item(item_id);
@@ -201,14 +201,15 @@ pub fn compute_function_contracts<'tcx>(
         if skip_def_id == Some(def_id) {
             continue;
         }
-        let directives = collect_function_directives(tcx, def_id, item.span)
-            .map_err(|err| directive_error_to_verification_result(tcx, def_id, err))?;
-        let Some(contract) = build_function_contract(tcx, def_id, &directives.directives)? else {
+        let Ok(directives) = collect_function_directives(tcx, def_id, item.span) else {
+            continue;
+        };
+        let Ok(contract) = build_function_contract(tcx, def_id, &directives.directives) else {
             continue;
         };
         contracts.insert(def_id, contract);
     }
-    Ok(contracts)
+    contracts
 }
 
 pub fn compute_hir_locals<'tcx>(
@@ -340,7 +341,6 @@ pub fn compute_directives<'tcx>(
             display_span: None,
             message: err.message,
         })?;
-    let has_auto_contract = has_auto_contract(&params, result);
     if let Some(directive) = req_directive {
         validate_function_contract_expr_prepass(
             directive.span,
@@ -385,7 +385,6 @@ pub fn compute_directives<'tcx>(
         .source_map()
         .span_to_diagnostic_string(tcx.def_span(def_id.to_def_id()));
     let function_contract = match (req_directive, ens_directive) {
-        (None, None) if !has_auto_contract => None,
         (None, None) => Some(FunctionContract {
             params: params.clone(),
             req: Expr::Bool(true),
@@ -555,19 +554,6 @@ fn directive_error_to_prepass(err: DirectiveError) -> LoopPrepassError {
     LoopPrepassError {
         span: err.span,
         display_span: None,
-        message: err.message,
-    }
-}
-
-fn directive_error_to_verification_result(
-    tcx: TyCtxt<'_>,
-    def_id: LocalDefId,
-    err: DirectiveError,
-) -> VerificationResult {
-    VerificationResult {
-        function: tcx.def_path_str(def_id.to_def_id()),
-        status: VerificationStatus::Unsupported,
-        span: tcx.sess.source_map().span_to_diagnostic_string(err.span),
         message: err.message,
     }
 }
@@ -747,7 +733,7 @@ fn build_function_contract<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     directives: &[FunctionDirective],
-) -> Result<Option<FunctionContract>, VerificationResult> {
+) -> Result<FunctionContract, VerificationResult> {
     let has_manual_contract = directives
         .iter()
         .any(|directive| matches!(directive.kind, DirectiveKind::Req | DirectiveKind::Ens));
@@ -758,7 +744,6 @@ fn build_function_contract<'tcx>(
     };
     let (params, result) =
         function_contract_signature_with_names(tcx, def_id, param_names.clone())?;
-    let has_auto_contract = has_auto_contract(&params, result);
     let mut req = None;
     let mut ens = None;
     let mut spec_scope = SpecScope::default();
@@ -812,8 +797,7 @@ fn build_function_contract<'tcx>(
         .source_map()
         .span_to_diagnostic_string(tcx.def_span(def_id.to_def_id()));
     match (req, ens) {
-        (None, None) if !has_auto_contract => Ok(None),
-        (None, None) => Ok(Some(FunctionContract {
+        (None, None) => Ok(FunctionContract {
             params,
             req: Expr::Bool(true),
             req_span: def_span.clone(),
@@ -821,8 +805,8 @@ fn build_function_contract<'tcx>(
             ens_span: def_span,
             spec_vars: spec_scope.ordered,
             result,
-        })),
-        (Some((req, req_span)), Some((ens, ens_span))) => Ok(Some(FunctionContract {
+        }),
+        (Some((req, req_span)), Some((ens, ens_span))) => Ok(FunctionContract {
             params,
             req,
             req_span,
@@ -830,8 +814,8 @@ fn build_function_contract<'tcx>(
             ens_span,
             spec_vars: spec_scope.ordered,
             result,
-        })),
-        _ if has_manual_contract => Err(function_contract_error(
+        }),
+        _ => Err(function_contract_error(
             tcx,
             def_id,
             &tcx.sess
@@ -839,7 +823,6 @@ fn build_function_contract<'tcx>(
                 .span_to_diagnostic_string(tcx.def_span(def_id.to_def_id())),
             "function contract requires exactly one //@ req and one //@ ens".to_owned(),
         )),
-        _ => Ok(None),
     }
 }
 
@@ -1238,13 +1221,6 @@ fn type_invariant_kind<'tcx>(ty: Ty<'tcx>) -> AutoInvariantKind {
         TyKind::Int(ty::IntTy::I32) => AutoInvariantKind::I32Range,
         _ => AutoInvariantKind::Trivial,
     }
-}
-
-fn has_auto_contract(params: &[ContractParam], result: ContractValueSpec) -> bool {
-    params
-        .iter()
-        .any(|param| !matches!(param.spec.invariant, AutoInvariantKind::Trivial))
-        || !matches!(result.invariant, AutoInvariantKind::Trivial)
 }
 
 fn function_contract_error<'tcx>(

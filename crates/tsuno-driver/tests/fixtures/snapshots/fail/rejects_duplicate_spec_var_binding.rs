@@ -1,4 +1,3 @@
-//@ verify
 fn rejects_duplicate_spec_var_binding() {
     //@ assert "?X == 0"
     let _a = 0;
