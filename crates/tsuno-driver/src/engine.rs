@@ -2317,11 +2317,11 @@ mod tests {
             let list3 = encoding.list(&[encoding.int(2), encoding.bool(true)]);
 
             with_solver(|solver| {
-                solver.assert(&encoding.is_true(&encoding.eqv(&list1, &list2)));
+                solver.assert(encoding.is_true(&encoding.eqv(&list1, &list2)));
                 assert_eq!(solver.check(), SatResult::Sat);
                 solver.reset();
 
-                solver.assert(&encoding.is_true(&encoding.eqv(&list1, &list3)));
+                solver.assert(encoding.is_true(&encoding.eqv(&list1, &list3)));
                 assert_eq!(solver.check(), SatResult::Unsat);
             });
         });
@@ -2333,7 +2333,7 @@ mod tests {
         with_value_encoding(|encoding| {
             let sum = encoding.add(&encoding.error(), &encoding.int(1));
             with_solver(|solver| {
-                solver.assert(&encoding.is_error(&sum));
+                solver.assert(encoding.is_error(&sum));
                 assert_eq!(solver.check(), SatResult::Sat);
             });
         });
@@ -2344,15 +2344,15 @@ mod tests {
         reset_solver();
         with_value_encoding(|encoding| {
             with_solver(|solver| {
-                solver.assert(&encoding.is_true(&encoding.bool(true)));
+                solver.assert(encoding.is_true(&encoding.bool(true)));
                 assert_eq!(solver.check(), SatResult::Sat);
                 solver.reset();
 
-                solver.assert(&encoding.is_true(&encoding.bool(false)));
+                solver.assert(encoding.is_true(&encoding.bool(false)));
                 assert_eq!(solver.check(), SatResult::Unsat);
                 solver.reset();
 
-                solver.assert(&encoding.is_true(&encoding.error()));
+                solver.assert(encoding.is_true(&encoding.error()));
                 assert_eq!(solver.check(), SatResult::Unsat);
             });
         });
