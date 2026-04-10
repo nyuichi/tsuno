@@ -6,6 +6,8 @@ status: Some(1)
 stdout:
 FAIL bad_loop
   loop invariant does not hold
-  src/main.rs:7:7: 7:31
+  src/main.rs:6:7: 6:31
+PASS main
+  all assertions discharged
 
 stderr:

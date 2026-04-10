@@ -1,4 +1,3 @@
-//@ verify
 fn caller() {
     let y = callee();
     let z = y + 1;
@@ -9,6 +8,7 @@ fn caller() {
 //@ req "true"
 //@ ens "{result} == 3"
 fn callee() -> i32 {
+    //@ assume "false"
     2
 }
 

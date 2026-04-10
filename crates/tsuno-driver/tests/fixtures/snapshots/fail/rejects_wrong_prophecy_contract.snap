@@ -6,6 +6,8 @@ status: Some(1)
 stdout:
 FAIL set_to_two
   mutable reference close failed
-  src/main.rs:6:2: 6:2
+  src/main.rs:5:2: 5:2
+PASS main
+  all assertions discharged
 
 stderr:

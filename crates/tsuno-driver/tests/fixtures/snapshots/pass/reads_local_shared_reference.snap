@@ -1,10 +1,13 @@
 ---
 source: crates/tsuno-driver/tests/snapshot_tests.rs
+assertion_line: 85
 expression: snapshot_output(output)
 ---
 status: Some(0)
 stdout:
 PASS reads_local_shared_reference
+  all assertions discharged
+PASS main
   all assertions discharged
 
 stderr:

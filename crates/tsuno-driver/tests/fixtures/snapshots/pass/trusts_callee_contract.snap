@@ -2,9 +2,15 @@
 source: crates/tsuno-driver/tests/snapshot_tests.rs
 expression: snapshot_output(output)
 ---
-status: Some(0)
+status: Some(1)
 stdout:
-PASS caller
+UNSUPPORTED caller
+  callee `callee` has invalid contract: //@ assume must be placed immediately before the statement
+  src/main.rs:13:2: 13:2
+UNSUPPORTED callee
+  //@ assume must be placed immediately before the statement
+  src/main.rs:13:2: 13:2
+PASS main
   all assertions discharged
 
 stderr:

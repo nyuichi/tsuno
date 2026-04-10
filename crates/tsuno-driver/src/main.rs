@@ -15,7 +15,6 @@ mod spec;
 
 use std::env;
 
-use crate::directive::has_verify_marker;
 use crate::engine::Verifier;
 use crate::report::{VerificationResult, print_report};
 use rustc_driver::{Callbacks, Compilation, run_compiler};
@@ -60,9 +59,6 @@ impl Callbacks for VerifyCallbacks {
                 continue;
             }
             let local_def_id = item.owner_id.def_id;
-            if !has_verify_marker(tcx, item.span) {
-                continue;
-            }
             let body = tcx
                 .mir_drops_elaborated_and_const_checked(local_def_id)
                 .steal();

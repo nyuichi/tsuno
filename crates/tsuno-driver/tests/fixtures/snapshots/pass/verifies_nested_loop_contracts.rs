@@ -1,4 +1,3 @@
-//@ verify
 fn nested_loops(mut x: i32) {
     let limit = 3_i32;
     while x < limit

@@ -1,4 +1,3 @@
-//@ verify
 fn reads_shared_reborrow_from_mut_ref(mut x: i32) {
     let m = &mut x;
     *m = 2;

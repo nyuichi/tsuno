@@ -4,7 +4,11 @@ expression: snapshot_output(output)
 ---
 status: Some(0)
 stdout:
+PASS bump
+  all assertions discharged
 PASS bad_after_call
+  all assertions discharged
+PASS main
   all assertions discharged
 
 stderr:

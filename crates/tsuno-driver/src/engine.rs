@@ -19,8 +19,8 @@ use z3::{
 
 use crate::prepass::{
     AssertionContracts, AssumptionContracts, AutoInvariantKind, ContractParam, ContractValueOrigin,
-    ContractValueSpec, FunctionContract, LoopContract, LoopContracts, ResolvedExprEnv,
-    compute_directives, compute_function_contracts,
+    ContractValueSpec, FunctionContract, FunctionContractEntry, LoopContract, LoopContracts,
+    ResolvedExprEnv, compute_directives, compute_function_contracts,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{BinaryOp, Expr, UnaryOp};
@@ -452,7 +452,7 @@ pub struct Verifier<'tcx> {
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     body: Body<'tcx>,
-    contracts: HashMap<LocalDefId, FunctionContract>,
+    contracts: HashMap<LocalDefId, FunctionContractEntry>,
     function_spec_vars: HashMap<String, Datatype>,
     loop_contracts: LoopContracts,
     assertion_contracts: AssertionContracts,
@@ -469,7 +469,7 @@ impl<'tcx> Verifier<'tcx> {
             assumption_contracts,
             function_contract,
             spec_var_names,
-            mut prepass_error,
+            prepass_error,
         ) = match compute_directives(tcx, def_id, item_span, &body) {
             Ok(prepass) => (
                 prepass.loop_contracts,
@@ -495,18 +495,14 @@ impl<'tcx> Verifier<'tcx> {
                 }),
             ),
         };
-        let contracts = match compute_function_contracts(tcx, Some(def_id)) {
-            Ok(contracts) => contracts,
-            Err(error) => {
-                prepass_error.get_or_insert(error);
-                HashMap::new()
-            }
-        };
+        let contracts = compute_function_contracts(tcx, Some(def_id));
         let next_sym = Cell::new(0);
         let function_spec_vars = instantiate_spec_vars(&next_sym, &spec_var_names);
         let mut contracts = contracts;
         if let Some(contract) = function_contract {
-            contracts.insert(def_id, contract);
+            contracts.insert(def_id, FunctionContractEntry::Ready(contract));
+        } else if let Some(error) = prepass_error.clone() {
+            contracts.insert(def_id, FunctionContractEntry::Invalid(error));
         }
         Self {
             tcx,
@@ -679,7 +675,9 @@ impl<'tcx> Verifier<'tcx> {
                 self.goto_target(state, *target, term.source_info.span)
             }
             TerminatorKind::Return => {
-                if let Some(contract) = self.contracts.get(&self.def_id) {
+                if let Some(FunctionContractEntry::Ready(contract)) =
+                    self.contracts.get(&self.def_id)
+                {
                     let formula = self.function_postcondition_to_z3(&state, contract)?;
                     self.require_constraint(
                         &mut state,
@@ -786,9 +784,14 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Vec<State>, VerificationResult> {
         let callee = self.called_def_id(func);
-        if let Some(def_id) = callee
-            && let Some(contract) = self.contracts.get(&def_id)
-        {
+        if let Some(def_id) = callee {
+            let contract = match self.contracts.get(&def_id) {
+                Some(FunctionContractEntry::Ready(contract)) => contract,
+                Some(FunctionContractEntry::Invalid(error)) => {
+                    return Err(self.invalid_local_contract_result(def_id, error));
+                }
+                None => return Err(self.missing_local_contract_result(def_id, span)),
+            };
             let spec = self.instantiate_contract_spec_vars(&contract.spec_vars);
             let env = self.call_env(&state, args, contract, span, spec.clone())?;
             let req = self.contract_req_to_z3(contract, &env, span)?;
@@ -1028,7 +1031,7 @@ impl<'tcx> Verifier<'tcx> {
             let value = self.fresh_for_rust_ty(ty, &format!("arg_{}", local.as_usize()))?;
             state.model.insert(local, value);
         }
-        if let Some(contract) = self.contracts.get(&self.def_id) {
+        if let Some(FunctionContractEntry::Ready(contract)) = self.contracts.get(&self.def_id) {
             let env =
                 CallEnv::for_function(self, &state, contract, self.function_spec_vars.clone())?;
             let req = self.contract_req_to_z3(contract, &env, self.tcx.def_span(self.def_id))?;
@@ -1943,6 +1946,28 @@ impl<'tcx> Verifier<'tcx> {
             return None;
         };
         def_id.as_local()
+    }
+
+    fn missing_local_contract_result(&self, def_id: LocalDefId, span: Span) -> VerificationResult {
+        let callee = self.tcx.def_path_str(def_id.to_def_id());
+        self.unsupported_result(
+            span,
+            format!("missing local function contract for `{callee}`"),
+        )
+    }
+
+    fn invalid_local_contract_result(
+        &self,
+        def_id: LocalDefId,
+        err: &VerificationResult,
+    ) -> VerificationResult {
+        let callee = self.tcx.def_path_str(def_id.to_def_id());
+        VerificationResult {
+            function: self.tcx.def_path_str(self.def_id.to_def_id()),
+            status: err.status.clone(),
+            span: err.span.clone(),
+            message: format!("callee `{callee}` has invalid contract: {}", err.message),
+        }
     }
 
     fn place_ty(&self, place: Place<'tcx>) -> Ty<'tcx> {

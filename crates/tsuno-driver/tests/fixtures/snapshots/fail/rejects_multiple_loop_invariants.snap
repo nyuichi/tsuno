@@ -6,6 +6,8 @@ status: Some(1)
 stdout:
 UNSUPPORTED bad_loop
   loop header may contain exactly one //@ inv before the body
-  src/main.rs:7:9: 7:19
+  src/main.rs:6:9: 6:19
+PASS main
+  all assertions discharged
 
 stderr:

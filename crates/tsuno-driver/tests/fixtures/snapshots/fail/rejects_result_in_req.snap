@@ -6,6 +6,8 @@ status: Some(1)
 stdout:
 UNSUPPORTED bad
   `result` is only supported in //@ ens predicates
-  src/main.rs:2:1: 2:24
+  src/main.rs:1:1: 1:24
+PASS main
+  all assertions discharged
 
 stderr:

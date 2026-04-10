@@ -1,4 +1,3 @@
-//@ verify
 fn caller() {
     sink(1_i32);
 }
