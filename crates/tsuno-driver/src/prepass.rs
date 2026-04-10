@@ -243,6 +243,16 @@ impl SpecScope {
         self.ordered.push(name.to_owned());
         Ok(())
     }
+
+    fn ordered_with(&self, other: &Self) -> Vec<String> {
+        let mut names = self.ordered.clone();
+        for name in &other.ordered {
+            if !self.bound.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        names
+    }
 }
 
 struct ExprResolutionContext<'a> {
@@ -264,7 +274,7 @@ pub fn compute_directives<'tcx>(
     let hir_locals = compute_hir_locals(tcx, body, &binding_info);
     let directives =
         collect_function_directives(tcx, def_id, item_span).map_err(directive_error_to_prepass)?;
-    let mut spec_scope = SpecScope::default();
+    let mut contract_scope = SpecScope::default();
     let mut req_directive = None;
     let mut ens_directive = None;
     for directive in &directives.directives {
@@ -306,9 +316,10 @@ pub fn compute_directives<'tcx>(
             &directive.expr,
             &params,
             false,
-            &mut spec_scope,
+            &mut contract_scope,
         )?;
     }
+    let mut body_scope = contract_scope.clone();
     let mut resolved_exprs = HashMap::new();
     for directive in directives.directives.iter().filter(|directive| {
         matches!(
@@ -323,7 +334,7 @@ pub fn compute_directives<'tcx>(
             directive.span,
             directive_anchor_span(&directive.attach),
             directive.kind,
-            &mut spec_scope,
+            &mut body_scope,
         )?;
         resolved_exprs.insert(directive.span_text.clone(), resolution);
     }
@@ -334,7 +345,7 @@ pub fn compute_directives<'tcx>(
             &directive.expr,
             &params,
             true,
-            &mut spec_scope,
+            &mut contract_scope,
         )?;
     }
     let function_contract = match (req_directive, ens_directive) {
@@ -345,7 +356,7 @@ pub fn compute_directives<'tcx>(
             req_span: req.span_text.clone(),
             ens: ens.expr.clone(),
             ens_span: ens.span_text.clone(),
-            spec_vars: spec_scope.ordered.clone(),
+            spec_vars: contract_scope.ordered.clone(),
         }),
         _ => {
             return Err(LoopPrepassError {
@@ -490,7 +501,7 @@ pub fn compute_directives<'tcx>(
         assertion_contracts,
         assumption_contracts,
         function_contract,
-        spec_vars: spec_scope.ordered,
+        spec_vars: body_scope.ordered_with(&contract_scope),
     })
 }
 
