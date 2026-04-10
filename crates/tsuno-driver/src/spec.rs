@@ -3,7 +3,7 @@ pub enum Expr {
     Bool(bool),
     Int(i64),
     Var(String),
-    Result,
+    Bind(String),
     Prophecy(String),
     Field {
         base: Box<Expr>,
@@ -182,6 +182,7 @@ enum Token {
     RParen,
     Comma,
     Dot,
+    Question,
     Plus,
     Minus,
     Star,
@@ -250,6 +251,10 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
             '.' => {
                 chars.next();
                 tokens.push(Token::Dot);
+            }
+            '?' => {
+                chars.next();
+                tokens.push(Token::Question);
             }
             '+' => {
                 chars.next();
@@ -494,8 +499,13 @@ impl Parser {
         match self.next() {
             Some(Token::Bool(value)) => Ok(Expr::Bool(*value)),
             Some(Token::Int(value)) => Ok(Expr::Int(*value)),
+            Some(Token::Question) => {
+                let Some(Token::Ident(ident)) = self.next() else {
+                    return Err(ParseError::new("expected identifier after `?`"));
+                };
+                Ok(Expr::Bind(ident.clone()))
+            }
             Some(Token::Ident(ident)) if ident == "__prophecy" => self.parse_prophecy_call(),
-            Some(Token::Ident(ident)) if ident == "result" => Ok(Expr::Result),
             Some(Token::Ident(ident)) => Ok(Expr::Var(ident.clone())),
             Some(Token::LParen) => {
                 let expr = self.parse_expr()?;
@@ -579,13 +589,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_result_only_in_surface_ast() {
-        let expr = parse_expr("ens", r#""{result} == 3""#).expect("expr");
+    fn parses_bind_expression() {
+        let expr = parse_expr("assert", r#""?x == 3""#).expect("expr");
         assert_eq!(
             expr,
             Expr::Binary {
                 op: BinaryOp::Eq,
-                lhs: Box::new(Expr::Result),
+                lhs: Box::new(Expr::Bind("x".to_owned())),
                 rhs: Box::new(Expr::Int(3)),
             }
         );
