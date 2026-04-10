@@ -6,7 +6,7 @@ use crate::directive::{
     collect_function_directives,
 };
 use crate::report::{VerificationResult, VerificationStatus};
-use crate::spec_syntax::{SpecBinaryOp, SpecExpr, SpecUnaryOp};
+use crate::spec::{BinaryOp, Expr, UnaryOp};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{HirId, ItemKind, Pat, PatKind};
 use rustc_middle::mir::{BasicBlock, Body, Local, PlaceElem, StatementKind, TerminatorKind};
@@ -32,11 +32,11 @@ pub enum MirSpecExpr {
         index: usize,
     },
     Unary {
-        op: SpecUnaryOp,
+        op: UnaryOp,
         arg: Box<MirSpecExpr>,
     },
     Binary {
-        op: SpecBinaryOp,
+        op: BinaryOp,
         lhs: Box<MirSpecExpr>,
         rhs: Box<MirSpecExpr>,
     },
@@ -84,10 +84,10 @@ pub struct AssumptionContracts {
 #[derive(Debug, Clone)]
 pub struct FunctionContract {
     pub params: Vec<String>,
-    pub req: SpecExpr,
+    pub req: Expr,
     #[allow(dead_code)]
     pub req_span: String,
-    pub ens: SpecExpr,
+    pub ens: Expr,
     pub ens_span: String,
 }
 
@@ -110,7 +110,7 @@ pub struct LoweredDirective {
     pub span_text: String,
     pub kind: DirectiveKind,
     pub target: LoweredDirectiveTarget,
-    pub expr: SpecExpr,
+    pub expr: Expr,
 }
 
 #[allow(dead_code)]
@@ -708,22 +708,18 @@ fn validate_function_contract_expr<'tcx>(
     def_id: LocalDefId,
     span: &str,
     kind: &str,
-    expr: &SpecExpr,
+    expr: &Expr,
 ) -> Result<(), VerificationResult> {
     match expr {
-        SpecExpr::Result if kind != "ens" => Err(function_contract_error(
+        Expr::Result if kind != "ens" => Err(function_contract_error(
             tcx,
             def_id,
             span,
             "`result` is only supported in //@ ens predicates".to_owned(),
         )),
-        SpecExpr::Field { base, .. } => {
-            validate_function_contract_expr(tcx, def_id, span, kind, base)
-        }
-        SpecExpr::Unary { arg, .. } => {
-            validate_function_contract_expr(tcx, def_id, span, kind, arg)
-        }
-        SpecExpr::Binary { lhs, rhs, .. } => {
+        Expr::Field { base, .. } => validate_function_contract_expr(tcx, def_id, span, kind, base),
+        Expr::Unary { arg, .. } => validate_function_contract_expr(tcx, def_id, span, kind, arg),
+        Expr::Binary { lhs, rhs, .. } => {
             validate_function_contract_expr(tcx, def_id, span, kind, lhs)?;
             validate_function_contract_expr(tcx, def_id, span, kind, rhs)
         }
@@ -735,21 +731,21 @@ fn validate_function_contract_expr_prepass(
     span: Span,
     span_text: &str,
     kind: &str,
-    expr: &SpecExpr,
+    expr: &Expr,
 ) -> Result<(), LoopPrepassError> {
     match expr {
-        SpecExpr::Result if kind != "ens" => Err(LoopPrepassError {
+        Expr::Result if kind != "ens" => Err(LoopPrepassError {
             span,
             display_span: Some(span_text.to_owned()),
             message: "`result` is only supported in //@ ens predicates".to_owned(),
         }),
-        SpecExpr::Field { base, .. } => {
+        Expr::Field { base, .. } => {
             validate_function_contract_expr_prepass(span, span_text, kind, base)
         }
-        SpecExpr::Unary { arg, .. } => {
+        Expr::Unary { arg, .. } => {
             validate_function_contract_expr_prepass(span, span_text, kind, arg)
         }
-        SpecExpr::Binary { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. } => {
             validate_function_contract_expr_prepass(span, span_text, kind, lhs)?;
             validate_function_contract_expr_prepass(span, span_text, kind, rhs)
         }
@@ -758,7 +754,7 @@ fn validate_function_contract_expr_prepass(
 }
 
 fn lower_spec_expr_to_mir(
-    expr: &SpecExpr,
+    expr: &Expr,
     binding_info: &HirBindingInfo,
     hir_locals: &HashMap<HirId, Local>,
     span: Span,
@@ -766,9 +762,9 @@ fn lower_spec_expr_to_mir(
     kind: DirectiveKind,
 ) -> Result<MirSpecExpr, LoopPrepassError> {
     match expr {
-        SpecExpr::Bool(value) => Ok(MirSpecExpr::Bool(*value)),
-        SpecExpr::Int(value) => Ok(MirSpecExpr::Int(*value)),
-        SpecExpr::Var(name) => {
+        Expr::Bool(value) => Ok(MirSpecExpr::Bool(*value)),
+        Expr::Int(value) => Ok(MirSpecExpr::Int(*value)),
+        Expr::Var(name) => {
             let symbol = Symbol::intern(name);
             let Some(hir_id) = resolve_binding_hir_id(binding_info, symbol, anchor_span) else {
                 return Err(LoopPrepassError {
@@ -786,12 +782,12 @@ fn lower_spec_expr_to_mir(
             };
             Ok(MirSpecExpr::Var(local))
         }
-        SpecExpr::Result => Err(LoopPrepassError {
+        Expr::Result => Err(LoopPrepassError {
             span,
             display_span: None,
             message: "`result` is only supported in //@ ens predicates".to_owned(),
         }),
-        SpecExpr::Prophecy(name) => {
+        Expr::Prophecy(name) => {
             let symbol = Symbol::intern(name);
             let Some(hir_id) = resolve_binding_hir_id(binding_info, symbol, anchor_span) else {
                 return Err(LoopPrepassError {
@@ -809,7 +805,7 @@ fn lower_spec_expr_to_mir(
             };
             Ok(MirSpecExpr::Prophecy(local))
         }
-        SpecExpr::Field { base, index } => Ok(MirSpecExpr::Field {
+        Expr::Field { base, index } => Ok(MirSpecExpr::Field {
             base: Box::new(lower_spec_expr_to_mir(
                 base,
                 binding_info,
@@ -820,7 +816,7 @@ fn lower_spec_expr_to_mir(
             )?),
             index: *index,
         }),
-        SpecExpr::Unary { op, arg } => Ok(MirSpecExpr::Unary {
+        Expr::Unary { op, arg } => Ok(MirSpecExpr::Unary {
             op: *op,
             arg: Box::new(lower_spec_expr_to_mir(
                 arg,
@@ -831,7 +827,7 @@ fn lower_spec_expr_to_mir(
                 kind,
             )?),
         }),
-        SpecExpr::Binary { op, lhs, rhs } => Ok(MirSpecExpr::Binary {
+        Expr::Binary { op, lhs, rhs } => Ok(MirSpecExpr::Binary {
             op: *op,
             lhs: Box::new(lower_spec_expr_to_mir(
                 lhs,

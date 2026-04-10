@@ -11,7 +11,7 @@ mod directive;
 mod engine;
 mod prepass;
 mod report;
-mod spec_syntax;
+mod spec;
 
 use std::env;
 

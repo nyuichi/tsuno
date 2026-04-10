@@ -1,33 +1,33 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SpecExpr {
+pub enum Expr {
     Bool(bool),
     Int(i64),
     Var(String),
     Result,
     Prophecy(String),
     Field {
-        base: Box<SpecExpr>,
+        base: Box<Expr>,
         index: usize,
     },
     Unary {
-        op: SpecUnaryOp,
-        arg: Box<SpecExpr>,
+        op: UnaryOp,
+        arg: Box<Expr>,
     },
     Binary {
-        op: SpecBinaryOp,
-        lhs: Box<SpecExpr>,
-        rhs: Box<SpecExpr>,
+        op: BinaryOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpecUnaryOp {
+pub enum UnaryOp {
     Not,
     Neg,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpecBinaryOp {
+pub enum BinaryOp {
     Add,
     Sub,
     Mul,
@@ -42,11 +42,11 @@ pub enum SpecBinaryOp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpecParseError {
+pub struct ParseError {
     message: String,
 }
 
-impl SpecParseError {
+impl ParseError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -54,29 +54,29 @@ impl SpecParseError {
     }
 }
 
-impl std::fmt::Display for SpecParseError {
+impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
     }
 }
 
-impl std::error::Error for SpecParseError {}
+impl std::error::Error for ParseError {}
 
-pub fn parse_spec_expr(kind: &str, text: &str) -> Result<SpecExpr, SpecParseError> {
+pub fn parse_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
     let decoded = decode_string_literal(kind, text)?;
-    let expanded = expand_spec_template(kind, &decoded)?;
+    let expanded = expand_template(kind, &decoded)?;
     let mut parser = Parser::new(&expanded)?;
     let expr = parser.parse_expr()?;
     parser.expect_end()?;
     Ok(expr)
 }
 
-fn decode_string_literal(kind: &str, text: &str) -> Result<String, SpecParseError> {
+fn decode_string_literal(kind: &str, text: &str) -> Result<String, ParseError> {
     let Some(inner) = text
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'))
     else {
-        return Err(SpecParseError::new(format!(
+        return Err(ParseError::new(format!(
             "failed to parse //@ {kind} predicate: expected string literal"
         )));
     };
@@ -89,7 +89,7 @@ fn decode_string_literal(kind: &str, text: &str) -> Result<String, SpecParseErro
             continue;
         }
         let Some(esc) = chars.next() else {
-            return Err(SpecParseError::new(format!(
+            return Err(ParseError::new(format!(
                 "failed to parse //@ {kind} predicate: trailing escape in string literal"
             )));
         };
@@ -101,7 +101,7 @@ fn decode_string_literal(kind: &str, text: &str) -> Result<String, SpecParseErro
             't' => out.push('\t'),
             '0' => out.push('\0'),
             _ => {
-                return Err(SpecParseError::new(format!(
+                return Err(ParseError::new(format!(
                     "failed to parse //@ {kind} predicate: unsupported escape `\\{esc}`"
                 )));
             }
@@ -111,7 +111,7 @@ fn decode_string_literal(kind: &str, text: &str) -> Result<String, SpecParseErro
     Ok(out)
 }
 
-fn expand_spec_template(kind: &str, raw: &str) -> Result<String, SpecParseError> {
+fn expand_template(kind: &str, raw: &str) -> Result<String, ParseError> {
     let mut out = String::new();
     let mut chars = raw.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -137,18 +137,18 @@ fn expand_spec_template(kind: &str, raw: &str) -> Result<String, SpecParseError>
                     inner.push(next);
                 }
                 if !closed {
-                    return Err(SpecParseError::new(format!(
+                    return Err(ParseError::new(format!(
                         "unclosed `{{` in //@ {kind} template"
                     )));
                 }
                 let inner = inner.trim();
                 if inner.is_empty() {
-                    return Err(SpecParseError::new(format!(
+                    return Err(ParseError::new(format!(
                         "empty interpolation in //@ {kind} template"
                     )));
                 }
                 if inner.strip_prefix("^:").is_some() {
-                    return Err(SpecParseError::new(format!(
+                    return Err(ParseError::new(format!(
                         "prophecy interpolation is unsupported in //@ {} templates; use `.cur` / `.fin`",
                         kind
                     )));
@@ -162,7 +162,7 @@ fn expand_spec_template(kind: &str, raw: &str) -> Result<String, SpecParseError>
                     chars.next();
                     out.push('}');
                 } else {
-                    return Err(SpecParseError::new(format!(
+                    return Err(ParseError::new(format!(
                         "unmatched `}}` in //@ {kind} template"
                     )));
                 }
@@ -196,7 +196,7 @@ enum Token {
     OrOr,
 }
 
-fn lex_expr(text: &str) -> Result<Vec<Token>, SpecParseError> {
+fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
     let mut tokens = Vec::new();
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.peek().copied() {
@@ -216,7 +216,7 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, SpecParseError> {
                 }
                 let value = digits
                     .parse::<i64>()
-                    .map_err(|_| SpecParseError::new("integer literal is too large"))?;
+                    .map_err(|_| ParseError::new("integer literal is too large"))?;
                 tokens.push(Token::Int(value));
             }
             'a'..='z' | 'A'..='Z' | '_' => {
@@ -277,7 +277,7 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, SpecParseError> {
                 if chars.next() == Some('=') {
                     tokens.push(Token::EqEq);
                 } else {
-                    return Err(SpecParseError::new("unexpected `=` in spec expression"));
+                    return Err(ParseError::new("unexpected `=` in spec expression"));
                 }
             }
             '>' => {
@@ -303,7 +303,7 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, SpecParseError> {
                 if chars.next() == Some('&') {
                     tokens.push(Token::AndAnd);
                 } else {
-                    return Err(SpecParseError::new("unexpected `&` in spec expression"));
+                    return Err(ParseError::new("unexpected `&` in spec expression"));
                 }
             }
             '|' => {
@@ -311,11 +311,11 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, SpecParseError> {
                 if chars.next() == Some('|') {
                     tokens.push(Token::OrOr);
                 } else {
-                    return Err(SpecParseError::new("unexpected `|` in spec expression"));
+                    return Err(ParseError::new("unexpected `|` in spec expression"));
                 }
             }
             _ => {
-                return Err(SpecParseError::new(format!(
+                return Err(ParseError::new(format!(
                     "unexpected character `{ch}` in spec expression"
                 )));
             }
@@ -330,33 +330,33 @@ struct Parser {
 }
 
 impl Parser {
-    fn new(text: &str) -> Result<Self, SpecParseError> {
+    fn new(text: &str) -> Result<Self, ParseError> {
         Ok(Self {
             tokens: lex_expr(text)?,
             cursor: 0,
         })
     }
 
-    fn parse_expr(&mut self) -> Result<SpecExpr, SpecParseError> {
+    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
         self.parse_or()
     }
 
-    fn expect_end(&self) -> Result<(), SpecParseError> {
+    fn expect_end(&self) -> Result<(), ParseError> {
         if self.cursor == self.tokens.len() {
             Ok(())
         } else {
-            Err(SpecParseError::new(
+            Err(ParseError::new(
                 "unexpected trailing tokens in spec expression",
             ))
         }
     }
 
-    fn parse_or(&mut self) -> Result<SpecExpr, SpecParseError> {
+    fn parse_or(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_and()?;
         while self.eat(&Token::OrOr) {
             let rhs = self.parse_and()?;
-            expr = SpecExpr::Binary {
-                op: SpecBinaryOp::Or,
+            expr = Expr::Binary {
+                op: BinaryOp::Or,
                 lhs: Box::new(expr),
                 rhs: Box::new(rhs),
             };
@@ -364,12 +364,12 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_and(&mut self) -> Result<SpecExpr, SpecParseError> {
+    fn parse_and(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_eq()?;
         while self.eat(&Token::AndAnd) {
             let rhs = self.parse_eq()?;
-            expr = SpecExpr::Binary {
-                op: SpecBinaryOp::And,
+            expr = Expr::Binary {
+                op: BinaryOp::And,
                 lhs: Box::new(expr),
                 rhs: Box::new(rhs),
             };
@@ -377,13 +377,13 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_eq(&mut self) -> Result<SpecExpr, SpecParseError> {
+    fn parse_eq(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_cmp()?;
         loop {
             let op = if self.eat(&Token::EqEq) {
-                Some(SpecBinaryOp::Eq)
+                Some(BinaryOp::Eq)
             } else if self.eat(&Token::Ne) {
-                Some(SpecBinaryOp::Ne)
+                Some(BinaryOp::Ne)
             } else {
                 None
             };
@@ -391,7 +391,7 @@ impl Parser {
                 break;
             };
             let rhs = self.parse_cmp()?;
-            expr = SpecExpr::Binary {
+            expr = Expr::Binary {
                 op,
                 lhs: Box::new(expr),
                 rhs: Box::new(rhs),
@@ -400,17 +400,17 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_cmp(&mut self) -> Result<SpecExpr, SpecParseError> {
+    fn parse_cmp(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_add()?;
         loop {
             let op = if self.eat(&Token::Lt) {
-                Some(SpecBinaryOp::Lt)
+                Some(BinaryOp::Lt)
             } else if self.eat(&Token::Le) {
-                Some(SpecBinaryOp::Le)
+                Some(BinaryOp::Le)
             } else if self.eat(&Token::Gt) {
-                Some(SpecBinaryOp::Gt)
+                Some(BinaryOp::Gt)
             } else if self.eat(&Token::Ge) {
-                Some(SpecBinaryOp::Ge)
+                Some(BinaryOp::Ge)
             } else {
                 None
             };
@@ -418,7 +418,7 @@ impl Parser {
                 break;
             };
             let rhs = self.parse_add()?;
-            expr = SpecExpr::Binary {
+            expr = Expr::Binary {
                 op,
                 lhs: Box::new(expr),
                 rhs: Box::new(rhs),
@@ -427,13 +427,13 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_add(&mut self) -> Result<SpecExpr, SpecParseError> {
+    fn parse_add(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_mul()?;
         loop {
             let op = if self.eat(&Token::Plus) {
-                Some(SpecBinaryOp::Add)
+                Some(BinaryOp::Add)
             } else if self.eat(&Token::Minus) {
-                Some(SpecBinaryOp::Sub)
+                Some(BinaryOp::Sub)
             } else {
                 None
             };
@@ -441,7 +441,7 @@ impl Parser {
                 break;
             };
             let rhs = self.parse_mul()?;
-            expr = SpecExpr::Binary {
+            expr = Expr::Binary {
                 op,
                 lhs: Box::new(expr),
                 rhs: Box::new(rhs),
@@ -450,12 +450,12 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_mul(&mut self) -> Result<SpecExpr, SpecParseError> {
+    fn parse_mul(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_unary()?;
         while self.eat(&Token::Star) {
             let rhs = self.parse_unary()?;
-            expr = SpecExpr::Binary {
-                op: SpecBinaryOp::Mul,
+            expr = Expr::Binary {
+                op: BinaryOp::Mul,
                 lhs: Box::new(expr),
                 rhs: Box::new(rhs),
             };
@@ -463,26 +463,26 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_unary(&mut self) -> Result<SpecExpr, SpecParseError> {
+    fn parse_unary(&mut self) -> Result<Expr, ParseError> {
         if self.eat(&Token::Bang) {
-            return Ok(SpecExpr::Unary {
-                op: SpecUnaryOp::Not,
+            return Ok(Expr::Unary {
+                op: UnaryOp::Not,
                 arg: Box::new(self.parse_unary()?),
             });
         }
         if self.eat(&Token::Minus) {
-            return Ok(SpecExpr::Unary {
-                op: SpecUnaryOp::Neg,
+            return Ok(Expr::Unary {
+                op: UnaryOp::Neg,
                 arg: Box::new(self.parse_unary()?),
             });
         }
         self.parse_postfix()
     }
 
-    fn parse_postfix(&mut self) -> Result<SpecExpr, SpecParseError> {
+    fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_primary()?;
         while self.eat(&Token::Dot) {
-            expr = SpecExpr::Field {
+            expr = Expr::Field {
                 base: Box::new(expr),
                 index: self.parse_field_index()?,
             };
@@ -490,40 +490,40 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_primary(&mut self) -> Result<SpecExpr, SpecParseError> {
+    fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         match self.next() {
-            Some(Token::Bool(value)) => Ok(SpecExpr::Bool(*value)),
-            Some(Token::Int(value)) => Ok(SpecExpr::Int(*value)),
+            Some(Token::Bool(value)) => Ok(Expr::Bool(*value)),
+            Some(Token::Int(value)) => Ok(Expr::Int(*value)),
             Some(Token::Ident(ident)) if ident == "__prophecy" => self.parse_prophecy_call(),
-            Some(Token::Ident(ident)) if ident == "result" => Ok(SpecExpr::Result),
-            Some(Token::Ident(ident)) => Ok(SpecExpr::Var(ident.clone())),
+            Some(Token::Ident(ident)) if ident == "result" => Ok(Expr::Result),
+            Some(Token::Ident(ident)) => Ok(Expr::Var(ident.clone())),
             Some(Token::LParen) => {
                 let expr = self.parse_expr()?;
                 self.expect(&Token::RParen)?;
                 Ok(expr)
             }
-            _ => Err(SpecParseError::new("expected a spec expression")),
+            _ => Err(ParseError::new("expected a spec expression")),
         }
     }
 
-    fn parse_prophecy_call(&mut self) -> Result<SpecExpr, SpecParseError> {
+    fn parse_prophecy_call(&mut self) -> Result<Expr, ParseError> {
         self.expect(&Token::LParen)?;
         let Some(Token::Ident(ident)) = self.next() else {
-            return Err(SpecParseError::new(
+            return Err(ParseError::new(
                 "unsupported prophecy argument in spec expression",
             ));
         };
         let ident = ident.clone();
         self.expect(&Token::RParen)?;
-        Ok(SpecExpr::Prophecy(ident))
+        Ok(Expr::Prophecy(ident))
     }
 
-    fn parse_field_index(&mut self) -> Result<usize, SpecParseError> {
+    fn parse_field_index(&mut self) -> Result<usize, ParseError> {
         match self.next() {
             Some(Token::Int(value)) if *value >= 0 => Ok(*value as usize),
             Some(Token::Ident(ident)) if ident == "cur" => Ok(0),
             Some(Token::Ident(ident)) if ident == "fin" => Ok(1),
-            _ => Err(SpecParseError::new(
+            _ => Err(ParseError::new(
                 "unsupported field access in spec expression",
             )),
         }
@@ -538,11 +538,11 @@ impl Parser {
         }
     }
 
-    fn expect(&mut self, token: &Token) -> Result<(), SpecParseError> {
+    fn expect(&mut self, token: &Token) -> Result<(), ParseError> {
         if self.eat(token) {
             Ok(())
         } else {
-            Err(SpecParseError::new(format!("expected token {:?}", token)))
+            Err(ParseError::new(format!("expected token {:?}", token)))
         }
     }
 
@@ -557,79 +557,79 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
-    use super::{SpecBinaryOp, SpecExpr, SpecUnaryOp, parse_spec_expr};
+    use super::{BinaryOp, Expr, UnaryOp, parse_expr};
 
     #[test]
     fn parses_template_interpolation_without_syn() {
-        let expr = parse_spec_expr("assert", r#""{x}.0.cur == 1""#).expect("expr");
+        let expr = parse_expr("assert", r#""{x}.0.cur == 1""#).expect("expr");
         assert_eq!(
             expr,
-            SpecExpr::Binary {
-                op: SpecBinaryOp::Eq,
-                lhs: Box::new(SpecExpr::Field {
-                    base: Box::new(SpecExpr::Field {
-                        base: Box::new(SpecExpr::Var("x".to_owned())),
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                lhs: Box::new(Expr::Field {
+                    base: Box::new(Expr::Field {
+                        base: Box::new(Expr::Var("x".to_owned())),
                         index: 0,
                     }),
                     index: 0,
                 }),
-                rhs: Box::new(SpecExpr::Int(1)),
+                rhs: Box::new(Expr::Int(1)),
             }
         );
     }
 
     #[test]
     fn parses_result_only_in_surface_ast() {
-        let expr = parse_spec_expr("ens", r#""{result} == 3""#).expect("expr");
+        let expr = parse_expr("ens", r#""{result} == 3""#).expect("expr");
         assert_eq!(
             expr,
-            SpecExpr::Binary {
-                op: SpecBinaryOp::Eq,
-                lhs: Box::new(SpecExpr::Result),
-                rhs: Box::new(SpecExpr::Int(3)),
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                lhs: Box::new(Expr::Result),
+                rhs: Box::new(Expr::Int(3)),
             }
         );
     }
 
     #[test]
     fn parses_prophecy_call() {
-        let expr = parse_spec_expr("inv", r#""__prophecy(x).fin >= 0""#).expect("expr");
+        let expr = parse_expr("inv", r#""__prophecy(x).fin >= 0""#).expect("expr");
         assert_eq!(
             expr,
-            SpecExpr::Binary {
-                op: SpecBinaryOp::Ge,
-                lhs: Box::new(SpecExpr::Field {
-                    base: Box::new(SpecExpr::Prophecy("x".to_owned())),
+            Expr::Binary {
+                op: BinaryOp::Ge,
+                lhs: Box::new(Expr::Field {
+                    base: Box::new(Expr::Prophecy("x".to_owned())),
                     index: 1,
                 }),
-                rhs: Box::new(SpecExpr::Int(0)),
+                rhs: Box::new(Expr::Int(0)),
             }
         );
     }
 
     #[test]
     fn keeps_operator_precedence() {
-        let expr = parse_spec_expr("assert", r#""!false || 1 + 2 * 3 == 7""#).expect("expr");
+        let expr = parse_expr("assert", r#""!false || 1 + 2 * 3 == 7""#).expect("expr");
         assert_eq!(
             expr,
-            SpecExpr::Binary {
-                op: SpecBinaryOp::Or,
-                lhs: Box::new(SpecExpr::Unary {
-                    op: SpecUnaryOp::Not,
-                    arg: Box::new(SpecExpr::Bool(false)),
+            Expr::Binary {
+                op: BinaryOp::Or,
+                lhs: Box::new(Expr::Unary {
+                    op: UnaryOp::Not,
+                    arg: Box::new(Expr::Bool(false)),
                 }),
-                rhs: Box::new(SpecExpr::Binary {
-                    op: SpecBinaryOp::Eq,
-                    lhs: Box::new(SpecExpr::Binary {
-                        op: SpecBinaryOp::Add,
-                        lhs: Box::new(SpecExpr::Int(1)),
-                        rhs: Box::new(SpecExpr::Binary {
-                            op: SpecBinaryOp::Mul,
-                            lhs: Box::new(SpecExpr::Int(2)),
-                            rhs: Box::new(SpecExpr::Int(3)),
+                rhs: Box::new(Expr::Binary {
+                    op: BinaryOp::Eq,
+                    lhs: Box::new(Expr::Binary {
+                        op: BinaryOp::Add,
+                        lhs: Box::new(Expr::Int(1)),
+                        rhs: Box::new(Expr::Binary {
+                            op: BinaryOp::Mul,
+                            lhs: Box::new(Expr::Int(2)),
+                            rhs: Box::new(Expr::Int(3)),
                         }),
                     }),
-                    rhs: Box::new(SpecExpr::Int(7)),
+                    rhs: Box::new(Expr::Int(7)),
                 }),
             }
         );
@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn rejects_prophecy_interpolation() {
-        let err = parse_spec_expr("req", r#""{^:x}""#).expect_err("should fail");
+        let err = parse_expr("req", r#""{^:x}""#).expect_err("should fail");
         assert!(err.to_string().contains("prophecy interpolation"));
     }
 }

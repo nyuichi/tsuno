@@ -22,7 +22,7 @@ use crate::prepass::{
     MirSpecExpr, compute_directives, compute_function_contracts,
 };
 use crate::report::{VerificationResult, VerificationStatus};
-use crate::spec_syntax::{SpecBinaryOp, SpecExpr, SpecUnaryOp};
+use crate::spec::{BinaryOp, Expr, UnaryOp};
 
 thread_local! {
     static GLOBAL_SOLVER: Solver = {
@@ -1551,25 +1551,25 @@ impl<'tcx> Verifier<'tcx> {
             MirSpecExpr::Unary { op, arg } => {
                 let value = self.mir_spec_to_value(state, arg)?;
                 Ok(match op {
-                    SpecUnaryOp::Not => self.value_not(&value),
-                    SpecUnaryOp::Neg => self.value_neg(&value),
+                    UnaryOp::Not => self.value_not(&value),
+                    UnaryOp::Neg => self.value_neg(&value),
                 })
             }
             MirSpecExpr::Binary { op, lhs, rhs } => {
                 let lhs = self.mir_spec_to_value(state, lhs)?;
                 let rhs = self.mir_spec_to_value(state, rhs)?;
                 Ok(match op {
-                    SpecBinaryOp::Eq => self.value_eqv(&lhs, &rhs),
-                    SpecBinaryOp::Ne => self.value_not(&self.value_eqv(&lhs, &rhs)),
-                    SpecBinaryOp::And => self.value_and(&lhs, &rhs),
-                    SpecBinaryOp::Or => self.value_or(&lhs, &rhs),
-                    SpecBinaryOp::Lt => self.value_lt(&lhs, &rhs),
-                    SpecBinaryOp::Le => self.value_le(&lhs, &rhs),
-                    SpecBinaryOp::Gt => self.value_gt(&lhs, &rhs),
-                    SpecBinaryOp::Ge => self.value_ge(&lhs, &rhs),
-                    SpecBinaryOp::Add => self.value_add(&lhs, &rhs),
-                    SpecBinaryOp::Sub => self.value_sub(&lhs, &rhs),
-                    SpecBinaryOp::Mul => self.value_mul(&lhs, &rhs),
+                    BinaryOp::Eq => self.value_eqv(&lhs, &rhs),
+                    BinaryOp::Ne => self.value_not(&self.value_eqv(&lhs, &rhs)),
+                    BinaryOp::And => self.value_and(&lhs, &rhs),
+                    BinaryOp::Or => self.value_or(&lhs, &rhs),
+                    BinaryOp::Lt => self.value_lt(&lhs, &rhs),
+                    BinaryOp::Le => self.value_le(&lhs, &rhs),
+                    BinaryOp::Gt => self.value_gt(&lhs, &rhs),
+                    BinaryOp::Ge => self.value_ge(&lhs, &rhs),
+                    BinaryOp::Add => self.value_add(&lhs, &rhs),
+                    BinaryOp::Sub => self.value_sub(&lhs, &rhs),
+                    BinaryOp::Mul => self.value_mul(&lhs, &rhs),
                 })
             }
         }
@@ -1579,10 +1579,10 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         current: &HashMap<String, Datatype>,
         prophecy: &HashMap<String, Datatype>,
-        expr: &SpecExpr,
+        expr: &Expr,
     ) -> Result<BoolExpr, VerificationResult> {
         match expr {
-            SpecExpr::Bool(value) => Ok(BoolExpr::Const(*value)),
+            Expr::Bool(value) => Ok(BoolExpr::Const(*value)),
             _ => Ok(BoolExpr::Value(
                 self.contract_expr_to_value(current, prophecy, expr)?,
             )),
@@ -1593,55 +1593,55 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         current: &HashMap<String, Datatype>,
         prophecy: &HashMap<String, Datatype>,
-        expr: &SpecExpr,
+        expr: &Expr,
     ) -> Result<Datatype, VerificationResult> {
         match expr {
-            SpecExpr::Bool(value) => Ok(self.value_bool(*value)),
-            SpecExpr::Int(value) => Ok(self.value_int(*value)),
-            SpecExpr::Var(name) => current.get(name).cloned().ok_or_else(|| {
+            Expr::Bool(value) => Ok(self.value_bool(*value)),
+            Expr::Int(value) => Ok(self.value_int(*value)),
+            Expr::Var(name) => current.get(name).cloned().ok_or_else(|| {
                 self.unsupported_result(
                     self.tcx.def_span(self.def_id),
                     format!("missing contract binding `{name}`"),
                 )
             }),
-            SpecExpr::Result => current.get("result").cloned().ok_or_else(|| {
+            Expr::Result => current.get("result").cloned().ok_or_else(|| {
                 self.unsupported_result(
                     self.tcx.def_span(self.def_id),
                     "missing contract binding `result`".to_owned(),
                 )
             }),
-            SpecExpr::Prophecy(name) => prophecy.get(name).cloned().ok_or_else(|| {
+            Expr::Prophecy(name) => prophecy.get(name).cloned().ok_or_else(|| {
                 self.unsupported_result(
                     self.tcx.def_span(self.def_id),
                     format!("missing prophecy binding `{name}`"),
                 )
             }),
-            SpecExpr::Field { base, index } => {
+            Expr::Field { base, index } => {
                 let value = self.contract_expr_to_value(current, prophecy, base)?;
                 self.project_tuple_field(value, *index, self.tcx.def_span(self.def_id))
             }
-            SpecExpr::Unary { op, arg } => {
+            Expr::Unary { op, arg } => {
                 let value = self.contract_expr_to_value(current, prophecy, arg)?;
                 Ok(match op {
-                    SpecUnaryOp::Not => self.value_not(&value),
-                    SpecUnaryOp::Neg => self.value_neg(&value),
+                    UnaryOp::Not => self.value_not(&value),
+                    UnaryOp::Neg => self.value_neg(&value),
                 })
             }
-            SpecExpr::Binary { op, lhs, rhs } => {
+            Expr::Binary { op, lhs, rhs } => {
                 let lhs = self.contract_expr_to_value(current, prophecy, lhs)?;
                 let rhs = self.contract_expr_to_value(current, prophecy, rhs)?;
                 Ok(match op {
-                    SpecBinaryOp::Eq => self.value_eqv(&lhs, &rhs),
-                    SpecBinaryOp::Ne => self.value_not(&self.value_eqv(&lhs, &rhs)),
-                    SpecBinaryOp::And => self.value_and(&lhs, &rhs),
-                    SpecBinaryOp::Or => self.value_or(&lhs, &rhs),
-                    SpecBinaryOp::Lt => self.value_lt(&lhs, &rhs),
-                    SpecBinaryOp::Le => self.value_le(&lhs, &rhs),
-                    SpecBinaryOp::Gt => self.value_gt(&lhs, &rhs),
-                    SpecBinaryOp::Ge => self.value_ge(&lhs, &rhs),
-                    SpecBinaryOp::Add => self.value_add(&lhs, &rhs),
-                    SpecBinaryOp::Sub => self.value_sub(&lhs, &rhs),
-                    SpecBinaryOp::Mul => self.value_mul(&lhs, &rhs),
+                    BinaryOp::Eq => self.value_eqv(&lhs, &rhs),
+                    BinaryOp::Ne => self.value_not(&self.value_eqv(&lhs, &rhs)),
+                    BinaryOp::And => self.value_and(&lhs, &rhs),
+                    BinaryOp::Or => self.value_or(&lhs, &rhs),
+                    BinaryOp::Lt => self.value_lt(&lhs, &rhs),
+                    BinaryOp::Le => self.value_le(&lhs, &rhs),
+                    BinaryOp::Gt => self.value_gt(&lhs, &rhs),
+                    BinaryOp::Ge => self.value_ge(&lhs, &rhs),
+                    BinaryOp::Add => self.value_add(&lhs, &rhs),
+                    BinaryOp::Sub => self.value_sub(&lhs, &rhs),
+                    BinaryOp::Mul => self.value_mul(&lhs, &rhs),
                 })
             }
         }
