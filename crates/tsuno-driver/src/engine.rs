@@ -447,12 +447,6 @@ enum BoolExpr {
     Not(Box<BoolExpr>),
 }
 
-#[derive(Debug, Clone)]
-struct EvaluatedRvalue {
-    value: Datatype,
-    constraints: Vec<BoolExpr>,
-}
-
 pub struct Verifier<'tcx> {
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
@@ -653,12 +647,8 @@ impl<'tcx> Verifier<'tcx> {
             }
             StatementKind::Assign(assign) => {
                 let (place, rvalue) = &**assign;
-                let eval = self.eval_rvalue(&mut state, rvalue, stmt.source_info.span)?;
-                self.write_place(&mut state, *place, eval.value, stmt.source_info.span)?;
-                for constraint in eval.constraints {
-                    let constraint = self.bool_expr_to_z3(&constraint)?;
-                    self.assume_constraint(&mut state, constraint);
-                }
+                let value = self.eval_rvalue(&mut state, rvalue, stmt.source_info.span)?;
+                self.write_place(&mut state, *place, value, stmt.source_info.span)?;
             }
             StatementKind::Nop
             | StatementKind::Coverage(..)
@@ -1105,12 +1095,9 @@ impl<'tcx> Verifier<'tcx> {
         state: &mut State,
         rvalue: &Rvalue<'tcx>,
         span: Span,
-    ) -> Result<EvaluatedRvalue, VerificationResult> {
+    ) -> Result<Datatype, VerificationResult> {
         match rvalue {
-            Rvalue::Use(operand) => Ok(EvaluatedRvalue {
-                value: self.eval_operand(state, operand, span)?,
-                constraints: Vec::new(),
-            }),
+            Rvalue::Use(operand) => self.eval_operand(state, operand, span),
             Rvalue::Ref(_, borrow_kind, place) => match borrow_kind {
                 BorrowKind::Mut {
                     kind: MutBorrowKind::Default | MutBorrowKind::TwoPhaseBorrow,
@@ -1129,10 +1116,7 @@ impl<'tcx> Verifier<'tcx> {
                     for operand in operands {
                         values.push(self.eval_operand(state, operand, span)?);
                     }
-                    Ok(EvaluatedRvalue {
-                        value: self.value_list(&values),
-                        constraints: Vec::new(),
-                    })
+                    Ok(self.value_list(&values))
                 }
                 _ => Err(self.unsupported_result(span, format!("unsupported aggregate {kind:?}"))),
             },
@@ -1145,7 +1129,7 @@ impl<'tcx> Verifier<'tcx> {
         state: &mut State,
         place: Place<'tcx>,
         span: Span,
-    ) -> Result<EvaluatedRvalue, VerificationResult> {
+    ) -> Result<Datatype, VerificationResult> {
         let current = self.read_place(state, place, ReadMode::Current, span)?;
         let final_value = if self.is_reborrow(place) {
             self.read_place(state, place, ReadMode::Final, span)?
@@ -1154,10 +1138,7 @@ impl<'tcx> Verifier<'tcx> {
             self.fresh_for_rust_ty(ty, "prophecy")?
         };
         self.write_place(state, place, final_value.clone(), span)?;
-        Ok(EvaluatedRvalue {
-            value: self.value_list(&[current, final_value]),
-            constraints: Vec::new(),
-        })
+        Ok(self.value_list(&[current, final_value]))
     }
 
     fn create_shared_borrow(
@@ -1165,11 +1146,8 @@ impl<'tcx> Verifier<'tcx> {
         state: &State,
         place: Place<'tcx>,
         span: Span,
-    ) -> Result<EvaluatedRvalue, VerificationResult> {
-        Ok(EvaluatedRvalue {
-            value: self.read_place(state, place, ReadMode::Current, span)?,
-            constraints: Vec::new(),
-        })
+    ) -> Result<Datatype, VerificationResult> {
+        self.read_place(state, place, ReadMode::Current, span)
     }
 
     fn eval_binary_op(
@@ -1179,49 +1157,22 @@ impl<'tcx> Verifier<'tcx> {
         lhs: &Operand<'tcx>,
         rhs: &Operand<'tcx>,
         span: Span,
-    ) -> Result<EvaluatedRvalue, VerificationResult> {
+    ) -> Result<Datatype, VerificationResult> {
         let lhs_value = self.eval_operand(state, lhs, span)?;
         let rhs_value = self.eval_operand(state, rhs, span)?;
         match op {
             BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow => {
                 self.eval_checked_binary_op(state, op, lhs, rhs, span)
             }
-            BinOp::Add => Ok(EvaluatedRvalue {
-                value: self.value_add(&lhs_value, &rhs_value),
-                constraints: Vec::new(),
-            }),
-            BinOp::Sub => Ok(EvaluatedRvalue {
-                value: self.value_sub(&lhs_value, &rhs_value),
-                constraints: Vec::new(),
-            }),
-            BinOp::Mul => Ok(EvaluatedRvalue {
-                value: self.value_mul(&lhs_value, &rhs_value),
-                constraints: Vec::new(),
-            }),
-            BinOp::Eq => Ok(EvaluatedRvalue {
-                value: self.value_eqv(&lhs_value, &rhs_value),
-                constraints: Vec::new(),
-            }),
-            BinOp::Ne => Ok(EvaluatedRvalue {
-                value: self.value_not(&self.value_eqv(&lhs_value, &rhs_value)),
-                constraints: Vec::new(),
-            }),
-            BinOp::Lt => Ok(EvaluatedRvalue {
-                value: self.value_lt(&lhs_value, &rhs_value),
-                constraints: Vec::new(),
-            }),
-            BinOp::Le => Ok(EvaluatedRvalue {
-                value: self.value_le(&lhs_value, &rhs_value),
-                constraints: Vec::new(),
-            }),
-            BinOp::Gt => Ok(EvaluatedRvalue {
-                value: self.value_gt(&lhs_value, &rhs_value),
-                constraints: Vec::new(),
-            }),
-            BinOp::Ge => Ok(EvaluatedRvalue {
-                value: self.value_ge(&lhs_value, &rhs_value),
-                constraints: Vec::new(),
-            }),
+            BinOp::Add => Ok(self.value_add(&lhs_value, &rhs_value)),
+            BinOp::Sub => Ok(self.value_sub(&lhs_value, &rhs_value)),
+            BinOp::Mul => Ok(self.value_mul(&lhs_value, &rhs_value)),
+            BinOp::Eq => Ok(self.value_eqv(&lhs_value, &rhs_value)),
+            BinOp::Ne => Ok(self.value_not(&self.value_eqv(&lhs_value, &rhs_value))),
+            BinOp::Lt => Ok(self.value_lt(&lhs_value, &rhs_value)),
+            BinOp::Le => Ok(self.value_le(&lhs_value, &rhs_value)),
+            BinOp::Gt => Ok(self.value_gt(&lhs_value, &rhs_value)),
+            BinOp::Ge => Ok(self.value_ge(&lhs_value, &rhs_value)),
             other => {
                 Err(self.unsupported_result(span, format!("unsupported binary operator {other:?}")))
             }
@@ -1235,7 +1186,7 @@ impl<'tcx> Verifier<'tcx> {
         lhs: &Operand<'tcx>,
         rhs: &Operand<'tcx>,
         span: Span,
-    ) -> Result<EvaluatedRvalue, VerificationResult> {
+    ) -> Result<Datatype, VerificationResult> {
         let lhs_value = self.eval_operand(state, lhs, span)?;
         let rhs_value = self.eval_operand(state, rhs, span)?;
         let result_ty = lhs.ty(&self.body.local_decls, self.tcx);
@@ -1251,10 +1202,7 @@ impl<'tcx> Verifier<'tcx> {
             }
         };
         let overflow_value = self.overflow_value_for_result(result_ty, &result_value, span)?;
-        Ok(EvaluatedRvalue {
-            value: self.value_list(&[result_value, overflow_value]),
-            constraints: Vec::new(),
-        })
+        Ok(self.value_list(&[result_value, overflow_value]))
     }
 
     fn eval_unary_op(
@@ -1263,17 +1211,11 @@ impl<'tcx> Verifier<'tcx> {
         op: UnOp,
         operand: &Operand<'tcx>,
         span: Span,
-    ) -> Result<EvaluatedRvalue, VerificationResult> {
+    ) -> Result<Datatype, VerificationResult> {
         let value = self.eval_operand(state, operand, span)?;
         match op {
-            UnOp::Not => Ok(EvaluatedRvalue {
-                value: self.value_not(&value),
-                constraints: Vec::new(),
-            }),
-            UnOp::Neg => Ok(EvaluatedRvalue {
-                value: self.value_neg(&value),
-                constraints: Vec::new(),
-            }),
+            UnOp::Not => Ok(self.value_not(&value)),
+            UnOp::Neg => Ok(self.value_neg(&value)),
             other => {
                 Err(self.unsupported_result(span, format!("unsupported unary operator {other:?}")))
             }
