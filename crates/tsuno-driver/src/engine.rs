@@ -12,8 +12,10 @@ use rustc_middle::mir::{
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::Span;
 use rustc_span::source_map::Spanned;
-use z3::ast::{Ast, Bool, Int};
-use z3::{SatResult, Solver, SortKind};
+use z3::ast::{Ast, Bool, Datatype, Int};
+use z3::{
+    DatatypeAccessor, DatatypeBuilder, DatatypeSort, RecFuncDecl, SatResult, Solver, SortKind,
+};
 
 use crate::directive::{SpecBinaryOp, SpecUnaryOp};
 use crate::prepass::{
@@ -32,9 +34,398 @@ thread_local! {
         solver.set_params(&params);
         solver
     };
+    static VALUE_ENCODING: ValueEncoding = {
+        init_z3();
+        ValueEncoding::new()
+    };
 }
 
 static Z3_INIT: Once = Once::new();
+
+struct ValueEncoding {
+    sort: DatatypeSort,
+    eqv: RecFuncDecl,
+    add: RecFuncDecl,
+    sub: RecFuncDecl,
+    mul: RecFuncDecl,
+    neg: RecFuncDecl,
+    not: RecFuncDecl,
+    andv: RecFuncDecl,
+    orv: RecFuncDecl,
+    ltv: RecFuncDecl,
+    lev: RecFuncDecl,
+    gtv: RecFuncDecl,
+    gev: RecFuncDecl,
+    is_true: RecFuncDecl,
+}
+
+impl ValueEncoding {
+    fn new() -> Self {
+        let sort = DatatypeBuilder::new("value")
+            .variant("error", vec![])
+            .variant("nil", vec![])
+            .variant(
+                "cons",
+                vec![
+                    ("car", DatatypeAccessor::datatype("value")),
+                    ("cdr", DatatypeAccessor::datatype("value")),
+                ],
+            )
+            .variant("int", vec![("i", DatatypeAccessor::Sort(z3::Sort::int()))])
+            .variant(
+                "bool",
+                vec![("b", DatatypeAccessor::Sort(z3::Sort::bool()))],
+            )
+            .finish();
+        let value_sort = sort.sort.clone();
+        let encoding = Self {
+            sort,
+            eqv: RecFuncDecl::new("eqv", &[&value_sort, &value_sort], &value_sort),
+            add: RecFuncDecl::new("addv", &[&value_sort, &value_sort], &value_sort),
+            sub: RecFuncDecl::new("subv", &[&value_sort, &value_sort], &value_sort),
+            mul: RecFuncDecl::new("mulv", &[&value_sort, &value_sort], &value_sort),
+            neg: RecFuncDecl::new("negv", &[&value_sort], &value_sort),
+            not: RecFuncDecl::new("notv", &[&value_sort], &value_sort),
+            andv: RecFuncDecl::new("andv", &[&value_sort, &value_sort], &value_sort),
+            orv: RecFuncDecl::new("orv", &[&value_sort, &value_sort], &value_sort),
+            ltv: RecFuncDecl::new("ltv", &[&value_sort, &value_sort], &value_sort),
+            lev: RecFuncDecl::new("lev", &[&value_sort, &value_sort], &value_sort),
+            gtv: RecFuncDecl::new("gtv", &[&value_sort, &value_sort], &value_sort),
+            gev: RecFuncDecl::new("gev", &[&value_sort, &value_sort], &value_sort),
+            is_true: RecFuncDecl::new("is_true", &[&value_sort], &z3::Sort::bool()),
+        };
+        encoding.define_functions();
+        encoding
+    }
+
+    fn error(&self) -> Datatype {
+        self.sort.variants[0]
+            .constructor
+            .apply(&[])
+            .as_datatype()
+            .unwrap()
+    }
+
+    fn nil(&self) -> Datatype {
+        self.sort.variants[1]
+            .constructor
+            .apply(&[])
+            .as_datatype()
+            .unwrap()
+    }
+
+    fn cons(&self, car: &Datatype, cdr: &Datatype) -> Datatype {
+        self.sort.variants[2]
+            .constructor
+            .apply(&[car, cdr])
+            .as_datatype()
+            .unwrap()
+    }
+
+    fn int(&self, value: i64) -> Datatype {
+        self.sort.variants[3]
+            .constructor
+            .apply(&[&Int::from_i64(value)])
+            .as_datatype()
+            .unwrap()
+    }
+
+    fn bool(&self, value: bool) -> Datatype {
+        self.wrap_bool(&Bool::from_bool(value))
+    }
+
+    fn wrap_bool(&self, value: &Bool) -> Datatype {
+        value.ite(&self.bool_true(), &self.bool_false())
+    }
+
+    fn wrap_int(&self, value: &Int) -> Datatype {
+        self.sort.variants[3]
+            .constructor
+            .apply(&[value])
+            .as_datatype()
+            .unwrap()
+    }
+
+    fn bool_true(&self) -> Datatype {
+        self.sort.variants[4]
+            .constructor
+            .apply(&[&Bool::from_bool(true)])
+            .as_datatype()
+            .unwrap()
+    }
+
+    fn bool_false(&self) -> Datatype {
+        self.sort.variants[4]
+            .constructor
+            .apply(&[&Bool::from_bool(false)])
+            .as_datatype()
+            .unwrap()
+    }
+
+    fn fresh(&self, name: &str) -> Datatype {
+        Datatype::new_const(name, &self.sort.sort)
+    }
+
+    fn list(&self, values: &[Datatype]) -> Datatype {
+        values
+            .iter()
+            .rev()
+            .fold(self.nil(), |tail, head| self.cons(head, &tail))
+    }
+
+    fn is_error(&self, value: &Datatype) -> Bool {
+        self.sort.variants[0]
+            .tester
+            .apply(&[value])
+            .as_bool()
+            .unwrap()
+    }
+
+    fn is_nil(&self, value: &Datatype) -> Bool {
+        self.sort.variants[1]
+            .tester
+            .apply(&[value])
+            .as_bool()
+            .unwrap()
+    }
+
+    fn is_cons(&self, value: &Datatype) -> Bool {
+        self.sort.variants[2]
+            .tester
+            .apply(&[value])
+            .as_bool()
+            .unwrap()
+    }
+
+    fn is_int(&self, value: &Datatype) -> Bool {
+        self.sort.variants[3]
+            .tester
+            .apply(&[value])
+            .as_bool()
+            .unwrap()
+    }
+
+    fn is_bool_value(&self, value: &Datatype) -> Bool {
+        self.sort.variants[4]
+            .tester
+            .apply(&[value])
+            .as_bool()
+            .unwrap()
+    }
+
+    fn car(&self, value: &Datatype) -> Datatype {
+        self.sort.variants[2].accessors[0]
+            .apply(&[value])
+            .as_datatype()
+            .unwrap()
+    }
+
+    fn cdr(&self, value: &Datatype) -> Datatype {
+        self.sort.variants[2].accessors[1]
+            .apply(&[value])
+            .as_datatype()
+            .unwrap()
+    }
+
+    fn int_data(&self, value: &Datatype) -> Int {
+        self.sort.variants[3].accessors[0]
+            .apply(&[value])
+            .as_int()
+            .unwrap()
+    }
+
+    fn bool_data(&self, value: &Datatype) -> Bool {
+        self.sort.variants[4].accessors[0]
+            .apply(&[value])
+            .as_bool()
+            .unwrap()
+    }
+
+    fn eqv(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        self.eqv.apply(&[lhs, rhs]).as_datatype().unwrap()
+    }
+
+    fn add(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        self.add.apply(&[lhs, rhs]).as_datatype().unwrap()
+    }
+
+    fn sub(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        self.sub.apply(&[lhs, rhs]).as_datatype().unwrap()
+    }
+
+    fn mul(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        self.mul.apply(&[lhs, rhs]).as_datatype().unwrap()
+    }
+
+    fn neg(&self, value: &Datatype) -> Datatype {
+        self.neg.apply(&[value]).as_datatype().unwrap()
+    }
+
+    fn notv(&self, value: &Datatype) -> Datatype {
+        self.not.apply(&[value]).as_datatype().unwrap()
+    }
+
+    fn andv(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        self.andv.apply(&[lhs, rhs]).as_datatype().unwrap()
+    }
+
+    fn orv(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        self.orv.apply(&[lhs, rhs]).as_datatype().unwrap()
+    }
+
+    fn ltv(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        self.ltv.apply(&[lhs, rhs]).as_datatype().unwrap()
+    }
+
+    fn lev(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        self.lev.apply(&[lhs, rhs]).as_datatype().unwrap()
+    }
+
+    fn gtv(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        self.gtv.apply(&[lhs, rhs]).as_datatype().unwrap()
+    }
+
+    fn gev(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        self.gev.apply(&[lhs, rhs]).as_datatype().unwrap()
+    }
+
+    fn is_true(&self, value: &Datatype) -> Bool {
+        self.is_true.apply(&[value]).as_bool().unwrap()
+    }
+
+    fn nth(&self, value: &Datatype, index: usize) -> Datatype {
+        let mut current = value.clone();
+        for _ in 0..index {
+            current = self.cdr(&current);
+        }
+        self.car(&current)
+    }
+
+    fn pair_first(&self, value: &Datatype) -> Datatype {
+        self.nth(value, 0)
+    }
+
+    fn pair_second(&self, value: &Datatype) -> Datatype {
+        self.nth(value, 1)
+    }
+
+    fn define_functions(&self) {
+        self.define_binary_bool_value(&self.andv, |lhs, rhs| Bool::and(&[lhs, rhs]));
+        self.define_binary_bool_value(&self.orv, |lhs, rhs| Bool::or(&[lhs, rhs]));
+        self.define_not();
+        self.define_binary_int_value(&self.add, |lhs, rhs| lhs + rhs);
+        self.define_binary_int_value(&self.sub, |lhs, rhs| lhs - rhs);
+        self.define_binary_int_value(&self.mul, |lhs, rhs| lhs * rhs);
+        self.define_neg();
+        self.define_binary_int_pred(&self.ltv, |lhs, rhs| lhs.lt(rhs));
+        self.define_binary_int_pred(&self.lev, |lhs, rhs| lhs.le(rhs));
+        self.define_binary_int_pred(&self.gtv, |lhs, rhs| lhs.gt(rhs));
+        self.define_binary_int_pred(&self.gev, |lhs, rhs| lhs.ge(rhs));
+        self.define_eqv();
+        self.define_is_true();
+    }
+
+    fn define_binary_bool_value(&self, func: &RecFuncDecl, op: impl Fn(&Bool, &Bool) -> Bool) {
+        let x = self.fresh("x");
+        let y = self.fresh("y");
+        let body = bool_or(vec![self.is_error(&x), self.is_error(&y)]).ite(
+            &self.error(),
+            &bool_and(vec![self.is_bool_value(&x), self.is_bool_value(&y)]).ite(
+                &self.wrap_bool(&op(&self.bool_data(&x), &self.bool_data(&y))),
+                &self.error(),
+            ),
+        );
+        func.add_def(&[&x, &y], &body);
+    }
+
+    fn define_binary_int_value(&self, func: &RecFuncDecl, op: impl Fn(&Int, &Int) -> Int) {
+        let x = self.fresh("x");
+        let y = self.fresh("y");
+        let body = bool_or(vec![self.is_error(&x), self.is_error(&y)]).ite(
+            &self.error(),
+            &bool_and(vec![self.is_int(&x), self.is_int(&y)]).ite(
+                &self.sort.variants[3]
+                    .constructor
+                    .apply(&[&op(&self.int_data(&x), &self.int_data(&y))])
+                    .as_datatype()
+                    .unwrap(),
+                &self.error(),
+            ),
+        );
+        func.add_def(&[&x, &y], &body);
+    }
+
+    fn define_binary_int_pred(&self, func: &RecFuncDecl, op: impl Fn(&Int, &Int) -> Bool) {
+        let x = self.fresh("x");
+        let y = self.fresh("y");
+        let body = bool_or(vec![self.is_error(&x), self.is_error(&y)]).ite(
+            &self.error(),
+            &bool_and(vec![self.is_int(&x), self.is_int(&y)]).ite(
+                &self.wrap_bool(&op(&self.int_data(&x), &self.int_data(&y))),
+                &self.error(),
+            ),
+        );
+        func.add_def(&[&x, &y], &body);
+    }
+
+    fn define_neg(&self) {
+        let x = self.fresh("x");
+        let body = self.is_error(&x).ite(
+            &self.error(),
+            &self.is_int(&x).ite(
+                &self.sort.variants[3]
+                    .constructor
+                    .apply(&[&(Int::from_i64(0) - self.int_data(&x))])
+                    .as_datatype()
+                    .unwrap(),
+                &self.error(),
+            ),
+        );
+        self.neg.add_def(&[&x], &body);
+    }
+
+    fn define_not(&self) {
+        let x = self.fresh("x");
+        let body = self.is_error(&x).ite(
+            &self.error(),
+            &self
+                .is_bool_value(&x)
+                .ite(&self.wrap_bool(&self.bool_data(&x).not()), &self.error()),
+        );
+        self.not.add_def(&[&x], &body);
+    }
+
+    fn define_eqv(&self) {
+        let x = self.fresh("x");
+        let y = self.fresh("y");
+        let body = bool_or(vec![self.is_error(&x), self.is_error(&y)]).ite(
+            &self.error(),
+            &self.is_nil(&x).ite(
+                &self.wrap_bool(&self.is_nil(&y)),
+                &bool_and(vec![self.is_cons(&x), self.is_cons(&y)]).ite(
+                    &self.andv(
+                        &self.eqv(&self.car(&x), &self.car(&y)),
+                        &self.eqv(&self.cdr(&x), &self.cdr(&y)),
+                    ),
+                    &bool_and(vec![self.is_int(&x), self.is_int(&y)]).ite(
+                        &self.wrap_bool(&self.int_data(&x).eq(self.int_data(&y))),
+                        &bool_and(vec![self.is_bool_value(&x), self.is_bool_value(&y)]).ite(
+                            &self.wrap_bool(&self.bool_data(&x).eq(self.bool_data(&y))),
+                            &self.bool_false(),
+                        ),
+                    ),
+                ),
+            ),
+        );
+        self.eqv.add_def(&[&x, &y], &body);
+    }
+
+    fn define_is_true(&self) {
+        let x = self.fresh("x");
+        let body = bool_and(vec![self.is_bool_value(&x), self.bool_data(&x)]);
+        self.is_true.add_def(&[&x], &body);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ControlPoint {
@@ -46,73 +437,20 @@ pub struct ControlPoint {
 pub struct State {
     pc: Bool,
     assertion: Bool,
-    model: BTreeMap<Local, SymVal>,
+    model: BTreeMap<Local, Datatype>,
     ctrl: ControlPoint,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SymTy {
-    Bool,
-    Int,
-    Tuple(Box<[SymTy]>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SymVar {
-    name: String,
-    ty: SymTy,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SymVal {
-    Var(SymVar),
-    Proj {
-        base: Box<SymVal>,
-        index: usize,
-        ty: SymTy,
-    },
-    Int(i64),
-    Bool(bool),
-    Tuple(Box<[SymVal]>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum IntExpr {
-    Value(SymVal),
-    Add(Box<IntExpr>, Box<IntExpr>),
-    Sub(Box<IntExpr>, Box<IntExpr>),
-    Mul(Box<IntExpr>, Box<IntExpr>),
-    Neg(Box<IntExpr>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CmpOp {
-    Eq,
-    Lt,
-    Le,
-    Gt,
-    Ge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BoolExpr {
     Const(bool),
-    Value(SymVal),
-    Cmp {
-        op: CmpOp,
-        lhs: IntExpr,
-        rhs: IntExpr,
-    },
-    Eq(SymVal, SymVal),
+    Value(Datatype),
     Not(Box<BoolExpr>),
-    And(Vec<BoolExpr>),
-    Or(Vec<BoolExpr>),
-    Implies(Box<BoolExpr>, Box<BoolExpr>),
 }
 
 #[derive(Debug, Clone)]
 struct EvaluatedRvalue {
-    value: SymVal,
+    value: Datatype,
     constraints: Vec<BoolExpr>,
 }
 
@@ -227,7 +565,7 @@ impl<'tcx> Verifier<'tcx> {
                     Ok(formula) => formula,
                     Err(err) => return err,
                 };
-                let formula = match self.bool_expr_to_z3(&formula, self.control_span(ctrl)) {
+                let formula = match self.bool_expr_to_z3(&formula) {
                     Ok(formula) => formula,
                     Err(err) => return err,
                 };
@@ -249,7 +587,7 @@ impl<'tcx> Verifier<'tcx> {
                     Ok(formula) => formula,
                     Err(err) => return err,
                 };
-                let formula = match self.bool_expr_to_z3(&formula, self.control_span(ctrl)) {
+                let formula = match self.bool_expr_to_z3(&formula) {
                     Ok(formula) => formula,
                     Err(err) => return err,
                 };
@@ -315,7 +653,7 @@ impl<'tcx> Verifier<'tcx> {
                 let eval = self.eval_rvalue(&mut state, rvalue, stmt.source_info.span)?;
                 self.write_place(&mut state, *place, eval.value, stmt.source_info.span)?;
                 for constraint in eval.constraints {
-                    let constraint = self.bool_expr_to_z3(&constraint, stmt.source_info.span)?;
+                    let constraint = self.bool_expr_to_z3(&constraint)?;
                     self.assume_constraint(&mut state, constraint);
                 }
             }
@@ -349,7 +687,7 @@ impl<'tcx> Verifier<'tcx> {
             TerminatorKind::Return => {
                 if let Some(contract) = self.contracts.get(&self.def_id) {
                     let formula = self.contract_to_bool(&state, contract, true)?;
-                    let formula = self.bool_expr_to_z3(&formula, term.source_info.span)?;
+                    let formula = self.bool_expr_to_z3(&formula)?;
                     self.require_constraint(
                         &mut state,
                         formula,
@@ -374,18 +712,16 @@ impl<'tcx> Verifier<'tcx> {
                     let branch = match discr.ty(&self.body, self.tcx).kind() {
                         TyKind::Bool => {
                             if value == 0 {
-                                not_expr(self.symval_to_bool_expr(&discr_value)?)
+                                not_expr(BoolExpr::Value(discr_value.clone()))
                             } else {
-                                self.symval_to_bool_expr(&discr_value)?
+                                BoolExpr::Value(discr_value.clone())
                             }
                         }
-                        _ => BoolExpr::Cmp {
-                            op: CmpOp::Eq,
-                            lhs: self.symval_to_int_expr(&discr_value)?,
-                            rhs: IntExpr::Value(SymVal::Int(value as i64)),
-                        },
+                        _ => BoolExpr::Value(
+                            self.value_eqv(&discr_value, &self.value_int(value as i64)),
+                        ),
                     };
-                    let branch = self.bool_expr_to_z3(&branch, term.source_info.span)?;
+                    let branch = self.bool_expr_to_z3(&branch)?;
                     seen_conditions.push(branch.clone());
                     let mut next = state.clone();
                     next.pc = bool_and(vec![next.pc, branch]);
@@ -412,11 +748,11 @@ impl<'tcx> Verifier<'tcx> {
                 ..
             } => {
                 let cond_value = self.eval_operand(&mut state, cond, term.source_info.span)?;
-                let mut formula = self.symval_to_bool_expr(&cond_value)?;
+                let mut formula = BoolExpr::Value(cond_value);
                 if !*expected {
                     formula = not_expr(formula);
                 }
-                let formula = self.bool_expr_to_z3(&formula, term.source_info.span)?;
+                let formula = self.bool_expr_to_z3(&formula)?;
                 self.require_constraint(
                     &mut state,
                     formula,
@@ -462,7 +798,7 @@ impl<'tcx> Verifier<'tcx> {
         {
             let env = self.call_env(&state, args, contract, span)?;
             let req = self.contract_expr_to_bool(&env.current, &env.prophecy, &contract.req)?;
-            let req = self.bool_expr_to_z3(&req, span)?;
+            let req = self.bool_expr_to_z3(&req)?;
             self.require_constraint(
                 &mut state,
                 req,
@@ -478,7 +814,7 @@ impl<'tcx> Verifier<'tcx> {
             self.consume_call_move_args(&mut state, args, span)?;
             env.current.insert("result".to_owned(), result_value);
             let ens = self.contract_expr_to_bool(&env.current, &env.prophecy, &contract.ens)?;
-            let ens = self.bool_expr_to_z3(&ens, span)?;
+            let ens = self.bool_expr_to_z3(&ens)?;
             self.assume_constraint(&mut state, ens);
         } else {
             let result_ty = self.place_ty(destination);
@@ -513,7 +849,7 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<Option<State>, VerificationResult> {
         if let Some(loop_contract) = self.loop_contracts.contract_by_header(target) {
             let invariant = self.mir_spec_to_bool(&state, &loop_contract.invariant)?;
-            let invariant = self.bool_expr_to_z3(&invariant, span)?;
+            let invariant = self.bool_expr_to_z3(&invariant)?;
             self.require_constraint(
                 &mut state,
                 invariant.clone(),
@@ -542,7 +878,7 @@ impl<'tcx> Verifier<'tcx> {
             && let Some(loop_contract) = self.loop_contracts.contract_by_header(header)
         {
             let invariant = self.mir_spec_to_bool(&state, &loop_contract.invariant)?;
-            let invariant = self.bool_expr_to_z3(&invariant, span)?;
+            let invariant = self.bool_expr_to_z3(&invariant)?;
             self.assume_constraint(&mut state, invariant);
         }
 
@@ -631,8 +967,7 @@ impl<'tcx> Verifier<'tcx> {
             let merged_value =
                 self.fresh_for_rust_ty(ty, &format!("merge_{}", local.as_usize()))?;
             for (state, incoming) in states.iter().zip(incoming_values.drain(..)) {
-                let equality =
-                    self.sym_eq_to_z3(&merged_value, &incoming, self.control_span(ctrl))?;
+                let equality = self.value_is_true(&self.value_eqv(&merged_value, &incoming));
                 merged.assertion =
                     bool_and(vec![merged.assertion, state.pc.clone().implies(equality)]);
             }
@@ -689,7 +1024,7 @@ impl<'tcx> Verifier<'tcx> {
         if let Some(contract) = self.contracts.get(&self.def_id) {
             let env = CallEnv::for_function(self, &state, contract)?;
             let req = self.contract_expr_to_bool(&env.current, &env.prophecy, &contract.req)?;
-            let req = self.bool_expr_to_z3(&req, self.tcx.def_span(self.def_id))?;
+            let req = self.bool_expr_to_z3(&req)?;
             self.assume_constraint(&mut state, req);
         }
         Ok(state)
@@ -707,7 +1042,7 @@ impl<'tcx> Verifier<'tcx> {
         let ty = self.body.local_decls[local].ty;
         let formulas = self.resolve_formulas(ty, &value, span)?;
         for formula in formulas {
-            let formula = self.bool_expr_to_z3(&formula, span)?;
+            let formula = self.bool_expr_to_z3(&formula)?;
             self.require_constraint(
                 state,
                 formula,
@@ -722,7 +1057,7 @@ impl<'tcx> Verifier<'tcx> {
     fn resolve_formulas(
         &self,
         ty: Ty<'tcx>,
-        value: &SymVal,
+        value: &Datatype,
         span: Span,
     ) -> Result<Vec<BoolExpr>, VerificationResult> {
         match ty.kind() {
@@ -736,24 +1071,12 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(formulas)
             }
             TyKind::Ref(_, inner, mutability) if mutability.is_mut() => {
-                let SymVal::Tuple(parts) = value else {
-                    return Err(self.unsupported_result(
-                        span,
-                        "mutable reference shape mismatch during resolve".to_owned(),
-                    ));
-                };
-                if parts.len() != 2 {
-                    return Err(self.unsupported_result(
-                        span,
-                        "mutable reference shape mismatch during resolve".to_owned(),
-                    ));
-                }
-                let cur = parts[0].clone();
-                let fin = parts[1].clone();
+                let cur = self.value_pair_first(value);
+                let fin = self.value_pair_second(value);
                 if !matches!(inner.kind(), TyKind::Tuple(_)) {
-                    return Ok(vec![BoolExpr::Eq(cur, fin)]);
+                    return Ok(vec![BoolExpr::Value(self.value_eqv(&cur, &fin))]);
                 }
-                Ok(vec![BoolExpr::Eq(cur, fin)])
+                Ok(vec![BoolExpr::Value(self.value_eqv(&cur, &fin))])
             }
             TyKind::Ref(_, _, _) => Ok(Vec::new()),
             TyKind::Bool | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Never => Ok(Vec::new()),
@@ -791,7 +1114,7 @@ impl<'tcx> Verifier<'tcx> {
                         values.push(self.eval_operand(state, operand, span)?);
                     }
                     Ok(EvaluatedRvalue {
-                        value: SymVal::Tuple(values.into_boxed_slice()),
+                        value: self.value_list(&values),
                         constraints: Vec::new(),
                     })
                 }
@@ -816,7 +1139,7 @@ impl<'tcx> Verifier<'tcx> {
         };
         self.write_place(state, place, final_value.clone(), span)?;
         Ok(EvaluatedRvalue {
-            value: SymVal::Tuple(vec![current, final_value].into_boxed_slice()),
+            value: self.value_list(&[current, final_value]),
             constraints: Vec::new(),
         })
     }
@@ -847,58 +1170,42 @@ impl<'tcx> Verifier<'tcx> {
             BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow => {
                 self.eval_checked_binary_op(state, op, lhs, rhs, span)
             }
-            BinOp::Add | BinOp::Sub | BinOp::Mul => {
-                let result =
-                    self.fresh_for_rust_ty(lhs.ty(&self.body.local_decls, self.tcx), "binop")?;
-                let lhs_term = self.symval_to_int_expr(&lhs_value)?;
-                let rhs_term = self.symval_to_int_expr(&rhs_value)?;
-                let term = match op {
-                    BinOp::Add => IntExpr::Add(Box::new(lhs_term), Box::new(rhs_term)),
-                    BinOp::Sub => IntExpr::Sub(Box::new(lhs_term), Box::new(rhs_term)),
-                    BinOp::Mul => IntExpr::Mul(Box::new(lhs_term), Box::new(rhs_term)),
-                    _ => unreachable!(),
-                };
-                Ok(EvaluatedRvalue {
-                    value: result.clone(),
-                    constraints: vec![BoolExpr::Cmp {
-                        op: CmpOp::Eq,
-                        lhs: self.symval_to_int_expr(&result)?,
-                        rhs: term,
-                    }],
-                })
-            }
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                let result = self.fresh_bool("cmp");
-                let formula = match op {
-                    BinOp::Eq => BoolExpr::Eq(lhs_value, rhs_value),
-                    BinOp::Ne => not_expr(BoolExpr::Eq(lhs_value, rhs_value)),
-                    BinOp::Lt => BoolExpr::Cmp {
-                        op: CmpOp::Lt,
-                        lhs: self.symval_to_int_expr(&lhs_value)?,
-                        rhs: self.symval_to_int_expr(&rhs_value)?,
-                    },
-                    BinOp::Le => BoolExpr::Cmp {
-                        op: CmpOp::Le,
-                        lhs: self.symval_to_int_expr(&lhs_value)?,
-                        rhs: self.symval_to_int_expr(&rhs_value)?,
-                    },
-                    BinOp::Gt => BoolExpr::Cmp {
-                        op: CmpOp::Gt,
-                        lhs: self.symval_to_int_expr(&lhs_value)?,
-                        rhs: self.symval_to_int_expr(&rhs_value)?,
-                    },
-                    BinOp::Ge => BoolExpr::Cmp {
-                        op: CmpOp::Ge,
-                        lhs: self.symval_to_int_expr(&lhs_value)?,
-                        rhs: self.symval_to_int_expr(&rhs_value)?,
-                    },
-                    _ => unreachable!(),
-                };
-                Ok(EvaluatedRvalue {
-                    value: result.clone(),
-                    constraints: vec![bool_assignment(result, formula)],
-                })
-            }
+            BinOp::Add => Ok(EvaluatedRvalue {
+                value: self.value_add(&lhs_value, &rhs_value),
+                constraints: Vec::new(),
+            }),
+            BinOp::Sub => Ok(EvaluatedRvalue {
+                value: self.value_sub(&lhs_value, &rhs_value),
+                constraints: Vec::new(),
+            }),
+            BinOp::Mul => Ok(EvaluatedRvalue {
+                value: self.value_mul(&lhs_value, &rhs_value),
+                constraints: Vec::new(),
+            }),
+            BinOp::Eq => Ok(EvaluatedRvalue {
+                value: self.value_eqv(&lhs_value, &rhs_value),
+                constraints: Vec::new(),
+            }),
+            BinOp::Ne => Ok(EvaluatedRvalue {
+                value: self.value_not(&self.value_eqv(&lhs_value, &rhs_value)),
+                constraints: Vec::new(),
+            }),
+            BinOp::Lt => Ok(EvaluatedRvalue {
+                value: self.value_lt(&lhs_value, &rhs_value),
+                constraints: Vec::new(),
+            }),
+            BinOp::Le => Ok(EvaluatedRvalue {
+                value: self.value_le(&lhs_value, &rhs_value),
+                constraints: Vec::new(),
+            }),
+            BinOp::Gt => Ok(EvaluatedRvalue {
+                value: self.value_gt(&lhs_value, &rhs_value),
+                constraints: Vec::new(),
+            }),
+            BinOp::Ge => Ok(EvaluatedRvalue {
+                value: self.value_ge(&lhs_value, &rhs_value),
+                constraints: Vec::new(),
+            }),
             other => {
                 Err(self.unsupported_result(span, format!("unsupported binary operator {other:?}")))
             }
@@ -916,20 +1223,10 @@ impl<'tcx> Verifier<'tcx> {
         let lhs_value = self.eval_operand(state, lhs, span)?;
         let rhs_value = self.eval_operand(state, rhs, span)?;
         let result_ty = lhs.ty(&self.body.local_decls, self.tcx);
-        let result_value = self.fresh_for_rust_ty(result_ty, "checked")?;
-        let overflow_value = self.fresh_bool("overflow");
-        let lhs_term = self.symval_to_int_expr(&lhs_value)?;
-        let rhs_term = self.symval_to_int_expr(&rhs_value)?;
-        let math = match op {
-            BinOp::Add | BinOp::AddWithOverflow => {
-                IntExpr::Add(Box::new(lhs_term), Box::new(rhs_term))
-            }
-            BinOp::Sub | BinOp::SubWithOverflow => {
-                IntExpr::Sub(Box::new(lhs_term), Box::new(rhs_term))
-            }
-            BinOp::Mul | BinOp::MulWithOverflow => {
-                IntExpr::Mul(Box::new(lhs_term), Box::new(rhs_term))
-            }
+        let result_value = match op {
+            BinOp::Add | BinOp::AddWithOverflow => self.value_add(&lhs_value, &rhs_value),
+            BinOp::Sub | BinOp::SubWithOverflow => self.value_sub(&lhs_value, &rhs_value),
+            BinOp::Mul | BinOp::MulWithOverflow => self.value_mul(&lhs_value, &rhs_value),
             other => {
                 return Err(self.unsupported_result(
                     span,
@@ -937,19 +1234,10 @@ impl<'tcx> Verifier<'tcx> {
                 ));
             }
         };
-        let overflow = not_expr(self.in_range_formula(result_ty, math.clone(), span)?);
+        let overflow_value = self.overflow_value_for_result(result_ty, &result_value, span)?;
         Ok(EvaluatedRvalue {
-            value: SymVal::Tuple(
-                vec![result_value.clone(), overflow_value.clone()].into_boxed_slice(),
-            ),
-            constraints: vec![
-                BoolExpr::Cmp {
-                    op: CmpOp::Eq,
-                    lhs: self.symval_to_int_expr(&result_value)?,
-                    rhs: math,
-                },
-                bool_assignment(overflow_value, overflow),
-            ],
+            value: self.value_list(&[result_value, overflow_value]),
+            constraints: Vec::new(),
         })
     }
 
@@ -962,27 +1250,14 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<EvaluatedRvalue, VerificationResult> {
         let value = self.eval_operand(state, operand, span)?;
         match op {
-            UnOp::Not => {
-                let result = self.fresh_bool("not");
-                let formula = not_expr(self.symval_to_bool_expr(&value)?);
-                Ok(EvaluatedRvalue {
-                    value: result.clone(),
-                    constraints: vec![bool_assignment(result, formula)],
-                })
-            }
-            UnOp::Neg => {
-                let result =
-                    self.fresh_for_rust_ty(operand.ty(&self.body.local_decls, self.tcx), "neg")?;
-                let term = IntExpr::Neg(Box::new(self.symval_to_int_expr(&value)?));
-                Ok(EvaluatedRvalue {
-                    value: result.clone(),
-                    constraints: vec![BoolExpr::Cmp {
-                        op: CmpOp::Eq,
-                        lhs: self.symval_to_int_expr(&result)?,
-                        rhs: term,
-                    }],
-                })
-            }
+            UnOp::Not => Ok(EvaluatedRvalue {
+                value: self.value_not(&value),
+                constraints: Vec::new(),
+            }),
+            UnOp::Neg => Ok(EvaluatedRvalue {
+                value: self.value_neg(&value),
+                constraints: Vec::new(),
+            }),
             other => {
                 Err(self.unsupported_result(span, format!("unsupported unary operator {other:?}")))
             }
@@ -994,7 +1269,7 @@ impl<'tcx> Verifier<'tcx> {
         state: &mut State,
         operand: &Operand<'tcx>,
         span: Span,
-    ) -> Result<SymVal, VerificationResult> {
+    ) -> Result<Datatype, VerificationResult> {
         let value = self.read_operand(state, operand, span)?;
         if matches!(operand, Operand::Move(_)) {
             self.consume_operand(state, operand, span)?;
@@ -1007,7 +1282,7 @@ impl<'tcx> Verifier<'tcx> {
         state: &State,
         operand: &Operand<'tcx>,
         span: Span,
-    ) -> Result<SymVal, VerificationResult> {
+    ) -> Result<Datatype, VerificationResult> {
         match operand {
             Operand::Copy(place) | Operand::Move(place) => {
                 self.read_place(state, *place, ReadMode::Current, span)
@@ -1040,7 +1315,7 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         constant: &ConstOperand<'tcx>,
         span: Span,
-    ) -> Result<SymVal, VerificationResult> {
+    ) -> Result<Datatype, VerificationResult> {
         let ty = constant.const_.ty();
         match ty.kind() {
             TyKind::Bool => {
@@ -1053,7 +1328,7 @@ impl<'tcx> Verifier<'tcx> {
                             "failed to evaluate boolean constant".to_owned(),
                         )
                     })?;
-                Ok(SymVal::Bool(value.try_to_bool().map_err(|_| {
+                Ok(self.value_bool(value.try_to_bool().map_err(|_| {
                     self.unsupported_result(span, "failed to evaluate boolean constant".to_owned())
                 })?))
             }
@@ -1067,9 +1342,9 @@ impl<'tcx> Verifier<'tcx> {
                             "failed to evaluate integer constant".to_owned(),
                         )
                     })?;
-                Ok(SymVal::Int(self.scalar_int_to_i64(ty, value, span)?))
+                Ok(self.value_int(self.scalar_int_to_i64(ty, value, span)?))
             }
-            TyKind::Tuple(fields) if fields.is_empty() => Ok(SymVal::Tuple(Box::new([]))),
+            TyKind::Tuple(fields) if fields.is_empty() => Ok(self.value_nil()),
             _ => Err(self.unsupported_result(span, format!("unsupported constant type {ty:?}"))),
         }
     }
@@ -1080,7 +1355,7 @@ impl<'tcx> Verifier<'tcx> {
         place: Place<'tcx>,
         mode: ReadMode,
         span: Span,
-    ) -> Result<SymVal, VerificationResult> {
+    ) -> Result<Datatype, VerificationResult> {
         let Some(root) = state.model.get(&place.local).cloned() else {
             return Err(
                 self.unsupported_result(span, format!("missing local {}", place.local.as_usize()))
@@ -1092,12 +1367,12 @@ impl<'tcx> Verifier<'tcx> {
 
     fn read_projection(
         &self,
-        value: SymVal,
+        value: Datatype,
         ty: Ty<'tcx>,
         projection: &[PlaceElem<'tcx>],
         mode: ReadMode,
         span: Span,
-    ) -> Result<SymVal, VerificationResult> {
+    ) -> Result<Datatype, VerificationResult> {
         if projection.is_empty() {
             return Ok(value);
         }
@@ -1109,21 +1384,9 @@ impl<'tcx> Verifier<'tcx> {
                     );
                 };
                 let next = if mutability.is_mut() {
-                    let SymVal::Tuple(parts) = value else {
-                        return Err(self.unsupported_result(
-                            span,
-                            "deref of non-reference symbolic value".to_owned(),
-                        ));
-                    };
-                    if parts.len() != 2 {
-                        return Err(self.unsupported_result(
-                            span,
-                            "mutable reference shape mismatch".to_owned(),
-                        ));
-                    }
                     match mode {
-                        ReadMode::Current => parts[0].clone(),
-                        ReadMode::Final => parts[1].clone(),
+                        ReadMode::Current => self.value_pair_first(&value),
+                        ReadMode::Final => self.value_pair_second(&value),
                     }
                 } else {
                     value
@@ -1154,7 +1417,7 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         state: &mut State,
         place: Place<'tcx>,
-        value: SymVal,
+        value: Datatype,
         span: Span,
     ) -> Result<(), VerificationResult> {
         let root = state
@@ -1171,12 +1434,12 @@ impl<'tcx> Verifier<'tcx> {
 
     fn write_projection(
         &self,
-        value: SymVal,
+        value: Datatype,
         ty: Ty<'tcx>,
         projection: &[PlaceElem<'tcx>],
-        replacement: SymVal,
+        replacement: Datatype,
         span: Span,
-    ) -> Result<SymVal, VerificationResult> {
+    ) -> Result<Datatype, VerificationResult> {
         if projection.is_empty() {
             return Ok(replacement);
         }
@@ -1194,36 +1457,16 @@ impl<'tcx> Verifier<'tcx> {
                         "assignment through shared reference is unsupported".to_owned(),
                     ));
                 }
-                let SymVal::Tuple(parts) = value else {
-                    return Err(self.unsupported_result(
-                        span,
-                        "deref assignment on non-reference symbolic value".to_owned(),
-                    ));
-                };
-                if parts.len() != 2 {
-                    return Err(self
-                        .unsupported_result(span, "mutable reference shape mismatch".to_owned()));
-                }
-                let mut items = parts.into_vec();
-                items[0] = self.write_projection(
-                    items[0].clone(),
+                let current = self.write_projection(
+                    self.value_pair_first(&value),
                     *inner,
                     &projection[1..],
                     replacement,
                     span,
                 )?;
-                Ok(SymVal::Tuple(items.into_boxed_slice()))
+                Ok(self.value_list(&[current, self.value_pair_second(&value)]))
             }
             PlaceElem::Field(field, _) => {
-                let field_types = match value.sym_ty() {
-                    SymTy::Tuple(fields) => fields.into_vec(),
-                    _ => {
-                        return Err(self.unsupported_result(
-                            span,
-                            "field assignment on non-tuple symbolic value".to_owned(),
-                        ));
-                    }
-                };
                 let index = field.index();
                 let TyKind::Tuple(fields) = ty.kind() else {
                     return Err(self.unsupported_result(
@@ -1234,15 +1477,10 @@ impl<'tcx> Verifier<'tcx> {
                 let rust_field_ty = fields.get(index).ok_or_else(|| {
                     self.unsupported_result(span, "tuple field out of range".to_owned())
                 })?;
-                if index >= field_types.len() {
-                    return Err(
-                        self.unsupported_result(span, "tuple field out of range".to_owned())
-                    );
-                }
-                let mut items = Vec::with_capacity(field_types.len());
-                for (current_index, field_ty) in field_types.into_iter().enumerate() {
+                let mut items = Vec::with_capacity(fields.len());
+                for current_index in 0..fields.len() {
                     let field_value =
-                        self.project_field(value.clone(), current_index, field_ty, span)?;
+                        self.project_tuple_field(value.clone(), current_index, span)?;
                     if current_index == index {
                         items.push(self.write_projection(
                             field_value,
@@ -1255,7 +1493,7 @@ impl<'tcx> Verifier<'tcx> {
                         items.push(field_value);
                     }
                 }
-                Ok(SymVal::Tuple(items.into_boxed_slice()))
+                Ok(self.value_list(&items))
             }
             other => Err(self
                 .unsupported_result(span, format!("unsupported assignment projection {other:?}"))),
@@ -1276,9 +1514,9 @@ impl<'tcx> Verifier<'tcx> {
     fn dangle_value(
         &self,
         ty: Ty<'tcx>,
-        value: &SymVal,
+        value: &Datatype,
         span: Span,
-    ) -> Result<SymVal, VerificationResult> {
+    ) -> Result<Datatype, VerificationResult> {
         match ty.kind() {
             TyKind::Tuple(fields) => {
                 let mut updated = Vec::with_capacity(fields.len());
@@ -1286,25 +1524,11 @@ impl<'tcx> Verifier<'tcx> {
                     let field_value = self.project_tuple_field(value.clone(), index, span)?;
                     updated.push(self.dangle_value(field_ty, &field_value, span)?);
                 }
-                Ok(SymVal::Tuple(updated.into_boxed_slice()))
+                Ok(self.value_list(&updated))
             }
             TyKind::Ref(_, inner, mutability) if mutability.is_mut() => {
-                let SymVal::Tuple(parts) = value else {
-                    return Err(self.unsupported_result(
-                        span,
-                        "reference shape mismatch during dangle".to_owned(),
-                    ));
-                };
-                if parts.len() != 2 {
-                    return Err(self.unsupported_result(
-                        span,
-                        "reference shape mismatch during dangle".to_owned(),
-                    ));
-                }
                 let fresh = self.fresh_for_rust_ty(*inner, "dangle")?;
-                Ok(SymVal::Tuple(
-                    vec![fresh, parts[1].clone()].into_boxed_slice(),
-                ))
+                Ok(self.value_list(&[fresh, self.value_pair_second(value)]))
             }
             TyKind::Ref(_, _, _) => Ok(value.clone()),
             TyKind::Bool | TyKind::Int(_) | TyKind::Uint(_) => Ok(value.clone()),
@@ -1322,128 +1546,7 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<BoolExpr, VerificationResult> {
         match expr {
             MirSpecExpr::Bool(value) => Ok(BoolExpr::Const(*value)),
-            MirSpecExpr::Int(_) => Err(self.unsupported_result(
-                self.control_span(state.ctrl),
-                "expected boolean spec expression".to_owned(),
-            )),
-            MirSpecExpr::Var(local) => {
-                self.symval_to_bool_expr(state.model.get(local).ok_or_else(|| {
-                    self.unsupported_result(
-                        self.control_span(state.ctrl),
-                        format!("missing local {}", local.as_usize()),
-                    )
-                })?)
-            }
-            MirSpecExpr::Prophecy(local) => {
-                let value = self.local_prophecy(state, *local, self.control_span(state.ctrl))?;
-                self.symval_to_bool_expr(&value)
-            }
-            MirSpecExpr::Field { .. } => {
-                let value = self.mir_spec_to_value(state, expr)?;
-                self.symval_to_bool_expr(&value)
-            }
-            MirSpecExpr::Unary { op, arg } => match op {
-                SpecUnaryOp::Not => Ok(not_expr(self.mir_spec_to_bool(state, arg)?)),
-                SpecUnaryOp::Neg => Err(self.unsupported_result(
-                    self.control_span(state.ctrl),
-                    "expected integer spec expression".to_owned(),
-                )),
-            },
-            MirSpecExpr::Binary { op, lhs, rhs } => self.spec_binary_to_bool(state, *op, lhs, rhs),
-        }
-    }
-
-    fn spec_binary_to_bool(
-        &self,
-        state: &State,
-        op: SpecBinaryOp,
-        lhs: &MirSpecExpr,
-        rhs: &MirSpecExpr,
-    ) -> Result<BoolExpr, VerificationResult> {
-        match op {
-            SpecBinaryOp::Eq => self.spec_eq_formula(state, lhs, rhs),
-            SpecBinaryOp::Ne => Ok(not_expr(self.spec_eq_formula(state, lhs, rhs)?)),
-            SpecBinaryOp::And => Ok(and_expr(vec![
-                self.mir_spec_to_bool(state, lhs)?,
-                self.mir_spec_to_bool(state, rhs)?,
-            ])),
-            SpecBinaryOp::Or => Ok(or_expr(vec![
-                self.mir_spec_to_bool(state, lhs)?,
-                self.mir_spec_to_bool(state, rhs)?,
-            ])),
-            SpecBinaryOp::Lt | SpecBinaryOp::Le | SpecBinaryOp::Gt | SpecBinaryOp::Ge => {
-                Ok(BoolExpr::Cmp {
-                    op: match op {
-                        SpecBinaryOp::Lt => CmpOp::Lt,
-                        SpecBinaryOp::Le => CmpOp::Le,
-                        SpecBinaryOp::Gt => CmpOp::Gt,
-                        SpecBinaryOp::Ge => CmpOp::Ge,
-                        _ => unreachable!(),
-                    },
-                    lhs: self.mir_spec_to_int(state, lhs)?,
-                    rhs: self.mir_spec_to_int(state, rhs)?,
-                })
-            }
-            SpecBinaryOp::Add | SpecBinaryOp::Sub | SpecBinaryOp::Mul => Err(self
-                .unsupported_result(
-                    self.control_span(state.ctrl),
-                    "expected boolean spec expression".to_owned(),
-                )),
-        }
-    }
-
-    fn mir_spec_to_int(
-        &self,
-        state: &State,
-        expr: &MirSpecExpr,
-    ) -> Result<IntExpr, VerificationResult> {
-        match expr {
-            MirSpecExpr::Int(value) => Ok(IntExpr::Value(SymVal::Int(*value))),
-            MirSpecExpr::Var(local) => {
-                self.symval_to_int_expr(state.model.get(local).ok_or_else(|| {
-                    self.unsupported_result(
-                        self.control_span(state.ctrl),
-                        format!("missing local {}", local.as_usize()),
-                    )
-                })?)
-            }
-            MirSpecExpr::Prophecy(local) => {
-                let value = self.local_prophecy(state, *local, self.control_span(state.ctrl))?;
-                self.symval_to_int_expr(&value)
-            }
-            MirSpecExpr::Field { .. } => {
-                let value = self.mir_spec_to_value(state, expr)?;
-                self.symval_to_int_expr(&value)
-            }
-            MirSpecExpr::Unary { op, arg } => match op {
-                SpecUnaryOp::Neg => Ok(IntExpr::Neg(Box::new(self.mir_spec_to_int(state, arg)?))),
-                SpecUnaryOp::Not => Err(self.unsupported_result(
-                    self.control_span(state.ctrl),
-                    "expected boolean spec expression".to_owned(),
-                )),
-            },
-            MirSpecExpr::Binary { op, lhs, rhs } => match op {
-                SpecBinaryOp::Add => Ok(IntExpr::Add(
-                    Box::new(self.mir_spec_to_int(state, lhs)?),
-                    Box::new(self.mir_spec_to_int(state, rhs)?),
-                )),
-                SpecBinaryOp::Sub => Ok(IntExpr::Sub(
-                    Box::new(self.mir_spec_to_int(state, lhs)?),
-                    Box::new(self.mir_spec_to_int(state, rhs)?),
-                )),
-                SpecBinaryOp::Mul => Ok(IntExpr::Mul(
-                    Box::new(self.mir_spec_to_int(state, lhs)?),
-                    Box::new(self.mir_spec_to_int(state, rhs)?),
-                )),
-                _ => Err(self.unsupported_result(
-                    self.control_span(state.ctrl),
-                    "expected integer spec expression".to_owned(),
-                )),
-            },
-            MirSpecExpr::Bool(_) => Err(self.unsupported_result(
-                self.control_span(state.ctrl),
-                "expected integer spec expression".to_owned(),
-            )),
+            _ => Ok(BoolExpr::Value(self.mir_spec_to_value(state, expr)?)),
         }
     }
 
@@ -1451,10 +1554,10 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         state: &State,
         expr: &MirSpecExpr,
-    ) -> Result<SymVal, VerificationResult> {
+    ) -> Result<Datatype, VerificationResult> {
         match expr {
-            MirSpecExpr::Bool(value) => Ok(SymVal::Bool(*value)),
-            MirSpecExpr::Int(value) => Ok(SymVal::Int(*value)),
+            MirSpecExpr::Bool(value) => Ok(self.value_bool(*value)),
+            MirSpecExpr::Int(value) => Ok(self.value_int(*value)),
             MirSpecExpr::Var(local) => state.model.get(local).cloned().ok_or_else(|| {
                 self.unsupported_result(
                     self.control_span(state.ctrl),
@@ -1468,182 +1571,56 @@ impl<'tcx> Verifier<'tcx> {
                 let value = self.mir_spec_to_value(state, base)?;
                 self.project_tuple_field(value, *index, self.control_span(state.ctrl))
             }
-            MirSpecExpr::Unary { .. } | MirSpecExpr::Binary { .. } => Err(self.unsupported_result(
-                self.control_span(state.ctrl),
-                "complex spec values are unsupported outside comparisons".to_owned(),
-            )),
+            MirSpecExpr::Unary { op, arg } => {
+                let value = self.mir_spec_to_value(state, arg)?;
+                Ok(match op {
+                    SpecUnaryOp::Not => self.value_not(&value),
+                    SpecUnaryOp::Neg => self.value_neg(&value),
+                })
+            }
+            MirSpecExpr::Binary { op, lhs, rhs } => {
+                let lhs = self.mir_spec_to_value(state, lhs)?;
+                let rhs = self.mir_spec_to_value(state, rhs)?;
+                Ok(match op {
+                    SpecBinaryOp::Eq => self.value_eqv(&lhs, &rhs),
+                    SpecBinaryOp::Ne => self.value_not(&self.value_eqv(&lhs, &rhs)),
+                    SpecBinaryOp::And => self.value_and(&lhs, &rhs),
+                    SpecBinaryOp::Or => self.value_or(&lhs, &rhs),
+                    SpecBinaryOp::Lt => self.value_lt(&lhs, &rhs),
+                    SpecBinaryOp::Le => self.value_le(&lhs, &rhs),
+                    SpecBinaryOp::Gt => self.value_gt(&lhs, &rhs),
+                    SpecBinaryOp::Ge => self.value_ge(&lhs, &rhs),
+                    SpecBinaryOp::Add => self.value_add(&lhs, &rhs),
+                    SpecBinaryOp::Sub => self.value_sub(&lhs, &rhs),
+                    SpecBinaryOp::Mul => self.value_mul(&lhs, &rhs),
+                })
+            }
         }
-    }
-
-    fn spec_eq_formula(
-        &self,
-        state: &State,
-        lhs: &MirSpecExpr,
-        rhs: &MirSpecExpr,
-    ) -> Result<BoolExpr, VerificationResult> {
-        if let (Ok(lhs), Ok(rhs)) = (
-            self.mir_spec_to_int(state, lhs),
-            self.mir_spec_to_int(state, rhs),
-        ) {
-            return Ok(BoolExpr::Cmp {
-                op: CmpOp::Eq,
-                lhs,
-                rhs,
-            });
-        }
-        Ok(BoolExpr::Eq(
-            self.mir_spec_to_value(state, lhs)?,
-            self.mir_spec_to_value(state, rhs)?,
-        ))
     }
 
     fn contract_expr_to_bool(
         &self,
-        current: &HashMap<String, SymVal>,
-        prophecy: &HashMap<String, SymVal>,
+        current: &HashMap<String, Datatype>,
+        prophecy: &HashMap<String, Datatype>,
         expr: &ContractExpr,
     ) -> Result<BoolExpr, VerificationResult> {
         match expr {
             ContractExpr::Bool(value) => Ok(BoolExpr::Const(*value)),
-            ContractExpr::Int(_) => Err(self.unsupported_result(
-                self.tcx.def_span(self.def_id),
-                "expected boolean contract expression".to_owned(),
-            )),
-            ContractExpr::Var(name) => {
-                self.symval_to_bool_expr(current.get(name).ok_or_else(|| {
-                    self.unsupported_result(
-                        self.tcx.def_span(self.def_id),
-                        format!("missing contract binding `{name}`"),
-                    )
-                })?)
-            }
-            ContractExpr::Prophecy(name) => {
-                self.symval_to_bool_expr(prophecy.get(name).ok_or_else(|| {
-                    self.unsupported_result(
-                        self.tcx.def_span(self.def_id),
-                        format!("missing prophecy binding `{name}`"),
-                    )
-                })?)
-            }
-            ContractExpr::Field { .. } => {
-                let value = self.contract_expr_to_value(current, prophecy, expr)?;
-                self.symval_to_bool_expr(&value)
-            }
-            ContractExpr::Unary { op, arg } => match op {
-                SpecUnaryOp::Not => Ok(not_expr(
-                    self.contract_expr_to_bool(current, prophecy, arg)?,
-                )),
-                SpecUnaryOp::Neg => Err(self.unsupported_result(
-                    self.tcx.def_span(self.def_id),
-                    "expected integer contract expression".to_owned(),
-                )),
-            },
-            ContractExpr::Binary { op, lhs, rhs } => match op {
-                SpecBinaryOp::Eq => self.contract_eq_formula(current, prophecy, lhs, rhs),
-                SpecBinaryOp::Ne => Ok(not_expr(
-                    self.contract_eq_formula(current, prophecy, lhs, rhs)?,
-                )),
-                SpecBinaryOp::And => Ok(and_expr(vec![
-                    self.contract_expr_to_bool(current, prophecy, lhs)?,
-                    self.contract_expr_to_bool(current, prophecy, rhs)?,
-                ])),
-                SpecBinaryOp::Or => Ok(or_expr(vec![
-                    self.contract_expr_to_bool(current, prophecy, lhs)?,
-                    self.contract_expr_to_bool(current, prophecy, rhs)?,
-                ])),
-                SpecBinaryOp::Lt | SpecBinaryOp::Le | SpecBinaryOp::Gt | SpecBinaryOp::Ge => {
-                    Ok(BoolExpr::Cmp {
-                        op: match op {
-                            SpecBinaryOp::Lt => CmpOp::Lt,
-                            SpecBinaryOp::Le => CmpOp::Le,
-                            SpecBinaryOp::Gt => CmpOp::Gt,
-                            SpecBinaryOp::Ge => CmpOp::Ge,
-                            _ => unreachable!(),
-                        },
-                        lhs: self.contract_expr_to_int(current, prophecy, lhs)?,
-                        rhs: self.contract_expr_to_int(current, prophecy, rhs)?,
-                    })
-                }
-                SpecBinaryOp::Add | SpecBinaryOp::Sub | SpecBinaryOp::Mul => Err(self
-                    .unsupported_result(
-                        self.tcx.def_span(self.def_id),
-                        "expected boolean contract expression".to_owned(),
-                    )),
-            },
-        }
-    }
-
-    fn contract_expr_to_int(
-        &self,
-        current: &HashMap<String, SymVal>,
-        prophecy: &HashMap<String, SymVal>,
-        expr: &ContractExpr,
-    ) -> Result<IntExpr, VerificationResult> {
-        match expr {
-            ContractExpr::Int(value) => Ok(IntExpr::Value(SymVal::Int(*value))),
-            ContractExpr::Var(name) => {
-                self.symval_to_int_expr(current.get(name).ok_or_else(|| {
-                    self.unsupported_result(
-                        self.tcx.def_span(self.def_id),
-                        format!("missing contract binding `{name}`"),
-                    )
-                })?)
-            }
-            ContractExpr::Prophecy(name) => {
-                self.symval_to_int_expr(prophecy.get(name).ok_or_else(|| {
-                    self.unsupported_result(
-                        self.tcx.def_span(self.def_id),
-                        format!("missing prophecy binding `{name}`"),
-                    )
-                })?)
-            }
-            ContractExpr::Field { .. } => {
-                let value = self.contract_expr_to_value(current, prophecy, expr)?;
-                self.symval_to_int_expr(&value)
-            }
-            ContractExpr::Unary { op, arg } => match op {
-                SpecUnaryOp::Neg => Ok(IntExpr::Neg(Box::new(
-                    self.contract_expr_to_int(current, prophecy, arg)?,
-                ))),
-                SpecUnaryOp::Not => Err(self.unsupported_result(
-                    self.tcx.def_span(self.def_id),
-                    "expected boolean contract expression".to_owned(),
-                )),
-            },
-            ContractExpr::Binary { op, lhs, rhs } => match op {
-                SpecBinaryOp::Add => Ok(IntExpr::Add(
-                    Box::new(self.contract_expr_to_int(current, prophecy, lhs)?),
-                    Box::new(self.contract_expr_to_int(current, prophecy, rhs)?),
-                )),
-                SpecBinaryOp::Sub => Ok(IntExpr::Sub(
-                    Box::new(self.contract_expr_to_int(current, prophecy, lhs)?),
-                    Box::new(self.contract_expr_to_int(current, prophecy, rhs)?),
-                )),
-                SpecBinaryOp::Mul => Ok(IntExpr::Mul(
-                    Box::new(self.contract_expr_to_int(current, prophecy, lhs)?),
-                    Box::new(self.contract_expr_to_int(current, prophecy, rhs)?),
-                )),
-                _ => Err(self.unsupported_result(
-                    self.tcx.def_span(self.def_id),
-                    "expected integer contract expression".to_owned(),
-                )),
-            },
-            ContractExpr::Bool(_) => Err(self.unsupported_result(
-                self.tcx.def_span(self.def_id),
-                "expected integer contract expression".to_owned(),
+            _ => Ok(BoolExpr::Value(
+                self.contract_expr_to_value(current, prophecy, expr)?,
             )),
         }
     }
 
     fn contract_expr_to_value(
         &self,
-        current: &HashMap<String, SymVal>,
-        prophecy: &HashMap<String, SymVal>,
+        current: &HashMap<String, Datatype>,
+        prophecy: &HashMap<String, Datatype>,
         expr: &ContractExpr,
-    ) -> Result<SymVal, VerificationResult> {
+    ) -> Result<Datatype, VerificationResult> {
         match expr {
-            ContractExpr::Bool(value) => Ok(SymVal::Bool(*value)),
-            ContractExpr::Int(value) => Ok(SymVal::Int(*value)),
+            ContractExpr::Bool(value) => Ok(self.value_bool(*value)),
+            ContractExpr::Int(value) => Ok(self.value_int(*value)),
             ContractExpr::Var(name) => current.get(name).cloned().ok_or_else(|| {
                 self.unsupported_result(
                     self.tcx.def_span(self.def_id),
@@ -1660,34 +1637,31 @@ impl<'tcx> Verifier<'tcx> {
                 let value = self.contract_expr_to_value(current, prophecy, base)?;
                 self.project_tuple_field(value, *index, self.tcx.def_span(self.def_id))
             }
-            _ => Err(self.unsupported_result(
-                self.tcx.def_span(self.def_id),
-                "complex contract values are unsupported outside comparisons".to_owned(),
-            )),
+            ContractExpr::Unary { op, arg } => {
+                let value = self.contract_expr_to_value(current, prophecy, arg)?;
+                Ok(match op {
+                    SpecUnaryOp::Not => self.value_not(&value),
+                    SpecUnaryOp::Neg => self.value_neg(&value),
+                })
+            }
+            ContractExpr::Binary { op, lhs, rhs } => {
+                let lhs = self.contract_expr_to_value(current, prophecy, lhs)?;
+                let rhs = self.contract_expr_to_value(current, prophecy, rhs)?;
+                Ok(match op {
+                    SpecBinaryOp::Eq => self.value_eqv(&lhs, &rhs),
+                    SpecBinaryOp::Ne => self.value_not(&self.value_eqv(&lhs, &rhs)),
+                    SpecBinaryOp::And => self.value_and(&lhs, &rhs),
+                    SpecBinaryOp::Or => self.value_or(&lhs, &rhs),
+                    SpecBinaryOp::Lt => self.value_lt(&lhs, &rhs),
+                    SpecBinaryOp::Le => self.value_le(&lhs, &rhs),
+                    SpecBinaryOp::Gt => self.value_gt(&lhs, &rhs),
+                    SpecBinaryOp::Ge => self.value_ge(&lhs, &rhs),
+                    SpecBinaryOp::Add => self.value_add(&lhs, &rhs),
+                    SpecBinaryOp::Sub => self.value_sub(&lhs, &rhs),
+                    SpecBinaryOp::Mul => self.value_mul(&lhs, &rhs),
+                })
+            }
         }
-    }
-
-    fn contract_eq_formula(
-        &self,
-        current: &HashMap<String, SymVal>,
-        prophecy: &HashMap<String, SymVal>,
-        lhs: &ContractExpr,
-        rhs: &ContractExpr,
-    ) -> Result<BoolExpr, VerificationResult> {
-        if let (Ok(lhs), Ok(rhs)) = (
-            self.contract_expr_to_int(current, prophecy, lhs),
-            self.contract_expr_to_int(current, prophecy, rhs),
-        ) {
-            return Ok(BoolExpr::Cmp {
-                op: CmpOp::Eq,
-                lhs,
-                rhs,
-            });
-        }
-        Ok(BoolExpr::Eq(
-            self.contract_expr_to_value(current, prophecy, lhs)?,
-            self.contract_expr_to_value(current, prophecy, rhs)?,
-        ))
     }
 
     fn contract_to_bool(
@@ -1740,160 +1714,11 @@ impl<'tcx> Verifier<'tcx> {
         with_solver(|solver| solver.check_assumptions(assumptions))
     }
 
-    fn bool_expr_to_z3(&self, expr: &BoolExpr, span: Span) -> Result<Bool, VerificationResult> {
+    fn bool_expr_to_z3(&self, expr: &BoolExpr) -> Result<Bool, VerificationResult> {
         match expr {
             BoolExpr::Const(value) => Ok(Bool::from_bool(*value)),
-            BoolExpr::Value(value) => self.symval_to_z3_bool(value, span),
-            BoolExpr::Eq(lhs, rhs) => self.sym_eq_to_z3(lhs, rhs, span),
-            BoolExpr::Cmp { op, lhs, rhs } => {
-                let lhs = self.int_expr_to_z3(lhs, span)?;
-                let rhs = self.int_expr_to_z3(rhs, span)?;
-                Ok(match op {
-                    CmpOp::Eq => lhs.eq(&rhs),
-                    CmpOp::Lt => lhs.lt(&rhs),
-                    CmpOp::Le => lhs.le(&rhs),
-                    CmpOp::Gt => lhs.gt(&rhs),
-                    CmpOp::Ge => lhs.ge(&rhs),
-                })
-            }
-            BoolExpr::Not(arg) => Ok(self.bool_expr_to_z3(arg, span)?.not()),
-            BoolExpr::And(args) => {
-                let args = args
-                    .iter()
-                    .map(|arg| self.bool_expr_to_z3(arg, span))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let refs = args.iter().collect::<Vec<_>>();
-                Ok(Bool::and(&refs))
-            }
-            BoolExpr::Or(args) => {
-                let args = args
-                    .iter()
-                    .map(|arg| self.bool_expr_to_z3(arg, span))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let refs = args.iter().collect::<Vec<_>>();
-                Ok(Bool::or(&refs))
-            }
-            BoolExpr::Implies(lhs, rhs) => Ok(self
-                .bool_expr_to_z3(lhs, span)?
-                .implies(self.bool_expr_to_z3(rhs, span)?)),
-        }
-    }
-
-    fn int_expr_to_z3(&self, expr: &IntExpr, span: Span) -> Result<Int, VerificationResult> {
-        match expr {
-            IntExpr::Value(value) => self.symval_to_z3_int(value, span),
-            IntExpr::Add(lhs, rhs) => {
-                Ok(self.int_expr_to_z3(lhs, span)? + self.int_expr_to_z3(rhs, span)?)
-            }
-            IntExpr::Sub(lhs, rhs) => {
-                Ok(self.int_expr_to_z3(lhs, span)? - self.int_expr_to_z3(rhs, span)?)
-            }
-            IntExpr::Mul(lhs, rhs) => {
-                Ok(self.int_expr_to_z3(lhs, span)? * self.int_expr_to_z3(rhs, span)?)
-            }
-            IntExpr::Neg(arg) => Ok(Int::from_i64(0) - self.int_expr_to_z3(arg, span)?),
-        }
-    }
-
-    fn symval_to_z3_bool(&self, value: &SymVal, span: Span) -> Result<Bool, VerificationResult> {
-        match value {
-            SymVal::Bool(value) => Ok(Bool::from_bool(*value)),
-            SymVal::Var(var) if matches!(var.ty, SymTy::Bool) => {
-                Ok(Bool::new_const(var.name.clone()))
-            }
-            SymVal::Proj {
-                base,
-                index,
-                ty: SymTy::Bool,
-            } => {
-                let base_name = self.symval_name(base, span)?;
-                Ok(Bool::new_const(format!("{base_name}.{index}")))
-            }
-            _ => Err(self.unsupported_result(span, "expected boolean symbolic value".to_owned())),
-        }
-    }
-
-    fn symval_to_z3_int(&self, value: &SymVal, span: Span) -> Result<Int, VerificationResult> {
-        match value {
-            SymVal::Int(value) => Ok(Int::from_i64(*value)),
-            SymVal::Var(var) if matches!(var.ty, SymTy::Int) => {
-                Ok(Int::new_const(var.name.clone()))
-            }
-            SymVal::Proj {
-                base,
-                index,
-                ty: SymTy::Int,
-            } => {
-                let base_name = self.symval_name(base, span)?;
-                Ok(Int::new_const(format!("{base_name}.{index}")))
-            }
-            _ => Err(self.unsupported_result(span, "expected integer symbolic value".to_owned())),
-        }
-    }
-
-    fn sym_eq_to_z3(
-        &self,
-        lhs: &SymVal,
-        rhs: &SymVal,
-        span: Span,
-    ) -> Result<Bool, VerificationResult> {
-        match lhs.sym_ty() {
-            SymTy::Tuple(fields) => {
-                let mut parts = Vec::with_capacity(fields.len());
-                for index in 0..fields.len() {
-                    let lhs_field = self.project_tuple_field(lhs.clone(), index, span)?;
-                    let rhs_field = self.project_tuple_field(rhs.clone(), index, span)?;
-                    parts.push(self.sym_eq_to_z3(&lhs_field, &rhs_field, span)?);
-                }
-                let refs = parts.iter().collect::<Vec<_>>();
-                Ok(Bool::and(&refs))
-            }
-            SymTy::Bool => Ok(self
-                .symval_to_z3_bool(lhs, span)?
-                .eq(self.symval_to_z3_bool(rhs, span)?)),
-            SymTy::Int => Ok(self
-                .symval_to_z3_int(lhs, span)?
-                .eq(self.symval_to_z3_int(rhs, span)?)),
-        }
-    }
-
-    fn symval_name(&self, value: &SymVal, span: Span) -> Result<String, VerificationResult> {
-        match value {
-            SymVal::Var(var) => Ok(var.name.clone()),
-            SymVal::Proj { base, index, .. } => {
-                Ok(format!("{}.{}", self.symval_name(base, span)?, index))
-            }
-            _ => Err(self.unsupported_result(span, "expected symbolic variable".to_owned())),
-        }
-    }
-
-    fn symval_to_bool_expr(&self, value: &SymVal) -> Result<BoolExpr, VerificationResult> {
-        match value {
-            SymVal::Bool(value) => Ok(BoolExpr::Const(*value)),
-            SymVal::Var(var) if matches!(var.ty, SymTy::Bool) => {
-                Ok(BoolExpr::Value(SymVal::Var(var.clone())))
-            }
-            SymVal::Proj {
-                ty: SymTy::Bool, ..
-            } => Ok(BoolExpr::Value(value.clone())),
-            _ => Err(self.unsupported_result(
-                self.tcx.def_span(self.def_id),
-                "expected boolean symbolic value".to_owned(),
-            )),
-        }
-    }
-
-    fn symval_to_int_expr(&self, value: &SymVal) -> Result<IntExpr, VerificationResult> {
-        match value {
-            SymVal::Int(value) => Ok(IntExpr::Value(SymVal::Int(*value))),
-            SymVal::Var(var) if matches!(var.ty, SymTy::Int) => {
-                Ok(IntExpr::Value(SymVal::Var(var.clone())))
-            }
-            SymVal::Proj { ty: SymTy::Int, .. } => Ok(IntExpr::Value(value.clone())),
-            _ => Err(self.unsupported_result(
-                self.tcx.def_span(self.def_id),
-                "expected integer symbolic value".to_owned(),
-            )),
+            BoolExpr::Value(value) => Ok(self.value_is_true(value)),
+            BoolExpr::Not(arg) => Ok(self.bool_expr_to_z3(arg)?.not()),
         }
     }
 
@@ -1902,18 +1727,14 @@ impl<'tcx> Verifier<'tcx> {
         state: &State,
         local: Local,
         span: Span,
-    ) -> Result<SymVal, VerificationResult> {
+    ) -> Result<Datatype, VerificationResult> {
         let value = state.model.get(&local).cloned().ok_or_else(|| {
             self.unsupported_result(span, format!("missing local {}", local.as_usize()))
         })?;
         let ty = self.body.local_decls[local].ty;
         match ty.kind() {
             TyKind::Ref(_, _, mutability) if mutability.is_mut() => {
-                let SymVal::Tuple(parts) = value else {
-                    return Err(self
-                        .unsupported_result(span, "mutable reference shape mismatch".to_owned()));
-                };
-                Ok(parts[1].clone())
+                Ok(self.value_pair_second(&value))
             }
             _ => Ok(value),
         }
@@ -1933,7 +1754,11 @@ impl<'tcx> Verifier<'tcx> {
             let ty = self.place_ty(place);
             if matches!(ty.kind(), TyKind::Ref(_, _, mutability) if mutability.is_mut()) {
                 let current = self.read_place(state, place, ReadMode::Current, span)?;
-                let updated = self.abstract_mut_ref(&current, span)?;
+                let inner = match ty.kind() {
+                    TyKind::Ref(_, inner, _) => *inner,
+                    _ => unreachable!(),
+                };
+                let updated = self.abstract_mut_ref(&current, inner, span)?;
                 self.write_place(state, place, updated, span)?;
             }
         }
@@ -1952,21 +1777,15 @@ impl<'tcx> Verifier<'tcx> {
         Ok(())
     }
 
-    fn abstract_mut_ref(&self, value: &SymVal, span: Span) -> Result<SymVal, VerificationResult> {
-        let SymVal::Tuple(parts) = value else {
-            return Err(
-                self.unsupported_result(span, "mutable reference shape mismatch".to_owned())
-            );
-        };
-        if parts.len() != 2 {
-            return Err(
-                self.unsupported_result(span, "mutable reference shape mismatch".to_owned())
-            );
-        }
-        let fresh = self.fresh_for_symty(&parts[1].sym_ty(), "opaque_cur")?;
-        Ok(SymVal::Tuple(
-            vec![fresh, parts[1].clone()].into_boxed_slice(),
-        ))
+    fn abstract_mut_ref(
+        &self,
+        value: &Datatype,
+        inner_ty: Ty<'tcx>,
+        _span: Span,
+    ) -> Result<Datatype, VerificationResult> {
+        let final_value = self.value_pair_second(value);
+        let fresh = self.fresh_for_rust_ty(inner_ty, "opaque_cur")?;
+        Ok(self.value_list(&[fresh, final_value]))
     }
 
     fn havoc_loop_written_locals(
@@ -2043,7 +1862,111 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn fresh_for_rust_ty(&self, ty: Ty<'tcx>, hint: &str) -> Result<SymVal, VerificationResult> {
+    fn value_error(&self) -> Datatype {
+        with_value_encoding(|encoding| encoding.error())
+    }
+
+    fn value_nil(&self) -> Datatype {
+        with_value_encoding(|encoding| encoding.nil())
+    }
+
+    fn value_int(&self, value: i64) -> Datatype {
+        with_value_encoding(|encoding| encoding.int(value))
+    }
+
+    fn value_bool(&self, value: bool) -> Datatype {
+        with_value_encoding(|encoding| encoding.bool(value))
+    }
+
+    fn value_wrap_bool(&self, value: &Bool) -> Datatype {
+        with_value_encoding(|encoding| encoding.wrap_bool(value))
+    }
+
+    fn value_wrap_int(&self, value: &Int) -> Datatype {
+        with_value_encoding(|encoding| encoding.wrap_int(value))
+    }
+
+    fn value_list(&self, values: &[Datatype]) -> Datatype {
+        with_value_encoding(|encoding| encoding.list(values))
+    }
+
+    fn value_eqv(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        with_value_encoding(|encoding| encoding.eqv(lhs, rhs))
+    }
+
+    fn value_add(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        with_value_encoding(|encoding| encoding.add(lhs, rhs))
+    }
+
+    fn value_sub(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        with_value_encoding(|encoding| encoding.sub(lhs, rhs))
+    }
+
+    fn value_mul(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        with_value_encoding(|encoding| encoding.mul(lhs, rhs))
+    }
+
+    fn value_neg(&self, value: &Datatype) -> Datatype {
+        with_value_encoding(|encoding| encoding.neg(value))
+    }
+
+    fn value_not(&self, value: &Datatype) -> Datatype {
+        with_value_encoding(|encoding| encoding.notv(value))
+    }
+
+    fn value_and(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        with_value_encoding(|encoding| encoding.andv(lhs, rhs))
+    }
+
+    fn value_or(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        with_value_encoding(|encoding| encoding.orv(lhs, rhs))
+    }
+
+    fn value_lt(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        with_value_encoding(|encoding| encoding.ltv(lhs, rhs))
+    }
+
+    fn value_le(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        with_value_encoding(|encoding| encoding.lev(lhs, rhs))
+    }
+
+    fn value_gt(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        with_value_encoding(|encoding| encoding.gtv(lhs, rhs))
+    }
+
+    fn value_ge(&self, lhs: &Datatype, rhs: &Datatype) -> Datatype {
+        with_value_encoding(|encoding| encoding.gev(lhs, rhs))
+    }
+
+    fn value_is_true(&self, value: &Datatype) -> Bool {
+        with_value_encoding(|encoding| encoding.is_true(value))
+    }
+
+    fn value_is_error(&self, value: &Datatype) -> Bool {
+        with_value_encoding(|encoding| encoding.is_error(value))
+    }
+
+    fn value_is_int(&self, value: &Datatype) -> Bool {
+        with_value_encoding(|encoding| encoding.is_int(value))
+    }
+
+    fn value_int_data(&self, value: &Datatype) -> Int {
+        with_value_encoding(|encoding| encoding.int_data(value))
+    }
+
+    fn value_nth(&self, value: &Datatype, index: usize) -> Datatype {
+        with_value_encoding(|encoding| encoding.nth(value, index))
+    }
+
+    fn value_pair_first(&self, value: &Datatype) -> Datatype {
+        with_value_encoding(|encoding| encoding.pair_first(value))
+    }
+
+    fn value_pair_second(&self, value: &Datatype) -> Datatype {
+        with_value_encoding(|encoding| encoding.pair_second(value))
+    }
+
+    fn fresh_for_rust_ty(&self, ty: Ty<'tcx>, hint: &str) -> Result<Datatype, VerificationResult> {
         if let TyKind::Ref(_, inner, mutability) = ty.kind()
             && mutability.is_mut()
         {
@@ -2055,7 +1978,7 @@ impl<'tcx> Verifier<'tcx> {
             }
             let current = self.fresh_for_rust_ty(*inner, &format!("{hint}_cur"))?;
             let final_value = self.fresh_for_rust_ty(*inner, &format!("{hint}_fin"))?;
-            return Ok(SymVal::Tuple(vec![current, final_value].into_boxed_slice()));
+            return Ok(self.value_list(&[current, final_value]));
         } else if let TyKind::Ref(_, inner, _) = ty.kind() {
             if self.ty_contains_ref(*inner) {
                 return Err(self.unsupported_result(
@@ -2065,112 +1988,40 @@ impl<'tcx> Verifier<'tcx> {
             }
             return self.fresh_for_rust_ty(*inner, hint);
         }
-        let sym_ty = self.sym_ty_from_rust_ty(ty, self.tcx.def_span(self.def_id))?;
-        self.fresh_for_symty(&sym_ty, hint)
-    }
-
-    fn fresh_for_symty(&self, ty: &SymTy, hint: &str) -> Result<SymVal, VerificationResult> {
-        Ok(match ty {
-            SymTy::Bool => self.fresh_bool(hint),
-            SymTy::Int => self.fresh_int(hint),
-            SymTy::Tuple(_) => SymVal::Var(SymVar {
-                name: self.fresh_name(hint),
-                ty: ty.clone(),
-            }),
-        })
+        match ty.kind() {
+            TyKind::Bool => Ok(self.value_wrap_bool(&Bool::new_const(self.fresh_name(hint)))),
+            TyKind::Int(_) | TyKind::Uint(_) => {
+                Ok(self.value_wrap_int(&Int::new_const(self.fresh_name(hint))))
+            }
+            TyKind::Never => Ok(self.value_error()),
+            TyKind::Tuple(fields) => {
+                let mut items = Vec::with_capacity(fields.len());
+                for (index, field) in fields.iter().enumerate() {
+                    items.push(self.fresh_for_rust_ty(field, &format!("{hint}_{index}"))?);
+                }
+                Ok(self.value_list(&items))
+            }
+            other => Err(self.unsupported_result(
+                self.tcx.def_span(self.def_id),
+                format!("unsupported type {other:?}"),
+            )),
+        }
     }
 
     fn project_tuple_field(
         &self,
-        value: SymVal,
+        value: Datatype,
         index: usize,
         span: Span,
-    ) -> Result<SymVal, VerificationResult> {
-        let ty = match value.sym_ty() {
-            SymTy::Tuple(fields) => fields.get(index).cloned().ok_or_else(|| {
-                self.unsupported_result(span, "tuple field out of range".to_owned())
-            })?,
-            _ => {
-                return Err(self.unsupported_result(
-                    span,
-                    "field projection on non-tuple symbolic value".to_owned(),
-                ));
-            }
-        };
-        self.project_field(value, index, ty, span)
-    }
-
-    fn project_field(
-        &self,
-        value: SymVal,
-        index: usize,
-        ty: SymTy,
-        span: Span,
-    ) -> Result<SymVal, VerificationResult> {
-        match value {
-            SymVal::Tuple(parts) => parts.get(index).cloned().ok_or_else(|| {
-                self.unsupported_result(span, "tuple field out of range".to_owned())
-            }),
-            other => Ok(SymVal::Proj {
-                base: Box::new(other),
-                index,
-                ty,
-            }),
-        }
-    }
-
-    fn fresh_bool(&self, hint: &str) -> SymVal {
-        SymVal::Var(SymVar {
-            name: self.fresh_name(hint),
-            ty: SymTy::Bool,
-        })
-    }
-
-    fn fresh_int(&self, hint: &str) -> SymVal {
-        SymVal::Var(SymVar {
-            name: self.fresh_name(hint),
-            ty: SymTy::Int,
-        })
+    ) -> Result<Datatype, VerificationResult> {
+        let _ = span;
+        Ok(self.value_nth(&value, index))
     }
 
     fn fresh_name(&self, hint: &str) -> String {
         let id = self.next_sym.get();
         self.next_sym.set(id + 1);
         format!("{hint}_{id}")
-    }
-
-    fn sym_ty_from_rust_ty(&self, ty: Ty<'tcx>, span: Span) -> Result<SymTy, VerificationResult> {
-        match ty.kind() {
-            TyKind::Bool => Ok(SymTy::Bool),
-            TyKind::Int(_) | TyKind::Uint(_) => Ok(SymTy::Int),
-            TyKind::Tuple(fields) => {
-                let mut items = Vec::with_capacity(fields.len());
-                for field in fields.iter() {
-                    items.push(self.sym_ty_from_rust_ty(field, span)?);
-                }
-                Ok(SymTy::Tuple(items.into_boxed_slice()))
-            }
-            TyKind::Ref(_, inner, mutability) if mutability.is_mut() => {
-                if self.ty_contains_ref(*inner) {
-                    return Err(self.unsupported_result(
-                        span,
-                        "nested reference types are unsupported".to_owned(),
-                    ));
-                }
-                let inner = self.sym_ty_from_rust_ty(*inner, span)?;
-                Ok(SymTy::Tuple(vec![inner.clone(), inner].into_boxed_slice()))
-            }
-            TyKind::Ref(_, inner, _) => {
-                if self.ty_contains_ref(*inner) {
-                    return Err(self.unsupported_result(
-                        span,
-                        "nested reference types are unsupported".to_owned(),
-                    ));
-                }
-                self.sym_ty_from_rust_ty(*inner, span)
-            }
-            other => Err(self.unsupported_result(span, format!("unsupported type {other:?}"))),
-        }
     }
 
     fn ty_contains_ref(&self, ty: Ty<'tcx>) -> bool {
@@ -2189,12 +2040,12 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn in_range_formula(
+    fn int_range_formula(
         &self,
         ty: Ty<'tcx>,
-        value: IntExpr,
+        value: &Datatype,
         span: Span,
-    ) -> Result<BoolExpr, VerificationResult> {
+    ) -> Result<Bool, VerificationResult> {
         let bounds =
             match ty.kind() {
                 TyKind::Int(kind) => match kind {
@@ -2224,18 +2075,24 @@ impl<'tcx> Verifier<'tcx> {
                         .unsupported_result(span, format!("expected integer type, found {ty:?}")));
                 }
             };
-        Ok(and_expr(vec![
-            BoolExpr::Cmp {
-                op: CmpOp::Ge,
-                lhs: value.clone(),
-                rhs: IntExpr::Value(SymVal::Int(bounds.0)),
-            },
-            BoolExpr::Cmp {
-                op: CmpOp::Le,
-                lhs: value,
-                rhs: IntExpr::Value(SymVal::Int(bounds.1)),
-            },
+        Ok(bool_and(vec![
+            self.value_is_int(value),
+            self.value_int_data(value).ge(bounds.0),
+            self.value_int_data(value).le(bounds.1),
         ]))
+    }
+
+    fn overflow_value_for_result(
+        &self,
+        ty: Ty<'tcx>,
+        value: &Datatype,
+        span: Span,
+    ) -> Result<Datatype, VerificationResult> {
+        let in_range = self.int_range_formula(ty, value, span)?;
+        Ok(self.value_is_error(value).ite(
+            &self.value_error(),
+            &self.value_wrap_bool(&bool_not(in_range)),
+        ))
     }
 
     fn scalar_int_to_i64(
@@ -2334,20 +2191,12 @@ impl<'tcx> Verifier<'tcx> {
     fn prophecy_from_typed_value(
         &self,
         ty: Ty<'tcx>,
-        value: &SymVal,
-        span: Span,
-    ) -> Result<SymVal, VerificationResult> {
+        value: &Datatype,
+        _span: Span,
+    ) -> Result<Datatype, VerificationResult> {
         match ty.kind() {
             TyKind::Ref(_, _, mutability) if mutability.is_mut() => {
-                let SymVal::Tuple(parts) = value else {
-                    return Err(self
-                        .unsupported_result(span, "mutable reference shape mismatch".to_owned()));
-                };
-                if parts.len() != 2 {
-                    return Err(self
-                        .unsupported_result(span, "mutable reference shape mismatch".to_owned()));
-                }
-                Ok(parts[1].clone())
+                Ok(self.value_pair_second(value))
             }
             _ => Ok(value.clone()),
         }
@@ -2362,8 +2211,8 @@ enum ReadMode {
 
 #[derive(Debug, Clone)]
 struct CallEnv {
-    current: HashMap<String, SymVal>,
-    prophecy: HashMap<String, SymVal>,
+    current: HashMap<String, Datatype>,
+    prophecy: HashMap<String, Datatype>,
 }
 
 impl CallEnv {
@@ -2403,24 +2252,6 @@ impl CallEnv {
     }
 }
 
-impl SymVal {
-    fn sym_ty(&self) -> SymTy {
-        match self {
-            SymVal::Var(var) => var.ty.clone(),
-            SymVal::Proj { ty, .. } => ty.clone(),
-            SymVal::Int(_) => SymTy::Int,
-            SymVal::Bool(_) => SymTy::Bool,
-            SymVal::Tuple(items) => SymTy::Tuple(
-                items
-                    .iter()
-                    .map(SymVal::sym_ty)
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            ),
-        }
-    }
-}
-
 fn init_z3() {
     Z3_INIT.call_once(|| {
         z3::set_global_param("model", "true");
@@ -2437,38 +2268,8 @@ fn with_solver<T>(f: impl FnOnce(&Solver) -> T) -> T {
     GLOBAL_SOLVER.with(|solver| f(solver))
 }
 
-fn and_expr(exprs: Vec<BoolExpr>) -> BoolExpr {
-    let mut flat = Vec::new();
-    for expr in exprs {
-        match expr {
-            BoolExpr::Const(true) => {}
-            BoolExpr::Const(false) => return BoolExpr::Const(false),
-            BoolExpr::And(items) => flat.extend(items),
-            other => flat.push(other),
-        }
-    }
-    match flat.len() {
-        0 => BoolExpr::Const(true),
-        1 => flat.pop().unwrap(),
-        _ => BoolExpr::And(flat),
-    }
-}
-
-fn or_expr(exprs: Vec<BoolExpr>) -> BoolExpr {
-    let mut flat = Vec::new();
-    for expr in exprs {
-        match expr {
-            BoolExpr::Const(false) => {}
-            BoolExpr::Const(true) => return BoolExpr::Const(true),
-            BoolExpr::Or(items) => flat.extend(items),
-            other => flat.push(other),
-        }
-    }
-    match flat.len() {
-        0 => BoolExpr::Const(false),
-        1 => flat.pop().unwrap(),
-        _ => BoolExpr::Or(flat),
-    }
+fn with_value_encoding<T>(f: impl FnOnce(&ValueEncoding) -> T) -> T {
+    VALUE_ENCODING.with(|encoding| f(encoding))
 }
 
 fn bool_and(exprs: Vec<Bool>) -> Bool {
@@ -2499,18 +2300,61 @@ fn not_expr(expr: BoolExpr) -> BoolExpr {
     }
 }
 
-fn implies_expr(lhs: BoolExpr, rhs: BoolExpr) -> BoolExpr {
-    BoolExpr::Implies(Box::new(lhs), Box::new(rhs))
-}
-
-fn bool_assignment(lhs: SymVal, rhs: BoolExpr) -> BoolExpr {
-    let lhs_bool = BoolExpr::Value(lhs);
-    and_expr(vec![
-        implies_expr(lhs_bool.clone(), rhs.clone()),
-        implies_expr(rhs, lhs_bool),
-    ])
-}
-
 fn span_text(tcx: TyCtxt<'_>, span: Span) -> String {
     tcx.sess.source_map().span_to_diagnostic_string(span)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_encoding_eqv_handles_lists() {
+        reset_solver();
+        with_value_encoding(|encoding| {
+            let list1 = encoding.list(&[encoding.int(1), encoding.bool(true)]);
+            let list2 = encoding.list(&[encoding.int(1), encoding.bool(true)]);
+            let list3 = encoding.list(&[encoding.int(2), encoding.bool(true)]);
+
+            with_solver(|solver| {
+                solver.assert(encoding.is_true(&encoding.eqv(&list1, &list2)));
+                assert_eq!(solver.check(), SatResult::Sat);
+                solver.reset();
+
+                solver.assert(encoding.is_true(&encoding.eqv(&list1, &list3)));
+                assert_eq!(solver.check(), SatResult::Unsat);
+            });
+        });
+    }
+
+    #[test]
+    fn value_encoding_add_propagates_error() {
+        reset_solver();
+        with_value_encoding(|encoding| {
+            let sum = encoding.add(&encoding.error(), &encoding.int(1));
+            with_solver(|solver| {
+                solver.assert(encoding.is_error(&sum));
+                assert_eq!(solver.check(), SatResult::Sat);
+            });
+        });
+    }
+
+    #[test]
+    fn value_encoding_is_true_only_accepts_true_bool() {
+        reset_solver();
+        with_value_encoding(|encoding| {
+            with_solver(|solver| {
+                solver.assert(encoding.is_true(&encoding.bool(true)));
+                assert_eq!(solver.check(), SatResult::Sat);
+                solver.reset();
+
+                solver.assert(encoding.is_true(&encoding.bool(false)));
+                assert_eq!(solver.check(), SatResult::Unsat);
+                solver.reset();
+
+                solver.assert(encoding.is_true(&encoding.error()));
+                assert_eq!(solver.check(), SatResult::Unsat);
+            });
+        });
+    }
 }
