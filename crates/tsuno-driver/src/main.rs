@@ -11,6 +11,7 @@ mod directive;
 mod engine;
 mod prepass;
 mod report;
+mod spec;
 
 use std::env;
 
@@ -65,7 +66,7 @@ impl Callbacks for VerifyCallbacks {
             let body = tcx
                 .mir_drops_elaborated_and_const_checked(local_def_id)
                 .steal();
-            let verifier = Verifier::new(tcx, local_def_id, body);
+            let verifier = Verifier::new(tcx, local_def_id, item.span, body);
             self.results.push(verifier.verify());
         }
         Compilation::Continue
