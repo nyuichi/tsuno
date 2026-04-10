@@ -8,7 +8,7 @@ UNSUPPORTED rejects_body_spec_var_in_ens
   unresolved binding `Y` in function contract
   src/main.rs:2:1: 2:26
 UNSUPPORTED main
-  missing local function contract for `DefId(0:3 ~ fixture[a8c4]::rejects_body_spec_var_in_ens)`
-  src/main.rs:12:13: 12:44
+  callee `rejects_body_spec_var_in_ens` has invalid contract: unresolved binding `Y` in function contract
+  src/main.rs:2:1: 2:26
 
 stderr:

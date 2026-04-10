@@ -105,6 +105,12 @@ pub struct FunctionContract {
     pub result: ContractValueSpec,
 }
 
+#[derive(Debug, Clone)]
+pub enum FunctionContractEntry {
+    Ready(FunctionContract),
+    Invalid(VerificationResult),
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum LoweredDirectiveTarget {
@@ -190,7 +196,7 @@ impl AssumptionContracts {
 pub fn compute_function_contracts<'tcx>(
     tcx: TyCtxt<'tcx>,
     skip_def_id: Option<LocalDefId>,
-) -> HashMap<LocalDefId, FunctionContract> {
+) -> HashMap<LocalDefId, FunctionContractEntry> {
     let mut contracts = HashMap::new();
     for item_id in tcx.hir_free_items() {
         let item = tcx.hir_item(item_id);
@@ -201,13 +207,16 @@ pub fn compute_function_contracts<'tcx>(
         if skip_def_id == Some(def_id) {
             continue;
         }
-        let Ok(directives) = collect_function_directives(tcx, def_id, item.span) else {
-            continue;
+        let entry = match collect_function_directives(tcx, def_id, item.span) {
+            Ok(directives) => match build_function_contract(tcx, def_id, &directives.directives) {
+                Ok(contract) => FunctionContractEntry::Ready(contract),
+                Err(err) => FunctionContractEntry::Invalid(err),
+            },
+            Err(err) => FunctionContractEntry::Invalid(directive_error_to_verification_result(
+                tcx, def_id, err,
+            )),
         };
-        let Ok(contract) = build_function_contract(tcx, def_id, &directives.directives) else {
-            continue;
-        };
-        contracts.insert(def_id, contract);
+        contracts.insert(def_id, entry);
     }
     contracts
 }
@@ -554,6 +563,19 @@ fn directive_error_to_prepass(err: DirectiveError) -> LoopPrepassError {
     LoopPrepassError {
         span: err.span,
         display_span: None,
+        message: err.message,
+    }
+}
+
+fn directive_error_to_verification_result(
+    tcx: TyCtxt<'_>,
+    def_id: LocalDefId,
+    err: DirectiveError,
+) -> VerificationResult {
+    VerificationResult {
+        function: tcx.def_path_str(def_id.to_def_id()),
+        status: VerificationStatus::Unsupported,
+        span: tcx.sess.source_map().span_to_diagnostic_string(err.span),
         message: err.message,
     }
 }
