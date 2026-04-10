@@ -19,7 +19,7 @@ use z3::{
 
 use crate::prepass::{
     AssertionContracts, AssumptionContracts, FunctionContract, LoopContract, LoopContracts,
-    MirSpecExpr, compute_directives, compute_function_contracts,
+    ResolvedExprEnv, compute_directives, compute_function_contracts,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{BinaryOp, Expr, UnaryOp};
@@ -556,7 +556,11 @@ impl<'tcx> Verifier<'tcx> {
                 .assertion_contracts
                 .assertion_at(ctrl.basic_block, ctrl.statement_index)
             {
-                let formula = match self.mir_spec_to_bool(&state, &assertion.assertion) {
+                let formula = match self.spec_expr_to_bool(
+                    &state,
+                    &assertion.assertion,
+                    &assertion.resolution,
+                ) {
                     Ok(formula) => formula,
                     Err(err) => return err,
                 };
@@ -578,7 +582,11 @@ impl<'tcx> Verifier<'tcx> {
                 .assumption_contracts
                 .assumption_at(ctrl.basic_block, ctrl.statement_index)
             {
-                let formula = match self.mir_spec_to_bool(&state, &assumption.assumption) {
+                let formula = match self.spec_expr_to_bool(
+                    &state,
+                    &assumption.assumption,
+                    &assumption.resolution,
+                ) {
                     Ok(formula) => formula,
                     Err(err) => return err,
                 };
@@ -846,7 +854,11 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Option<State>, VerificationResult> {
         if let Some(loop_contract) = self.loop_contracts.contract_by_header(target) {
-            let invariant = self.mir_spec_to_bool(&state, &loop_contract.invariant)?;
+            let invariant = self.spec_expr_to_bool(
+                &state,
+                &loop_contract.invariant,
+                &loop_contract.resolution,
+            )?;
             let invariant = self.bool_expr_to_z3(&invariant)?;
             self.require_constraint(
                 &mut state,
@@ -875,7 +887,11 @@ impl<'tcx> Verifier<'tcx> {
         if let Some(header) = self.loop_contracts.header_for_invariant_block(target)
             && let Some(loop_contract) = self.loop_contracts.contract_by_header(header)
         {
-            let invariant = self.mir_spec_to_bool(&state, &loop_contract.invariant)?;
+            let invariant = self.spec_expr_to_bool(
+                &state,
+                &loop_contract.invariant,
+                &loop_contract.resolution,
+            )?;
             let invariant = self.bool_expr_to_z3(&invariant)?;
             self.assume_constraint(&mut state, invariant);
         }
@@ -1539,32 +1555,30 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn mir_spec_to_bool(
+    fn spec_expr_to_bool(
         &self,
         state: &State,
-        expr: &MirSpecExpr,
+        expr: &Expr,
+        resolved: &ResolvedExprEnv,
     ) -> Result<BoolExpr, VerificationResult> {
         match expr {
-            MirSpecExpr::Bool(value) => Ok(BoolExpr::Const(*value)),
-            _ => Ok(BoolExpr::Value(self.mir_spec_to_value(state, expr)?)),
+            Expr::Bool(value) => Ok(BoolExpr::Const(*value)),
+            _ => Ok(BoolExpr::Value(
+                self.spec_expr_to_value(state, expr, resolved)?,
+            )),
         }
     }
 
-    fn mir_spec_to_value(
+    fn spec_expr_to_value(
         &self,
         state: &State,
-        expr: &MirSpecExpr,
+        expr: &Expr,
+        resolved: &ResolvedExprEnv,
     ) -> Result<Datatype, VerificationResult> {
         match expr {
-            MirSpecExpr::Bool(value) => Ok(self.value_bool(*value)),
-            MirSpecExpr::Int(value) => Ok(self.value_int(*value)),
-            MirSpecExpr::Var(local) => state.model.get(local).cloned().ok_or_else(|| {
-                self.unsupported_result(
-                    self.control_span(state.ctrl),
-                    format!("missing local {}", local.as_usize()),
-                )
-            }),
-            MirSpecExpr::SpecVar(name) => {
+            Expr::Bool(value) => Ok(self.value_bool(*value)),
+            Expr::Int(value) => Ok(self.value_int(*value)),
+            Expr::Var(name) if resolved.spec_vars.contains(name) => {
                 self.function_spec_vars.get(name).cloned().ok_or_else(|| {
                     self.unsupported_result(
                         self.control_span(state.ctrl),
@@ -1572,23 +1586,49 @@ impl<'tcx> Verifier<'tcx> {
                     )
                 })
             }
-            MirSpecExpr::Prophecy(local) => {
+            Expr::Var(name) => {
+                let Some(local) = resolved.locals.get(name) else {
+                    return Err(self.unsupported_result(
+                        self.control_span(state.ctrl),
+                        format!("missing local binding `{name}`"),
+                    ));
+                };
+                state.model.get(local).cloned().ok_or_else(|| {
+                    self.unsupported_result(
+                        self.control_span(state.ctrl),
+                        format!("missing local {}", local.as_usize()),
+                    )
+                })
+            }
+            Expr::Bind(name) => self.function_spec_vars.get(name).cloned().ok_or_else(|| {
+                self.unsupported_result(
+                    self.control_span(state.ctrl),
+                    format!("missing spec binding `{name}`"),
+                )
+            }),
+            Expr::Prophecy(name) => {
+                let Some(local) = resolved.prophecies.get(name) else {
+                    return Err(self.unsupported_result(
+                        self.control_span(state.ctrl),
+                        format!("missing prophecy binding `{name}`"),
+                    ));
+                };
                 self.local_prophecy(state, *local, self.control_span(state.ctrl))
             }
-            MirSpecExpr::Field { base, index } => {
-                let value = self.mir_spec_to_value(state, base)?;
+            Expr::Field { base, index } => {
+                let value = self.spec_expr_to_value(state, base, resolved)?;
                 self.project_tuple_field(value, *index, self.control_span(state.ctrl))
             }
-            MirSpecExpr::Unary { op, arg } => {
-                let value = self.mir_spec_to_value(state, arg)?;
+            Expr::Unary { op, arg } => {
+                let value = self.spec_expr_to_value(state, arg, resolved)?;
                 Ok(match op {
                     UnaryOp::Not => self.value_not(&value),
                     UnaryOp::Neg => self.value_neg(&value),
                 })
             }
-            MirSpecExpr::Binary { op, lhs, rhs } => {
-                let lhs = self.mir_spec_to_value(state, lhs)?;
-                let rhs = self.mir_spec_to_value(state, rhs)?;
+            Expr::Binary { op, lhs, rhs } => {
+                let lhs = self.spec_expr_to_value(state, lhs, resolved)?;
+                let rhs = self.spec_expr_to_value(state, rhs, resolved)?;
                 Ok(match op {
                     BinaryOp::Eq => self.value_eqv(&lhs, &rhs),
                     BinaryOp::Ne => self.value_not(&self.value_eqv(&lhs, &rhs)),

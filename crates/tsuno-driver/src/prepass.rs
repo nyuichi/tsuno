@@ -6,7 +6,7 @@ use crate::directive::{
     collect_function_directives,
 };
 use crate::report::{VerificationResult, VerificationStatus};
-use crate::spec::{BinaryOp, Expr, UnaryOp};
+use crate::spec::Expr;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{HirId, ItemKind, Pat, PatKind};
 use rustc_middle::mir::{BasicBlock, Body, Local, PlaceElem, StatementKind, TerminatorKind};
@@ -20,27 +20,11 @@ pub struct HirBindingInfo {
     pub by_name: HashMap<Symbol, Vec<(HirId, Span)>>,
 }
 
-#[derive(Debug, Clone)]
-pub enum MirSpecExpr {
-    Bool(bool),
-    Int(i64),
-    Var(Local),
-    SpecVar(String),
-    #[allow(dead_code)]
-    Prophecy(Local),
-    Field {
-        base: Box<MirSpecExpr>,
-        index: usize,
-    },
-    Unary {
-        op: UnaryOp,
-        arg: Box<MirSpecExpr>,
-    },
-    Binary {
-        op: BinaryOp,
-        lhs: Box<MirSpecExpr>,
-        rhs: Box<MirSpecExpr>,
-    },
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedExprEnv {
+    pub locals: HashMap<String, Local>,
+    pub prophecies: HashMap<String, Local>,
+    pub spec_vars: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,7 +32,8 @@ pub struct LoopContract {
     pub header: BasicBlock,
     pub hir_loop_id: HirId,
     pub invariant_block: BasicBlock,
-    pub invariant: MirSpecExpr,
+    pub invariant: Expr,
+    pub resolution: ResolvedExprEnv,
     pub invariant_span: String,
     pub body_blocks: BTreeSet<BasicBlock>,
     pub exit_blocks: BTreeSet<BasicBlock>,
@@ -63,7 +48,8 @@ pub struct LoopContracts {
 
 #[derive(Debug, Clone)]
 pub struct AssertionContract {
-    pub assertion: MirSpecExpr,
+    pub assertion: Expr,
+    pub resolution: ResolvedExprEnv,
     pub assertion_span: String,
 }
 
@@ -74,7 +60,8 @@ pub struct AssertionContracts {
 
 #[derive(Debug, Clone)]
 pub struct AssumptionContract {
-    pub assumption: MirSpecExpr,
+    pub assumption: Expr,
+    pub resolution: ResolvedExprEnv,
 }
 
 #[derive(Debug, Clone)]
@@ -313,14 +300,14 @@ pub fn compute_directives<'tcx>(
             &mut spec_scope,
         )?;
     }
-    let mut lowered_exprs = HashMap::new();
+    let mut resolved_exprs = HashMap::new();
     for directive in directives.directives.iter().filter(|directive| {
         matches!(
             directive.kind,
             DirectiveKind::Assert | DirectiveKind::Assume | DirectiveKind::Inv
         )
     }) {
-        let expr = lower_spec_expr_to_mir(
+        let resolution = resolve_expr_env(
             &directive.expr,
             &binding_info,
             &hir_locals,
@@ -329,7 +316,7 @@ pub fn compute_directives<'tcx>(
             directive.kind,
             &mut spec_scope,
         )?;
-        lowered_exprs.insert(directive.span_text.clone(), expr);
+        resolved_exprs.insert(directive.span_text.clone(), resolution);
     }
     if let Some(directive) = ens_directive {
         validate_function_contract_expr_prepass(
@@ -360,7 +347,7 @@ pub fn compute_directives<'tcx>(
             });
         }
     };
-    let loop_contracts = collect_loop_contracts(tcx, body, &directives, &lowered_exprs)?;
+    let loop_contracts = collect_loop_contracts(tcx, body, &directives, &resolved_exprs)?;
     let mut assertion_contracts = AssertionContracts::empty();
     let mut assumption_contracts = AssumptionContracts::empty();
     let mut lowered = Vec::with_capacity(directives.directives.len());
@@ -393,16 +380,17 @@ pub fn compute_directives<'tcx>(
                             .span_to_diagnostic_string(directive.span)
                     ),
                 })?;
-                let assertion = lowered_exprs
+                let resolution = resolved_exprs
                     .get(&directive.span_text)
                     .cloned()
-                    .expect("lowered assertion expression");
+                    .expect("resolved assertion expression");
                 if assertion_contracts
                     .by_control_point
                     .insert(
                         control,
                         AssertionContract {
-                            assertion,
+                            assertion: directive.expr.clone(),
+                            resolution,
                             assertion_span: directive.span_text.clone(),
                         },
                     )
@@ -435,13 +423,19 @@ pub fn compute_directives<'tcx>(
                             .span_to_diagnostic_string(directive.span)
                     ),
                 })?;
-                let assumption = lowered_exprs
+                let resolution = resolved_exprs
                     .get(&directive.span_text)
                     .cloned()
-                    .expect("lowered assumption expression");
+                    .expect("resolved assumption expression");
                 if assumption_contracts
                     .by_control_point
-                    .insert(control, AssumptionContract { assumption })
+                    .insert(
+                        control,
+                        AssumptionContract {
+                            assumption: directive.expr.clone(),
+                            resolution,
+                        },
+                    )
                     .is_some()
                 {
                     return Err(LoopPrepassError {
@@ -565,7 +559,7 @@ fn collect_loop_contracts<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     directives: &CollectedFunctionDirectives,
-    lowered_exprs: &HashMap<String, MirSpecExpr>,
+    resolved_exprs: &HashMap<String, ResolvedExprEnv>,
 ) -> Result<LoopContracts, LoopPrepassError> {
     let preds = body.basic_blocks.predecessors();
     let doms = body.basic_blocks.dominators();
@@ -590,7 +584,8 @@ fn collect_loop_contracts<'tcx>(
                         header,
                         hir_loop_id: HirId::INVALID,
                         invariant_block: header,
-                        invariant: MirSpecExpr::Bool(true),
+                        invariant: Expr::Bool(true),
+                        resolution: ResolvedExprEnv::default(),
                         invariant_span: tcx.sess.source_map().span_to_diagnostic_string(
                             body.basic_blocks[header].terminator().source_info.span,
                         ),
@@ -646,14 +641,15 @@ fn collect_loop_contracts<'tcx>(
             .filter(|block| *block != header)
             .min_by_key(|block| (loop_entry_distance(body, loop_info, *block), block.index()))
             .unwrap_or(header);
-        let invariant = lowered_exprs
+        let resolution = resolved_exprs
             .get(&directive.span_text)
             .cloned()
-            .expect("lowered invariant expression");
+            .expect("resolved invariant expression");
         let loop_contract = loops.get_mut(&header).expect("loop info present");
         loop_contract.hir_loop_id = loop_expr_id;
         loop_contract.invariant_block = invariant_block;
-        loop_contract.invariant = invariant;
+        loop_contract.invariant = directive.expr.clone();
+        loop_contract.resolution = resolution;
         loop_contract.invariant_span = directive.span_text.clone();
     }
 
@@ -843,7 +839,7 @@ fn validate_contract_expr_core(
     }
 }
 
-fn lower_spec_expr_to_mir(
+fn resolve_expr_env(
     expr: &Expr,
     binding_info: &HirBindingInfo,
     hir_locals: &HashMap<HirId, Local>,
@@ -851,13 +847,37 @@ fn lower_spec_expr_to_mir(
     anchor_span: Span,
     kind: DirectiveKind,
     spec_scope: &mut SpecScope,
-) -> Result<MirSpecExpr, LoopPrepassError> {
+) -> Result<ResolvedExprEnv, LoopPrepassError> {
+    let mut resolved = ResolvedExprEnv::default();
+    resolve_expr_env_into(
+        expr,
+        binding_info,
+        hir_locals,
+        span,
+        anchor_span,
+        kind,
+        spec_scope,
+        &mut resolved,
+    )?;
+    Ok(resolved)
+}
+
+fn resolve_expr_env_into(
+    expr: &Expr,
+    binding_info: &HirBindingInfo,
+    hir_locals: &HashMap<HirId, Local>,
+    span: Span,
+    anchor_span: Span,
+    kind: DirectiveKind,
+    spec_scope: &mut SpecScope,
+    resolved: &mut ResolvedExprEnv,
+) -> Result<(), LoopPrepassError> {
     match expr {
-        Expr::Bool(value) => Ok(MirSpecExpr::Bool(*value)),
-        Expr::Int(value) => Ok(MirSpecExpr::Int(*value)),
+        Expr::Bool(_) | Expr::Int(_) => Ok(()),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
-                return Ok(MirSpecExpr::SpecVar(name.clone()));
+                resolved.spec_vars.insert(name.clone());
+                return Ok(());
             }
             let symbol = Symbol::intern(name);
             let Some(hir_id) = resolve_binding_hir_id(binding_info, symbol, anchor_span) else {
@@ -874,11 +894,13 @@ fn lower_spec_expr_to_mir(
                     message: format!("missing MIR local for HIR id {:?}", hir_id),
                 });
             };
-            Ok(MirSpecExpr::Var(local))
+            resolved.locals.insert(name.clone(), local);
+            Ok(())
         }
         Expr::Bind(name) => {
             spec_scope.bind(name, span, None, kind.keyword())?;
-            Ok(MirSpecExpr::SpecVar(name.clone()))
+            resolved.spec_vars.insert(name.clone());
+            Ok(())
         }
         Expr::Prophecy(name) => {
             let symbol = Symbol::intern(name);
@@ -896,35 +918,31 @@ fn lower_spec_expr_to_mir(
                     message: format!("missing MIR local for HIR id {:?}", hir_id),
                 });
             };
-            Ok(MirSpecExpr::Prophecy(local))
+            resolved.prophecies.insert(name.clone(), local);
+            Ok(())
         }
-        Expr::Field { base, index } => Ok(MirSpecExpr::Field {
-            base: Box::new(lower_spec_expr_to_mir(
-                base,
-                binding_info,
-                hir_locals,
-                span,
-                anchor_span,
-                kind,
-                spec_scope,
-            )?),
-            index: *index,
-        }),
-        Expr::Unary { op, arg } => Ok(MirSpecExpr::Unary {
-            op: *op,
-            arg: Box::new(lower_spec_expr_to_mir(
-                arg,
-                binding_info,
-                hir_locals,
-                span,
-                anchor_span,
-                kind,
-                spec_scope,
-            )?),
-        }),
-        Expr::Binary { op, lhs, rhs } => Ok(MirSpecExpr::Binary {
-            op: *op,
-            lhs: Box::new(lower_spec_expr_to_mir(
+        Expr::Field { base, .. } => resolve_expr_env_into(
+            base,
+            binding_info,
+            hir_locals,
+            span,
+            anchor_span,
+            kind,
+            spec_scope,
+            resolved,
+        ),
+        Expr::Unary { arg, .. } => resolve_expr_env_into(
+            arg,
+            binding_info,
+            hir_locals,
+            span,
+            anchor_span,
+            kind,
+            spec_scope,
+            resolved,
+        ),
+        Expr::Binary { lhs, rhs, .. } => {
+            resolve_expr_env_into(
                 lhs,
                 binding_info,
                 hir_locals,
@@ -932,8 +950,9 @@ fn lower_spec_expr_to_mir(
                 anchor_span,
                 kind,
                 spec_scope,
-            )?),
-            rhs: Box::new(lower_spec_expr_to_mir(
+                resolved,
+            )?;
+            resolve_expr_env_into(
                 rhs,
                 binding_info,
                 hir_locals,
@@ -941,8 +960,9 @@ fn lower_spec_expr_to_mir(
                 anchor_span,
                 kind,
                 spec_scope,
-            )?),
-        }),
+                resolved,
+            )
+        }
     }
 }
 
