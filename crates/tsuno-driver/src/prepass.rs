@@ -245,6 +245,15 @@ impl SpecScope {
     }
 }
 
+struct ExprResolutionContext<'a> {
+    binding_info: &'a HirBindingInfo,
+    hir_locals: &'a HashMap<HirId, Local>,
+    span: Span,
+    anchor_span: Span,
+    kind: DirectiveKind,
+    spec_scope: &'a mut SpecScope,
+}
+
 pub fn compute_directives<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
@@ -849,47 +858,42 @@ fn resolve_expr_env(
     spec_scope: &mut SpecScope,
 ) -> Result<ResolvedExprEnv, LoopPrepassError> {
     let mut resolved = ResolvedExprEnv::default();
-    resolve_expr_env_into(
-        expr,
+    let mut ctx = ExprResolutionContext {
         binding_info,
         hir_locals,
         span,
         anchor_span,
         kind,
         spec_scope,
-        &mut resolved,
-    )?;
+    };
+    resolve_expr_env_into(expr, &mut ctx, &mut resolved)?;
     Ok(resolved)
 }
 
 fn resolve_expr_env_into(
     expr: &Expr,
-    binding_info: &HirBindingInfo,
-    hir_locals: &HashMap<HirId, Local>,
-    span: Span,
-    anchor_span: Span,
-    kind: DirectiveKind,
-    spec_scope: &mut SpecScope,
+    ctx: &mut ExprResolutionContext<'_>,
     resolved: &mut ResolvedExprEnv,
 ) -> Result<(), LoopPrepassError> {
     match expr {
         Expr::Bool(_) | Expr::Int(_) => Ok(()),
         Expr::Var(name) => {
-            if spec_scope.visible.contains(name) {
+            if ctx.spec_scope.visible.contains(name) {
                 resolved.spec_vars.insert(name.clone());
                 return Ok(());
             }
             let symbol = Symbol::intern(name);
-            let Some(hir_id) = resolve_binding_hir_id(binding_info, symbol, anchor_span) else {
+            let Some(hir_id) = resolve_binding_hir_id(ctx.binding_info, symbol, ctx.anchor_span)
+            else {
                 return Err(LoopPrepassError {
-                    span,
+                    span: ctx.span,
                     display_span: None,
-                    message: format!("unresolved binding `{name}` in //@ {}", kind.keyword()),
+                    message: format!("unresolved binding `{name}` in //@ {}", ctx.kind.keyword()),
                 });
             };
-            let Some(local) = hir_locals.get(&hir_id).copied() else {
+            let Some(local) = ctx.hir_locals.get(&hir_id).copied() else {
                 return Err(LoopPrepassError {
-                    span: anchor_span,
+                    span: ctx.anchor_span,
                     display_span: None,
                     message: format!("missing MIR local for HIR id {:?}", hir_id),
                 });
@@ -898,22 +902,24 @@ fn resolve_expr_env_into(
             Ok(())
         }
         Expr::Bind(name) => {
-            spec_scope.bind(name, span, None, kind.keyword())?;
+            ctx.spec_scope
+                .bind(name, ctx.span, None, ctx.kind.keyword())?;
             resolved.spec_vars.insert(name.clone());
             Ok(())
         }
         Expr::Prophecy(name) => {
             let symbol = Symbol::intern(name);
-            let Some(hir_id) = resolve_binding_hir_id(binding_info, symbol, anchor_span) else {
+            let Some(hir_id) = resolve_binding_hir_id(ctx.binding_info, symbol, ctx.anchor_span)
+            else {
                 return Err(LoopPrepassError {
-                    span,
+                    span: ctx.span,
                     display_span: None,
-                    message: format!("unresolved binding `{name}` in //@ {}", kind.keyword()),
+                    message: format!("unresolved binding `{name}` in //@ {}", ctx.kind.keyword()),
                 });
             };
-            let Some(local) = hir_locals.get(&hir_id).copied() else {
+            let Some(local) = ctx.hir_locals.get(&hir_id).copied() else {
                 return Err(LoopPrepassError {
-                    span: anchor_span,
+                    span: ctx.anchor_span,
                     display_span: None,
                     message: format!("missing MIR local for HIR id {:?}", hir_id),
                 });
@@ -921,47 +927,11 @@ fn resolve_expr_env_into(
             resolved.prophecies.insert(name.clone(), local);
             Ok(())
         }
-        Expr::Field { base, .. } => resolve_expr_env_into(
-            base,
-            binding_info,
-            hir_locals,
-            span,
-            anchor_span,
-            kind,
-            spec_scope,
-            resolved,
-        ),
-        Expr::Unary { arg, .. } => resolve_expr_env_into(
-            arg,
-            binding_info,
-            hir_locals,
-            span,
-            anchor_span,
-            kind,
-            spec_scope,
-            resolved,
-        ),
+        Expr::Field { base, .. } => resolve_expr_env_into(base, ctx, resolved),
+        Expr::Unary { arg, .. } => resolve_expr_env_into(arg, ctx, resolved),
         Expr::Binary { lhs, rhs, .. } => {
-            resolve_expr_env_into(
-                lhs,
-                binding_info,
-                hir_locals,
-                span,
-                anchor_span,
-                kind,
-                spec_scope,
-                resolved,
-            )?;
-            resolve_expr_env_into(
-                rhs,
-                binding_info,
-                hir_locals,
-                span,
-                anchor_span,
-                kind,
-                spec_scope,
-                resolved,
-            )
+            resolve_expr_env_into(lhs, ctx, resolved)?;
+            resolve_expr_env_into(rhs, ctx, resolved)
         }
     }
 }
