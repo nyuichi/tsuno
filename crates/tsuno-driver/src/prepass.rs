@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::ControlFlow;
 
 use crate::directive::{
@@ -6,7 +6,7 @@ use crate::directive::{
     collect_function_directives,
 };
 use crate::report::{VerificationResult, VerificationStatus};
-use crate::spec::{BinaryOp, Expr, UnaryOp};
+use crate::spec::Expr;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{HirId, ItemKind, Pat, PatKind};
 use rustc_middle::mir::{BasicBlock, Body, Local, PlaceElem, StatementKind, TerminatorKind};
@@ -20,26 +20,11 @@ pub struct HirBindingInfo {
     pub by_name: HashMap<Symbol, Vec<(HirId, Span)>>,
 }
 
-#[derive(Debug, Clone)]
-pub enum MirSpecExpr {
-    Bool(bool),
-    Int(i64),
-    Var(Local),
-    #[allow(dead_code)]
-    Prophecy(Local),
-    Field {
-        base: Box<MirSpecExpr>,
-        index: usize,
-    },
-    Unary {
-        op: UnaryOp,
-        arg: Box<MirSpecExpr>,
-    },
-    Binary {
-        op: BinaryOp,
-        lhs: Box<MirSpecExpr>,
-        rhs: Box<MirSpecExpr>,
-    },
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedExprEnv {
+    pub locals: HashMap<String, Local>,
+    pub prophecies: HashMap<String, Local>,
+    pub spec_vars: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,7 +32,8 @@ pub struct LoopContract {
     pub header: BasicBlock,
     pub hir_loop_id: HirId,
     pub invariant_block: BasicBlock,
-    pub invariant: MirSpecExpr,
+    pub invariant: Expr,
+    pub resolution: ResolvedExprEnv,
     pub invariant_span: String,
     pub body_blocks: BTreeSet<BasicBlock>,
     pub exit_blocks: BTreeSet<BasicBlock>,
@@ -62,7 +48,8 @@ pub struct LoopContracts {
 
 #[derive(Debug, Clone)]
 pub struct AssertionContract {
-    pub assertion: MirSpecExpr,
+    pub assertion: Expr,
+    pub resolution: ResolvedExprEnv,
     pub assertion_span: String,
 }
 
@@ -73,7 +60,8 @@ pub struct AssertionContracts {
 
 #[derive(Debug, Clone)]
 pub struct AssumptionContract {
-    pub assumption: MirSpecExpr,
+    pub assumption: Expr,
+    pub resolution: ResolvedExprEnv,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +77,7 @@ pub struct FunctionContract {
     pub req_span: String,
     pub ens: Expr,
     pub ens_span: String,
+    pub spec_vars: Vec<String>,
 }
 
 #[allow(dead_code)]
@@ -121,6 +110,7 @@ pub struct DirectivePrepass {
     pub assertion_contracts: AssertionContracts,
     pub assumption_contracts: AssumptionContracts,
     pub function_contract: Option<FunctionContract>,
+    pub spec_vars: Vec<String>,
 }
 
 impl LoopContracts {
@@ -174,6 +164,7 @@ impl AssumptionContracts {
 
 pub fn compute_function_contracts<'tcx>(
     tcx: TyCtxt<'tcx>,
+    skip_def_id: Option<LocalDefId>,
 ) -> Result<HashMap<LocalDefId, FunctionContract>, VerificationResult> {
     let mut contracts = HashMap::new();
     for item_id in tcx.hir_free_items() {
@@ -182,6 +173,9 @@ pub fn compute_function_contracts<'tcx>(
             continue;
         };
         let def_id = item.owner_id.def_id;
+        if skip_def_id == Some(def_id) {
+            continue;
+        }
         let directives = collect_function_directives(tcx, def_id, item.span)
             .map_err(|err| directive_error_to_verification_result(tcx, def_id, err))?;
         let Some(contract) = build_function_contract(tcx, def_id, &directives.directives)? else {
@@ -222,6 +216,44 @@ pub struct LoopPrepassError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Default)]
+struct SpecScope {
+    visible: HashSet<String>,
+    bound: HashSet<String>,
+    ordered: Vec<String>,
+}
+
+impl SpecScope {
+    fn bind(
+        &mut self,
+        name: &str,
+        span: Span,
+        display_span: Option<String>,
+        kind: &str,
+    ) -> Result<(), LoopPrepassError> {
+        if self.bound.contains(name) {
+            return Err(LoopPrepassError {
+                span,
+                display_span,
+                message: format!("duplicate spec binding `?{name}` in //@ {kind}"),
+            });
+        }
+        self.bound.insert(name.to_owned());
+        self.visible.insert(name.to_owned());
+        self.ordered.push(name.to_owned());
+        Ok(())
+    }
+}
+
+struct ExprResolutionContext<'a> {
+    binding_info: &'a HirBindingInfo,
+    hir_locals: &'a HashMap<HirId, Local>,
+    span: Span,
+    anchor_span: Span,
+    kind: DirectiveKind,
+    spec_scope: &'a mut SpecScope,
+}
+
 pub fn compute_directives<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
@@ -232,9 +264,99 @@ pub fn compute_directives<'tcx>(
     let hir_locals = compute_hir_locals(tcx, body, &binding_info);
     let directives =
         collect_function_directives(tcx, def_id, item_span).map_err(directive_error_to_prepass)?;
-    let function_contract = build_function_contract_prepass(tcx, def_id, &directives.directives)?;
-    let loop_contracts =
-        collect_loop_contracts(tcx, body, &directives, &binding_info, &hir_locals)?;
+    let mut spec_scope = SpecScope::default();
+    let mut req_directive = None;
+    let mut ens_directive = None;
+    for directive in &directives.directives {
+        match directive.kind {
+            DirectiveKind::Req => {
+                if req_directive.replace(directive).is_some() {
+                    return Err(LoopPrepassError {
+                        span: directive.span,
+                        display_span: Some(directive.span_text.clone()),
+                        message: "multiple //@ req directives for a function".to_owned(),
+                    });
+                }
+            }
+            DirectiveKind::Ens => {
+                if ens_directive.replace(directive).is_some() {
+                    return Err(LoopPrepassError {
+                        span: directive.span,
+                        display_span: Some(directive.span_text.clone()),
+                        message: "multiple //@ ens directives for a function".to_owned(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    let params = if req_directive.is_some() || ens_directive.is_some() {
+        function_param_names(tcx, def_id).map_err(|err| LoopPrepassError {
+            span: tcx.def_span(def_id.to_def_id()),
+            display_span: None,
+            message: err.message,
+        })?
+    } else {
+        Vec::new()
+    };
+    if let Some(directive) = req_directive {
+        validate_function_contract_expr_prepass(
+            directive.span,
+            &directive.span_text,
+            &directive.expr,
+            &params,
+            false,
+            &mut spec_scope,
+        )?;
+    }
+    let mut resolved_exprs = HashMap::new();
+    for directive in directives.directives.iter().filter(|directive| {
+        matches!(
+            directive.kind,
+            DirectiveKind::Assert | DirectiveKind::Assume | DirectiveKind::Inv
+        )
+    }) {
+        let resolution = resolve_expr_env(
+            &directive.expr,
+            &binding_info,
+            &hir_locals,
+            directive.span,
+            directive_anchor_span(&directive.attach),
+            directive.kind,
+            &mut spec_scope,
+        )?;
+        resolved_exprs.insert(directive.span_text.clone(), resolution);
+    }
+    if let Some(directive) = ens_directive {
+        validate_function_contract_expr_prepass(
+            directive.span,
+            &directive.span_text,
+            &directive.expr,
+            &params,
+            true,
+            &mut spec_scope,
+        )?;
+    }
+    let function_contract = match (req_directive, ens_directive) {
+        (None, None) => None,
+        (Some(req), Some(ens)) => Some(FunctionContract {
+            params: params.clone(),
+            req: req.expr.clone(),
+            req_span: req.span_text.clone(),
+            ens: ens.expr.clone(),
+            ens_span: ens.span_text.clone(),
+            spec_vars: spec_scope.ordered.clone(),
+        }),
+        _ => {
+            return Err(LoopPrepassError {
+                span: tcx.def_span(def_id.to_def_id()),
+                display_span: None,
+                message: "function contract requires exactly one //@ req and one //@ ens"
+                    .to_owned(),
+            });
+        }
+    };
+    let loop_contracts = collect_loop_contracts(tcx, body, &directives, &resolved_exprs)?;
     let mut assertion_contracts = AssertionContracts::empty();
     let mut assumption_contracts = AssumptionContracts::empty();
     let mut lowered = Vec::with_capacity(directives.directives.len());
@@ -267,20 +389,17 @@ pub fn compute_directives<'tcx>(
                             .span_to_diagnostic_string(directive.span)
                     ),
                 })?;
-                let assertion = lower_spec_expr_to_mir(
-                    &directive.expr,
-                    &binding_info,
-                    &hir_locals,
-                    directive.span,
-                    directive_anchor_span(&directive.attach),
-                    directive.kind,
-                )?;
+                let resolution = resolved_exprs
+                    .get(&directive.span_text)
+                    .cloned()
+                    .expect("resolved assertion expression");
                 if assertion_contracts
                     .by_control_point
                     .insert(
                         control,
                         AssertionContract {
-                            assertion,
+                            assertion: directive.expr.clone(),
+                            resolution,
                             assertion_span: directive.span_text.clone(),
                         },
                     )
@@ -313,17 +432,19 @@ pub fn compute_directives<'tcx>(
                             .span_to_diagnostic_string(directive.span)
                     ),
                 })?;
-                let assumption = lower_spec_expr_to_mir(
-                    &directive.expr,
-                    &binding_info,
-                    &hir_locals,
-                    directive.span,
-                    directive_anchor_span(&directive.attach),
-                    directive.kind,
-                )?;
+                let resolution = resolved_exprs
+                    .get(&directive.span_text)
+                    .cloned()
+                    .expect("resolved assumption expression");
                 if assumption_contracts
                     .by_control_point
-                    .insert(control, AssumptionContract { assumption })
+                    .insert(
+                        control,
+                        AssumptionContract {
+                            assumption: directive.expr.clone(),
+                            resolution,
+                        },
+                    )
                     .is_some()
                 {
                     return Err(LoopPrepassError {
@@ -369,6 +490,7 @@ pub fn compute_directives<'tcx>(
         assertion_contracts,
         assumption_contracts,
         function_contract,
+        spec_vars: spec_scope.ordered,
     })
 }
 
@@ -446,8 +568,7 @@ fn collect_loop_contracts<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     directives: &CollectedFunctionDirectives,
-    binding_info: &HirBindingInfo,
-    hir_locals: &HashMap<HirId, Local>,
+    resolved_exprs: &HashMap<String, ResolvedExprEnv>,
 ) -> Result<LoopContracts, LoopPrepassError> {
     let preds = body.basic_blocks.predecessors();
     let doms = body.basic_blocks.dominators();
@@ -472,7 +593,8 @@ fn collect_loop_contracts<'tcx>(
                         header,
                         hir_loop_id: HirId::INVALID,
                         invariant_block: header,
-                        invariant: MirSpecExpr::Bool(true),
+                        invariant: Expr::Bool(true),
+                        resolution: ResolvedExprEnv::default(),
                         invariant_span: tcx.sess.source_map().span_to_diagnostic_string(
                             body.basic_blocks[header].terminator().source_info.span,
                         ),
@@ -521,8 +643,6 @@ fn collect_loop_contracts<'tcx>(
             continue;
         };
         let loop_info = &loops[&header];
-        let header_span = body.basic_blocks[header].terminator().source_info.span;
-        let entry_span = loop_entry_anchor_span(body, loop_info).unwrap_or(header_span);
         let invariant_block = loop_info
             .body_blocks
             .iter()
@@ -530,18 +650,15 @@ fn collect_loop_contracts<'tcx>(
             .filter(|block| *block != header)
             .min_by_key(|block| (loop_entry_distance(body, loop_info, *block), block.index()))
             .unwrap_or(header);
-        let invariant = lower_spec_expr_to_mir(
-            &directive.expr,
-            binding_info,
-            hir_locals,
-            directive.span,
-            entry_span,
-            DirectiveKind::Inv,
-        )?;
+        let resolution = resolved_exprs
+            .get(&directive.span_text)
+            .cloned()
+            .expect("resolved invariant expression");
         let loop_contract = loops.get_mut(&header).expect("loop info present");
         loop_contract.hir_loop_id = loop_expr_id;
         loop_contract.invariant_block = invariant_block;
-        loop_contract.invariant = invariant;
+        loop_contract.invariant = directive.expr.clone();
+        loop_contract.resolution = resolution;
         loop_contract.invariant_span = directive.span_text.clone();
     }
 
@@ -574,8 +691,17 @@ fn build_function_contract<'tcx>(
     def_id: LocalDefId,
     directives: &[FunctionDirective],
 ) -> Result<Option<FunctionContract>, VerificationResult> {
+    let has_contract = directives
+        .iter()
+        .any(|directive| matches!(directive.kind, DirectiveKind::Req | DirectiveKind::Ens));
+    let params = if has_contract {
+        function_param_names(tcx, def_id)?
+    } else {
+        Vec::new()
+    };
     let mut req = None;
     let mut ens = None;
+    let mut spec_scope = SpecScope::default();
     for directive in directives {
         match directive.kind {
             DirectiveKind::Req => {
@@ -590,9 +716,11 @@ fn build_function_contract<'tcx>(
                 validate_function_contract_expr(
                     tcx,
                     def_id,
-                    &directive.span_text,
-                    "req",
                     &directive.expr,
+                    &directive.span_text,
+                    &params,
+                    false,
+                    &mut spec_scope,
                 )?;
                 req = Some((directive.expr.clone(), directive.span_text.clone()));
             }
@@ -608,24 +736,26 @@ fn build_function_contract<'tcx>(
                 validate_function_contract_expr(
                     tcx,
                     def_id,
-                    &directive.span_text,
-                    "ens",
                     &directive.expr,
+                    &directive.span_text,
+                    &params,
+                    true,
+                    &mut spec_scope,
                 )?;
                 ens = Some((directive.expr.clone(), directive.span_text.clone()));
             }
             _ => {}
         }
     }
-
     match (req, ens) {
         (None, None) => Ok(None),
         (Some((req, req_span)), Some((ens, ens_span))) => Ok(Some(FunctionContract {
-            params: function_param_names(tcx, def_id)?,
+            params,
             req,
             req_span,
             ens,
             ens_span,
+            spec_vars: spec_scope.ordered,
         })),
         _ => Err(function_contract_error(
             tcx,
@@ -638,214 +768,171 @@ fn build_function_contract<'tcx>(
     }
 }
 
-fn build_function_contract_prepass(
-    tcx: TyCtxt<'_>,
-    def_id: LocalDefId,
-    directives: &[FunctionDirective],
-) -> Result<Option<FunctionContract>, LoopPrepassError> {
-    let mut req = None;
-    let mut ens = None;
-    for directive in directives {
-        match directive.kind {
-            DirectiveKind::Req => {
-                if req.is_some() {
-                    return Err(LoopPrepassError {
-                        span: directive.span,
-                        display_span: Some(directive.span_text.clone()),
-                        message: "multiple //@ req directives for a function".to_owned(),
-                    });
-                }
-                validate_function_contract_expr_prepass(
-                    directive.span,
-                    &directive.span_text,
-                    "req",
-                    &directive.expr,
-                )?;
-                req = Some((directive.expr.clone(), directive.span_text.clone()));
-            }
-            DirectiveKind::Ens => {
-                if ens.is_some() {
-                    return Err(LoopPrepassError {
-                        span: directive.span,
-                        display_span: Some(directive.span_text.clone()),
-                        message: "multiple //@ ens directives for a function".to_owned(),
-                    });
-                }
-                validate_function_contract_expr_prepass(
-                    directive.span,
-                    &directive.span_text,
-                    "ens",
-                    &directive.expr,
-                )?;
-                ens = Some((directive.expr.clone(), directive.span_text.clone()));
-            }
-            _ => {}
-        }
-    }
-    match (req, ens) {
-        (None, None) => Ok(None),
-        (Some((req, req_span)), Some((ens, ens_span))) => Ok(Some(FunctionContract {
-            params: function_param_names(tcx, def_id).map_err(|err| LoopPrepassError {
-                span: tcx.def_span(def_id.to_def_id()),
-                display_span: None,
-                message: err.message,
-            })?,
-            req,
-            req_span,
-            ens,
-            ens_span,
-        })),
-        _ => Err(LoopPrepassError {
-            span: tcx.def_span(def_id.to_def_id()),
-            display_span: None,
-            message: "function contract requires exactly one //@ req and one //@ ens".to_owned(),
-        }),
-    }
-}
-
 fn validate_function_contract_expr<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
-    span: &str,
-    kind: &str,
     expr: &Expr,
+    span: &str,
+    params: &[String],
+    allow_result: bool,
+    spec_scope: &mut SpecScope,
 ) -> Result<(), VerificationResult> {
-    match expr {
-        Expr::Result if kind != "ens" => Err(function_contract_error(
-            tcx,
-            def_id,
-            span,
-            "`result` is only supported in //@ ens predicates".to_owned(),
-        )),
-        Expr::Field { base, .. } => validate_function_contract_expr(tcx, def_id, span, kind, base),
-        Expr::Unary { arg, .. } => validate_function_contract_expr(tcx, def_id, span, kind, arg),
-        Expr::Binary { lhs, rhs, .. } => {
-            validate_function_contract_expr(tcx, def_id, span, kind, lhs)?;
-            validate_function_contract_expr(tcx, def_id, span, kind, rhs)
-        }
-        _ => Ok(()),
-    }
+    validate_contract_expr_core(expr, spec_scope, params, allow_result)
+        .map_err(|message| function_contract_error(tcx, def_id, span, message))
 }
 
 fn validate_function_contract_expr_prepass(
     span: Span,
     span_text: &str,
-    kind: &str,
     expr: &Expr,
+    params: &[String],
+    allow_result: bool,
+    spec_scope: &mut SpecScope,
 ) -> Result<(), LoopPrepassError> {
-    match expr {
-        Expr::Result if kind != "ens" => Err(LoopPrepassError {
+    validate_contract_expr_core(expr, spec_scope, params, allow_result).map_err(|message| {
+        LoopPrepassError {
             span,
             display_span: Some(span_text.to_owned()),
-            message: "`result` is only supported in //@ ens predicates".to_owned(),
-        }),
+            message,
+        }
+    })
+}
+
+fn validate_contract_expr_core(
+    expr: &Expr,
+    spec_scope: &mut SpecScope,
+    params: &[String],
+    allow_result: bool,
+) -> Result<(), String> {
+    match expr {
+        Expr::Bool(_) | Expr::Int(_) => Ok(()),
+        Expr::Var(name) => {
+            if spec_scope.visible.contains(name)
+                || params.iter().any(|param| param == name)
+                || (allow_result && name == "result")
+            {
+                return Ok(());
+            }
+            if name == "result" {
+                return Err("`result` is only supported in //@ ens predicates".to_owned());
+            }
+            Err(format!("unresolved binding `{name}` in function contract"))
+        }
+        Expr::Bind(name) => spec_scope
+            .bind(
+                name,
+                Span::default(),
+                None,
+                if allow_result { "ens" } else { "req" },
+            )
+            .map_err(|err| err.message),
+        Expr::Prophecy(name) => {
+            if params.iter().any(|param| param == name) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "unresolved prophecy binding `{name}` in function contract"
+                ))
+            }
+        }
         Expr::Field { base, .. } => {
-            validate_function_contract_expr_prepass(span, span_text, kind, base)
+            validate_contract_expr_core(base, spec_scope, params, allow_result)
         }
         Expr::Unary { arg, .. } => {
-            validate_function_contract_expr_prepass(span, span_text, kind, arg)
+            validate_contract_expr_core(arg, spec_scope, params, allow_result)
         }
         Expr::Binary { lhs, rhs, .. } => {
-            validate_function_contract_expr_prepass(span, span_text, kind, lhs)?;
-            validate_function_contract_expr_prepass(span, span_text, kind, rhs)
+            validate_contract_expr_core(lhs, spec_scope, params, allow_result)?;
+            validate_contract_expr_core(rhs, spec_scope, params, allow_result)
         }
-        _ => Ok(()),
     }
 }
 
-fn lower_spec_expr_to_mir(
+fn resolve_expr_env(
     expr: &Expr,
     binding_info: &HirBindingInfo,
     hir_locals: &HashMap<HirId, Local>,
     span: Span,
     anchor_span: Span,
     kind: DirectiveKind,
-) -> Result<MirSpecExpr, LoopPrepassError> {
+    spec_scope: &mut SpecScope,
+) -> Result<ResolvedExprEnv, LoopPrepassError> {
+    let mut resolved = ResolvedExprEnv::default();
+    let mut ctx = ExprResolutionContext {
+        binding_info,
+        hir_locals,
+        span,
+        anchor_span,
+        kind,
+        spec_scope,
+    };
+    resolve_expr_env_into(expr, &mut ctx, &mut resolved)?;
+    Ok(resolved)
+}
+
+fn resolve_expr_env_into(
+    expr: &Expr,
+    ctx: &mut ExprResolutionContext<'_>,
+    resolved: &mut ResolvedExprEnv,
+) -> Result<(), LoopPrepassError> {
     match expr {
-        Expr::Bool(value) => Ok(MirSpecExpr::Bool(*value)),
-        Expr::Int(value) => Ok(MirSpecExpr::Int(*value)),
+        Expr::Bool(_) | Expr::Int(_) => Ok(()),
         Expr::Var(name) => {
+            if ctx.spec_scope.visible.contains(name) {
+                resolved.spec_vars.insert(name.clone());
+                return Ok(());
+            }
             let symbol = Symbol::intern(name);
-            let Some(hir_id) = resolve_binding_hir_id(binding_info, symbol, anchor_span) else {
+            let Some(hir_id) = resolve_binding_hir_id(ctx.binding_info, symbol, ctx.anchor_span)
+            else {
                 return Err(LoopPrepassError {
-                    span,
+                    span: ctx.span,
                     display_span: None,
-                    message: format!("unresolved binding `{name}` in //@ {}", kind.keyword()),
+                    message: format!("unresolved binding `{name}` in //@ {}", ctx.kind.keyword()),
                 });
             };
-            let Some(local) = hir_locals.get(&hir_id).copied() else {
+            let Some(local) = ctx.hir_locals.get(&hir_id).copied() else {
                 return Err(LoopPrepassError {
-                    span: anchor_span,
+                    span: ctx.anchor_span,
                     display_span: None,
                     message: format!("missing MIR local for HIR id {:?}", hir_id),
                 });
             };
-            Ok(MirSpecExpr::Var(local))
+            resolved.locals.insert(name.clone(), local);
+            Ok(())
         }
-        Expr::Result => Err(LoopPrepassError {
-            span,
-            display_span: None,
-            message: "`result` is only supported in //@ ens predicates".to_owned(),
-        }),
+        Expr::Bind(name) => {
+            ctx.spec_scope
+                .bind(name, ctx.span, None, ctx.kind.keyword())?;
+            resolved.spec_vars.insert(name.clone());
+            Ok(())
+        }
         Expr::Prophecy(name) => {
             let symbol = Symbol::intern(name);
-            let Some(hir_id) = resolve_binding_hir_id(binding_info, symbol, anchor_span) else {
+            let Some(hir_id) = resolve_binding_hir_id(ctx.binding_info, symbol, ctx.anchor_span)
+            else {
                 return Err(LoopPrepassError {
-                    span,
+                    span: ctx.span,
                     display_span: None,
-                    message: format!("unresolved binding `{name}` in //@ {}", kind.keyword()),
+                    message: format!("unresolved binding `{name}` in //@ {}", ctx.kind.keyword()),
                 });
             };
-            let Some(local) = hir_locals.get(&hir_id).copied() else {
+            let Some(local) = ctx.hir_locals.get(&hir_id).copied() else {
                 return Err(LoopPrepassError {
-                    span: anchor_span,
+                    span: ctx.anchor_span,
                     display_span: None,
                     message: format!("missing MIR local for HIR id {:?}", hir_id),
                 });
             };
-            Ok(MirSpecExpr::Prophecy(local))
+            resolved.prophecies.insert(name.clone(), local);
+            Ok(())
         }
-        Expr::Field { base, index } => Ok(MirSpecExpr::Field {
-            base: Box::new(lower_spec_expr_to_mir(
-                base,
-                binding_info,
-                hir_locals,
-                span,
-                anchor_span,
-                kind,
-            )?),
-            index: *index,
-        }),
-        Expr::Unary { op, arg } => Ok(MirSpecExpr::Unary {
-            op: *op,
-            arg: Box::new(lower_spec_expr_to_mir(
-                arg,
-                binding_info,
-                hir_locals,
-                span,
-                anchor_span,
-                kind,
-            )?),
-        }),
-        Expr::Binary { op, lhs, rhs } => Ok(MirSpecExpr::Binary {
-            op: *op,
-            lhs: Box::new(lower_spec_expr_to_mir(
-                lhs,
-                binding_info,
-                hir_locals,
-                span,
-                anchor_span,
-                kind,
-            )?),
-            rhs: Box::new(lower_spec_expr_to_mir(
-                rhs,
-                binding_info,
-                hir_locals,
-                span,
-                anchor_span,
-                kind,
-            )?),
-        }),
+        Expr::Field { base, .. } => resolve_expr_env_into(base, ctx, resolved),
+        Expr::Unary { arg, .. } => resolve_expr_env_into(arg, ctx, resolved),
+        Expr::Binary { lhs, rhs, .. } => {
+            resolve_expr_env_into(lhs, ctx, resolved)?;
+            resolve_expr_env_into(rhs, ctx, resolved)
+        }
     }
 }
 
