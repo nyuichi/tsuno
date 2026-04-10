@@ -17,13 +17,12 @@ use z3::{
     DatatypeAccessor, DatatypeBuilder, DatatypeSort, RecFuncDecl, SatResult, Solver, SortKind,
 };
 
-use crate::directive::{SpecBinaryOp, SpecUnaryOp};
 use crate::prepass::{
-    AssertionContracts, AssumptionContracts, ContractExpr, FunctionContract, LoopContract,
-    LoopContracts, MirSpecExpr, compute_assertions, compute_assumptions,
-    compute_function_contracts, compute_loops,
+    AssertionContracts, AssumptionContracts, FunctionContract, LoopContract, LoopContracts,
+    MirSpecExpr, compute_directives, compute_function_contracts,
 };
 use crate::report::{VerificationResult, VerificationStatus};
+use crate::spec_syntax::{SpecBinaryOp, SpecExpr, SpecUnaryOp};
 
 thread_local! {
     static GLOBAL_SOLVER: Solver = {
@@ -467,51 +466,29 @@ pub struct Verifier<'tcx> {
 }
 
 impl<'tcx> Verifier<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: Body<'tcx>) -> Self {
-        let (loop_contracts, mut prepass_error) = match compute_loops(tcx, def_id, &body) {
-            Ok(loop_contracts) => (loop_contracts, None),
-            Err(error) => (
-                LoopContracts::empty(),
-                Some(VerificationResult {
-                    function: tcx.def_path_str(def_id.to_def_id()),
-                    status: VerificationStatus::Unsupported,
-                    span: span_text(tcx, error.span),
-                    message: error.message,
-                }),
-            ),
-        };
-        let assertion_contracts = if prepass_error.is_none() {
-            match compute_assertions(tcx, def_id, &body) {
-                Ok(assertion_contracts) => assertion_contracts,
-                Err(error) => {
-                    prepass_error = Some(VerificationResult {
+    pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, item_span: Span, body: Body<'tcx>) -> Self {
+        let (loop_contracts, assertion_contracts, assumption_contracts, mut prepass_error) =
+            match compute_directives(tcx, def_id, item_span, &body) {
+                Ok(prepass) => (
+                    prepass.loop_contracts,
+                    prepass.assertion_contracts,
+                    prepass.assumption_contracts,
+                    None,
+                ),
+                Err(error) => (
+                    LoopContracts::empty(),
+                    AssertionContracts::empty(),
+                    AssumptionContracts::empty(),
+                    Some(VerificationResult {
                         function: tcx.def_path_str(def_id.to_def_id()),
                         status: VerificationStatus::Unsupported,
-                        span: span_text(tcx, error.span),
+                        span: error
+                            .display_span
+                            .unwrap_or_else(|| span_text(tcx, error.span)),
                         message: error.message,
-                    });
-                    AssertionContracts::empty()
-                }
-            }
-        } else {
-            AssertionContracts::empty()
-        };
-        let assumption_contracts = if prepass_error.is_none() {
-            match compute_assumptions(tcx, def_id, &body) {
-                Ok(assumption_contracts) => assumption_contracts,
-                Err(error) => {
-                    prepass_error = Some(VerificationResult {
-                        function: tcx.def_path_str(def_id.to_def_id()),
-                        status: VerificationStatus::Unsupported,
-                        span: span_text(tcx, error.span),
-                        message: error.message,
-                    });
-                    AssumptionContracts::empty()
-                }
-            }
-        } else {
-            AssumptionContracts::empty()
-        };
+                    }),
+                ),
+            };
         let contracts = match compute_function_contracts(tcx) {
             Ok(contracts) => contracts,
             Err(error) => {
@@ -1602,10 +1579,10 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         current: &HashMap<String, Datatype>,
         prophecy: &HashMap<String, Datatype>,
-        expr: &ContractExpr,
+        expr: &SpecExpr,
     ) -> Result<BoolExpr, VerificationResult> {
         match expr {
-            ContractExpr::Bool(value) => Ok(BoolExpr::Const(*value)),
+            SpecExpr::Bool(value) => Ok(BoolExpr::Const(*value)),
             _ => Ok(BoolExpr::Value(
                 self.contract_expr_to_value(current, prophecy, expr)?,
             )),
@@ -1616,35 +1593,41 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         current: &HashMap<String, Datatype>,
         prophecy: &HashMap<String, Datatype>,
-        expr: &ContractExpr,
+        expr: &SpecExpr,
     ) -> Result<Datatype, VerificationResult> {
         match expr {
-            ContractExpr::Bool(value) => Ok(self.value_bool(*value)),
-            ContractExpr::Int(value) => Ok(self.value_int(*value)),
-            ContractExpr::Var(name) => current.get(name).cloned().ok_or_else(|| {
+            SpecExpr::Bool(value) => Ok(self.value_bool(*value)),
+            SpecExpr::Int(value) => Ok(self.value_int(*value)),
+            SpecExpr::Var(name) => current.get(name).cloned().ok_or_else(|| {
                 self.unsupported_result(
                     self.tcx.def_span(self.def_id),
                     format!("missing contract binding `{name}`"),
                 )
             }),
-            ContractExpr::Prophecy(name) => prophecy.get(name).cloned().ok_or_else(|| {
+            SpecExpr::Result => current.get("result").cloned().ok_or_else(|| {
+                self.unsupported_result(
+                    self.tcx.def_span(self.def_id),
+                    "missing contract binding `result`".to_owned(),
+                )
+            }),
+            SpecExpr::Prophecy(name) => prophecy.get(name).cloned().ok_or_else(|| {
                 self.unsupported_result(
                     self.tcx.def_span(self.def_id),
                     format!("missing prophecy binding `{name}`"),
                 )
             }),
-            ContractExpr::Field { base, index } => {
+            SpecExpr::Field { base, index } => {
                 let value = self.contract_expr_to_value(current, prophecy, base)?;
                 self.project_tuple_field(value, *index, self.tcx.def_span(self.def_id))
             }
-            ContractExpr::Unary { op, arg } => {
+            SpecExpr::Unary { op, arg } => {
                 let value = self.contract_expr_to_value(current, prophecy, arg)?;
                 Ok(match op {
                     SpecUnaryOp::Not => self.value_not(&value),
                     SpecUnaryOp::Neg => self.value_neg(&value),
                 })
             }
-            ContractExpr::Binary { op, lhs, rhs } => {
+            SpecExpr::Binary { op, lhs, rhs } => {
                 let lhs = self.contract_expr_to_value(current, prophecy, lhs)?;
                 let rhs = self.contract_expr_to_value(current, prophecy, rhs)?;
                 Ok(match op {
