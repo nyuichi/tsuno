@@ -18,12 +18,12 @@ use z3::{
 };
 
 use crate::prepass::{
-    AssertionContracts, AssumptionContracts, AutoInvariantKind, ContractParam, ContractValueOrigin,
-    ContractValueSpec, FunctionContract, FunctionContractEntry, LoopContract, LoopContracts,
-    ResolvedExprEnv, compute_directives, contract_value_spec,
+    AssertionContracts, AssumptionContracts, ContractParam, FunctionContract,
+    FunctionContractEntry, LoopContract, LoopContracts, ResolvedExprEnv, compute_directives,
+    spec_ty_for_rust_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
-use crate::spec::{BinaryOp, TypedExpr, TypedExprKind, UnaryOp};
+use crate::spec::{BinaryOp, SpecTy, TypedExpr, TypedExprKind, UnaryOp};
 
 thread_local! {
     static GLOBAL_SOLVER: Solver = {
@@ -2318,37 +2318,72 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn invariant_formula(
+    fn int_range_formula_for_spec_ty(
         &self,
-        invariant: AutoInvariantKind,
+        ty: &SpecTy,
         value: &Datatype,
         span: Span,
     ) -> Result<Option<Bool>, VerificationResult> {
-        match invariant {
-            AutoInvariantKind::Trivial => Ok(None),
-            AutoInvariantKind::I32Range => Ok(Some(self.int_range_formula(
-                self.tcx.types.i32,
-                value,
-                span,
-            )?)),
-        }
-    }
-
-    fn contract_spec_formula(
-        &self,
-        spec: ContractValueSpec,
-        value: &Datatype,
-        span: Span,
-    ) -> Result<Option<Bool>, VerificationResult> {
-        let target = match spec.origin {
-            ContractValueOrigin::Direct => value.clone(),
-            ContractValueOrigin::Current => self.value_pair_first(value),
+        let rust_ty = match ty {
+            SpecTy::I8 => Some(self.tcx.types.i8),
+            SpecTy::I16 => Some(self.tcx.types.i16),
+            SpecTy::I32 => Some(self.tcx.types.i32),
+            SpecTy::I64 => Some(self.tcx.types.i64),
+            SpecTy::Isize => Some(self.tcx.types.isize),
+            SpecTy::U8 => Some(self.tcx.types.u8),
+            SpecTy::U16 => Some(self.tcx.types.u16),
+            SpecTy::U32 => Some(self.tcx.types.u32),
+            SpecTy::U64 => Some(self.tcx.types.u64),
+            SpecTy::Usize => Some(self.tcx.types.usize),
+            SpecTy::Bool
+            | SpecTy::IntLiteral
+            | SpecTy::Tuple(_)
+            | SpecTy::Ref(_)
+            | SpecTy::Mut(_) => None,
         };
-        self.invariant_formula(spec.invariant, &target, span)
+        rust_ty
+            .map(|rust_ty| self.int_range_formula(rust_ty, value, span))
+            .transpose()
     }
 
-    fn contract_value_spec_for_ty(&self, ty: Ty<'tcx>) -> ContractValueSpec {
-        contract_value_spec(self.tcx, ty).expect("supported contract type")
+    fn spec_ty_formula(
+        &self,
+        ty: &SpecTy,
+        value: &Datatype,
+        span: Span,
+    ) -> Result<Option<Bool>, VerificationResult> {
+        match ty {
+            SpecTy::Bool | SpecTy::IntLiteral => Ok(None),
+            SpecTy::I8
+            | SpecTy::I16
+            | SpecTy::I32
+            | SpecTy::I64
+            | SpecTy::Isize
+            | SpecTy::U8
+            | SpecTy::U16
+            | SpecTy::U32
+            | SpecTy::U64
+            | SpecTy::Usize => self.int_range_formula_for_spec_ty(ty, value, span),
+            SpecTy::Ref(inner) => self.spec_ty_formula(inner, value, span),
+            SpecTy::Mut(inner) => {
+                let current = self.value_pair_first(value);
+                self.spec_ty_formula(inner, &current, span)
+            }
+            SpecTy::Tuple(items) => {
+                let mut formulas = Vec::new();
+                for (index, item) in items.iter().enumerate() {
+                    let field = self.project_field(value.clone(), index, span)?;
+                    if let Some(formula) = self.spec_ty_formula(item, &field, span)? {
+                        formulas.push(formula);
+                    }
+                }
+                if formulas.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(bool_and(formulas)))
+                }
+            }
+        }
     }
 
     fn require_type_invariant(
@@ -2359,8 +2394,9 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
         message: String,
     ) -> Result<(), VerificationResult> {
-        let spec = self.contract_value_spec_for_ty(ty);
-        let Some(formula) = self.contract_spec_formula(spec, value, span)? else {
+        let spec_ty =
+            spec_ty_for_rust_ty(self.tcx, ty).map_err(|err| self.unsupported_result(span, err))?;
+        let Some(formula) = self.spec_ty_formula(&spec_ty, value, span)? else {
             return Ok(());
         };
         self.require_constraint(state, formula, span, span_text(self.tcx, span), message)
@@ -2501,19 +2537,17 @@ impl<'tcx> Verifier<'tcx> {
             let Some(result) = env.current.get("result") else {
                 return Ok(Vec::new());
             };
-            let Some(formula) =
-                self.contract_spec_formula(contract.result.clone(), result, span)?
-            else {
+            let Some(formula) = self.spec_ty_formula(&contract.result, result, span)? else {
                 return Ok(Vec::new());
             };
             return Ok(vec![formula]);
         }
         let mut formulas = Vec::new();
-        for ContractParam { name, spec } in &contract.params {
+        for ContractParam { name, ty } in &contract.params {
             let value = env.current.get(name).cloned().ok_or_else(|| {
                 self.unsupported_result(span, format!("missing contract binding `{name}`"))
             })?;
-            if let Some(formula) = self.contract_spec_formula(spec.clone(), &value, span)? {
+            if let Some(formula) = self.spec_ty_formula(ty, &value, span)? {
                 formulas.push(formula);
             }
         }

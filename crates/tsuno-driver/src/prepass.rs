@@ -68,29 +68,10 @@ pub struct AssumptionContracts {
     pub by_control_point: HashMap<(BasicBlock, usize), AssumptionContract>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AutoInvariantKind {
-    Trivial,
-    I32Range,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContractValueOrigin {
-    Direct,
-    Current,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContractValueSpec {
-    pub ty: SpecTy,
-    pub invariant: AutoInvariantKind,
-    pub origin: ContractValueOrigin,
-}
-
 #[derive(Debug, Clone)]
 pub struct ContractParam {
     pub name: String,
-    pub spec: ContractValueSpec,
+    pub ty: SpecTy,
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +83,7 @@ pub struct FunctionContract {
     pub ens: TypedExpr,
     pub ens_span: String,
     pub spec_vars: Vec<String>,
-    pub result: ContractValueSpec,
+    pub result: SpecTy,
 }
 
 #[derive(Debug, Clone)]
@@ -412,7 +393,10 @@ impl SpecTypeInference {
 fn unify_spec_tys(lhs: &SpecTy, rhs: &SpecTy) -> Result<SpecTy, String> {
     match (lhs, rhs) {
         (SpecTy::Bool, SpecTy::Bool) => Ok(SpecTy::Bool),
-        (SpecTy::Int, SpecTy::Int) => Ok(SpecTy::Int),
+        (SpecTy::IntLiteral, SpecTy::IntLiteral) => Ok(SpecTy::IntLiteral),
+        (SpecTy::IntLiteral, rhs) if is_concrete_integer_spec_ty(rhs) => Ok(rhs.clone()),
+        (lhs, SpecTy::IntLiteral) if is_concrete_integer_spec_ty(lhs) => Ok(lhs.clone()),
+        (lhs, rhs) if lhs == rhs => Ok(lhs.clone()),
         (SpecTy::Ref(lhs), SpecTy::Ref(rhs)) => {
             Ok(SpecTy::Ref(Box::new(unify_spec_tys(lhs, rhs)?)))
         }
@@ -437,7 +421,17 @@ fn unify_spec_tys(lhs: &SpecTy, rhs: &SpecTy) -> Result<SpecTy, String> {
 fn display_spec_ty(ty: &SpecTy) -> String {
     match ty {
         SpecTy::Bool => "bool".to_owned(),
-        SpecTy::Int => "int".to_owned(),
+        SpecTy::IntLiteral => "{integer}".to_owned(),
+        SpecTy::I8 => "i8".to_owned(),
+        SpecTy::I16 => "i16".to_owned(),
+        SpecTy::I32 => "i32".to_owned(),
+        SpecTy::I64 => "i64".to_owned(),
+        SpecTy::Isize => "isize".to_owned(),
+        SpecTy::U8 => "u8".to_owned(),
+        SpecTy::U16 => "u16".to_owned(),
+        SpecTy::U32 => "u32".to_owned(),
+        SpecTy::U64 => "u64".to_owned(),
+        SpecTy::Usize => "usize".to_owned(),
         SpecTy::Ref(inner) => format!("Ref<{}>", display_spec_ty(inner)),
         SpecTy::Mut(inner) => format!("Mut<{}>", display_spec_ty(inner)),
         SpecTy::Tuple(items) => format!(
@@ -449,6 +443,46 @@ fn display_spec_ty(ty: &SpecTy) -> String {
                 .join(", ")
         ),
     }
+}
+
+fn is_integer_spec_ty(ty: &SpecTy) -> bool {
+    matches!(
+        ty,
+        SpecTy::IntLiteral
+            | SpecTy::I8
+            | SpecTy::I16
+            | SpecTy::I32
+            | SpecTy::I64
+            | SpecTy::Isize
+            | SpecTy::U8
+            | SpecTy::U16
+            | SpecTy::U32
+            | SpecTy::U64
+            | SpecTy::Usize
+    )
+}
+
+fn is_concrete_integer_spec_ty(ty: &SpecTy) -> bool {
+    is_integer_spec_ty(ty) && *ty != SpecTy::IntLiteral
+}
+
+fn is_fully_inferred_spec_ty(ty: &SpecTy) -> bool {
+    match ty {
+        SpecTy::IntLiteral => false,
+        SpecTy::Tuple(items) => items.iter().all(is_fully_inferred_spec_ty),
+        SpecTy::Ref(inner) | SpecTy::Mut(inner) => is_fully_inferred_spec_ty(inner),
+        _ => true,
+    }
+}
+
+fn inferred_spec_var_ty(inferred: &mut SpecTypeInference, name: &str) -> Result<SpecTy, String> {
+    let ty = inferred
+        .resolved_ty(name)
+        .ok_or_else(|| format!("could not infer a type for `?{name}`"))?;
+    if !is_fully_inferred_spec_ty(&ty) {
+        return Err(format!("could not infer a type for `?{name}`"));
+    }
+    Ok(ty)
 }
 
 fn constrain_expr_ty(
@@ -485,12 +519,50 @@ fn unify_expr_tys(
     }
 }
 
-fn rust_ty_to_spec_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<SpecTy, String> {
+fn numeric_expr_result_ty(
+    inferred: &mut SpecTypeInference,
+    lhs: &InferredExprTy,
+    rhs: &InferredExprTy,
+) -> Result<InferredExprTy, String> {
+    unify_expr_tys(inferred, lhs, rhs)?;
+    Ok(match (lhs, rhs) {
+        (InferredExprTy::Known(lhs), InferredExprTy::Known(rhs)) => {
+            InferredExprTy::Known(unify_spec_tys(lhs, rhs)?)
+        }
+        (InferredExprTy::SpecVar(name), InferredExprTy::Known(ty))
+        | (InferredExprTy::Known(ty), InferredExprTy::SpecVar(name)) => {
+            inferred.constrain(name, ty)?;
+            InferredExprTy::Known(ty.clone())
+        }
+        (InferredExprTy::SpecVar(lhs), InferredExprTy::SpecVar(_rhs)) => inferred
+            .resolved_ty(lhs)
+            .map(InferredExprTy::Known)
+            .unwrap_or_else(|| InferredExprTy::SpecVar(lhs.clone())),
+        _ => InferredExprTy::Unknown,
+    })
+}
+
+pub fn spec_ty_for_rust_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<SpecTy, String> {
     match ty.kind() {
         TyKind::Bool => Ok(SpecTy::Bool),
-        TyKind::Int(_) | TyKind::Uint(_) => Ok(SpecTy::Int),
+        TyKind::Int(kind) => Ok(match kind {
+            ty::IntTy::I8 => SpecTy::I8,
+            ty::IntTy::I16 => SpecTy::I16,
+            ty::IntTy::I32 => SpecTy::I32,
+            ty::IntTy::I64 => SpecTy::I64,
+            ty::IntTy::Isize => SpecTy::Isize,
+            other => return Err(format!("unsupported integer type {other:?}")),
+        }),
+        TyKind::Uint(kind) => Ok(match kind {
+            ty::UintTy::U8 => SpecTy::U8,
+            ty::UintTy::U16 => SpecTy::U16,
+            ty::UintTy::U32 => SpecTy::U32,
+            ty::UintTy::U64 => SpecTy::U64,
+            ty::UintTy::Usize => SpecTy::Usize,
+            other => return Err(format!("unsupported integer type {other:?}")),
+        }),
         TyKind::Ref(_, inner, mutability) => {
-            let inner = rust_ty_to_spec_ty(tcx, *inner)?;
+            let inner = spec_ty_for_rust_ty(tcx, *inner)?;
             if mutability.is_mut() {
                 Ok(SpecTy::Mut(Box::new(inner)))
             } else {
@@ -500,14 +572,14 @@ fn rust_ty_to_spec_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<SpecTy, S
         TyKind::Tuple(fields) => {
             let mut items = Vec::with_capacity(fields.len());
             for field in fields.iter() {
-                items.push(rust_ty_to_spec_ty(tcx, field)?);
+                items.push(spec_ty_for_rust_ty(tcx, field)?);
             }
             Ok(SpecTy::Tuple(items))
         }
         TyKind::Adt(adt_def, args) if adt_def.is_struct() => {
             let mut items = Vec::new();
             for field in adt_def.non_enum_variant().fields.iter() {
-                items.push(rust_ty_to_spec_ty(tcx, field.ty(tcx, args))?);
+                items.push(spec_ty_for_rust_ty(tcx, field.ty(tcx, args))?);
             }
             Ok(SpecTy::Tuple(items))
         }
@@ -525,7 +597,7 @@ fn infer_contract_expr_types(
 ) -> Result<InferredExprTy, String> {
     match expr {
         Expr::Bool(_) => Ok(InferredExprTy::Known(SpecTy::Bool)),
-        Expr::Int(_) => Ok(InferredExprTy::Known(SpecTy::Int)),
+        Expr::Int(_) => Ok(InferredExprTy::Known(SpecTy::IntLiteral)),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
                 inferred.ensure_var(name);
@@ -624,8 +696,8 @@ fn infer_contract_expr_types(
                     Ok(InferredExprTy::Known(SpecTy::Bool))
                 }
                 crate::spec::UnaryOp::Neg => {
-                    constrain_expr_ty(inferred, &arg_ty, &SpecTy::Int)?;
-                    Ok(InferredExprTy::Known(SpecTy::Int))
+                    constrain_expr_ty(inferred, &arg_ty, &SpecTy::IntLiteral)?;
+                    Ok(arg_ty)
                 }
             }
         }
@@ -660,18 +732,17 @@ fn infer_contract_expr_types(
                 | crate::spec::BinaryOp::Le
                 | crate::spec::BinaryOp::Gt
                 | crate::spec::BinaryOp::Ge => {
-                    constrain_expr_ty(inferred, &lhs_ty, &SpecTy::Int)?;
-                    constrain_expr_ty(inferred, &rhs_ty, &SpecTy::Int)?;
-                    unify_expr_tys(inferred, &lhs_ty, &rhs_ty)?;
+                    constrain_expr_ty(inferred, &lhs_ty, &SpecTy::IntLiteral)?;
+                    constrain_expr_ty(inferred, &rhs_ty, &SpecTy::IntLiteral)?;
+                    let _ = numeric_expr_result_ty(inferred, &lhs_ty, &rhs_ty)?;
                     Ok(InferredExprTy::Known(SpecTy::Bool))
                 }
                 crate::spec::BinaryOp::Add
                 | crate::spec::BinaryOp::Sub
                 | crate::spec::BinaryOp::Mul => {
-                    constrain_expr_ty(inferred, &lhs_ty, &SpecTy::Int)?;
-                    constrain_expr_ty(inferred, &rhs_ty, &SpecTy::Int)?;
-                    unify_expr_tys(inferred, &lhs_ty, &rhs_ty)?;
-                    Ok(InferredExprTy::Known(SpecTy::Int))
+                    constrain_expr_ty(inferred, &lhs_ty, &SpecTy::IntLiteral)?;
+                    constrain_expr_ty(inferred, &rhs_ty, &SpecTy::IntLiteral)?;
+                    numeric_expr_result_ty(inferred, &lhs_ty, &rhs_ty)
                 }
             }
         }
@@ -687,7 +758,7 @@ fn infer_body_expr_types<'tcx>(
 ) -> Result<InferredExprTy, String> {
     match expr {
         Expr::Bool(_) => Ok(InferredExprTy::Known(SpecTy::Bool)),
-        Expr::Int(_) => Ok(InferredExprTy::Known(SpecTy::Int)),
+        Expr::Int(_) => Ok(InferredExprTy::Known(SpecTy::IntLiteral)),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
                 inferred.ensure_var(name);
@@ -749,8 +820,8 @@ fn infer_body_expr_types<'tcx>(
                     Ok(InferredExprTy::Known(SpecTy::Bool))
                 }
                 crate::spec::UnaryOp::Neg => {
-                    constrain_expr_ty(inferred, &arg_ty, &SpecTy::Int)?;
-                    Ok(InferredExprTy::Known(SpecTy::Int))
+                    constrain_expr_ty(inferred, &arg_ty, &SpecTy::IntLiteral)?;
+                    Ok(arg_ty)
                 }
             }
         }
@@ -771,18 +842,17 @@ fn infer_body_expr_types<'tcx>(
                 | crate::spec::BinaryOp::Le
                 | crate::spec::BinaryOp::Gt
                 | crate::spec::BinaryOp::Ge => {
-                    constrain_expr_ty(inferred, &lhs_ty, &SpecTy::Int)?;
-                    constrain_expr_ty(inferred, &rhs_ty, &SpecTy::Int)?;
-                    unify_expr_tys(inferred, &lhs_ty, &rhs_ty)?;
+                    constrain_expr_ty(inferred, &lhs_ty, &SpecTy::IntLiteral)?;
+                    constrain_expr_ty(inferred, &rhs_ty, &SpecTy::IntLiteral)?;
+                    let _ = numeric_expr_result_ty(inferred, &lhs_ty, &rhs_ty)?;
                     Ok(InferredExprTy::Known(SpecTy::Bool))
                 }
                 crate::spec::BinaryOp::Add
                 | crate::spec::BinaryOp::Sub
                 | crate::spec::BinaryOp::Mul => {
-                    constrain_expr_ty(inferred, &lhs_ty, &SpecTy::Int)?;
-                    constrain_expr_ty(inferred, &rhs_ty, &SpecTy::Int)?;
-                    unify_expr_tys(inferred, &lhs_ty, &rhs_ty)?;
-                    Ok(InferredExprTy::Known(SpecTy::Int))
+                    constrain_expr_ty(inferred, &lhs_ty, &SpecTy::IntLiteral)?;
+                    constrain_expr_ty(inferred, &rhs_ty, &SpecTy::IntLiteral)?;
+                    numeric_expr_result_ty(inferred, &lhs_ty, &rhs_ty)
                 }
             }
         }
@@ -800,7 +870,7 @@ fn local_spec_tys<'tcx>(
 ) -> Result<HashMap<String, SpecTy>, String> {
     let mut types = HashMap::new();
     for (name, local) in &resolved.locals {
-        let ty = rust_ty_to_spec_ty(tcx, body.local_decls[*local].ty)?;
+        let ty = spec_ty_for_rust_ty(tcx, body.local_decls[*local].ty)?;
         types.insert(name.clone(), ty);
     }
     Ok(types)
@@ -820,14 +890,12 @@ fn typed_contract_expr(
             kind: TypedExprKind::Bool(*value),
         }),
         Expr::Int(value) => Ok(TypedExpr {
-            ty: SpecTy::Int,
+            ty: SpecTy::IntLiteral,
             kind: TypedExprKind::Int(*value),
         }),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
-                let ty = inferred
-                    .resolved_ty(name)
-                    .ok_or_else(|| format!("could not infer a type for `?{name}`"))?;
+                let ty = inferred_spec_var_ty(inferred, name)?;
                 return Ok(TypedExpr {
                     ty,
                     kind: TypedExprKind::Var(name.clone()),
@@ -859,9 +927,7 @@ fn typed_contract_expr(
                     if allow_result { "ens" } else { "req" },
                 )
                 .map_err(|err| err.message)?;
-            let ty = inferred
-                .resolved_ty(name)
-                .ok_or_else(|| format!("could not infer a type for `?{name}`"))?;
+            let ty = inferred_spec_var_ty(inferred, name)?;
             Ok(TypedExpr {
                 ty,
                 kind: TypedExprKind::Bind(name.clone()),
@@ -939,14 +1005,14 @@ fn typed_contract_expr(
                     })
                 }
                 crate::spec::UnaryOp::Neg => {
-                    if arg.ty != SpecTy::Int {
+                    if !is_integer_spec_ty(&arg.ty) {
                         return Err(format!(
-                            "unary `-` requires `int`, found `{}`",
+                            "unary `-` requires an integer, found `{}`",
                             display_spec_ty(&arg.ty)
                         ));
                     }
                     Ok(TypedExpr {
-                        ty: SpecTy::Int,
+                        ty: arg.ty.clone(),
                         kind: TypedExprKind::Unary {
                             op: *op,
                             arg: Box::new(arg),
@@ -978,14 +1044,12 @@ fn typed_body_expr(
             kind: TypedExprKind::Bool(*value),
         }),
         Expr::Int(value) => Ok(TypedExpr {
-            ty: SpecTy::Int,
+            ty: SpecTy::IntLiteral,
             kind: TypedExprKind::Int(*value),
         }),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
-                let ty = inferred
-                    .resolved_ty(name)
-                    .ok_or_else(|| format!("could not infer a type for `?{name}`"))?;
+                let ty = inferred_spec_var_ty(inferred, name)?;
                 return Ok(TypedExpr {
                     ty,
                     kind: TypedExprKind::Var(name.clone()),
@@ -1004,9 +1068,7 @@ fn typed_body_expr(
             spec_scope
                 .bind(name, Span::default(), None, kind.keyword())
                 .map_err(|err| err.message)?;
-            let ty = inferred
-                .resolved_ty(name)
-                .ok_or_else(|| format!("could not infer a type for `?{name}`"))?;
+            let ty = inferred_spec_var_ty(inferred, name)?;
             Ok(TypedExpr {
                 ty,
                 kind: TypedExprKind::Bind(name.clone()),
@@ -1080,14 +1142,14 @@ fn typed_body_expr(
                     })
                 }
                 crate::spec::UnaryOp::Neg => {
-                    if arg.ty != SpecTy::Int {
+                    if !is_integer_spec_ty(&arg.ty) {
                         return Err(format!(
-                            "unary `-` requires `int`, found `{}`",
+                            "unary `-` requires an integer, found `{}`",
                             display_spec_ty(&arg.ty)
                         ));
                     }
                     Ok(TypedExpr {
-                        ty: SpecTy::Int,
+                        ty: arg.ty.clone(),
                         kind: TypedExprKind::Unary {
                             op: *op,
                             arg: Box::new(arg),
@@ -1148,9 +1210,10 @@ fn type_binary_expr(
         | crate::spec::BinaryOp::Le
         | crate::spec::BinaryOp::Gt
         | crate::spec::BinaryOp::Ge => {
-            if lhs.ty != SpecTy::Int || rhs.ty != SpecTy::Int {
+            let unified = unify_spec_tys(&lhs.ty, &rhs.ty)?;
+            if !is_integer_spec_ty(&unified) {
                 return Err(format!(
-                    "comparison requires `int`, found `{}` and `{}`",
+                    "comparison requires integers, found `{}` and `{}`",
                     display_spec_ty(&lhs.ty),
                     display_spec_ty(&rhs.ty)
                 ));
@@ -1165,15 +1228,16 @@ fn type_binary_expr(
             })
         }
         crate::spec::BinaryOp::Add | crate::spec::BinaryOp::Sub | crate::spec::BinaryOp::Mul => {
-            if lhs.ty != SpecTy::Int || rhs.ty != SpecTy::Int {
+            let unified = unify_spec_tys(&lhs.ty, &rhs.ty)?;
+            if !is_integer_spec_ty(&unified) {
                 return Err(format!(
-                    "arithmetic requires `int`, found `{}` and `{}`",
+                    "arithmetic requires integers, found `{}` and `{}`",
                     display_spec_ty(&lhs.ty),
                     display_spec_ty(&rhs.ty)
                 ));
             }
             Ok(TypedExpr {
-                ty: SpecTy::Int,
+                ty: unified,
                 kind: TypedExprKind::Binary {
                     op,
                     lhs: Box::new(lhs),
@@ -1237,9 +1301,9 @@ pub fn compute_directives<'tcx>(
         })?;
     let param_tys: HashMap<_, _> = params
         .iter()
-        .map(|param| (param.name.clone(), param.spec.ty.clone()))
+        .map(|param| (param.name.clone(), param.ty.clone()))
         .collect();
-    let result_ty = result.ty.clone();
+    let result_ty = result.clone();
     if let Some(directive) = req_directive {
         validate_function_contract_expr_prepass(
             directive.span,
@@ -1834,9 +1898,9 @@ fn build_contract_only<'tcx>(
         function_contract_signature_with_names(tcx, def_id, param_names.clone())?;
     let param_tys: HashMap<_, _> = params
         .iter()
-        .map(|param| (param.name.clone(), param.spec.ty.clone()))
+        .map(|param| (param.name.clone(), param.ty.clone()))
         .collect();
-    let result_ty = result.ty.clone();
+    let result_ty = result.clone();
     let mut req = None;
     let mut ens = None;
     let mut validate_scope = SpecScope::default();
@@ -2270,7 +2334,7 @@ fn function_contract_signature_with_names<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     names: Vec<String>,
-) -> Result<(Vec<ContractParam>, ContractValueSpec), VerificationResult> {
+) -> Result<(Vec<ContractParam>, SpecTy), VerificationResult> {
     let sig = tcx.fn_sig(def_id).instantiate_identity();
     let inputs = sig.inputs().skip_binder();
     if inputs.len() != names.len() {
@@ -2291,8 +2355,8 @@ fn function_contract_signature_with_names<'tcx>(
         .into_iter()
         .zip(inputs.iter().copied())
         .map(|(name, ty)| {
-            contract_value_spec(tcx, ty)
-                .map(|spec| ContractParam { name, spec })
+            spec_ty_for_rust_ty(tcx, ty)
+                .map(|ty| ContractParam { name, ty })
                 .map_err(|message| {
                     function_contract_error(
                         tcx,
@@ -2305,7 +2369,7 @@ fn function_contract_signature_with_names<'tcx>(
                 })
         })
         .collect::<Result<Vec<_>, VerificationResult>>()?;
-    let result = contract_value_spec(tcx, sig.output().skip_binder()).map_err(|message| {
+    let result = spec_ty_for_rust_ty(tcx, sig.output().skip_binder()).map_err(|message| {
         function_contract_error(
             tcx,
             def_id,
@@ -2316,36 +2380,6 @@ fn function_contract_signature_with_names<'tcx>(
         )
     })?;
     Ok((params, result))
-}
-
-pub fn contract_value_spec<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    ty: Ty<'tcx>,
-) -> Result<ContractValueSpec, String> {
-    let spec_ty = rust_ty_to_spec_ty(tcx, ty)?;
-    Ok(match ty.kind() {
-        TyKind::Ref(_, inner, mutability) => ContractValueSpec {
-            ty: spec_ty,
-            invariant: type_invariant_kind(*inner),
-            origin: if mutability.is_mut() {
-                ContractValueOrigin::Current
-            } else {
-                ContractValueOrigin::Direct
-            },
-        },
-        _ => ContractValueSpec {
-            ty: spec_ty,
-            invariant: type_invariant_kind(ty),
-            origin: ContractValueOrigin::Direct,
-        },
-    })
-}
-
-fn type_invariant_kind<'tcx>(ty: Ty<'tcx>) -> AutoInvariantKind {
-    match ty.kind() {
-        TyKind::Int(ty::IntTy::I32) => AutoInvariantKind::I32Range,
-        _ => AutoInvariantKind::Trivial,
-    }
 }
 
 fn function_contract_error<'tcx>(
