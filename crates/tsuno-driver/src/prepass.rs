@@ -749,7 +749,7 @@ fn infer_contract_expr_types(
     }
 }
 
-fn infer_body_expr_types<'tcx>(
+fn infer_body_expr_types(
     expr: &Expr,
     kind: DirectiveKind,
     spec_scope: &mut SpecScope,

@@ -317,22 +317,7 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
                         break;
                     }
                 }
-                if chars.peek() == Some(&'i') {
-                    let mut suffix = String::new();
-                    while let Some(next) = chars.peek().copied() {
-                        if next.is_ascii_alphanumeric() || next == '_' {
-                            suffix.push(next);
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    let suffix = parse_int_suffix(&suffix)?;
-                    tokens.push(Token::Int(IntLiteral {
-                        digits,
-                        suffix: Some(suffix),
-                    }));
-                } else if chars.peek() == Some(&'u') {
+                if matches!(chars.peek(), Some(next) if next.is_ascii_alphabetic()) {
                     let mut suffix = String::new();
                     while let Some(next) = chars.peek().copied() {
                         if next.is_ascii_alphanumeric() || next == '_' {
