@@ -597,7 +597,7 @@ fn infer_contract_expr_types(
 ) -> Result<InferredExprTy, String> {
     match expr {
         Expr::Bool(_) => Ok(InferredExprTy::Known(SpecTy::Bool)),
-        Expr::Int(_) => Ok(InferredExprTy::Known(SpecTy::IntLiteral)),
+        Expr::Int(lit) => Ok(InferredExprTy::Known(lit.spec_ty())),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
                 inferred.ensure_var(name);
@@ -758,7 +758,7 @@ fn infer_body_expr_types<'tcx>(
 ) -> Result<InferredExprTy, String> {
     match expr {
         Expr::Bool(_) => Ok(InferredExprTy::Known(SpecTy::Bool)),
-        Expr::Int(_) => Ok(InferredExprTy::Known(SpecTy::IntLiteral)),
+        Expr::Int(lit) => Ok(InferredExprTy::Known(lit.spec_ty())),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
                 inferred.ensure_var(name);
@@ -889,9 +889,9 @@ fn typed_contract_expr(
             ty: SpecTy::Bool,
             kind: TypedExprKind::Bool(*value),
         }),
-        Expr::Int(value) => Ok(TypedExpr {
-            ty: SpecTy::IntLiteral,
-            kind: TypedExprKind::Int(*value),
+        Expr::Int(lit) => Ok(TypedExpr {
+            ty: lit.spec_ty(),
+            kind: TypedExprKind::Int(lit.clone()),
         }),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
@@ -1043,9 +1043,9 @@ fn typed_body_expr(
             ty: SpecTy::Bool,
             kind: TypedExprKind::Bool(*value),
         }),
-        Expr::Int(value) => Ok(TypedExpr {
-            ty: SpecTy::IntLiteral,
-            kind: TypedExprKind::Int(*value),
+        Expr::Int(lit) => Ok(TypedExpr {
+            ty: lit.spec_ty(),
+            kind: TypedExprKind::Int(lit.clone()),
         }),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {

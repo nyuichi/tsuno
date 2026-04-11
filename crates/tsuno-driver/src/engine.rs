@@ -2,6 +2,7 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::str::FromStr;
 use std::sync::Once;
 
 use rustc_hir::def_id::LocalDefId;
@@ -1420,7 +1421,7 @@ impl<'tcx> Verifier<'tcx> {
                             "failed to evaluate integer constant".to_owned(),
                         )
                     })?;
-                Ok(self.value_int(self.scalar_int_to_i64(ty, value, span)?))
+                self.scalar_int_to_value(ty, value, span)
             }
             TyKind::Tuple(fields) if fields.is_empty() => Ok(self.value_nil()),
             TyKind::Adt(adt_def, _)
@@ -1643,7 +1644,9 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<Datatype, VerificationResult> {
         match &expr.kind {
             TypedExprKind::Bool(value) => Ok(self.value_bool(*value)),
-            TypedExprKind::Int(value) => Ok(self.value_int(*value)),
+            TypedExprKind::Int(value) => {
+                self.value_decimal_int(&value.digits, self.control_span(state.ctrl))
+            }
             TypedExprKind::Var(name) if resolved.spec_vars.contains(name) => {
                 self.function_spec_vars.get(name).cloned().ok_or_else(|| {
                     self.unsupported_result(
@@ -1739,7 +1742,9 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<Datatype, VerificationResult> {
         match &expr.kind {
             TypedExprKind::Bool(value) => Ok(self.value_bool(*value)),
-            TypedExprKind::Int(value) => Ok(self.value_int(*value)),
+            TypedExprKind::Int(value) => {
+                self.value_decimal_int(&value.digits, self.tcx.def_span(self.def_id))
+            }
             TypedExprKind::Var(name) if spec.contains_key(name) => {
                 spec.get(name).cloned().ok_or_else(|| {
                     self.unsupported_result(
@@ -2012,6 +2017,13 @@ impl<'tcx> Verifier<'tcx> {
         with_value_encoding(|encoding| encoding.int(value))
     }
 
+    fn value_decimal_int(&self, digits: &str, span: Span) -> Result<Datatype, VerificationResult> {
+        let int = Int::from_str(digits).map_err(|()| {
+            self.unsupported_result(span, format!("invalid integer literal `{digits}`"))
+        })?;
+        Ok(self.value_wrap_int(&int))
+    }
+
     fn value_bool(&self, value: bool) -> Datatype {
         with_value_encoding(|encoding| encoding.bool(value))
     }
@@ -2237,22 +2249,28 @@ impl<'tcx> Verifier<'tcx> {
         let bounds =
             match ty.kind() {
                 TyKind::Int(kind) => match kind {
-                    ty::IntTy::I8 => (-128_i64, 127_i64),
-                    ty::IntTy::I16 => (-32768_i64, 32767_i64),
-                    ty::IntTy::I32 => (i32::MIN as i64, i32::MAX as i64),
-                    ty::IntTy::I64 => (i64::MIN, i64::MAX),
-                    ty::IntTy::Isize => (i64::MIN, i64::MAX),
+                    ty::IntTy::I8 => (Int::from_i64(i8::MIN.into()), Int::from_i64(i8::MAX.into())),
+                    ty::IntTy::I16 => (
+                        Int::from_i64(i16::MIN.into()),
+                        Int::from_i64(i16::MAX.into()),
+                    ),
+                    ty::IntTy::I32 => (
+                        Int::from_i64(i32::MIN.into()),
+                        Int::from_i64(i32::MAX.into()),
+                    ),
+                    ty::IntTy::I64 => (Int::from_i64(i64::MIN), Int::from_i64(i64::MAX)),
+                    ty::IntTy::Isize => self.pointer_sized_int_bounds(true)?,
                     _ => {
                         return Err(self
                             .unsupported_result(span, format!("unsupported integer type {ty:?}")));
                     }
                 },
                 TyKind::Uint(kind) => match kind {
-                    ty::UintTy::U8 => (0_i64, u8::MAX as i64),
-                    ty::UintTy::U16 => (0_i64, u16::MAX as i64),
-                    ty::UintTy::U32 => (0_i64, u32::MAX as i64),
-                    ty::UintTy::U64 => (0_i64, i64::MAX),
-                    ty::UintTy::Usize => (0_i64, i64::MAX),
+                    ty::UintTy::U8 => (Int::from_u64(0), Int::from_u64(u8::MAX.into())),
+                    ty::UintTy::U16 => (Int::from_u64(0), Int::from_u64(u16::MAX.into())),
+                    ty::UintTy::U32 => (Int::from_u64(0), Int::from_u64(u32::MAX.into())),
+                    ty::UintTy::U64 => (Int::from_u64(0), Int::from_u64(u64::MAX)),
+                    ty::UintTy::Usize => self.pointer_sized_int_bounds(false)?,
                     _ => {
                         return Err(self
                             .unsupported_result(span, format!("unsupported integer type {ty:?}")));
@@ -2265,8 +2283,8 @@ impl<'tcx> Verifier<'tcx> {
             };
         Ok(bool_and(vec![
             self.value_is_int(value),
-            self.value_int_data(value).ge(bounds.0),
-            self.value_int_data(value).le(bounds.1),
+            self.value_int_data(value).ge(&bounds.0),
+            self.value_int_data(value).le(&bounds.1),
         ]))
     }
 
@@ -2283,39 +2301,86 @@ impl<'tcx> Verifier<'tcx> {
         ))
     }
 
-    fn scalar_int_to_i64(
+    fn pointer_sized_int_bounds(&self, signed: bool) -> Result<(Int, Int), VerificationResult> {
+        let bits = self.tcx.data_layout.pointer_size().bits();
+        if signed {
+            let lower = -(1_i128 << (bits - 1));
+            let upper = (1_i128 << (bits - 1)) - 1;
+            let lower = Int::from_str(&lower.to_string()).map_err(|()| {
+                self.unsupported_result(
+                    self.tcx.def_span(self.def_id),
+                    "invalid isize lower bound".to_owned(),
+                )
+            })?;
+            let upper = Int::from_str(&upper.to_string()).map_err(|()| {
+                self.unsupported_result(
+                    self.tcx.def_span(self.def_id),
+                    "invalid isize upper bound".to_owned(),
+                )
+            })?;
+            Ok((lower, upper))
+        } else {
+            let upper = (1_u128 << bits) - 1;
+            let upper = Int::from_str(&upper.to_string()).map_err(|()| {
+                self.unsupported_result(
+                    self.tcx.def_span(self.def_id),
+                    "invalid usize upper bound".to_owned(),
+                )
+            })?;
+            Ok((Int::from_u64(0), upper))
+        }
+    }
+
+    fn scalar_int_to_value(
         &self,
         ty: Ty<'tcx>,
         value: ty::ScalarInt,
         span: Span,
-    ) -> Result<i64, VerificationResult> {
-        match ty.kind() {
-            TyKind::Int(kind) => Ok(match kind {
-                ty::IntTy::I8 => value.to_i8().into(),
-                ty::IntTy::I16 => value.to_i16().into(),
-                ty::IntTy::I32 => value.to_i32().into(),
-                ty::IntTy::I64 => value.to_i64(),
-                ty::IntTy::Isize => value.to_i64(),
+    ) -> Result<Datatype, VerificationResult> {
+        let int = match ty.kind() {
+            TyKind::Int(kind) => match kind {
+                ty::IntTy::I8 => Int::from_i64(value.to_i8().into()),
+                ty::IntTy::I16 => Int::from_i64(value.to_i16().into()),
+                ty::IntTy::I32 => Int::from_i64(value.to_i32().into()),
+                ty::IntTy::I64 => Int::from_i64(value.to_i64()),
+                ty::IntTy::Isize => Int::from_str(&value.to_target_isize(self.tcx).to_string())
+                    .map_err(|()| {
+                        self.unsupported_result(
+                            span,
+                            format!("failed to evaluate integer constant for {ty:?}"),
+                        )
+                    })?,
                 _ => {
                     return Err(
                         self.unsupported_result(span, format!("unsupported integer type {ty:?}"))
                     );
                 }
-            }),
-            TyKind::Uint(kind) => Ok(match kind {
-                ty::UintTy::U8 => value.to_u8().into(),
-                ty::UintTy::U16 => value.to_u16().into(),
-                ty::UintTy::U32 => value.to_u32().into(),
-                ty::UintTy::U64 => value.to_u64() as i64,
-                ty::UintTy::Usize => value.to_u64() as i64,
+            },
+            TyKind::Uint(kind) => match kind {
+                ty::UintTy::U8 => Int::from_u64(value.to_u8().into()),
+                ty::UintTy::U16 => Int::from_u64(value.to_u16().into()),
+                ty::UintTy::U32 => Int::from_u64(value.to_u32().into()),
+                ty::UintTy::U64 => Int::from_u64(value.to_u64()),
+                ty::UintTy::Usize => Int::from_str(&value.to_target_usize(self.tcx).to_string())
+                    .map_err(|()| {
+                        self.unsupported_result(
+                            span,
+                            format!("failed to evaluate integer constant for {ty:?}"),
+                        )
+                    })?,
                 _ => {
                     return Err(
                         self.unsupported_result(span, format!("unsupported integer type {ty:?}"))
                     );
                 }
-            }),
-            _ => Err(self.unsupported_result(span, format!("expected integer type, found {ty:?}"))),
-        }
+            },
+            _ => {
+                return Err(
+                    self.unsupported_result(span, format!("expected integer type, found {ty:?}"))
+                );
+            }
+        };
+        Ok(self.value_wrap_int(&int))
     }
 
     fn int_range_formula_for_spec_ty(
