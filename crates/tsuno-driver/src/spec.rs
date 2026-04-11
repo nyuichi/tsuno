@@ -1,13 +1,18 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expr {
     Bool(bool),
-    Int(i64),
+    Int(IntLiteral),
     Var(String),
     Bind(String),
-    Prophecy(String),
-    Field {
+    TupleField {
         base: Box<Expr>,
         index: usize,
+    },
+    Deref {
+        base: Box<Expr>,
+    },
+    Fin {
+        base: Box<Expr>,
     },
     Unary {
         op: UnaryOp,
@@ -18,6 +23,110 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedExpr {
+    pub ty: SpecTy,
+    pub kind: TypedExprKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypedExprKind {
+    Bool(bool),
+    Int(IntLiteral),
+    Var(String),
+    Bind(String),
+    TupleField {
+        base: Box<TypedExpr>,
+        index: usize,
+    },
+    Deref {
+        base: Box<TypedExpr>,
+    },
+    Fin {
+        base: Box<TypedExpr>,
+    },
+    Unary {
+        op: UnaryOp,
+        arg: Box<TypedExpr>,
+    },
+    Binary {
+        op: BinaryOp,
+        lhs: Box<TypedExpr>,
+        rhs: Box<TypedExpr>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntSuffix {
+    I8,
+    I16,
+    I32,
+    I64,
+    Isize,
+    U8,
+    U16,
+    U32,
+    U64,
+    Usize,
+}
+
+impl IntSuffix {
+    pub fn spec_ty(self) -> SpecTy {
+        match self {
+            Self::I8 => SpecTy::I8,
+            Self::I16 => SpecTy::I16,
+            Self::I32 => SpecTy::I32,
+            Self::I64 => SpecTy::I64,
+            Self::Isize => SpecTy::Isize,
+            Self::U8 => SpecTy::U8,
+            Self::U16 => SpecTy::U16,
+            Self::U32 => SpecTy::U32,
+            Self::U64 => SpecTy::U64,
+            Self::Usize => SpecTy::Usize,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntLiteral {
+    pub digits: String,
+    pub suffix: Option<IntSuffix>,
+}
+
+impl IntLiteral {
+    pub fn spec_ty(&self) -> SpecTy {
+        self.suffix
+            .map(IntSuffix::spec_ty)
+            .unwrap_or(SpecTy::IntLiteral)
+    }
+
+    fn as_unsuffixed_usize(&self) -> Option<usize> {
+        match self.suffix {
+            Some(_) => None,
+            None => self.digits.parse::<usize>().ok(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecTy {
+    Bool,
+    IntLiteral,
+    I8,
+    I16,
+    I32,
+    I64,
+    Isize,
+    U8,
+    U16,
+    U32,
+    U64,
+    Usize,
+    Tuple(Vec<SpecTy>),
+    Ref(Box<SpecTy>),
+    Mut(Box<SpecTy>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,12 +256,6 @@ fn expand_template(kind: &str, raw: &str) -> Result<String, ParseError> {
                         "empty interpolation in //@ {kind} template"
                     )));
                 }
-                if inner.strip_prefix("^:").is_some() {
-                    return Err(ParseError::new(format!(
-                        "prophecy interpolation is unsupported in //@ {} templates; use `.cur` / `.fin`",
-                        kind
-                    )));
-                }
                 out.push('(');
                 out.push_str(inner);
                 out.push(')');
@@ -176,11 +279,10 @@ fn expand_template(kind: &str, raw: &str) -> Result<String, ParseError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Token {
     Ident(String),
-    Int(i64),
+    Int(IntLiteral),
     Bool(bool),
     LParen,
     RParen,
-    Comma,
     Dot,
     Question,
     Plus,
@@ -215,10 +317,27 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
                         break;
                     }
                 }
-                let value = digits
-                    .parse::<i64>()
-                    .map_err(|_| ParseError::new("integer literal is too large"))?;
-                tokens.push(Token::Int(value));
+                if matches!(chars.peek(), Some(next) if next.is_ascii_alphabetic()) {
+                    let mut suffix = String::new();
+                    while let Some(next) = chars.peek().copied() {
+                        if next.is_ascii_alphanumeric() || next == '_' {
+                            suffix.push(next);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    let suffix = parse_int_suffix(&suffix)?;
+                    tokens.push(Token::Int(IntLiteral {
+                        digits,
+                        suffix: Some(suffix),
+                    }));
+                } else {
+                    tokens.push(Token::Int(IntLiteral {
+                        digits,
+                        suffix: None,
+                    }));
+                }
             }
             'a'..='z' | 'A'..='Z' | '_' => {
                 let mut ident = String::new();
@@ -243,10 +362,6 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
             ')' => {
                 chars.next();
                 tokens.push(Token::RParen);
-            }
-            ',' => {
-                chars.next();
-                tokens.push(Token::Comma);
             }
             '.' => {
                 chars.next();
@@ -327,6 +442,24 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
         }
     }
     Ok(tokens)
+}
+
+fn parse_int_suffix(text: &str) -> Result<IntSuffix, ParseError> {
+    match text {
+        "i8" => Ok(IntSuffix::I8),
+        "i16" => Ok(IntSuffix::I16),
+        "i32" => Ok(IntSuffix::I32),
+        "i64" => Ok(IntSuffix::I64),
+        "isize" => Ok(IntSuffix::Isize),
+        "u8" => Ok(IntSuffix::U8),
+        "u16" => Ok(IntSuffix::U16),
+        "u32" => Ok(IntSuffix::U32),
+        "u64" => Ok(IntSuffix::U64),
+        "usize" => Ok(IntSuffix::Usize),
+        _ => Err(ParseError::new(format!(
+            "unsupported integer literal suffix `{text}` in spec expression"
+        ))),
+    }
 }
 
 struct Parser {
@@ -481,15 +614,34 @@ impl Parser {
                 arg: Box::new(self.parse_unary()?),
             });
         }
+        if self.eat(&Token::Star) {
+            return Ok(Expr::Deref {
+                base: Box::new(self.parse_unary()?),
+            });
+        }
         self.parse_postfix()
     }
 
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_primary()?;
         while self.eat(&Token::Dot) {
-            expr = Expr::Field {
-                base: Box::new(expr),
-                index: self.parse_field_index()?,
+            expr = match self.next() {
+                Some(Token::Int(value)) if value.as_unsuffixed_usize().is_some() => {
+                    Expr::TupleField {
+                        base: Box::new(expr),
+                        index: value
+                            .as_unsuffixed_usize()
+                            .expect("checked tuple field index"),
+                    }
+                }
+                Some(Token::Ident(ident)) if ident == "fin" => Expr::Fin {
+                    base: Box::new(expr),
+                },
+                _ => {
+                    return Err(ParseError::new(
+                        "unsupported field access in spec expression",
+                    ));
+                }
             };
         }
         Ok(expr)
@@ -498,14 +650,13 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         match self.next() {
             Some(Token::Bool(value)) => Ok(Expr::Bool(*value)),
-            Some(Token::Int(value)) => Ok(Expr::Int(*value)),
+            Some(Token::Int(value)) => Ok(Expr::Int(value.clone())),
             Some(Token::Question) => {
                 let Some(Token::Ident(ident)) = self.next() else {
                     return Err(ParseError::new("expected identifier after `?`"));
                 };
                 Ok(Expr::Bind(ident.clone()))
             }
-            Some(Token::Ident(ident)) if ident == "__prophecy" => self.parse_prophecy_call(),
             Some(Token::Ident(ident)) => Ok(Expr::Var(ident.clone())),
             Some(Token::LParen) => {
                 let expr = self.parse_expr()?;
@@ -513,29 +664,6 @@ impl Parser {
                 Ok(expr)
             }
             _ => Err(ParseError::new("expected a spec expression")),
-        }
-    }
-
-    fn parse_prophecy_call(&mut self) -> Result<Expr, ParseError> {
-        self.expect(&Token::LParen)?;
-        let Some(Token::Ident(ident)) = self.next() else {
-            return Err(ParseError::new(
-                "unsupported prophecy argument in spec expression",
-            ));
-        };
-        let ident = ident.clone();
-        self.expect(&Token::RParen)?;
-        Ok(Expr::Prophecy(ident))
-    }
-
-    fn parse_field_index(&mut self) -> Result<usize, ParseError> {
-        match self.next() {
-            Some(Token::Int(value)) if *value >= 0 => Ok(*value as usize),
-            Some(Token::Ident(ident)) if ident == "cur" => Ok(0),
-            Some(Token::Ident(ident)) if ident == "fin" => Ok(1),
-            _ => Err(ParseError::new(
-                "unsupported field access in spec expression",
-            )),
         }
     }
 
@@ -567,23 +695,40 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
-    use super::{BinaryOp, Expr, UnaryOp, parse_expr};
+    use super::{BinaryOp, Expr, IntLiteral, IntSuffix, UnaryOp, parse_expr};
 
     #[test]
-    fn parses_template_interpolation_without_syn() {
-        let expr = parse_expr("assert", r#""{x}.0.cur == 1""#).expect("expr");
+    fn parses_deref_and_fin() {
+        let expr = parse_expr("assert", r#""*{x} == {y}.fin""#).expect("expr");
         assert_eq!(
             expr,
             Expr::Binary {
                 op: BinaryOp::Eq,
-                lhs: Box::new(Expr::Field {
-                    base: Box::new(Expr::Field {
-                        base: Box::new(Expr::Var("x".to_owned())),
-                        index: 0,
-                    }),
+                lhs: Box::new(Expr::Deref {
+                    base: Box::new(Expr::Var("x".to_owned())),
+                }),
+                rhs: Box::new(Expr::Fin {
+                    base: Box::new(Expr::Var("y".to_owned())),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_tuple_projection() {
+        let expr = parse_expr("assert", r#""{x}.0 == 1i32""#).expect("expr");
+        assert_eq!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                lhs: Box::new(Expr::TupleField {
+                    base: Box::new(Expr::Var("x".to_owned())),
                     index: 0,
                 }),
-                rhs: Box::new(Expr::Int(1)),
+                rhs: Box::new(Expr::Int(IntLiteral {
+                    digits: "1".to_owned(),
+                    suffix: Some(IntSuffix::I32),
+                })),
             }
         );
     }
@@ -596,23 +741,10 @@ mod tests {
             Expr::Binary {
                 op: BinaryOp::Eq,
                 lhs: Box::new(Expr::Bind("x".to_owned())),
-                rhs: Box::new(Expr::Int(3)),
-            }
-        );
-    }
-
-    #[test]
-    fn parses_prophecy_call() {
-        let expr = parse_expr("inv", r#""__prophecy(x).fin >= 0""#).expect("expr");
-        assert_eq!(
-            expr,
-            Expr::Binary {
-                op: BinaryOp::Ge,
-                lhs: Box::new(Expr::Field {
-                    base: Box::new(Expr::Prophecy("x".to_owned())),
-                    index: 1,
-                }),
-                rhs: Box::new(Expr::Int(0)),
+                rhs: Box::new(Expr::Int(IntLiteral {
+                    digits: "3".to_owned(),
+                    suffix: None,
+                })),
             }
         );
     }
@@ -632,22 +764,56 @@ mod tests {
                     op: BinaryOp::Eq,
                     lhs: Box::new(Expr::Binary {
                         op: BinaryOp::Add,
-                        lhs: Box::new(Expr::Int(1)),
+                        lhs: Box::new(Expr::Int(IntLiteral {
+                            digits: "1".to_owned(),
+                            suffix: None,
+                        })),
                         rhs: Box::new(Expr::Binary {
                             op: BinaryOp::Mul,
-                            lhs: Box::new(Expr::Int(2)),
-                            rhs: Box::new(Expr::Int(3)),
+                            lhs: Box::new(Expr::Int(IntLiteral {
+                                digits: "2".to_owned(),
+                                suffix: None,
+                            })),
+                            rhs: Box::new(Expr::Int(IntLiteral {
+                                digits: "3".to_owned(),
+                                suffix: None,
+                            })),
                         }),
                     }),
-                    rhs: Box::new(Expr::Int(7)),
+                    rhs: Box::new(Expr::Int(IntLiteral {
+                        digits: "7".to_owned(),
+                        suffix: None,
+                    })),
                 }),
             }
         );
     }
 
     #[test]
-    fn rejects_prophecy_interpolation() {
-        let err = parse_expr("req", r#""{^:x}""#).expect_err("should fail");
-        assert!(err.to_string().contains("prophecy interpolation"));
+    fn rejects_cur_accessor() {
+        let err = parse_expr("assert", r#""{x}.cur""#).expect_err("should fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported field access in spec expression")
+        );
+    }
+
+    #[test]
+    fn parses_large_integer_suffixes() {
+        let expr = parse_expr("assert", r#""18446744073709551615u64 == 0usize""#).expect("expr");
+        assert_eq!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                lhs: Box::new(Expr::Int(IntLiteral {
+                    digits: "18446744073709551615".to_owned(),
+                    suffix: Some(IntSuffix::U64),
+                })),
+                rhs: Box::new(Expr::Int(IntLiteral {
+                    digits: "0".to_owned(),
+                    suffix: Some(IntSuffix::Usize),
+                })),
+            }
+        );
     }
 }

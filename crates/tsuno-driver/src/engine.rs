@@ -2,6 +2,7 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::str::FromStr;
 use std::sync::Once;
 
 use rustc_hir::def_id::LocalDefId;
@@ -18,12 +19,12 @@ use z3::{
 };
 
 use crate::prepass::{
-    AssertionContracts, AssumptionContracts, AutoInvariantKind, ContractParam, ContractValueOrigin,
-    ContractValueSpec, FunctionContract, FunctionContractEntry, LoopContract, LoopContracts,
-    ResolvedExprEnv, compute_directives, compute_function_contracts,
+    AssertionContracts, AssumptionContracts, ContractParam, FunctionContract,
+    FunctionContractEntry, LoopContract, LoopContracts, ResolvedExprEnv, compute_directives,
+    spec_ty_for_rust_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
-use crate::spec::{BinaryOp, Expr, UnaryOp};
+use crate::spec::{BinaryOp, SpecTy, TypedExpr, TypedExprKind, UnaryOp};
 
 thread_local! {
     static GLOBAL_SOLVER: Solver = {
@@ -462,7 +463,13 @@ pub struct Verifier<'tcx> {
 }
 
 impl<'tcx> Verifier<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, item_span: Span, body: Body<'tcx>) -> Self {
+    pub fn new(
+        tcx: TyCtxt<'tcx>,
+        def_id: LocalDefId,
+        item_span: Span,
+        body: Body<'tcx>,
+        contracts: HashMap<LocalDefId, FunctionContractEntry>,
+    ) -> Self {
         let (
             loop_contracts,
             assertion_contracts,
@@ -495,7 +502,6 @@ impl<'tcx> Verifier<'tcx> {
                 }),
             ),
         };
-        let contracts = compute_function_contracts(tcx, Some(def_id));
         let next_sym = Cell::new(0);
         let function_spec_vars = instantiate_spec_vars(&next_sym, &spec_var_names);
         let mut contracts = contracts;
@@ -1415,7 +1421,7 @@ impl<'tcx> Verifier<'tcx> {
                             "failed to evaluate integer constant".to_owned(),
                         )
                     })?;
-                Ok(self.value_int(self.scalar_int_to_i64(ty, value, span)?))
+                self.scalar_int_to_value(ty, value, span)
             }
             TyKind::Tuple(fields) if fields.is_empty() => Ok(self.value_nil()),
             TyKind::Adt(adt_def, _)
@@ -1619,11 +1625,11 @@ impl<'tcx> Verifier<'tcx> {
     fn spec_expr_to_bool(
         &self,
         state: &State,
-        expr: &Expr,
+        expr: &TypedExpr,
         resolved: &ResolvedExprEnv,
     ) -> Result<BoolExpr, VerificationResult> {
-        match expr {
-            Expr::Bool(value) => Ok(BoolExpr::Const(*value)),
+        match &expr.kind {
+            TypedExprKind::Bool(value) => Ok(BoolExpr::Const(*value)),
             _ => Ok(BoolExpr::Value(
                 self.spec_expr_to_value(state, expr, resolved)?,
             )),
@@ -1633,13 +1639,15 @@ impl<'tcx> Verifier<'tcx> {
     fn spec_expr_to_value(
         &self,
         state: &State,
-        expr: &Expr,
+        expr: &TypedExpr,
         resolved: &ResolvedExprEnv,
     ) -> Result<Datatype, VerificationResult> {
-        match expr {
-            Expr::Bool(value) => Ok(self.value_bool(*value)),
-            Expr::Int(value) => Ok(self.value_int(*value)),
-            Expr::Var(name) if resolved.spec_vars.contains(name) => {
+        match &expr.kind {
+            TypedExprKind::Bool(value) => Ok(self.value_bool(*value)),
+            TypedExprKind::Int(value) => {
+                self.value_decimal_int(&value.digits, self.control_span(state.ctrl))
+            }
+            TypedExprKind::Var(name) if resolved.spec_vars.contains(name) => {
                 self.function_spec_vars.get(name).cloned().ok_or_else(|| {
                     self.unsupported_result(
                         self.control_span(state.ctrl),
@@ -1647,7 +1655,7 @@ impl<'tcx> Verifier<'tcx> {
                     )
                 })
             }
-            Expr::Var(name) => {
+            TypedExprKind::Var(name) => {
                 let Some(local) = resolved.locals.get(name) else {
                     return Err(self.unsupported_result(
                         self.control_span(state.ctrl),
@@ -1661,33 +1669,38 @@ impl<'tcx> Verifier<'tcx> {
                     )
                 })
             }
-            Expr::Bind(name) => self.function_spec_vars.get(name).cloned().ok_or_else(|| {
-                self.unsupported_result(
-                    self.control_span(state.ctrl),
-                    format!("missing spec binding `{name}`"),
-                )
-            }),
-            Expr::Prophecy(name) => {
-                let Some(local) = resolved.prophecies.get(name) else {
-                    return Err(self.unsupported_result(
+            TypedExprKind::Bind(name) => {
+                self.function_spec_vars.get(name).cloned().ok_or_else(|| {
+                    self.unsupported_result(
                         self.control_span(state.ctrl),
-                        format!("missing prophecy binding `{name}`"),
-                    ));
-                };
-                self.local_prophecy(state, *local, self.control_span(state.ctrl))
+                        format!("missing spec binding `{name}`"),
+                    )
+                })
             }
-            Expr::Field { base, index } => {
+            TypedExprKind::TupleField { base, index } => {
                 let value = self.spec_expr_to_value(state, base, resolved)?;
                 self.project_field(value, *index, self.control_span(state.ctrl))
             }
-            Expr::Unary { op, arg } => {
+            TypedExprKind::Deref { base } => {
+                let value = self.spec_expr_to_value(state, base, resolved)?;
+                match &base.ty {
+                    crate::spec::SpecTy::Ref(_) => Ok(value),
+                    crate::spec::SpecTy::Mut(_) => Ok(self.value_pair_first(&value)),
+                    _ => unreachable!("typed deref base"),
+                }
+            }
+            TypedExprKind::Fin { base } => {
+                let value = self.spec_expr_to_value(state, base, resolved)?;
+                Ok(self.value_pair_second(&value))
+            }
+            TypedExprKind::Unary { op, arg } => {
                 let value = self.spec_expr_to_value(state, arg, resolved)?;
                 Ok(match op {
                     UnaryOp::Not => self.value_not(&value),
                     UnaryOp::Neg => self.value_neg(&value),
                 })
             }
-            Expr::Binary { op, lhs, rhs } => {
+            TypedExprKind::Binary { op, lhs, rhs } => {
                 let lhs = self.spec_expr_to_value(state, lhs, resolved)?;
                 let rhs = self.spec_expr_to_value(state, rhs, resolved)?;
                 Ok(match op {
@@ -1710,14 +1723,13 @@ impl<'tcx> Verifier<'tcx> {
     fn contract_expr_to_bool(
         &self,
         current: &HashMap<String, Datatype>,
-        prophecy: &HashMap<String, Datatype>,
         spec: &HashMap<String, Datatype>,
-        expr: &Expr,
+        expr: &TypedExpr,
     ) -> Result<BoolExpr, VerificationResult> {
-        match expr {
-            Expr::Bool(value) => Ok(BoolExpr::Const(*value)),
+        match &expr.kind {
+            TypedExprKind::Bool(value) => Ok(BoolExpr::Const(*value)),
             _ => Ok(BoolExpr::Value(
-                self.contract_expr_to_value(current, prophecy, spec, expr)?,
+                self.contract_expr_to_value(current, spec, expr)?,
             )),
         }
     }
@@ -1725,14 +1737,15 @@ impl<'tcx> Verifier<'tcx> {
     fn contract_expr_to_value(
         &self,
         current: &HashMap<String, Datatype>,
-        prophecy: &HashMap<String, Datatype>,
         spec: &HashMap<String, Datatype>,
-        expr: &Expr,
+        expr: &TypedExpr,
     ) -> Result<Datatype, VerificationResult> {
-        match expr {
-            Expr::Bool(value) => Ok(self.value_bool(*value)),
-            Expr::Int(value) => Ok(self.value_int(*value)),
-            Expr::Var(name) if spec.contains_key(name) => {
+        match &expr.kind {
+            TypedExprKind::Bool(value) => Ok(self.value_bool(*value)),
+            TypedExprKind::Int(value) => {
+                self.value_decimal_int(&value.digits, self.tcx.def_span(self.def_id))
+            }
+            TypedExprKind::Var(name) if spec.contains_key(name) => {
                 spec.get(name).cloned().ok_or_else(|| {
                     self.unsupported_result(
                         self.tcx.def_span(self.def_id),
@@ -1740,38 +1753,44 @@ impl<'tcx> Verifier<'tcx> {
                     )
                 })
             }
-            Expr::Var(name) => current.get(name).cloned().ok_or_else(|| {
+            TypedExprKind::Var(name) => current.get(name).cloned().ok_or_else(|| {
                 self.unsupported_result(
                     self.tcx.def_span(self.def_id),
                     format!("missing contract binding `{name}`"),
                 )
             }),
-            Expr::Bind(name) => spec.get(name).cloned().ok_or_else(|| {
+            TypedExprKind::Bind(name) => spec.get(name).cloned().ok_or_else(|| {
                 self.unsupported_result(
                     self.tcx.def_span(self.def_id),
                     format!("missing spec binding `{name}`"),
                 )
             }),
-            Expr::Prophecy(name) => prophecy.get(name).cloned().ok_or_else(|| {
-                self.unsupported_result(
-                    self.tcx.def_span(self.def_id),
-                    format!("missing prophecy binding `{name}`"),
-                )
-            }),
-            Expr::Field { base, index } => {
-                let value = self.contract_expr_to_value(current, prophecy, spec, base)?;
+            TypedExprKind::TupleField { base, index } => {
+                let value = self.contract_expr_to_value(current, spec, base)?;
                 self.project_field(value, *index, self.tcx.def_span(self.def_id))
             }
-            Expr::Unary { op, arg } => {
-                let value = self.contract_expr_to_value(current, prophecy, spec, arg)?;
+            TypedExprKind::Deref { base } => {
+                let value = self.contract_expr_to_value(current, spec, base)?;
+                match &base.ty {
+                    crate::spec::SpecTy::Ref(_) => Ok(value),
+                    crate::spec::SpecTy::Mut(_) => Ok(self.value_pair_first(&value)),
+                    _ => unreachable!("typed deref base"),
+                }
+            }
+            TypedExprKind::Fin { base } => {
+                let value = self.contract_expr_to_value(current, spec, base)?;
+                Ok(self.value_pair_second(&value))
+            }
+            TypedExprKind::Unary { op, arg } => {
+                let value = self.contract_expr_to_value(current, spec, arg)?;
                 Ok(match op {
                     UnaryOp::Not => self.value_not(&value),
                     UnaryOp::Neg => self.value_neg(&value),
                 })
             }
-            Expr::Binary { op, lhs, rhs } => {
-                let lhs = self.contract_expr_to_value(current, prophecy, spec, lhs)?;
-                let rhs = self.contract_expr_to_value(current, prophecy, spec, rhs)?;
+            TypedExprKind::Binary { op, lhs, rhs } => {
+                let lhs = self.contract_expr_to_value(current, spec, lhs)?;
+                let rhs = self.contract_expr_to_value(current, spec, rhs)?;
                 Ok(match op {
                     BinaryOp::Eq => self.value_eqv(&lhs, &rhs),
                     BinaryOp::Ne => self.value_not(&self.value_eqv(&lhs, &rhs)),
@@ -1839,24 +1858,6 @@ impl<'tcx> Verifier<'tcx> {
             BoolExpr::Const(value) => Ok(Bool::from_bool(*value)),
             BoolExpr::Value(value) => Ok(self.value_is_true(value)),
             BoolExpr::Not(arg) => Ok(self.bool_expr_to_z3(arg)?.not()),
-        }
-    }
-
-    fn local_prophecy(
-        &self,
-        state: &State,
-        local: Local,
-        span: Span,
-    ) -> Result<Datatype, VerificationResult> {
-        let value = state.model.get(&local).cloned().ok_or_else(|| {
-            self.unsupported_result(span, format!("missing local {}", local.as_usize()))
-        })?;
-        let ty = self.body.local_decls[local].ty;
-        match ty.kind() {
-            TyKind::Ref(_, _, mutability) if mutability.is_mut() => {
-                Ok(self.value_pair_second(&value))
-            }
-            _ => Ok(value),
         }
     }
 
@@ -2014,6 +2015,13 @@ impl<'tcx> Verifier<'tcx> {
 
     fn value_int(&self, value: i64) -> Datatype {
         with_value_encoding(|encoding| encoding.int(value))
+    }
+
+    fn value_decimal_int(&self, digits: &str, span: Span) -> Result<Datatype, VerificationResult> {
+        let int = Int::from_str(digits).map_err(|()| {
+            self.unsupported_result(span, format!("invalid integer literal `{digits}`"))
+        })?;
+        Ok(self.value_wrap_int(&int))
     }
 
     fn value_bool(&self, value: bool) -> Datatype {
@@ -2241,22 +2249,28 @@ impl<'tcx> Verifier<'tcx> {
         let bounds =
             match ty.kind() {
                 TyKind::Int(kind) => match kind {
-                    ty::IntTy::I8 => (-128_i64, 127_i64),
-                    ty::IntTy::I16 => (-32768_i64, 32767_i64),
-                    ty::IntTy::I32 => (i32::MIN as i64, i32::MAX as i64),
-                    ty::IntTy::I64 => (i64::MIN, i64::MAX),
-                    ty::IntTy::Isize => (i64::MIN, i64::MAX),
+                    ty::IntTy::I8 => (Int::from_i64(i8::MIN.into()), Int::from_i64(i8::MAX.into())),
+                    ty::IntTy::I16 => (
+                        Int::from_i64(i16::MIN.into()),
+                        Int::from_i64(i16::MAX.into()),
+                    ),
+                    ty::IntTy::I32 => (
+                        Int::from_i64(i32::MIN.into()),
+                        Int::from_i64(i32::MAX.into()),
+                    ),
+                    ty::IntTy::I64 => (Int::from_i64(i64::MIN), Int::from_i64(i64::MAX)),
+                    ty::IntTy::Isize => self.pointer_sized_int_bounds(true)?,
                     _ => {
                         return Err(self
                             .unsupported_result(span, format!("unsupported integer type {ty:?}")));
                     }
                 },
                 TyKind::Uint(kind) => match kind {
-                    ty::UintTy::U8 => (0_i64, u8::MAX as i64),
-                    ty::UintTy::U16 => (0_i64, u16::MAX as i64),
-                    ty::UintTy::U32 => (0_i64, u32::MAX as i64),
-                    ty::UintTy::U64 => (0_i64, i64::MAX),
-                    ty::UintTy::Usize => (0_i64, i64::MAX),
+                    ty::UintTy::U8 => (Int::from_u64(0), Int::from_u64(u8::MAX.into())),
+                    ty::UintTy::U16 => (Int::from_u64(0), Int::from_u64(u16::MAX.into())),
+                    ty::UintTy::U32 => (Int::from_u64(0), Int::from_u64(u32::MAX.into())),
+                    ty::UintTy::U64 => (Int::from_u64(0), Int::from_u64(u64::MAX)),
+                    ty::UintTy::Usize => self.pointer_sized_int_bounds(false)?,
                     _ => {
                         return Err(self
                             .unsupported_result(span, format!("unsupported integer type {ty:?}")));
@@ -2269,8 +2283,8 @@ impl<'tcx> Verifier<'tcx> {
             };
         Ok(bool_and(vec![
             self.value_is_int(value),
-            self.value_int_data(value).ge(bounds.0),
-            self.value_int_data(value).le(bounds.1),
+            self.value_int_data(value).ge(&bounds.0),
+            self.value_int_data(value).le(&bounds.1),
         ]))
     }
 
@@ -2287,91 +2301,153 @@ impl<'tcx> Verifier<'tcx> {
         ))
     }
 
-    fn scalar_int_to_i64(
+    fn pointer_sized_int_bounds(&self, signed: bool) -> Result<(Int, Int), VerificationResult> {
+        let bits = self.tcx.data_layout.pointer_size().bits();
+        if signed {
+            let lower = -(1_i128 << (bits - 1));
+            let upper = (1_i128 << (bits - 1)) - 1;
+            let lower = Int::from_str(&lower.to_string()).map_err(|()| {
+                self.unsupported_result(
+                    self.tcx.def_span(self.def_id),
+                    "invalid isize lower bound".to_owned(),
+                )
+            })?;
+            let upper = Int::from_str(&upper.to_string()).map_err(|()| {
+                self.unsupported_result(
+                    self.tcx.def_span(self.def_id),
+                    "invalid isize upper bound".to_owned(),
+                )
+            })?;
+            Ok((lower, upper))
+        } else {
+            let upper = (1_u128 << bits) - 1;
+            let upper = Int::from_str(&upper.to_string()).map_err(|()| {
+                self.unsupported_result(
+                    self.tcx.def_span(self.def_id),
+                    "invalid usize upper bound".to_owned(),
+                )
+            })?;
+            Ok((Int::from_u64(0), upper))
+        }
+    }
+
+    fn scalar_int_to_value(
         &self,
         ty: Ty<'tcx>,
         value: ty::ScalarInt,
         span: Span,
-    ) -> Result<i64, VerificationResult> {
-        match ty.kind() {
-            TyKind::Int(kind) => Ok(match kind {
-                ty::IntTy::I8 => value.to_i8().into(),
-                ty::IntTy::I16 => value.to_i16().into(),
-                ty::IntTy::I32 => value.to_i32().into(),
-                ty::IntTy::I64 => value.to_i64(),
-                ty::IntTy::Isize => value.to_i64(),
+    ) -> Result<Datatype, VerificationResult> {
+        let int = match ty.kind() {
+            TyKind::Int(kind) => match kind {
+                ty::IntTy::I8 => Int::from_i64(value.to_i8().into()),
+                ty::IntTy::I16 => Int::from_i64(value.to_i16().into()),
+                ty::IntTy::I32 => Int::from_i64(value.to_i32().into()),
+                ty::IntTy::I64 => Int::from_i64(value.to_i64()),
+                ty::IntTy::Isize => Int::from_str(&value.to_target_isize(self.tcx).to_string())
+                    .map_err(|()| {
+                        self.unsupported_result(
+                            span,
+                            format!("failed to evaluate integer constant for {ty:?}"),
+                        )
+                    })?,
                 _ => {
                     return Err(
                         self.unsupported_result(span, format!("unsupported integer type {ty:?}"))
                     );
                 }
-            }),
-            TyKind::Uint(kind) => Ok(match kind {
-                ty::UintTy::U8 => value.to_u8().into(),
-                ty::UintTy::U16 => value.to_u16().into(),
-                ty::UintTy::U32 => value.to_u32().into(),
-                ty::UintTy::U64 => value.to_u64() as i64,
-                ty::UintTy::Usize => value.to_u64() as i64,
+            },
+            TyKind::Uint(kind) => match kind {
+                ty::UintTy::U8 => Int::from_u64(value.to_u8().into()),
+                ty::UintTy::U16 => Int::from_u64(value.to_u16().into()),
+                ty::UintTy::U32 => Int::from_u64(value.to_u32().into()),
+                ty::UintTy::U64 => Int::from_u64(value.to_u64()),
+                ty::UintTy::Usize => Int::from_str(&value.to_target_usize(self.tcx).to_string())
+                    .map_err(|()| {
+                        self.unsupported_result(
+                            span,
+                            format!("failed to evaluate integer constant for {ty:?}"),
+                        )
+                    })?,
                 _ => {
                     return Err(
                         self.unsupported_result(span, format!("unsupported integer type {ty:?}"))
                     );
                 }
-            }),
-            _ => Err(self.unsupported_result(span, format!("expected integer type, found {ty:?}"))),
-        }
-    }
-
-    fn invariant_formula(
-        &self,
-        invariant: AutoInvariantKind,
-        value: &Datatype,
-        span: Span,
-    ) -> Result<Option<Bool>, VerificationResult> {
-        match invariant {
-            AutoInvariantKind::Trivial => Ok(None),
-            AutoInvariantKind::I32Range => Ok(Some(self.int_range_formula(
-                self.tcx.types.i32,
-                value,
-                span,
-            )?)),
-        }
-    }
-
-    fn contract_spec_formula(
-        &self,
-        spec: ContractValueSpec,
-        value: &Datatype,
-        span: Span,
-    ) -> Result<Option<Bool>, VerificationResult> {
-        let target = match spec.origin {
-            ContractValueOrigin::Direct => value.clone(),
-            ContractValueOrigin::Current => self.value_pair_first(value),
+            },
+            _ => {
+                return Err(
+                    self.unsupported_result(span, format!("expected integer type, found {ty:?}"))
+                );
+            }
         };
-        self.invariant_formula(spec.invariant, &target, span)
+        Ok(self.value_wrap_int(&int))
     }
 
-    fn contract_value_spec_for_ty(&self, ty: Ty<'tcx>) -> ContractValueSpec {
-        match ty.kind() {
-            TyKind::Ref(_, inner, mutability) => ContractValueSpec {
-                invariant: self.type_invariant_kind(*inner),
-                origin: if mutability.is_mut() {
-                    ContractValueOrigin::Current
+    fn int_range_formula_for_spec_ty(
+        &self,
+        ty: &SpecTy,
+        value: &Datatype,
+        span: Span,
+    ) -> Result<Option<Bool>, VerificationResult> {
+        let rust_ty = match ty {
+            SpecTy::I8 => Some(self.tcx.types.i8),
+            SpecTy::I16 => Some(self.tcx.types.i16),
+            SpecTy::I32 => Some(self.tcx.types.i32),
+            SpecTy::I64 => Some(self.tcx.types.i64),
+            SpecTy::Isize => Some(self.tcx.types.isize),
+            SpecTy::U8 => Some(self.tcx.types.u8),
+            SpecTy::U16 => Some(self.tcx.types.u16),
+            SpecTy::U32 => Some(self.tcx.types.u32),
+            SpecTy::U64 => Some(self.tcx.types.u64),
+            SpecTy::Usize => Some(self.tcx.types.usize),
+            SpecTy::Bool
+            | SpecTy::IntLiteral
+            | SpecTy::Tuple(_)
+            | SpecTy::Ref(_)
+            | SpecTy::Mut(_) => None,
+        };
+        rust_ty
+            .map(|rust_ty| self.int_range_formula(rust_ty, value, span))
+            .transpose()
+    }
+
+    fn spec_ty_formula(
+        &self,
+        ty: &SpecTy,
+        value: &Datatype,
+        span: Span,
+    ) -> Result<Option<Bool>, VerificationResult> {
+        match ty {
+            SpecTy::Bool | SpecTy::IntLiteral => Ok(None),
+            SpecTy::I8
+            | SpecTy::I16
+            | SpecTy::I32
+            | SpecTy::I64
+            | SpecTy::Isize
+            | SpecTy::U8
+            | SpecTy::U16
+            | SpecTy::U32
+            | SpecTy::U64
+            | SpecTy::Usize => self.int_range_formula_for_spec_ty(ty, value, span),
+            SpecTy::Ref(inner) => self.spec_ty_formula(inner, value, span),
+            SpecTy::Mut(inner) => {
+                let current = self.value_pair_first(value);
+                self.spec_ty_formula(inner, &current, span)
+            }
+            SpecTy::Tuple(items) => {
+                let mut formulas = Vec::new();
+                for (index, item) in items.iter().enumerate() {
+                    let field = self.project_field(value.clone(), index, span)?;
+                    if let Some(formula) = self.spec_ty_formula(item, &field, span)? {
+                        formulas.push(formula);
+                    }
+                }
+                if formulas.is_empty() {
+                    Ok(None)
                 } else {
-                    ContractValueOrigin::Direct
-                },
-            },
-            _ => ContractValueSpec {
-                invariant: self.type_invariant_kind(ty),
-                origin: ContractValueOrigin::Direct,
-            },
-        }
-    }
-
-    fn type_invariant_kind(&self, ty: Ty<'tcx>) -> AutoInvariantKind {
-        match ty.kind() {
-            TyKind::Int(ty::IntTy::I32) => AutoInvariantKind::I32Range,
-            _ => AutoInvariantKind::Trivial,
+                    Ok(Some(bool_and(formulas)))
+                }
+            }
         }
     }
 
@@ -2383,8 +2459,9 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
         message: String,
     ) -> Result<(), VerificationResult> {
-        let spec = self.contract_value_spec_for_ty(ty);
-        let Some(formula) = self.contract_spec_formula(spec, value, span)? else {
+        let spec_ty =
+            spec_ty_for_rust_ty(self.tcx, ty).map_err(|err| self.unsupported_result(span, err))?;
+        let Some(formula) = self.spec_ty_formula(&spec_ty, value, span)? else {
             return Ok(());
         };
         self.require_constraint(state, formula, span, span_text(self.tcx, span), message)
@@ -2453,7 +2530,6 @@ impl<'tcx> Verifier<'tcx> {
         spec: HashMap<String, Datatype>,
     ) -> Result<CallEnv, VerificationResult> {
         let mut current = HashMap::new();
-        let mut prophecy = HashMap::new();
         if contract.params.len() != args.len() {
             return Err(self.unsupported_result(
                 span,
@@ -2466,18 +2542,9 @@ impl<'tcx> Verifier<'tcx> {
         }
         for (param, arg) in contract.params.iter().zip(args.iter()) {
             let value = self.read_operand(state, &arg.node, span)?;
-            let ty = arg.node.ty(&self.body.local_decls, self.tcx);
             current.insert(param.name.clone(), value.clone());
-            prophecy.insert(
-                param.name.clone(),
-                self.prophecy_from_typed_value(ty, &value, span)?,
-            );
         }
-        Ok(CallEnv {
-            current,
-            prophecy,
-            spec,
-        })
+        Ok(CallEnv { current, spec })
     }
 
     fn instantiate_contract_spec_vars(&self, names: &[String]) -> HashMap<String, Datatype> {
@@ -2487,30 +2554,6 @@ impl<'tcx> Verifier<'tcx> {
             spec.insert(name.clone(), value);
         }
         spec
-    }
-
-    fn prophecy_from_typed_value(
-        &self,
-        ty: Ty<'tcx>,
-        value: &Datatype,
-        _span: Span,
-    ) -> Result<Datatype, VerificationResult> {
-        match ty.kind() {
-            TyKind::Ref(_, _, mutability) if mutability.is_mut() => {
-                Ok(self.value_pair_second(value))
-            }
-            _ => {
-                let Some(fields) = self.composite_field_tys(ty) else {
-                    return Ok(value.clone());
-                };
-                let mut items = Vec::with_capacity(fields.len());
-                for (index, field_ty) in fields.into_iter().enumerate() {
-                    let field_value = self.project_field(value.clone(), index, _span)?;
-                    items.push(self.prophecy_from_typed_value(field_ty, &field_value, _span)?);
-                }
-                Ok(self.value_list(&items))
-            }
-        }
     }
 
     fn contract_req_to_z3(
@@ -2539,9 +2582,9 @@ impl<'tcx> Verifier<'tcx> {
         is_post: bool,
     ) -> Result<Bool, VerificationResult> {
         let manual = if is_post {
-            self.contract_expr_to_bool(&env.current, &env.prophecy, &env.spec, &contract.ens)?
+            self.contract_expr_to_bool(&env.current, &env.spec, &contract.ens)?
         } else {
-            self.contract_expr_to_bool(&env.current, &env.prophecy, &env.spec, &contract.req)?
+            self.contract_expr_to_bool(&env.current, &env.spec, &contract.req)?
         };
         let mut formulas = vec![self.bool_expr_to_z3(&manual)?];
         formulas.extend(self.auto_contract_formulas(contract, env, span, is_post)?);
@@ -2559,17 +2602,17 @@ impl<'tcx> Verifier<'tcx> {
             let Some(result) = env.current.get("result") else {
                 return Ok(Vec::new());
             };
-            let Some(formula) = self.contract_spec_formula(contract.result, result, span)? else {
+            let Some(formula) = self.spec_ty_formula(&contract.result, result, span)? else {
                 return Ok(Vec::new());
             };
             return Ok(vec![formula]);
         }
         let mut formulas = Vec::new();
-        for ContractParam { name, spec } in &contract.params {
+        for ContractParam { name, ty } in &contract.params {
             let value = env.current.get(name).cloned().ok_or_else(|| {
                 self.unsupported_result(span, format!("missing contract binding `{name}`"))
             })?;
-            if let Some(formula) = self.contract_spec_formula(*spec, &value, span)? {
+            if let Some(formula) = self.spec_ty_formula(ty, &value, span)? {
                 formulas.push(formula);
             }
         }
@@ -2586,7 +2629,6 @@ enum ReadMode {
 #[derive(Debug, Clone)]
 struct CallEnv {
     current: HashMap<String, Datatype>,
-    prophecy: HashMap<String, Datatype>,
     spec: HashMap<String, Datatype>,
 }
 
@@ -2598,7 +2640,6 @@ impl CallEnv {
         spec: HashMap<String, Datatype>,
     ) -> Result<Self, VerificationResult> {
         let mut current = HashMap::new();
-        let mut prophecy = HashMap::new();
         for (param, local) in contract
             .params
             .iter()
@@ -2610,24 +2651,12 @@ impl CallEnv {
                     format!("missing local {}", local.as_usize()),
                 )
             })?;
-            prophecy.insert(
-                param.name.clone(),
-                verifier.prophecy_from_typed_value(
-                    verifier.body.local_decls[local].ty,
-                    &value,
-                    verifier.control_span(state.ctrl),
-                )?,
-            );
             current.insert(param.name.clone(), value);
         }
         if let Some(result) = state.model.get(&Local::from_usize(0)).cloned() {
             current.insert("result".to_owned(), result);
         }
-        Ok(Self {
-            current,
-            prophecy,
-            spec,
-        })
+        Ok(Self { current, spec })
     }
 }
 

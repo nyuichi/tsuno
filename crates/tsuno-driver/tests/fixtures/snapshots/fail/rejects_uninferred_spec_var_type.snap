@@ -1,0 +1,14 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+expression: snapshot_output(output)
+---
+status: Some(1)
+stdout:
+UNSUPPORTED rejects_uninferred_spec_var_type
+  could not infer a type for `?X`
+  src/main.rs:1:1: 1:19
+UNSUPPORTED main
+  callee `rejects_uninferred_spec_var_type` has invalid contract: could not infer a type for `?X`
+  src/main.rs:1:1: 1:19
+
+stderr:
