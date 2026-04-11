@@ -4,7 +4,6 @@ struct Pair {
     right: bool,
 }
 
-//@ verify
 fn reads_shared_struct_field(pair: Pair) {
     let left = pair.left;
     let right = pair.right;

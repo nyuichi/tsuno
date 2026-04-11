@@ -6,6 +6,8 @@ status: Some(1)
 stdout:
 UNSUPPORTED rejects_drop_struct_initial_state
   structs with Drop are unsupported: Droppy
-  src/main.rs:10:1: 10:52
+  src/main.rs:9:1: 9:52
+PASS main
+  all assertions discharged
 
 stderr:

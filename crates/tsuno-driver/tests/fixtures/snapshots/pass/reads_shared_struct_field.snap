@@ -6,5 +6,7 @@ status: Some(0)
 stdout:
 PASS reads_shared_struct_field
   all assertions discharged
+PASS main
+  all assertions discharged
 
 stderr:
