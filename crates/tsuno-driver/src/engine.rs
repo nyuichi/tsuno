@@ -1070,22 +1070,18 @@ impl<'tcx> Verifier<'tcx> {
         value: &Datatype,
         span: Span,
     ) -> Result<Vec<BoolExpr>, VerificationResult> {
-        match ty.kind() {
-            TyKind::Tuple(fields) => {
-                let mut formulas = Vec::new();
-                let field_tys: Vec<_> = fields.iter().collect();
-                for (index, field_ty) in field_tys.into_iter().enumerate() {
-                    let field_value = self.project_tuple_field(value.clone(), index, span)?;
-                    formulas.extend(self.resolve_formulas(field_ty, &field_value, span)?);
-                }
-                Ok(formulas)
+        if let Some(fields) = self.composite_field_tys(ty) {
+            let mut formulas = Vec::new();
+            for (index, field_ty) in fields.into_iter().enumerate() {
+                let field_value = self.project_field(value.clone(), index, span)?;
+                formulas.extend(self.resolve_formulas(field_ty, &field_value, span)?);
             }
-            TyKind::Ref(_, inner, mutability) if mutability.is_mut() => {
+            return Ok(formulas);
+        }
+        match ty.kind() {
+            TyKind::Ref(_, _inner, mutability) if mutability.is_mut() => {
                 let cur = self.value_pair_first(value);
                 let fin = self.value_pair_second(value);
-                if !matches!(inner.kind(), TyKind::Tuple(_)) {
-                    return Ok(vec![BoolExpr::Value(self.value_eqv(&cur, &fin))]);
-                }
                 Ok(vec![BoolExpr::Value(self.value_eqv(&cur, &fin))])
             }
             TyKind::Ref(_, _, _) => Ok(Vec::new()),
@@ -1117,6 +1113,19 @@ impl<'tcx> Verifier<'tcx> {
             Rvalue::Aggregate(kind, operands) => match **kind {
                 AggregateKind::Tuple => {
                     let mut values = Vec::with_capacity(operands.len());
+                    for operand in operands {
+                        values.push(self.eval_operand(state, operand, span)?);
+                    }
+                    Ok(self.value_list(&values))
+                }
+                AggregateKind::Adt(def_id, variant_idx, args, _, _) => {
+                    let adt_def = self.tcx.adt_def(def_id);
+                    if !adt_def.is_struct() || variant_idx.as_usize() != 0 {
+                        return Err(self
+                            .unsupported_result(span, format!("unsupported aggregate {kind:?}")));
+                    }
+                    let field_tys = self.adt_field_tys(adt_def, args);
+                    let mut values = Vec::with_capacity(field_tys.len());
                     for operand in operands {
                         values.push(self.eval_operand(state, operand, span)?);
                     }
@@ -1409,6 +1418,11 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(self.value_int(self.scalar_int_to_i64(ty, value, span)?))
             }
             TyKind::Tuple(fields) if fields.is_empty() => Ok(self.value_nil()),
+            TyKind::Adt(adt_def, _)
+                if adt_def.is_struct() && adt_def.non_enum_variant().fields.is_empty() =>
+            {
+                Ok(self.value_nil())
+            }
             _ => Err(self.unsupported_result(span, format!("unsupported constant type {ty:?}"))),
         }
     }
@@ -1458,15 +1472,15 @@ impl<'tcx> Verifier<'tcx> {
                 self.read_projection(next, *inner, &projection[1..], mode, span)
             }
             PlaceElem::Field(field, _) => {
-                let next = self.project_tuple_field(value, field.index(), span)?;
-                let TyKind::Tuple(fields) = ty.kind() else {
+                let next = self.project_field(value, field.index(), span)?;
+                let Some(fields) = self.composite_field_tys(ty) else {
                     return Err(self.unsupported_result(
                         span,
-                        "field projection on non-tuple place".to_owned(),
+                        "field projection on non-composite place".to_owned(),
                     ));
                 };
                 let field_ty = fields.get(field.index()).ok_or_else(|| {
-                    self.unsupported_result(span, "tuple field out of range".to_owned())
+                    self.unsupported_result(span, "field index out of range".to_owned())
                 })?;
                 self.read_projection(next, *field_ty, &projection[1..], mode, span)
             }
@@ -1532,19 +1546,18 @@ impl<'tcx> Verifier<'tcx> {
             }
             PlaceElem::Field(field, _) => {
                 let index = field.index();
-                let TyKind::Tuple(fields) = ty.kind() else {
+                let Some(fields) = self.composite_field_tys(ty) else {
                     return Err(self.unsupported_result(
                         span,
-                        "field assignment on non-tuple place".to_owned(),
+                        "field assignment on non-composite place".to_owned(),
                     ));
                 };
                 let rust_field_ty = fields.get(index).ok_or_else(|| {
-                    self.unsupported_result(span, "tuple field out of range".to_owned())
+                    self.unsupported_result(span, "field index out of range".to_owned())
                 })?;
                 let mut items = Vec::with_capacity(fields.len());
                 for current_index in 0..fields.len() {
-                    let field_value =
-                        self.project_tuple_field(value.clone(), current_index, span)?;
+                    let field_value = self.project_field(value.clone(), current_index, span)?;
                     if current_index == index {
                         items.push(self.write_projection(
                             field_value,
@@ -1581,15 +1594,15 @@ impl<'tcx> Verifier<'tcx> {
         value: &Datatype,
         span: Span,
     ) -> Result<Datatype, VerificationResult> {
-        match ty.kind() {
-            TyKind::Tuple(fields) => {
-                let mut updated = Vec::with_capacity(fields.len());
-                for (index, field_ty) in fields.iter().enumerate() {
-                    let field_value = self.project_tuple_field(value.clone(), index, span)?;
-                    updated.push(self.dangle_value(field_ty, &field_value, span)?);
-                }
-                Ok(self.value_list(&updated))
+        if let Some(fields) = self.composite_field_tys(ty) {
+            let mut updated = Vec::with_capacity(fields.len());
+            for (index, field_ty) in fields.into_iter().enumerate() {
+                let field_value = self.project_field(value.clone(), index, span)?;
+                updated.push(self.dangle_value(field_ty, &field_value, span)?);
             }
+            return Ok(self.value_list(&updated));
+        }
+        match ty.kind() {
             TyKind::Ref(_, inner, mutability) if mutability.is_mut() => {
                 let fresh = self.fresh_for_rust_ty(*inner, "dangle")?;
                 Ok(self.value_list(&[fresh, self.value_pair_second(value)]))
@@ -1665,7 +1678,7 @@ impl<'tcx> Verifier<'tcx> {
             }
             Expr::Field { base, index } => {
                 let value = self.spec_expr_to_value(state, base, resolved)?;
-                self.project_tuple_field(value, *index, self.control_span(state.ctrl))
+                self.project_field(value, *index, self.control_span(state.ctrl))
             }
             Expr::Unary { op, arg } => {
                 let value = self.spec_expr_to_value(state, arg, resolved)?;
@@ -1747,7 +1760,7 @@ impl<'tcx> Verifier<'tcx> {
             }),
             Expr::Field { base, index } => {
                 let value = self.contract_expr_to_value(current, prophecy, spec, base)?;
-                self.project_tuple_field(value, *index, self.tcx.def_span(self.def_id))
+                self.project_field(value, *index, self.tcx.def_span(self.def_id))
             }
             Expr::Unary { op, arg } => {
                 let value = self.contract_expr_to_value(current, prophecy, spec, arg)?;
@@ -2135,6 +2148,26 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(self.value_list(&items))
             }
+            TyKind::Adt(adt_def, args) => {
+                if !adt_def.is_struct() {
+                    return Err(self.unsupported_result(
+                        self.tcx.def_span(self.def_id),
+                        format!("unsupported type {ty:?}"),
+                    ));
+                }
+                if adt_def.has_dtor(self.tcx) {
+                    return Err(self.unsupported_result(
+                        self.tcx.def_span(self.def_id),
+                        format!("structs with Drop are unsupported: {ty:?}"),
+                    ));
+                }
+                let field_tys = self.adt_field_tys(*adt_def, args);
+                let mut items = Vec::with_capacity(field_tys.len());
+                for (index, field_ty) in field_tys.into_iter().enumerate() {
+                    items.push(self.fresh_for_rust_ty(field_ty, &format!("{hint}_{index}"))?);
+                }
+                Ok(self.value_list(&items))
+            }
             other => Err(self.unsupported_result(
                 self.tcx.def_span(self.def_id),
                 format!("unsupported type {other:?}"),
@@ -2142,7 +2175,7 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn project_tuple_field(
+    fn project_field(
         &self,
         value: Datatype,
         index: usize,
@@ -2158,20 +2191,45 @@ impl<'tcx> Verifier<'tcx> {
         format!("{hint}_{id}")
     }
 
-    fn ty_contains_ref(&self, ty: Ty<'tcx>) -> bool {
+    fn composite_field_tys(&self, ty: Ty<'tcx>) -> Option<Vec<Ty<'tcx>>> {
         match ty.kind() {
-            TyKind::Ref(..) => true,
-            TyKind::Tuple(fields) => fields.iter().any(|field| self.ty_contains_ref(field)),
-            _ => false,
+            TyKind::Tuple(fields) => Some(fields.iter().collect()),
+            TyKind::Adt(adt_def, args) => {
+                if adt_def.is_struct() {
+                    Some(self.adt_field_tys(*adt_def, args))
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
-    fn ty_contains_mut_ref(&self, ty: Ty<'tcx>) -> bool {
-        match ty.kind() {
-            TyKind::Ref(_, _, mutability) if mutability.is_mut() => true,
-            TyKind::Tuple(fields) => fields.iter().any(|field| self.ty_contains_mut_ref(field)),
-            _ => false,
+    fn adt_field_tys(
+        &self,
+        adt_def: ty::AdtDef<'tcx>,
+        args: ty::GenericArgsRef<'tcx>,
+    ) -> Vec<Ty<'tcx>> {
+        adt_def
+            .non_enum_variant()
+            .fields
+            .iter()
+            .map(|field| field.ty(self.tcx, args))
+            .collect()
+    }
+
+    fn ty_contains_ref(&self, ty: Ty<'tcx>) -> bool {
+        if let Some(fields) = self.composite_field_tys(ty) {
+            return fields.iter().any(|field| self.ty_contains_ref(*field));
         }
+        matches!(ty.kind(), TyKind::Ref(_, _, _))
+    }
+
+    fn ty_contains_mut_ref(&self, ty: Ty<'tcx>) -> bool {
+        if let Some(fields) = self.composite_field_tys(ty) {
+            return fields.iter().any(|field| self.ty_contains_mut_ref(*field));
+        }
+        matches!(ty.kind(), TyKind::Ref(_, _, mutability) if mutability.is_mut())
     }
 
     fn int_range_formula(
@@ -2441,7 +2499,17 @@ impl<'tcx> Verifier<'tcx> {
             TyKind::Ref(_, _, mutability) if mutability.is_mut() => {
                 Ok(self.value_pair_second(value))
             }
-            _ => Ok(value.clone()),
+            _ => {
+                let Some(fields) = self.composite_field_tys(ty) else {
+                    return Ok(value.clone());
+                };
+                let mut items = Vec::with_capacity(fields.len());
+                for (index, field_ty) in fields.into_iter().enumerate() {
+                    let field_value = self.project_field(value.clone(), index, _span)?;
+                    items.push(self.prophecy_from_typed_value(field_ty, &field_value, _span)?);
+                }
+                Ok(self.value_list(&items))
+            }
         }
     }
 
