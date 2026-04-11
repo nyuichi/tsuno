@@ -1,0 +1,11 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+expression: snapshot_output(output)
+---
+status: Some(1)
+stdout:
+UNSUPPORTED rejects_drop_struct_initial_state
+  structs with Drop are unsupported: Droppy
+  src/main.rs:10:1: 10:52
+
+stderr:
