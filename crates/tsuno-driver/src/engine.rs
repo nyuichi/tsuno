@@ -2222,20 +2222,14 @@ impl<'tcx> Verifier<'tcx> {
         if let Some(fields) = self.composite_field_tys(ty) {
             return fields.iter().any(|field| self.ty_contains_ref(*field));
         }
-        match ty.kind() {
-            TyKind::Ref(..) => true,
-            _ => false,
-        }
+        matches!(ty.kind(), TyKind::Ref(_, _, _))
     }
 
     fn ty_contains_mut_ref(&self, ty: Ty<'tcx>) -> bool {
         if let Some(fields) = self.composite_field_tys(ty) {
             return fields.iter().any(|field| self.ty_contains_mut_ref(*field));
         }
-        match ty.kind() {
-            TyKind::Ref(_, _, mutability) if mutability.is_mut() => true,
-            _ => false,
-        }
+        matches!(ty.kind(), TyKind::Ref(_, _, mutability) if mutability.is_mut())
     }
 
     fn int_range_formula(
