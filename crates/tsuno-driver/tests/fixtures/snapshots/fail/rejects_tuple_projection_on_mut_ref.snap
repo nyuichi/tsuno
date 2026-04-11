@@ -4,9 +4,9 @@ expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
-UNSUPPORTED set_to_two
-  unexpected trailing tokens in //@ ens predicate
-  src/main.rs:3:1: 5:2
+UNSUPPORTED rejects_tuple_projection_on_mut_ref
+  tuple field access requires a tuple, found `Mut<int>`
+  src/main.rs:3:5: 3:32
 PASS main
   all assertions discharged
 

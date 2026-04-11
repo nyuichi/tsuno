@@ -20,10 +20,10 @@ use z3::{
 use crate::prepass::{
     AssertionContracts, AssumptionContracts, AutoInvariantKind, ContractParam, ContractValueOrigin,
     ContractValueSpec, FunctionContract, FunctionContractEntry, LoopContract, LoopContracts,
-    ResolvedExprEnv, compute_directives, compute_function_contracts,
+    ResolvedExprEnv, compute_directives, contract_value_spec,
 };
 use crate::report::{VerificationResult, VerificationStatus};
-use crate::spec::{BinaryOp, Expr, UnaryOp};
+use crate::spec::{BinaryOp, TypedExpr, TypedExprKind, UnaryOp};
 
 thread_local! {
     static GLOBAL_SOLVER: Solver = {
@@ -462,7 +462,13 @@ pub struct Verifier<'tcx> {
 }
 
 impl<'tcx> Verifier<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, item_span: Span, body: Body<'tcx>) -> Self {
+    pub fn new(
+        tcx: TyCtxt<'tcx>,
+        def_id: LocalDefId,
+        item_span: Span,
+        body: Body<'tcx>,
+        contracts: HashMap<LocalDefId, FunctionContractEntry>,
+    ) -> Self {
         let (
             loop_contracts,
             assertion_contracts,
@@ -495,7 +501,6 @@ impl<'tcx> Verifier<'tcx> {
                 }),
             ),
         };
-        let contracts = compute_function_contracts(tcx, Some(def_id));
         let next_sym = Cell::new(0);
         let function_spec_vars = instantiate_spec_vars(&next_sym, &spec_var_names);
         let mut contracts = contracts;
@@ -1619,11 +1624,11 @@ impl<'tcx> Verifier<'tcx> {
     fn spec_expr_to_bool(
         &self,
         state: &State,
-        expr: &Expr,
+        expr: &TypedExpr,
         resolved: &ResolvedExprEnv,
     ) -> Result<BoolExpr, VerificationResult> {
-        match expr {
-            Expr::Bool(value) => Ok(BoolExpr::Const(*value)),
+        match &expr.kind {
+            TypedExprKind::Bool(value) => Ok(BoolExpr::Const(*value)),
             _ => Ok(BoolExpr::Value(
                 self.spec_expr_to_value(state, expr, resolved)?,
             )),
@@ -1633,13 +1638,13 @@ impl<'tcx> Verifier<'tcx> {
     fn spec_expr_to_value(
         &self,
         state: &State,
-        expr: &Expr,
+        expr: &TypedExpr,
         resolved: &ResolvedExprEnv,
     ) -> Result<Datatype, VerificationResult> {
-        match expr {
-            Expr::Bool(value) => Ok(self.value_bool(*value)),
-            Expr::Int(value) => Ok(self.value_int(*value)),
-            Expr::Var(name) if resolved.spec_vars.contains(name) => {
+        match &expr.kind {
+            TypedExprKind::Bool(value) => Ok(self.value_bool(*value)),
+            TypedExprKind::Int(value) => Ok(self.value_int(*value)),
+            TypedExprKind::Var(name) if resolved.spec_vars.contains(name) => {
                 self.function_spec_vars.get(name).cloned().ok_or_else(|| {
                     self.unsupported_result(
                         self.control_span(state.ctrl),
@@ -1647,7 +1652,7 @@ impl<'tcx> Verifier<'tcx> {
                     )
                 })
             }
-            Expr::Var(name) => {
+            TypedExprKind::Var(name) => {
                 let Some(local) = resolved.locals.get(name) else {
                     return Err(self.unsupported_result(
                         self.control_span(state.ctrl),
@@ -1661,33 +1666,38 @@ impl<'tcx> Verifier<'tcx> {
                     )
                 })
             }
-            Expr::Bind(name) => self.function_spec_vars.get(name).cloned().ok_or_else(|| {
-                self.unsupported_result(
-                    self.control_span(state.ctrl),
-                    format!("missing spec binding `{name}`"),
-                )
-            }),
-            Expr::Prophecy(name) => {
-                let Some(local) = resolved.prophecies.get(name) else {
-                    return Err(self.unsupported_result(
+            TypedExprKind::Bind(name) => {
+                self.function_spec_vars.get(name).cloned().ok_or_else(|| {
+                    self.unsupported_result(
                         self.control_span(state.ctrl),
-                        format!("missing prophecy binding `{name}`"),
-                    ));
-                };
-                self.local_prophecy(state, *local, self.control_span(state.ctrl))
+                        format!("missing spec binding `{name}`"),
+                    )
+                })
             }
-            Expr::Field { base, index } => {
+            TypedExprKind::TupleField { base, index } => {
                 let value = self.spec_expr_to_value(state, base, resolved)?;
                 self.project_field(value, *index, self.control_span(state.ctrl))
             }
-            Expr::Unary { op, arg } => {
+            TypedExprKind::Deref { base } => {
+                let value = self.spec_expr_to_value(state, base, resolved)?;
+                match &base.ty {
+                    crate::spec::SpecTy::Ref(_) => Ok(value),
+                    crate::spec::SpecTy::Mut(_) => Ok(self.value_pair_first(&value)),
+                    _ => unreachable!("typed deref base"),
+                }
+            }
+            TypedExprKind::Fin { base } => {
+                let value = self.spec_expr_to_value(state, base, resolved)?;
+                Ok(self.value_pair_second(&value))
+            }
+            TypedExprKind::Unary { op, arg } => {
                 let value = self.spec_expr_to_value(state, arg, resolved)?;
                 Ok(match op {
                     UnaryOp::Not => self.value_not(&value),
                     UnaryOp::Neg => self.value_neg(&value),
                 })
             }
-            Expr::Binary { op, lhs, rhs } => {
+            TypedExprKind::Binary { op, lhs, rhs } => {
                 let lhs = self.spec_expr_to_value(state, lhs, resolved)?;
                 let rhs = self.spec_expr_to_value(state, rhs, resolved)?;
                 Ok(match op {
@@ -1710,14 +1720,13 @@ impl<'tcx> Verifier<'tcx> {
     fn contract_expr_to_bool(
         &self,
         current: &HashMap<String, Datatype>,
-        prophecy: &HashMap<String, Datatype>,
         spec: &HashMap<String, Datatype>,
-        expr: &Expr,
+        expr: &TypedExpr,
     ) -> Result<BoolExpr, VerificationResult> {
-        match expr {
-            Expr::Bool(value) => Ok(BoolExpr::Const(*value)),
+        match &expr.kind {
+            TypedExprKind::Bool(value) => Ok(BoolExpr::Const(*value)),
             _ => Ok(BoolExpr::Value(
-                self.contract_expr_to_value(current, prophecy, spec, expr)?,
+                self.contract_expr_to_value(current, spec, expr)?,
             )),
         }
     }
@@ -1725,14 +1734,13 @@ impl<'tcx> Verifier<'tcx> {
     fn contract_expr_to_value(
         &self,
         current: &HashMap<String, Datatype>,
-        prophecy: &HashMap<String, Datatype>,
         spec: &HashMap<String, Datatype>,
-        expr: &Expr,
+        expr: &TypedExpr,
     ) -> Result<Datatype, VerificationResult> {
-        match expr {
-            Expr::Bool(value) => Ok(self.value_bool(*value)),
-            Expr::Int(value) => Ok(self.value_int(*value)),
-            Expr::Var(name) if spec.contains_key(name) => {
+        match &expr.kind {
+            TypedExprKind::Bool(value) => Ok(self.value_bool(*value)),
+            TypedExprKind::Int(value) => Ok(self.value_int(*value)),
+            TypedExprKind::Var(name) if spec.contains_key(name) => {
                 spec.get(name).cloned().ok_or_else(|| {
                     self.unsupported_result(
                         self.tcx.def_span(self.def_id),
@@ -1740,38 +1748,44 @@ impl<'tcx> Verifier<'tcx> {
                     )
                 })
             }
-            Expr::Var(name) => current.get(name).cloned().ok_or_else(|| {
+            TypedExprKind::Var(name) => current.get(name).cloned().ok_or_else(|| {
                 self.unsupported_result(
                     self.tcx.def_span(self.def_id),
                     format!("missing contract binding `{name}`"),
                 )
             }),
-            Expr::Bind(name) => spec.get(name).cloned().ok_or_else(|| {
+            TypedExprKind::Bind(name) => spec.get(name).cloned().ok_or_else(|| {
                 self.unsupported_result(
                     self.tcx.def_span(self.def_id),
                     format!("missing spec binding `{name}`"),
                 )
             }),
-            Expr::Prophecy(name) => prophecy.get(name).cloned().ok_or_else(|| {
-                self.unsupported_result(
-                    self.tcx.def_span(self.def_id),
-                    format!("missing prophecy binding `{name}`"),
-                )
-            }),
-            Expr::Field { base, index } => {
-                let value = self.contract_expr_to_value(current, prophecy, spec, base)?;
+            TypedExprKind::TupleField { base, index } => {
+                let value = self.contract_expr_to_value(current, spec, base)?;
                 self.project_field(value, *index, self.tcx.def_span(self.def_id))
             }
-            Expr::Unary { op, arg } => {
-                let value = self.contract_expr_to_value(current, prophecy, spec, arg)?;
+            TypedExprKind::Deref { base } => {
+                let value = self.contract_expr_to_value(current, spec, base)?;
+                match &base.ty {
+                    crate::spec::SpecTy::Ref(_) => Ok(value),
+                    crate::spec::SpecTy::Mut(_) => Ok(self.value_pair_first(&value)),
+                    _ => unreachable!("typed deref base"),
+                }
+            }
+            TypedExprKind::Fin { base } => {
+                let value = self.contract_expr_to_value(current, spec, base)?;
+                Ok(self.value_pair_second(&value))
+            }
+            TypedExprKind::Unary { op, arg } => {
+                let value = self.contract_expr_to_value(current, spec, arg)?;
                 Ok(match op {
                     UnaryOp::Not => self.value_not(&value),
                     UnaryOp::Neg => self.value_neg(&value),
                 })
             }
-            Expr::Binary { op, lhs, rhs } => {
-                let lhs = self.contract_expr_to_value(current, prophecy, spec, lhs)?;
-                let rhs = self.contract_expr_to_value(current, prophecy, spec, rhs)?;
+            TypedExprKind::Binary { op, lhs, rhs } => {
+                let lhs = self.contract_expr_to_value(current, spec, lhs)?;
+                let rhs = self.contract_expr_to_value(current, spec, rhs)?;
                 Ok(match op {
                     BinaryOp::Eq => self.value_eqv(&lhs, &rhs),
                     BinaryOp::Ne => self.value_not(&self.value_eqv(&lhs, &rhs)),
@@ -1839,24 +1853,6 @@ impl<'tcx> Verifier<'tcx> {
             BoolExpr::Const(value) => Ok(Bool::from_bool(*value)),
             BoolExpr::Value(value) => Ok(self.value_is_true(value)),
             BoolExpr::Not(arg) => Ok(self.bool_expr_to_z3(arg)?.not()),
-        }
-    }
-
-    fn local_prophecy(
-        &self,
-        state: &State,
-        local: Local,
-        span: Span,
-    ) -> Result<Datatype, VerificationResult> {
-        let value = state.model.get(&local).cloned().ok_or_else(|| {
-            self.unsupported_result(span, format!("missing local {}", local.as_usize()))
-        })?;
-        let ty = self.body.local_decls[local].ty;
-        match ty.kind() {
-            TyKind::Ref(_, _, mutability) if mutability.is_mut() => {
-                Ok(self.value_pair_second(&value))
-            }
-            _ => Ok(value),
         }
     }
 
@@ -2352,27 +2348,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn contract_value_spec_for_ty(&self, ty: Ty<'tcx>) -> ContractValueSpec {
-        match ty.kind() {
-            TyKind::Ref(_, inner, mutability) => ContractValueSpec {
-                invariant: self.type_invariant_kind(*inner),
-                origin: if mutability.is_mut() {
-                    ContractValueOrigin::Current
-                } else {
-                    ContractValueOrigin::Direct
-                },
-            },
-            _ => ContractValueSpec {
-                invariant: self.type_invariant_kind(ty),
-                origin: ContractValueOrigin::Direct,
-            },
-        }
-    }
-
-    fn type_invariant_kind(&self, ty: Ty<'tcx>) -> AutoInvariantKind {
-        match ty.kind() {
-            TyKind::Int(ty::IntTy::I32) => AutoInvariantKind::I32Range,
-            _ => AutoInvariantKind::Trivial,
-        }
+        contract_value_spec(self.tcx, ty).expect("supported contract type")
     }
 
     fn require_type_invariant(
@@ -2453,7 +2429,6 @@ impl<'tcx> Verifier<'tcx> {
         spec: HashMap<String, Datatype>,
     ) -> Result<CallEnv, VerificationResult> {
         let mut current = HashMap::new();
-        let mut prophecy = HashMap::new();
         if contract.params.len() != args.len() {
             return Err(self.unsupported_result(
                 span,
@@ -2466,18 +2441,9 @@ impl<'tcx> Verifier<'tcx> {
         }
         for (param, arg) in contract.params.iter().zip(args.iter()) {
             let value = self.read_operand(state, &arg.node, span)?;
-            let ty = arg.node.ty(&self.body.local_decls, self.tcx);
             current.insert(param.name.clone(), value.clone());
-            prophecy.insert(
-                param.name.clone(),
-                self.prophecy_from_typed_value(ty, &value, span)?,
-            );
         }
-        Ok(CallEnv {
-            current,
-            prophecy,
-            spec,
-        })
+        Ok(CallEnv { current, spec })
     }
 
     fn instantiate_contract_spec_vars(&self, names: &[String]) -> HashMap<String, Datatype> {
@@ -2487,30 +2453,6 @@ impl<'tcx> Verifier<'tcx> {
             spec.insert(name.clone(), value);
         }
         spec
-    }
-
-    fn prophecy_from_typed_value(
-        &self,
-        ty: Ty<'tcx>,
-        value: &Datatype,
-        _span: Span,
-    ) -> Result<Datatype, VerificationResult> {
-        match ty.kind() {
-            TyKind::Ref(_, _, mutability) if mutability.is_mut() => {
-                Ok(self.value_pair_second(value))
-            }
-            _ => {
-                let Some(fields) = self.composite_field_tys(ty) else {
-                    return Ok(value.clone());
-                };
-                let mut items = Vec::with_capacity(fields.len());
-                for (index, field_ty) in fields.into_iter().enumerate() {
-                    let field_value = self.project_field(value.clone(), index, _span)?;
-                    items.push(self.prophecy_from_typed_value(field_ty, &field_value, _span)?);
-                }
-                Ok(self.value_list(&items))
-            }
-        }
     }
 
     fn contract_req_to_z3(
@@ -2539,9 +2481,9 @@ impl<'tcx> Verifier<'tcx> {
         is_post: bool,
     ) -> Result<Bool, VerificationResult> {
         let manual = if is_post {
-            self.contract_expr_to_bool(&env.current, &env.prophecy, &env.spec, &contract.ens)?
+            self.contract_expr_to_bool(&env.current, &env.spec, &contract.ens)?
         } else {
-            self.contract_expr_to_bool(&env.current, &env.prophecy, &env.spec, &contract.req)?
+            self.contract_expr_to_bool(&env.current, &env.spec, &contract.req)?
         };
         let mut formulas = vec![self.bool_expr_to_z3(&manual)?];
         formulas.extend(self.auto_contract_formulas(contract, env, span, is_post)?);
@@ -2559,7 +2501,9 @@ impl<'tcx> Verifier<'tcx> {
             let Some(result) = env.current.get("result") else {
                 return Ok(Vec::new());
             };
-            let Some(formula) = self.contract_spec_formula(contract.result, result, span)? else {
+            let Some(formula) =
+                self.contract_spec_formula(contract.result.clone(), result, span)?
+            else {
                 return Ok(Vec::new());
             };
             return Ok(vec![formula]);
@@ -2569,7 +2513,7 @@ impl<'tcx> Verifier<'tcx> {
             let value = env.current.get(name).cloned().ok_or_else(|| {
                 self.unsupported_result(span, format!("missing contract binding `{name}`"))
             })?;
-            if let Some(formula) = self.contract_spec_formula(*spec, &value, span)? {
+            if let Some(formula) = self.contract_spec_formula(spec.clone(), &value, span)? {
                 formulas.push(formula);
             }
         }
@@ -2586,7 +2530,6 @@ enum ReadMode {
 #[derive(Debug, Clone)]
 struct CallEnv {
     current: HashMap<String, Datatype>,
-    prophecy: HashMap<String, Datatype>,
     spec: HashMap<String, Datatype>,
 }
 
@@ -2598,7 +2541,6 @@ impl CallEnv {
         spec: HashMap<String, Datatype>,
     ) -> Result<Self, VerificationResult> {
         let mut current = HashMap::new();
-        let mut prophecy = HashMap::new();
         for (param, local) in contract
             .params
             .iter()
@@ -2610,24 +2552,12 @@ impl CallEnv {
                     format!("missing local {}", local.as_usize()),
                 )
             })?;
-            prophecy.insert(
-                param.name.clone(),
-                verifier.prophecy_from_typed_value(
-                    verifier.body.local_decls[local].ty,
-                    &value,
-                    verifier.control_span(state.ctrl),
-                )?,
-            );
             current.insert(param.name.clone(), value);
         }
         if let Some(result) = state.model.get(&Local::from_usize(0)).cloned() {
             current.insert("result".to_owned(), result);
         }
-        Ok(Self {
-            current,
-            prophecy,
-            spec,
-        })
+        Ok(Self { current, spec })
     }
 }
 

@@ -4,10 +4,15 @@ pub enum Expr {
     Int(i64),
     Var(String),
     Bind(String),
-    Prophecy(String),
-    Field {
+    TupleField {
         base: Box<Expr>,
         index: usize,
+    },
+    Deref {
+        base: Box<Expr>,
+    },
+    Fin {
+        base: Box<Expr>,
     },
     Unary {
         op: UnaryOp,
@@ -18,6 +23,48 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedExpr {
+    pub ty: SpecTy,
+    pub kind: TypedExprKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypedExprKind {
+    Bool(bool),
+    Int(i64),
+    Var(String),
+    Bind(String),
+    TupleField {
+        base: Box<TypedExpr>,
+        index: usize,
+    },
+    Deref {
+        base: Box<TypedExpr>,
+    },
+    Fin {
+        base: Box<TypedExpr>,
+    },
+    Unary {
+        op: UnaryOp,
+        arg: Box<TypedExpr>,
+    },
+    Binary {
+        op: BinaryOp,
+        lhs: Box<TypedExpr>,
+        rhs: Box<TypedExpr>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecTy {
+    Bool,
+    Int,
+    Tuple(Vec<SpecTy>),
+    Ref(Box<SpecTy>),
+    Mut(Box<SpecTy>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,12 +194,6 @@ fn expand_template(kind: &str, raw: &str) -> Result<String, ParseError> {
                         "empty interpolation in //@ {kind} template"
                     )));
                 }
-                if inner.strip_prefix("^:").is_some() {
-                    return Err(ParseError::new(format!(
-                        "prophecy interpolation is unsupported in //@ {} templates; use `.cur` / `.fin`",
-                        kind
-                    )));
-                }
                 out.push('(');
                 out.push_str(inner);
                 out.push(')');
@@ -180,7 +221,6 @@ enum Token {
     Bool(bool),
     LParen,
     RParen,
-    Comma,
     Dot,
     Question,
     Plus,
@@ -215,6 +255,22 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
                         break;
                     }
                 }
+                if chars.peek() == Some(&'i') {
+                    let mut suffix = String::new();
+                    while let Some(next) = chars.peek().copied() {
+                        if next.is_ascii_alphanumeric() || next == '_' {
+                            suffix.push(next);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if suffix != "i32" {
+                        return Err(ParseError::new(format!(
+                            "unsupported integer literal suffix `{suffix}` in spec expression"
+                        )));
+                    }
+                }
                 let value = digits
                     .parse::<i64>()
                     .map_err(|_| ParseError::new("integer literal is too large"))?;
@@ -243,10 +299,6 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
             ')' => {
                 chars.next();
                 tokens.push(Token::RParen);
-            }
-            ',' => {
-                chars.next();
-                tokens.push(Token::Comma);
             }
             '.' => {
                 chars.next();
@@ -481,15 +533,30 @@ impl Parser {
                 arg: Box::new(self.parse_unary()?),
             });
         }
+        if self.eat(&Token::Star) {
+            return Ok(Expr::Deref {
+                base: Box::new(self.parse_unary()?),
+            });
+        }
         self.parse_postfix()
     }
 
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_primary()?;
         while self.eat(&Token::Dot) {
-            expr = Expr::Field {
-                base: Box::new(expr),
-                index: self.parse_field_index()?,
+            expr = match self.next() {
+                Some(Token::Int(value)) if *value >= 0 => Expr::TupleField {
+                    base: Box::new(expr),
+                    index: *value as usize,
+                },
+                Some(Token::Ident(ident)) if ident == "fin" => Expr::Fin {
+                    base: Box::new(expr),
+                },
+                _ => {
+                    return Err(ParseError::new(
+                        "unsupported field access in spec expression",
+                    ));
+                }
             };
         }
         Ok(expr)
@@ -505,7 +572,6 @@ impl Parser {
                 };
                 Ok(Expr::Bind(ident.clone()))
             }
-            Some(Token::Ident(ident)) if ident == "__prophecy" => self.parse_prophecy_call(),
             Some(Token::Ident(ident)) => Ok(Expr::Var(ident.clone())),
             Some(Token::LParen) => {
                 let expr = self.parse_expr()?;
@@ -513,29 +579,6 @@ impl Parser {
                 Ok(expr)
             }
             _ => Err(ParseError::new("expected a spec expression")),
-        }
-    }
-
-    fn parse_prophecy_call(&mut self) -> Result<Expr, ParseError> {
-        self.expect(&Token::LParen)?;
-        let Some(Token::Ident(ident)) = self.next() else {
-            return Err(ParseError::new(
-                "unsupported prophecy argument in spec expression",
-            ));
-        };
-        let ident = ident.clone();
-        self.expect(&Token::RParen)?;
-        Ok(Expr::Prophecy(ident))
-    }
-
-    fn parse_field_index(&mut self) -> Result<usize, ParseError> {
-        match self.next() {
-            Some(Token::Int(value)) if *value >= 0 => Ok(*value as usize),
-            Some(Token::Ident(ident)) if ident == "cur" => Ok(0),
-            Some(Token::Ident(ident)) if ident == "fin" => Ok(1),
-            _ => Err(ParseError::new(
-                "unsupported field access in spec expression",
-            )),
         }
     }
 
@@ -570,17 +613,31 @@ mod tests {
     use super::{BinaryOp, Expr, UnaryOp, parse_expr};
 
     #[test]
-    fn parses_template_interpolation_without_syn() {
-        let expr = parse_expr("assert", r#""{x}.0.cur == 1""#).expect("expr");
+    fn parses_deref_and_fin() {
+        let expr = parse_expr("assert", r#""*{x} == {y}.fin""#).expect("expr");
         assert_eq!(
             expr,
             Expr::Binary {
                 op: BinaryOp::Eq,
-                lhs: Box::new(Expr::Field {
-                    base: Box::new(Expr::Field {
-                        base: Box::new(Expr::Var("x".to_owned())),
-                        index: 0,
-                    }),
+                lhs: Box::new(Expr::Deref {
+                    base: Box::new(Expr::Var("x".to_owned())),
+                }),
+                rhs: Box::new(Expr::Fin {
+                    base: Box::new(Expr::Var("y".to_owned())),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_tuple_projection() {
+        let expr = parse_expr("assert", r#""{x}.0 == 1i32""#).expect("expr");
+        assert_eq!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                lhs: Box::new(Expr::TupleField {
+                    base: Box::new(Expr::Var("x".to_owned())),
                     index: 0,
                 }),
                 rhs: Box::new(Expr::Int(1)),
@@ -597,22 +654,6 @@ mod tests {
                 op: BinaryOp::Eq,
                 lhs: Box::new(Expr::Bind("x".to_owned())),
                 rhs: Box::new(Expr::Int(3)),
-            }
-        );
-    }
-
-    #[test]
-    fn parses_prophecy_call() {
-        let expr = parse_expr("inv", r#""__prophecy(x).fin >= 0""#).expect("expr");
-        assert_eq!(
-            expr,
-            Expr::Binary {
-                op: BinaryOp::Ge,
-                lhs: Box::new(Expr::Field {
-                    base: Box::new(Expr::Prophecy("x".to_owned())),
-                    index: 1,
-                }),
-                rhs: Box::new(Expr::Int(0)),
             }
         );
     }
@@ -646,8 +687,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_prophecy_interpolation() {
-        let err = parse_expr("req", r#""{^:x}""#).expect_err("should fail");
-        assert!(err.to_string().contains("prophecy interpolation"));
+    fn rejects_cur_accessor() {
+        let err = parse_expr("assert", r#""{x}.cur""#).expect_err("should fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported field access in spec expression")
+        );
     }
 }

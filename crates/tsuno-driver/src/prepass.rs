@@ -6,7 +6,7 @@ use crate::directive::{
     collect_function_directives,
 };
 use crate::report::{VerificationResult, VerificationStatus};
-use crate::spec::Expr;
+use crate::spec::{Expr, SpecTy, TypedExpr, TypedExprKind};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{HirId, ItemKind, Pat, PatKind};
 use rustc_middle::mir::{BasicBlock, Body, Local, PlaceElem, StatementKind, TerminatorKind};
@@ -23,7 +23,6 @@ pub struct HirBindingInfo {
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedExprEnv {
     pub locals: HashMap<String, Local>,
-    pub prophecies: HashMap<String, Local>,
     pub spec_vars: HashSet<String>,
 }
 
@@ -32,7 +31,7 @@ pub struct LoopContract {
     pub header: BasicBlock,
     pub hir_loop_id: HirId,
     pub invariant_block: BasicBlock,
-    pub invariant: Expr,
+    pub invariant: TypedExpr,
     pub resolution: ResolvedExprEnv,
     pub invariant_span: String,
     pub body_blocks: BTreeSet<BasicBlock>,
@@ -48,7 +47,7 @@ pub struct LoopContracts {
 
 #[derive(Debug, Clone)]
 pub struct AssertionContract {
-    pub assertion: Expr,
+    pub assertion: TypedExpr,
     pub resolution: ResolvedExprEnv,
     pub assertion_span: String,
 }
@@ -60,7 +59,7 @@ pub struct AssertionContracts {
 
 #[derive(Debug, Clone)]
 pub struct AssumptionContract {
-    pub assumption: Expr,
+    pub assumption: TypedExpr,
     pub resolution: ResolvedExprEnv,
 }
 
@@ -81,8 +80,9 @@ pub enum ContractValueOrigin {
     Current,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractValueSpec {
+    pub ty: SpecTy,
     pub invariant: AutoInvariantKind,
     pub origin: ContractValueOrigin,
 }
@@ -96,10 +96,10 @@ pub struct ContractParam {
 #[derive(Debug, Clone)]
 pub struct FunctionContract {
     pub params: Vec<ContractParam>,
-    pub req: Expr,
+    pub req: TypedExpr,
     #[allow(dead_code)]
     pub req_span: String,
-    pub ens: Expr,
+    pub ens: TypedExpr,
     pub ens_span: String,
     pub spec_vars: Vec<String>,
     pub result: ContractValueSpec,
@@ -208,13 +208,34 @@ pub fn compute_function_contracts<'tcx>(
             continue;
         }
         let entry = match collect_function_directives(tcx, def_id, item.span) {
-            Ok(directives) => match build_function_contract(tcx, def_id, &directives.directives) {
-                Ok(contract) => FunctionContractEntry::Ready(contract),
-                Err(err) => FunctionContractEntry::Invalid(err),
-            },
-            Err(err) => FunctionContractEntry::Invalid(directive_error_to_verification_result(
-                tcx, def_id, err,
-            )),
+            Ok(directives) => {
+                let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
+                match compute_directives(tcx, def_id, item.span, &body.borrow()) {
+                    Ok(prepass) => match prepass.function_contract {
+                        Some(contract) => FunctionContractEntry::Ready(contract),
+                        None => FunctionContractEntry::Invalid(function_contract_error(
+                            tcx,
+                            def_id,
+                            &tcx.sess
+                                .source_map()
+                                .span_to_diagnostic_string(tcx.def_span(def_id.to_def_id())),
+                            "missing function contract".to_owned(),
+                        )),
+                    },
+                    Err(_) => match build_contract_only(tcx, def_id, &directives.directives) {
+                        Ok(contract) => FunctionContractEntry::Ready(contract),
+                        Err(err) => FunctionContractEntry::Invalid(err),
+                    },
+                }
+            }
+            Err(err) => FunctionContractEntry::Invalid(
+                LoopPrepassError {
+                    span: err.span,
+                    display_span: None,
+                    message: err.message,
+                }
+                .into_verification_result(tcx, def_id),
+            ),
         };
         contracts.insert(def_id, entry);
     }
@@ -249,6 +270,19 @@ pub struct LoopPrepassError {
     pub span: Span,
     pub display_span: Option<String>,
     pub message: String,
+}
+
+impl LoopPrepassError {
+    fn into_verification_result(self, tcx: TyCtxt<'_>, def_id: LocalDefId) -> VerificationResult {
+        VerificationResult {
+            function: tcx.def_path_str(def_id.to_def_id()),
+            status: VerificationStatus::Unsupported,
+            span: self
+                .display_span
+                .unwrap_or_else(|| tcx.sess.source_map().span_to_diagnostic_string(self.span)),
+            message: self.message,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -297,6 +331,857 @@ struct ExprResolutionContext<'a> {
     anchor_span: Span,
     kind: DirectiveKind,
     spec_scope: &'a mut SpecScope,
+}
+
+#[derive(Debug, Clone)]
+enum InferredExprTy {
+    Known(SpecTy),
+    SpecVar(String),
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SpecTypeInference {
+    parent: HashMap<String, String>,
+    concrete: HashMap<String, SpecTy>,
+}
+
+impl SpecTypeInference {
+    fn ensure_var(&mut self, name: &str) {
+        self.parent
+            .entry(name.to_owned())
+            .or_insert_with(|| name.to_owned());
+    }
+
+    fn find(&mut self, name: &str) -> String {
+        self.ensure_var(name);
+        let parent = self.parent.get(name).cloned().expect("spec var parent");
+        if parent == name {
+            return parent;
+        }
+        let root = self.find(&parent);
+        self.parent.insert(name.to_owned(), root.clone());
+        root
+    }
+
+    fn union(&mut self, lhs: &str, rhs: &str) -> Result<(), String> {
+        let lhs_root = self.find(lhs);
+        let rhs_root = self.find(rhs);
+        if lhs_root == rhs_root {
+            return Ok(());
+        }
+        let lhs_ty = self.concrete.get(&lhs_root).cloned();
+        let rhs_ty = self.concrete.get(&rhs_root).cloned();
+        self.parent.insert(rhs_root.clone(), lhs_root.clone());
+        match (lhs_ty, rhs_ty) {
+            (Some(lhs_ty), Some(rhs_ty)) => {
+                self.concrete
+                    .insert(lhs_root.clone(), unify_spec_tys(&lhs_ty, &rhs_ty)?);
+            }
+            (Some(lhs_ty), None) => {
+                self.concrete.insert(lhs_root.clone(), lhs_ty);
+            }
+            (None, Some(rhs_ty)) => {
+                self.concrete.insert(lhs_root.clone(), rhs_ty);
+            }
+            (None, None) => {}
+        }
+        Ok(())
+    }
+
+    fn constrain(&mut self, name: &str, ty: &SpecTy) -> Result<(), String> {
+        let root = self.find(name);
+        match self.concrete.get(&root).cloned() {
+            Some(existing) => {
+                let unified = unify_spec_tys(&existing, ty)?;
+                self.concrete.insert(root, unified);
+            }
+            None => {
+                self.concrete.insert(root, ty.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn resolved_ty(&mut self, name: &str) -> Option<SpecTy> {
+        let root = self.find(name);
+        self.concrete.get(&root).cloned()
+    }
+}
+
+fn unify_spec_tys(lhs: &SpecTy, rhs: &SpecTy) -> Result<SpecTy, String> {
+    match (lhs, rhs) {
+        (SpecTy::Bool, SpecTy::Bool) => Ok(SpecTy::Bool),
+        (SpecTy::Int, SpecTy::Int) => Ok(SpecTy::Int),
+        (SpecTy::Ref(lhs), SpecTy::Ref(rhs)) => {
+            Ok(SpecTy::Ref(Box::new(unify_spec_tys(lhs, rhs)?)))
+        }
+        (SpecTy::Mut(lhs), SpecTy::Mut(rhs)) => {
+            Ok(SpecTy::Mut(Box::new(unify_spec_tys(lhs, rhs)?)))
+        }
+        (SpecTy::Tuple(lhs), SpecTy::Tuple(rhs)) if lhs.len() == rhs.len() => {
+            let mut items = Vec::with_capacity(lhs.len());
+            for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
+                items.push(unify_spec_tys(lhs, rhs)?);
+            }
+            Ok(SpecTy::Tuple(items))
+        }
+        _ => Err(format!(
+            "type mismatch between `{}` and `{}`",
+            display_spec_ty(lhs),
+            display_spec_ty(rhs)
+        )),
+    }
+}
+
+fn display_spec_ty(ty: &SpecTy) -> String {
+    match ty {
+        SpecTy::Bool => "bool".to_owned(),
+        SpecTy::Int => "int".to_owned(),
+        SpecTy::Ref(inner) => format!("Ref<{}>", display_spec_ty(inner)),
+        SpecTy::Mut(inner) => format!("Mut<{}>", display_spec_ty(inner)),
+        SpecTy::Tuple(items) => format!(
+            "({})",
+            items
+                .iter()
+                .map(display_spec_ty)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn constrain_expr_ty(
+    inferred: &mut SpecTypeInference,
+    ty: &InferredExprTy,
+    expected: &SpecTy,
+) -> Result<(), String> {
+    match ty {
+        InferredExprTy::Known(actual) => {
+            let _ = unify_spec_tys(actual, expected)?;
+            Ok(())
+        }
+        InferredExprTy::SpecVar(name) => inferred.constrain(name, expected),
+        InferredExprTy::Unknown => Ok(()),
+    }
+}
+
+fn unify_expr_tys(
+    inferred: &mut SpecTypeInference,
+    lhs: &InferredExprTy,
+    rhs: &InferredExprTy,
+) -> Result<(), String> {
+    match (lhs, rhs) {
+        (InferredExprTy::Known(lhs), InferredExprTy::Known(rhs)) => {
+            let _ = unify_spec_tys(lhs, rhs)?;
+            Ok(())
+        }
+        (InferredExprTy::SpecVar(lhs), InferredExprTy::SpecVar(rhs)) => inferred.union(lhs, rhs),
+        (InferredExprTy::SpecVar(name), InferredExprTy::Known(ty))
+        | (InferredExprTy::Known(ty), InferredExprTy::SpecVar(name)) => {
+            inferred.constrain(name, ty)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn rust_ty_to_spec_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<SpecTy, String> {
+    match ty.kind() {
+        TyKind::Bool => Ok(SpecTy::Bool),
+        TyKind::Int(_) | TyKind::Uint(_) => Ok(SpecTy::Int),
+        TyKind::Ref(_, inner, mutability) => {
+            let inner = rust_ty_to_spec_ty(tcx, *inner)?;
+            if mutability.is_mut() {
+                Ok(SpecTy::Mut(Box::new(inner)))
+            } else {
+                Ok(SpecTy::Ref(Box::new(inner)))
+            }
+        }
+        TyKind::Tuple(fields) => {
+            let mut items = Vec::with_capacity(fields.len());
+            for field in fields.iter() {
+                items.push(rust_ty_to_spec_ty(tcx, field)?);
+            }
+            Ok(SpecTy::Tuple(items))
+        }
+        TyKind::Adt(adt_def, args) if adt_def.is_struct() => {
+            let mut items = Vec::new();
+            for field in adt_def.non_enum_variant().fields.iter() {
+                items.push(rust_ty_to_spec_ty(tcx, field.ty(tcx, args))?);
+            }
+            Ok(SpecTy::Tuple(items))
+        }
+        other => Err(format!("unsupported type {other:?}")),
+    }
+}
+
+fn infer_contract_expr_types(
+    expr: &Expr,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    inferred: &mut SpecTypeInference,
+) -> Result<InferredExprTy, String> {
+    match expr {
+        Expr::Bool(_) => Ok(InferredExprTy::Known(SpecTy::Bool)),
+        Expr::Int(_) => Ok(InferredExprTy::Known(SpecTy::Int)),
+        Expr::Var(name) => {
+            if spec_scope.visible.contains(name) {
+                inferred.ensure_var(name);
+                return Ok(InferredExprTy::SpecVar(name.clone()));
+            }
+            if let Some(ty) = params.get(name) {
+                return Ok(InferredExprTy::Known(ty.clone()));
+            }
+            if allow_result && name == "result" {
+                return Ok(InferredExprTy::Known(result_ty.clone()));
+            }
+            if name == "result" {
+                return Err("`result` is only supported in //@ ens predicates".to_owned());
+            }
+            Err(format!("unresolved binding `{name}` in function contract"))
+        }
+        Expr::Bind(name) => {
+            spec_scope
+                .bind(
+                    name,
+                    Span::default(),
+                    None,
+                    if allow_result { "ens" } else { "req" },
+                )
+                .map_err(|err| err.message)?;
+            inferred.ensure_var(name);
+            Ok(InferredExprTy::SpecVar(name.clone()))
+        }
+        Expr::TupleField { base, .. } => {
+            let base_ty = infer_contract_expr_types(
+                base,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?;
+            match base_ty {
+                InferredExprTy::Known(SpecTy::Tuple(_)) => Ok(InferredExprTy::Unknown),
+                InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
+                InferredExprTy::Known(other) => Err(format!(
+                    "tuple field access requires a tuple, found `{}`",
+                    display_spec_ty(&other)
+                )),
+            }
+        }
+        Expr::Deref { base } => {
+            let base_ty = infer_contract_expr_types(
+                base,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?;
+            match base_ty {
+                InferredExprTy::Known(SpecTy::Ref(inner))
+                | InferredExprTy::Known(SpecTy::Mut(inner)) => Ok(InferredExprTy::Known(*inner)),
+                InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
+                InferredExprTy::Known(other) => Err(format!(
+                    "dereference requires Ref<T> or Mut<T>, found `{}`",
+                    display_spec_ty(&other)
+                )),
+            }
+        }
+        Expr::Fin { base } => {
+            let base_ty = infer_contract_expr_types(
+                base,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?;
+            match base_ty {
+                InferredExprTy::Known(SpecTy::Mut(inner)) => Ok(InferredExprTy::Known(*inner)),
+                InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
+                InferredExprTy::Known(other) => Err(format!(
+                    "`.fin` requires Mut<T>, found `{}`",
+                    display_spec_ty(&other)
+                )),
+            }
+        }
+        Expr::Unary { op, arg } => {
+            let arg_ty = infer_contract_expr_types(
+                arg,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?;
+            match op {
+                crate::spec::UnaryOp::Not => {
+                    constrain_expr_ty(inferred, &arg_ty, &SpecTy::Bool)?;
+                    Ok(InferredExprTy::Known(SpecTy::Bool))
+                }
+                crate::spec::UnaryOp::Neg => {
+                    constrain_expr_ty(inferred, &arg_ty, &SpecTy::Int)?;
+                    Ok(InferredExprTy::Known(SpecTy::Int))
+                }
+            }
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let lhs_ty = infer_contract_expr_types(
+                lhs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?;
+            let rhs_ty = infer_contract_expr_types(
+                rhs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?;
+            match op {
+                crate::spec::BinaryOp::Eq | crate::spec::BinaryOp::Ne => {
+                    unify_expr_tys(inferred, &lhs_ty, &rhs_ty)?;
+                    Ok(InferredExprTy::Known(SpecTy::Bool))
+                }
+                crate::spec::BinaryOp::And | crate::spec::BinaryOp::Or => {
+                    constrain_expr_ty(inferred, &lhs_ty, &SpecTy::Bool)?;
+                    constrain_expr_ty(inferred, &rhs_ty, &SpecTy::Bool)?;
+                    Ok(InferredExprTy::Known(SpecTy::Bool))
+                }
+                crate::spec::BinaryOp::Lt
+                | crate::spec::BinaryOp::Le
+                | crate::spec::BinaryOp::Gt
+                | crate::spec::BinaryOp::Ge => {
+                    constrain_expr_ty(inferred, &lhs_ty, &SpecTy::Int)?;
+                    constrain_expr_ty(inferred, &rhs_ty, &SpecTy::Int)?;
+                    unify_expr_tys(inferred, &lhs_ty, &rhs_ty)?;
+                    Ok(InferredExprTy::Known(SpecTy::Bool))
+                }
+                crate::spec::BinaryOp::Add
+                | crate::spec::BinaryOp::Sub
+                | crate::spec::BinaryOp::Mul => {
+                    constrain_expr_ty(inferred, &lhs_ty, &SpecTy::Int)?;
+                    constrain_expr_ty(inferred, &rhs_ty, &SpecTy::Int)?;
+                    unify_expr_tys(inferred, &lhs_ty, &rhs_ty)?;
+                    Ok(InferredExprTy::Known(SpecTy::Int))
+                }
+            }
+        }
+    }
+}
+
+fn infer_body_expr_types<'tcx>(
+    expr: &Expr,
+    kind: DirectiveKind,
+    spec_scope: &mut SpecScope,
+    local_tys: &HashMap<String, SpecTy>,
+    inferred: &mut SpecTypeInference,
+) -> Result<InferredExprTy, String> {
+    match expr {
+        Expr::Bool(_) => Ok(InferredExprTy::Known(SpecTy::Bool)),
+        Expr::Int(_) => Ok(InferredExprTy::Known(SpecTy::Int)),
+        Expr::Var(name) => {
+            if spec_scope.visible.contains(name) {
+                inferred.ensure_var(name);
+                return Ok(InferredExprTy::SpecVar(name.clone()));
+            }
+            local_tys
+                .get(name)
+                .cloned()
+                .map(InferredExprTy::Known)
+                .ok_or_else(|| format!("unresolved binding `{name}` in //@ {}", kind.keyword()))
+        }
+        Expr::Bind(name) => {
+            spec_scope
+                .bind(name, Span::default(), None, kind.keyword())
+                .map_err(|err| err.message)?;
+            inferred.ensure_var(name);
+            Ok(InferredExprTy::SpecVar(name.clone()))
+        }
+        Expr::TupleField { base, .. } => {
+            let base_ty =
+                infer_body_expr_types(expr_base(base), kind, spec_scope, local_tys, inferred)?;
+            match base_ty {
+                InferredExprTy::Known(SpecTy::Tuple(_)) => Ok(InferredExprTy::Unknown),
+                InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
+                InferredExprTy::Known(other) => Err(format!(
+                    "tuple field access requires a tuple, found `{}`",
+                    display_spec_ty(&other)
+                )),
+            }
+        }
+        Expr::Deref { base } => {
+            let base_ty = infer_body_expr_types(base, kind, spec_scope, local_tys, inferred)?;
+            match base_ty {
+                InferredExprTy::Known(SpecTy::Ref(inner))
+                | InferredExprTy::Known(SpecTy::Mut(inner)) => Ok(InferredExprTy::Known(*inner)),
+                InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
+                InferredExprTy::Known(other) => Err(format!(
+                    "dereference requires Ref<T> or Mut<T>, found `{}`",
+                    display_spec_ty(&other)
+                )),
+            }
+        }
+        Expr::Fin { base } => {
+            let base_ty = infer_body_expr_types(base, kind, spec_scope, local_tys, inferred)?;
+            match base_ty {
+                InferredExprTy::Known(SpecTy::Mut(inner)) => Ok(InferredExprTy::Known(*inner)),
+                InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
+                InferredExprTy::Known(other) => Err(format!(
+                    "`.fin` requires Mut<T>, found `{}`",
+                    display_spec_ty(&other)
+                )),
+            }
+        }
+        Expr::Unary { op, arg } => {
+            let arg_ty = infer_body_expr_types(arg, kind, spec_scope, local_tys, inferred)?;
+            match op {
+                crate::spec::UnaryOp::Not => {
+                    constrain_expr_ty(inferred, &arg_ty, &SpecTy::Bool)?;
+                    Ok(InferredExprTy::Known(SpecTy::Bool))
+                }
+                crate::spec::UnaryOp::Neg => {
+                    constrain_expr_ty(inferred, &arg_ty, &SpecTy::Int)?;
+                    Ok(InferredExprTy::Known(SpecTy::Int))
+                }
+            }
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let lhs_ty = infer_body_expr_types(lhs, kind, spec_scope, local_tys, inferred)?;
+            let rhs_ty = infer_body_expr_types(rhs, kind, spec_scope, local_tys, inferred)?;
+            match op {
+                crate::spec::BinaryOp::Eq | crate::spec::BinaryOp::Ne => {
+                    unify_expr_tys(inferred, &lhs_ty, &rhs_ty)?;
+                    Ok(InferredExprTy::Known(SpecTy::Bool))
+                }
+                crate::spec::BinaryOp::And | crate::spec::BinaryOp::Or => {
+                    constrain_expr_ty(inferred, &lhs_ty, &SpecTy::Bool)?;
+                    constrain_expr_ty(inferred, &rhs_ty, &SpecTy::Bool)?;
+                    Ok(InferredExprTy::Known(SpecTy::Bool))
+                }
+                crate::spec::BinaryOp::Lt
+                | crate::spec::BinaryOp::Le
+                | crate::spec::BinaryOp::Gt
+                | crate::spec::BinaryOp::Ge => {
+                    constrain_expr_ty(inferred, &lhs_ty, &SpecTy::Int)?;
+                    constrain_expr_ty(inferred, &rhs_ty, &SpecTy::Int)?;
+                    unify_expr_tys(inferred, &lhs_ty, &rhs_ty)?;
+                    Ok(InferredExprTy::Known(SpecTy::Bool))
+                }
+                crate::spec::BinaryOp::Add
+                | crate::spec::BinaryOp::Sub
+                | crate::spec::BinaryOp::Mul => {
+                    constrain_expr_ty(inferred, &lhs_ty, &SpecTy::Int)?;
+                    constrain_expr_ty(inferred, &rhs_ty, &SpecTy::Int)?;
+                    unify_expr_tys(inferred, &lhs_ty, &rhs_ty)?;
+                    Ok(InferredExprTy::Known(SpecTy::Int))
+                }
+            }
+        }
+    }
+}
+
+fn expr_base(base: &Expr) -> &Expr {
+    base
+}
+
+fn local_spec_tys<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    resolved: &ResolvedExprEnv,
+) -> Result<HashMap<String, SpecTy>, String> {
+    let mut types = HashMap::new();
+    for (name, local) in &resolved.locals {
+        let ty = rust_ty_to_spec_ty(tcx, body.local_decls[*local].ty)?;
+        types.insert(name.clone(), ty);
+    }
+    Ok(types)
+}
+
+fn typed_contract_expr(
+    expr: &Expr,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    inferred: &mut SpecTypeInference,
+) -> Result<TypedExpr, String> {
+    match expr {
+        Expr::Bool(value) => Ok(TypedExpr {
+            ty: SpecTy::Bool,
+            kind: TypedExprKind::Bool(*value),
+        }),
+        Expr::Int(value) => Ok(TypedExpr {
+            ty: SpecTy::Int,
+            kind: TypedExprKind::Int(*value),
+        }),
+        Expr::Var(name) => {
+            if spec_scope.visible.contains(name) {
+                let ty = inferred
+                    .resolved_ty(name)
+                    .ok_or_else(|| format!("could not infer a type for `?{name}`"))?;
+                return Ok(TypedExpr {
+                    ty,
+                    kind: TypedExprKind::Var(name.clone()),
+                });
+            }
+            if let Some(ty) = params.get(name) {
+                return Ok(TypedExpr {
+                    ty: ty.clone(),
+                    kind: TypedExprKind::Var(name.clone()),
+                });
+            }
+            if allow_result && name == "result" {
+                return Ok(TypedExpr {
+                    ty: result_ty.clone(),
+                    kind: TypedExprKind::Var(name.clone()),
+                });
+            }
+            if name == "result" {
+                return Err("`result` is only supported in //@ ens predicates".to_owned());
+            }
+            Err(format!("unresolved binding `{name}` in function contract"))
+        }
+        Expr::Bind(name) => {
+            spec_scope
+                .bind(
+                    name,
+                    Span::default(),
+                    None,
+                    if allow_result { "ens" } else { "req" },
+                )
+                .map_err(|err| err.message)?;
+            let ty = inferred
+                .resolved_ty(name)
+                .ok_or_else(|| format!("could not infer a type for `?{name}`"))?;
+            Ok(TypedExpr {
+                ty,
+                kind: TypedExprKind::Bind(name.clone()),
+            })
+        }
+        Expr::TupleField { base, index } => {
+            let base =
+                typed_contract_expr(base, spec_scope, params, allow_result, result_ty, inferred)?;
+            let SpecTy::Tuple(items) = &base.ty else {
+                return Err(format!(
+                    "tuple field access requires a tuple, found `{}`",
+                    display_spec_ty(&base.ty)
+                ));
+            };
+            let Some(field_ty) = items.get(*index) else {
+                return Err(format!("tuple field .{index} is out of bounds"));
+            };
+            Ok(TypedExpr {
+                ty: field_ty.clone(),
+                kind: TypedExprKind::TupleField {
+                    base: Box::new(base),
+                    index: *index,
+                },
+            })
+        }
+        Expr::Deref { base } => {
+            let base =
+                typed_contract_expr(base, spec_scope, params, allow_result, result_ty, inferred)?;
+            match &base.ty {
+                SpecTy::Ref(inner) | SpecTy::Mut(inner) => Ok(TypedExpr {
+                    ty: (**inner).clone(),
+                    kind: TypedExprKind::Deref {
+                        base: Box::new(base),
+                    },
+                }),
+                other => Err(format!(
+                    "dereference requires Ref<T> or Mut<T>, found `{}`",
+                    display_spec_ty(other)
+                )),
+            }
+        }
+        Expr::Fin { base } => {
+            let base =
+                typed_contract_expr(base, spec_scope, params, allow_result, result_ty, inferred)?;
+            match &base.ty {
+                SpecTy::Mut(inner) => Ok(TypedExpr {
+                    ty: (**inner).clone(),
+                    kind: TypedExprKind::Fin {
+                        base: Box::new(base),
+                    },
+                }),
+                other => Err(format!(
+                    "`.fin` requires Mut<T>, found `{}`",
+                    display_spec_ty(other)
+                )),
+            }
+        }
+        Expr::Unary { op, arg } => {
+            let arg =
+                typed_contract_expr(arg, spec_scope, params, allow_result, result_ty, inferred)?;
+            match op {
+                crate::spec::UnaryOp::Not => {
+                    if arg.ty != SpecTy::Bool {
+                        return Err(format!(
+                            "`!` requires `bool`, found `{}`",
+                            display_spec_ty(&arg.ty)
+                        ));
+                    }
+                    Ok(TypedExpr {
+                        ty: SpecTy::Bool,
+                        kind: TypedExprKind::Unary {
+                            op: *op,
+                            arg: Box::new(arg),
+                        },
+                    })
+                }
+                crate::spec::UnaryOp::Neg => {
+                    if arg.ty != SpecTy::Int {
+                        return Err(format!(
+                            "unary `-` requires `int`, found `{}`",
+                            display_spec_ty(&arg.ty)
+                        ));
+                    }
+                    Ok(TypedExpr {
+                        ty: SpecTy::Int,
+                        kind: TypedExprKind::Unary {
+                            op: *op,
+                            arg: Box::new(arg),
+                        },
+                    })
+                }
+            }
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let lhs =
+                typed_contract_expr(lhs, spec_scope, params, allow_result, result_ty, inferred)?;
+            let rhs =
+                typed_contract_expr(rhs, spec_scope, params, allow_result, result_ty, inferred)?;
+            type_binary_expr(*op, lhs, rhs)
+        }
+    }
+}
+
+fn typed_body_expr(
+    expr: &Expr,
+    kind: DirectiveKind,
+    spec_scope: &mut SpecScope,
+    local_tys: &HashMap<String, SpecTy>,
+    inferred: &mut SpecTypeInference,
+) -> Result<TypedExpr, String> {
+    match expr {
+        Expr::Bool(value) => Ok(TypedExpr {
+            ty: SpecTy::Bool,
+            kind: TypedExprKind::Bool(*value),
+        }),
+        Expr::Int(value) => Ok(TypedExpr {
+            ty: SpecTy::Int,
+            kind: TypedExprKind::Int(*value),
+        }),
+        Expr::Var(name) => {
+            if spec_scope.visible.contains(name) {
+                let ty = inferred
+                    .resolved_ty(name)
+                    .ok_or_else(|| format!("could not infer a type for `?{name}`"))?;
+                return Ok(TypedExpr {
+                    ty,
+                    kind: TypedExprKind::Var(name.clone()),
+                });
+            }
+            let ty = local_tys
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("unresolved binding `{name}` in //@ {}", kind.keyword()))?;
+            Ok(TypedExpr {
+                ty,
+                kind: TypedExprKind::Var(name.clone()),
+            })
+        }
+        Expr::Bind(name) => {
+            spec_scope
+                .bind(name, Span::default(), None, kind.keyword())
+                .map_err(|err| err.message)?;
+            let ty = inferred
+                .resolved_ty(name)
+                .ok_or_else(|| format!("could not infer a type for `?{name}`"))?;
+            Ok(TypedExpr {
+                ty,
+                kind: TypedExprKind::Bind(name.clone()),
+            })
+        }
+        Expr::TupleField { base, index } => {
+            let base = typed_body_expr(expr_base(base), kind, spec_scope, local_tys, inferred)?;
+            let SpecTy::Tuple(items) = &base.ty else {
+                return Err(format!(
+                    "tuple field access requires a tuple, found `{}`",
+                    display_spec_ty(&base.ty)
+                ));
+            };
+            let Some(field_ty) = items.get(*index) else {
+                return Err(format!("tuple field .{index} is out of bounds"));
+            };
+            Ok(TypedExpr {
+                ty: field_ty.clone(),
+                kind: TypedExprKind::TupleField {
+                    base: Box::new(base),
+                    index: *index,
+                },
+            })
+        }
+        Expr::Deref { base } => {
+            let base = typed_body_expr(base, kind, spec_scope, local_tys, inferred)?;
+            match &base.ty {
+                SpecTy::Ref(inner) | SpecTy::Mut(inner) => Ok(TypedExpr {
+                    ty: (**inner).clone(),
+                    kind: TypedExprKind::Deref {
+                        base: Box::new(base),
+                    },
+                }),
+                other => Err(format!(
+                    "dereference requires Ref<T> or Mut<T>, found `{}`",
+                    display_spec_ty(other)
+                )),
+            }
+        }
+        Expr::Fin { base } => {
+            let base = typed_body_expr(base, kind, spec_scope, local_tys, inferred)?;
+            match &base.ty {
+                SpecTy::Mut(inner) => Ok(TypedExpr {
+                    ty: (**inner).clone(),
+                    kind: TypedExprKind::Fin {
+                        base: Box::new(base),
+                    },
+                }),
+                other => Err(format!(
+                    "`.fin` requires Mut<T>, found `{}`",
+                    display_spec_ty(other)
+                )),
+            }
+        }
+        Expr::Unary { op, arg } => {
+            let arg = typed_body_expr(arg, kind, spec_scope, local_tys, inferred)?;
+            match op {
+                crate::spec::UnaryOp::Not => {
+                    if arg.ty != SpecTy::Bool {
+                        return Err(format!(
+                            "`!` requires `bool`, found `{}`",
+                            display_spec_ty(&arg.ty)
+                        ));
+                    }
+                    Ok(TypedExpr {
+                        ty: SpecTy::Bool,
+                        kind: TypedExprKind::Unary {
+                            op: *op,
+                            arg: Box::new(arg),
+                        },
+                    })
+                }
+                crate::spec::UnaryOp::Neg => {
+                    if arg.ty != SpecTy::Int {
+                        return Err(format!(
+                            "unary `-` requires `int`, found `{}`",
+                            display_spec_ty(&arg.ty)
+                        ));
+                    }
+                    Ok(TypedExpr {
+                        ty: SpecTy::Int,
+                        kind: TypedExprKind::Unary {
+                            op: *op,
+                            arg: Box::new(arg),
+                        },
+                    })
+                }
+            }
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let lhs = typed_body_expr(lhs, kind, spec_scope, local_tys, inferred)?;
+            let rhs = typed_body_expr(rhs, kind, spec_scope, local_tys, inferred)?;
+            type_binary_expr(*op, lhs, rhs)
+        }
+    }
+}
+
+fn type_binary_expr(
+    op: crate::spec::BinaryOp,
+    lhs: TypedExpr,
+    rhs: TypedExpr,
+) -> Result<TypedExpr, String> {
+    match op {
+        crate::spec::BinaryOp::Eq | crate::spec::BinaryOp::Ne => {
+            let _ = unify_spec_tys(&lhs.ty, &rhs.ty)?;
+            if matches!(lhs.ty, SpecTy::Ref(_) | SpecTy::Mut(_)) {
+                return Err(format!(
+                    "`==` and `!=` are not supported for `{}`",
+                    display_spec_ty(&lhs.ty)
+                ));
+            }
+            Ok(TypedExpr {
+                ty: SpecTy::Bool,
+                kind: TypedExprKind::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+            })
+        }
+        crate::spec::BinaryOp::And | crate::spec::BinaryOp::Or => {
+            if lhs.ty != SpecTy::Bool || rhs.ty != SpecTy::Bool {
+                return Err(format!(
+                    "logical operators require `bool`, found `{}` and `{}`",
+                    display_spec_ty(&lhs.ty),
+                    display_spec_ty(&rhs.ty)
+                ));
+            }
+            Ok(TypedExpr {
+                ty: SpecTy::Bool,
+                kind: TypedExprKind::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+            })
+        }
+        crate::spec::BinaryOp::Lt
+        | crate::spec::BinaryOp::Le
+        | crate::spec::BinaryOp::Gt
+        | crate::spec::BinaryOp::Ge => {
+            if lhs.ty != SpecTy::Int || rhs.ty != SpecTy::Int {
+                return Err(format!(
+                    "comparison requires `int`, found `{}` and `{}`",
+                    display_spec_ty(&lhs.ty),
+                    display_spec_ty(&rhs.ty)
+                ));
+            }
+            Ok(TypedExpr {
+                ty: SpecTy::Bool,
+                kind: TypedExprKind::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+            })
+        }
+        crate::spec::BinaryOp::Add | crate::spec::BinaryOp::Sub | crate::spec::BinaryOp::Mul => {
+            if lhs.ty != SpecTy::Int || rhs.ty != SpecTy::Int {
+                return Err(format!(
+                    "arithmetic requires `int`, found `{}` and `{}`",
+                    display_spec_ty(&lhs.ty),
+                    display_spec_ty(&rhs.ty)
+                ));
+            }
+            Ok(TypedExpr {
+                ty: SpecTy::Int,
+                kind: TypedExprKind::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+            })
+        }
+    }
 }
 
 pub fn compute_directives<'tcx>(
@@ -350,6 +1235,11 @@ pub fn compute_directives<'tcx>(
             display_span: None,
             message: err.message,
         })?;
+    let param_tys: HashMap<_, _> = params
+        .iter()
+        .map(|param| (param.name.clone(), param.spec.ty.clone()))
+        .collect();
+    let result_ty = result.ty.clone();
     if let Some(directive) = req_directive {
         validate_function_contract_expr_prepass(
             directive.span,
@@ -389,25 +1279,200 @@ pub fn compute_directives<'tcx>(
             &mut contract_scope,
         )?;
     }
+    let mut inferred = SpecTypeInference::default();
+    let mut contract_infer_scope = SpecScope::default();
+    if let Some(directive) = req_directive {
+        infer_contract_expr_types(
+            &directive.expr,
+            &mut contract_infer_scope,
+            &param_tys,
+            false,
+            &result_ty,
+            &mut inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span: directive.span,
+            display_span: Some(directive.span_text.clone()),
+            message,
+        })?;
+    }
+    let mut body_infer_scope = contract_infer_scope.clone();
+    for directive in directives.directives.iter().filter(|directive| {
+        matches!(
+            directive.kind,
+            DirectiveKind::Assert | DirectiveKind::Assume | DirectiveKind::Inv
+        )
+    }) {
+        let resolution = resolved_exprs
+            .get(&directive.span_text)
+            .expect("resolved body expression");
+        let local_tys =
+            local_spec_tys(tcx, body, resolution).map_err(|message| LoopPrepassError {
+                span: directive.span,
+                display_span: Some(directive.span_text.clone()),
+                message,
+            })?;
+        infer_body_expr_types(
+            &directive.expr,
+            directive.kind,
+            &mut body_infer_scope,
+            &local_tys,
+            &mut inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span: directive.span,
+            display_span: Some(directive.span_text.clone()),
+            message,
+        })?;
+    }
+    if let Some(directive) = ens_directive {
+        infer_contract_expr_types(
+            &directive.expr,
+            &mut contract_infer_scope,
+            &param_tys,
+            true,
+            &result_ty,
+            &mut inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span: directive.span,
+            display_span: Some(directive.span_text.clone()),
+            message,
+        })?;
+    }
     let def_span = tcx
         .sess
         .source_map()
         .span_to_diagnostic_string(tcx.def_span(def_id.to_def_id()));
+    let typed_req = match req_directive {
+        Some(directive) => {
+            let mut scope = SpecScope::default();
+            Some(
+                typed_contract_expr(
+                    &directive.expr,
+                    &mut scope,
+                    &param_tys,
+                    false,
+                    &result_ty,
+                    &mut inferred,
+                )
+                .map_err(|message| LoopPrepassError {
+                    span: directive.span,
+                    display_span: Some(directive.span_text.clone()),
+                    message,
+                })?,
+            )
+        }
+        None => None,
+    };
+    let mut typed_body_exprs = HashMap::new();
+    let mut body_type_scope = if req_directive.is_some() {
+        let mut scope = SpecScope::default();
+        if let Some(directive) = req_directive {
+            let _ = typed_contract_expr(
+                &directive.expr,
+                &mut scope,
+                &param_tys,
+                false,
+                &result_ty,
+                &mut inferred,
+            )
+            .map_err(|message| LoopPrepassError {
+                span: directive.span,
+                display_span: Some(directive.span_text.clone()),
+                message,
+            })?;
+        }
+        scope
+    } else {
+        SpecScope::default()
+    };
+    for directive in directives.directives.iter().filter(|directive| {
+        matches!(
+            directive.kind,
+            DirectiveKind::Assert | DirectiveKind::Assume | DirectiveKind::Inv
+        )
+    }) {
+        let resolution = resolved_exprs
+            .get(&directive.span_text)
+            .expect("resolved body expression");
+        let local_tys =
+            local_spec_tys(tcx, body, resolution).map_err(|message| LoopPrepassError {
+                span: directive.span,
+                display_span: Some(directive.span_text.clone()),
+                message,
+            })?;
+        let typed = typed_body_expr(
+            &directive.expr,
+            directive.kind,
+            &mut body_type_scope,
+            &local_tys,
+            &mut inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span: directive.span,
+            display_span: Some(directive.span_text.clone()),
+            message,
+        })?;
+        typed_body_exprs.insert(directive.span_text.clone(), typed);
+    }
+    let typed_ens = match ens_directive {
+        Some(directive) => {
+            let mut scope = SpecScope::default();
+            if let Some(req) = req_directive {
+                let _ = typed_contract_expr(
+                    &req.expr,
+                    &mut scope,
+                    &param_tys,
+                    false,
+                    &result_ty,
+                    &mut inferred,
+                )
+                .map_err(|message| LoopPrepassError {
+                    span: req.span,
+                    display_span: Some(req.span_text.clone()),
+                    message,
+                })?;
+            }
+            Some(
+                typed_contract_expr(
+                    &directive.expr,
+                    &mut scope,
+                    &param_tys,
+                    true,
+                    &result_ty,
+                    &mut inferred,
+                )
+                .map_err(|message| LoopPrepassError {
+                    span: directive.span,
+                    display_span: Some(directive.span_text.clone()),
+                    message,
+                })?,
+            )
+        }
+        None => None,
+    };
     let function_contract = match (req_directive, ens_directive) {
         (None, None) => Some(FunctionContract {
             params: params.clone(),
-            req: Expr::Bool(true),
+            req: TypedExpr {
+                ty: SpecTy::Bool,
+                kind: TypedExprKind::Bool(true),
+            },
             req_span: def_span.clone(),
-            ens: Expr::Bool(true),
+            ens: TypedExpr {
+                ty: SpecTy::Bool,
+                kind: TypedExprKind::Bool(true),
+            },
             ens_span: def_span,
             spec_vars: contract_scope.ordered.clone(),
             result,
         }),
         (Some(req), Some(ens)) => Some(FunctionContract {
             params: params.clone(),
-            req: req.expr.clone(),
+            req: typed_req.expect("typed req"),
             req_span: req.span_text.clone(),
-            ens: ens.expr.clone(),
+            ens: typed_ens.expect("typed ens"),
             ens_span: ens.span_text.clone(),
             spec_vars: contract_scope.ordered.clone(),
             result,
@@ -421,7 +1486,8 @@ pub fn compute_directives<'tcx>(
             });
         }
     };
-    let loop_contracts = collect_loop_contracts(tcx, body, &directives, &resolved_exprs)?;
+    let loop_contracts =
+        collect_loop_contracts(tcx, body, &directives, &resolved_exprs, &typed_body_exprs)?;
     let mut assertion_contracts = AssertionContracts::empty();
     let mut assumption_contracts = AssumptionContracts::empty();
     let mut lowered = Vec::with_capacity(directives.directives.len());
@@ -463,7 +1529,10 @@ pub fn compute_directives<'tcx>(
                     .insert(
                         control,
                         AssertionContract {
-                            assertion: directive.expr.clone(),
+                            assertion: typed_body_exprs
+                                .get(&directive.span_text)
+                                .cloned()
+                                .expect("typed assertion expression"),
                             resolution,
                             assertion_span: directive.span_text.clone(),
                         },
@@ -506,7 +1575,10 @@ pub fn compute_directives<'tcx>(
                     .insert(
                         control,
                         AssumptionContract {
-                            assumption: directive.expr.clone(),
+                            assumption: typed_body_exprs
+                                .get(&directive.span_text)
+                                .cloned()
+                                .expect("typed assumption expression"),
                             resolution,
                         },
                     )
@@ -567,19 +1639,6 @@ fn directive_error_to_prepass(err: DirectiveError) -> LoopPrepassError {
     }
 }
 
-fn directive_error_to_verification_result(
-    tcx: TyCtxt<'_>,
-    def_id: LocalDefId,
-    err: DirectiveError,
-) -> VerificationResult {
-    VerificationResult {
-        function: tcx.def_path_str(def_id.to_def_id()),
-        status: VerificationStatus::Unsupported,
-        span: tcx.sess.source_map().span_to_diagnostic_string(err.span),
-        message: err.message,
-    }
-}
-
 pub fn collect_hir_binding_info<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
@@ -634,6 +1693,7 @@ fn collect_loop_contracts<'tcx>(
     body: &Body<'tcx>,
     directives: &CollectedFunctionDirectives,
     resolved_exprs: &HashMap<String, ResolvedExprEnv>,
+    typed_exprs: &HashMap<String, TypedExpr>,
 ) -> Result<LoopContracts, LoopPrepassError> {
     let preds = body.basic_blocks.predecessors();
     let doms = body.basic_blocks.dominators();
@@ -658,7 +1718,10 @@ fn collect_loop_contracts<'tcx>(
                         header,
                         hir_loop_id: HirId::INVALID,
                         invariant_block: header,
-                        invariant: Expr::Bool(true),
+                        invariant: TypedExpr {
+                            ty: SpecTy::Bool,
+                            kind: TypedExprKind::Bool(true),
+                        },
                         resolution: ResolvedExprEnv::default(),
                         invariant_span: tcx.sess.source_map().span_to_diagnostic_string(
                             body.basic_blocks[header].terminator().source_info.span,
@@ -722,7 +1785,10 @@ fn collect_loop_contracts<'tcx>(
         let loop_contract = loops.get_mut(&header).expect("loop info present");
         loop_contract.hir_loop_id = loop_expr_id;
         loop_contract.invariant_block = invariant_block;
-        loop_contract.invariant = directive.expr.clone();
+        loop_contract.invariant = typed_exprs
+            .get(&directive.span_text)
+            .cloned()
+            .expect("typed invariant expression");
         loop_contract.resolution = resolution;
         loop_contract.invariant_span = directive.span_text.clone();
     }
@@ -751,7 +1817,7 @@ fn collect_loop_contracts<'tcx>(
     })
 }
 
-fn build_function_contract<'tcx>(
+fn build_contract_only<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     directives: &[FunctionDirective],
@@ -766,9 +1832,14 @@ fn build_function_contract<'tcx>(
     };
     let (params, result) =
         function_contract_signature_with_names(tcx, def_id, param_names.clone())?;
+    let param_tys: HashMap<_, _> = params
+        .iter()
+        .map(|param| (param.name.clone(), param.spec.ty.clone()))
+        .collect();
+    let result_ty = result.ty.clone();
     let mut req = None;
     let mut ens = None;
-    let mut spec_scope = SpecScope::default();
+    let mut validate_scope = SpecScope::default();
     for directive in directives {
         match directive.kind {
             DirectiveKind::Req => {
@@ -780,16 +1851,16 @@ fn build_function_contract<'tcx>(
                         "multiple //@ req directives for a function".to_owned(),
                     ));
                 }
-                validate_function_contract_expr(
-                    tcx,
-                    def_id,
+                validate_contract_expr_core(
                     &directive.expr,
-                    &directive.span_text,
+                    &mut validate_scope,
                     &param_names,
                     false,
-                    &mut spec_scope,
-                )?;
-                req = Some((directive.expr.clone(), directive.span_text.clone()));
+                )
+                .map_err(|message| {
+                    function_contract_error(tcx, def_id, &directive.span_text, message)
+                })?;
+                req = Some(directive);
             }
             DirectiveKind::Ens => {
                 if ens.is_some() {
@@ -800,16 +1871,16 @@ fn build_function_contract<'tcx>(
                         "multiple //@ ens directives for a function".to_owned(),
                     ));
                 }
-                validate_function_contract_expr(
-                    tcx,
-                    def_id,
+                validate_contract_expr_core(
                     &directive.expr,
-                    &directive.span_text,
+                    &mut validate_scope,
                     &param_names,
                     true,
-                    &mut spec_scope,
-                )?;
-                ens = Some((directive.expr.clone(), directive.span_text.clone()));
+                )
+                .map_err(|message| {
+                    function_contract_error(tcx, def_id, &directive.span_text, message)
+                })?;
+                ens = Some(directive);
             }
             _ => {}
         }
@@ -821,44 +1892,77 @@ fn build_function_contract<'tcx>(
     match (req, ens) {
         (None, None) => Ok(FunctionContract {
             params,
-            req: Expr::Bool(true),
+            req: TypedExpr {
+                ty: SpecTy::Bool,
+                kind: TypedExprKind::Bool(true),
+            },
             req_span: def_span.clone(),
-            ens: Expr::Bool(true),
+            ens: TypedExpr {
+                ty: SpecTy::Bool,
+                kind: TypedExprKind::Bool(true),
+            },
             ens_span: def_span,
-            spec_vars: spec_scope.ordered,
+            spec_vars: validate_scope.ordered,
             result,
         }),
-        (Some((req, req_span)), Some((ens, ens_span))) => Ok(FunctionContract {
-            params,
-            req,
-            req_span,
-            ens,
-            ens_span,
-            spec_vars: spec_scope.ordered,
-            result,
-        }),
+        (Some(req), Some(ens)) => {
+            let mut inferred = SpecTypeInference::default();
+            let mut infer_scope = SpecScope::default();
+            infer_contract_expr_types(
+                &req.expr,
+                &mut infer_scope,
+                &param_tys,
+                false,
+                &result_ty,
+                &mut inferred,
+            )
+            .map_err(|message| function_contract_error(tcx, def_id, &req.span_text, message))?;
+            infer_contract_expr_types(
+                &ens.expr,
+                &mut infer_scope,
+                &param_tys,
+                true,
+                &result_ty,
+                &mut inferred,
+            )
+            .map_err(|message| function_contract_error(tcx, def_id, &ens.span_text, message))?;
+
+            let mut req_scope = SpecScope::default();
+            let typed_req = typed_contract_expr(
+                &req.expr,
+                &mut req_scope,
+                &param_tys,
+                false,
+                &result_ty,
+                &mut inferred,
+            )
+            .map_err(|message| function_contract_error(tcx, def_id, &req.span_text, message))?;
+            let typed_ens = typed_contract_expr(
+                &ens.expr,
+                &mut req_scope,
+                &param_tys,
+                true,
+                &result_ty,
+                &mut inferred,
+            )
+            .map_err(|message| function_contract_error(tcx, def_id, &ens.span_text, message))?;
+            Ok(FunctionContract {
+                params,
+                req: typed_req,
+                req_span: req.span_text.clone(),
+                ens: typed_ens,
+                ens_span: ens.span_text.clone(),
+                spec_vars: validate_scope.ordered,
+                result,
+            })
+        }
         _ => Err(function_contract_error(
             tcx,
             def_id,
-            &tcx.sess
-                .source_map()
-                .span_to_diagnostic_string(tcx.def_span(def_id.to_def_id())),
+            &def_span,
             "function contract requires exactly one //@ req and one //@ ens".to_owned(),
         )),
     }
-}
-
-fn validate_function_contract_expr<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-    expr: &Expr,
-    span: &str,
-    params: &[String],
-    allow_result: bool,
-    spec_scope: &mut SpecScope,
-) -> Result<(), VerificationResult> {
-    validate_contract_expr_core(expr, spec_scope, params, allow_result)
-        .map_err(|message| function_contract_error(tcx, def_id, span, message))
 }
 
 fn validate_function_contract_expr_prepass(
@@ -906,16 +2010,7 @@ fn validate_contract_expr_core(
                 if allow_result { "ens" } else { "req" },
             )
             .map_err(|err| err.message),
-        Expr::Prophecy(name) => {
-            if params.iter().any(|param| param == name) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "unresolved prophecy binding `{name}` in function contract"
-                ))
-            }
-        }
-        Expr::Field { base, .. } => {
+        Expr::TupleField { base, .. } | Expr::Deref { base } | Expr::Fin { base } => {
             validate_contract_expr_core(base, spec_scope, params, allow_result)
         }
         Expr::Unary { arg, .. } => {
@@ -987,27 +2082,9 @@ fn resolve_expr_env_into(
             resolved.spec_vars.insert(name.clone());
             Ok(())
         }
-        Expr::Prophecy(name) => {
-            let symbol = Symbol::intern(name);
-            let Some(hir_id) = resolve_binding_hir_id(ctx.binding_info, symbol, ctx.anchor_span)
-            else {
-                return Err(LoopPrepassError {
-                    span: ctx.span,
-                    display_span: None,
-                    message: format!("unresolved binding `{name}` in //@ {}", ctx.kind.keyword()),
-                });
-            };
-            let Some(local) = ctx.hir_locals.get(&hir_id).copied() else {
-                return Err(LoopPrepassError {
-                    span: ctx.anchor_span,
-                    display_span: None,
-                    message: format!("missing MIR local for HIR id {:?}", hir_id),
-                });
-            };
-            resolved.prophecies.insert(name.clone(), local);
-            Ok(())
+        Expr::TupleField { base, .. } | Expr::Deref { base } | Expr::Fin { base } => {
+            resolve_expr_env_into(base, ctx, resolved)
         }
-        Expr::Field { base, .. } => resolve_expr_env_into(base, ctx, resolved),
         Expr::Unary { arg, .. } => resolve_expr_env_into(arg, ctx, resolved),
         Expr::Binary { lhs, rhs, .. } => {
             resolve_expr_env_into(lhs, ctx, resolved)?;
@@ -1213,17 +2290,42 @@ fn function_contract_signature_with_names<'tcx>(
     let params = names
         .into_iter()
         .zip(inputs.iter().copied())
-        .map(|(name, ty)| ContractParam {
-            name,
-            spec: contract_value_spec(ty),
+        .map(|(name, ty)| {
+            contract_value_spec(tcx, ty)
+                .map(|spec| ContractParam { name, spec })
+                .map_err(|message| {
+                    function_contract_error(
+                        tcx,
+                        def_id,
+                        &tcx.sess
+                            .source_map()
+                            .span_to_diagnostic_string(tcx.def_span(def_id.to_def_id())),
+                        message,
+                    )
+                })
         })
-        .collect();
-    Ok((params, contract_value_spec(sig.output().skip_binder())))
+        .collect::<Result<Vec<_>, VerificationResult>>()?;
+    let result = contract_value_spec(tcx, sig.output().skip_binder()).map_err(|message| {
+        function_contract_error(
+            tcx,
+            def_id,
+            &tcx.sess
+                .source_map()
+                .span_to_diagnostic_string(tcx.def_span(def_id.to_def_id())),
+            message,
+        )
+    })?;
+    Ok((params, result))
 }
 
-fn contract_value_spec<'tcx>(ty: Ty<'tcx>) -> ContractValueSpec {
-    match ty.kind() {
+pub fn contract_value_spec<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+) -> Result<ContractValueSpec, String> {
+    let spec_ty = rust_ty_to_spec_ty(tcx, ty)?;
+    Ok(match ty.kind() {
         TyKind::Ref(_, inner, mutability) => ContractValueSpec {
+            ty: spec_ty,
             invariant: type_invariant_kind(*inner),
             origin: if mutability.is_mut() {
                 ContractValueOrigin::Current
@@ -1232,10 +2334,11 @@ fn contract_value_spec<'tcx>(ty: Ty<'tcx>) -> ContractValueSpec {
             },
         },
         _ => ContractValueSpec {
+            ty: spec_ty,
             invariant: type_invariant_kind(ty),
             origin: ContractValueOrigin::Direct,
         },
-    }
+    })
 }
 
 fn type_invariant_kind<'tcx>(ty: Ty<'tcx>) -> AutoInvariantKind {
