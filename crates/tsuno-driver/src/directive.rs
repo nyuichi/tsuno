@@ -69,7 +69,7 @@ pub fn collect_function_directives<'tcx>(
     item_span: Span,
 ) -> Result<CollectedFunctionDirectives, DirectiveError> {
     let body = tcx.hir_body_owned_by(def_id);
-    let mut directives = collect_contract_directives(tcx, def_id, item_span)?;
+    let mut directives = collect_contract_directives(tcx, def_id, item_span, body.value.span)?;
     let mut collector = FunctionDirectiveCollector {
         tcx,
         directives: Vec::new(),
@@ -88,17 +88,32 @@ fn collect_contract_directives<'tcx>(
     tcx: TyCtxt<'tcx>,
     _def_id: LocalDefId,
     item_span: Span,
+    body_span: Span,
 ) -> Result<Vec<FunctionDirective>, DirectiveError> {
     let loc = tcx.sess.source_map().lookup_char_pos(item_span.lo());
     let Some(source) = loc.file.src.as_deref() else {
         return Ok(Vec::new());
     };
-    let Some(lines) = function_contract_lines_before_item(source, loc.line) else {
+    if let Some(lines) = function_contract_lines_before_item(source, loc.line)
+        && lines
+            .iter()
+            .any(|line| line.starts_with("//@ req") || line.starts_with("//@ ens"))
+    {
+        return Err(DirectiveError {
+            span: item_span,
+            message:
+                "function contract directives must be placed immediately before the function body"
+                    .to_owned(),
+        });
+    }
+
+    let body_line = tcx.sess.source_map().lookup_char_pos(body_span.lo()).line;
+    let Some(lines) = function_contract_lines_before_body(source, body_line) else {
         return Ok(Vec::new());
     };
 
     let file_name = loc.file.name.prefer_local().to_string();
-    let block_start_line = loc.line - lines.len();
+    let block_start_line = body_line - lines.len();
     let mut directives = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         let line_no = block_start_line + index;
@@ -150,12 +165,23 @@ pub(crate) fn function_contract_lines_before_item(
     source: &str,
     item_line: usize,
 ) -> Option<Vec<String>> {
-    if item_line <= 1 {
+    function_contract_lines_before_line(source, item_line)
+}
+
+pub(crate) fn function_contract_lines_before_body(
+    source: &str,
+    body_line: usize,
+) -> Option<Vec<String>> {
+    function_contract_lines_before_line(source, body_line)
+}
+
+fn function_contract_lines_before_line(source: &str, line_no: usize) -> Option<Vec<String>> {
+    if line_no <= 1 {
         return None;
     }
 
     let lines: Vec<_> = source.lines().collect();
-    let mut idx = item_line.saturating_sub(2);
+    let mut idx = line_no.saturating_sub(2);
     let mut block = Vec::new();
     while let Some(line) = lines.get(idx) {
         let trimmed = line.trim();
@@ -624,7 +650,21 @@ fn spec_directive_line<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::function_contract_lines_before_item;
+    use super::{function_contract_lines_before_body, function_contract_lines_before_item};
+
+    #[test]
+    fn collects_function_contract_lines_before_body() {
+        let source =
+            "fn callee() -> i32\n//@ req \"true\"\n//@ ens \"{result} == 3\"\n{\n    2\n}\n";
+        let lines = function_contract_lines_before_body(source, 4).unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "//@ req \"true\"".to_owned(),
+                "//@ ens \"{result} == 3\"".to_owned()
+            ]
+        );
+    }
 
     #[test]
     fn collects_function_contract_lines_before_item() {

@@ -1,6 +1,7 @@
+fn rejects_body_spec_var_in_ens(x: i32) -> i32
 //@ req "?X == x"
 //@ ens "result == X + Y"
-fn rejects_body_spec_var_in_ens(x: i32) -> i32 {
+{
     //@ assert "X == x"
     let pair = (x, 1);
     //@ assert "?Y == {pair}.1"

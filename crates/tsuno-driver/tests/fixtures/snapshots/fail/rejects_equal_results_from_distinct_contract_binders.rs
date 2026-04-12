@@ -1,6 +1,7 @@
+fn id(x: i32) -> i32
 //@ req "true"
 //@ ens "?R == result && result == x"
-fn id(x: i32) -> i32 {
+{
     x
 }
 
