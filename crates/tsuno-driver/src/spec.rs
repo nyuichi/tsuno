@@ -124,6 +124,7 @@ pub enum SpecTy {
     U32,
     U64,
     Usize,
+    List(Box<SpecTy>),
     Tuple(Vec<SpecTy>),
     Ref(Box<SpecTy>),
     Mut(Box<SpecTy>),

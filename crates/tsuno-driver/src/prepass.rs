@@ -12,6 +12,7 @@ use rustc_hir::{HirId, ItemKind, Pat, PatKind};
 use rustc_middle::mir::{BasicBlock, Body, Local, PlaceElem, StatementKind, TerminatorKind};
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::def_id::LocalDefId;
+use rustc_span::symbol::sym;
 use rustc_span::{Span, Symbol};
 
 #[derive(Debug, Clone, Default)]
@@ -403,6 +404,9 @@ fn unify_spec_tys(lhs: &SpecTy, rhs: &SpecTy) -> Result<SpecTy, String> {
         (SpecTy::Mut(lhs), SpecTy::Mut(rhs)) => {
             Ok(SpecTy::Mut(Box::new(unify_spec_tys(lhs, rhs)?)))
         }
+        (SpecTy::List(lhs), SpecTy::List(rhs)) => {
+            Ok(SpecTy::List(Box::new(unify_spec_tys(lhs, rhs)?)))
+        }
         (SpecTy::Tuple(lhs), SpecTy::Tuple(rhs)) if lhs.len() == rhs.len() => {
             let mut items = Vec::with_capacity(lhs.len());
             for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
@@ -432,6 +436,7 @@ fn display_spec_ty(ty: &SpecTy) -> String {
         SpecTy::U32 => "u32".to_owned(),
         SpecTy::U64 => "u64".to_owned(),
         SpecTy::Usize => "usize".to_owned(),
+        SpecTy::List(inner) => format!("List<{}>", display_spec_ty(inner)),
         SpecTy::Ref(inner) => format!("Ref<{}>", display_spec_ty(inner)),
         SpecTy::Mut(inner) => format!("Mut<{}>", display_spec_ty(inner)),
         SpecTy::Tuple(items) => format!(
@@ -470,8 +475,21 @@ fn is_fully_inferred_spec_ty(ty: &SpecTy) -> bool {
     match ty {
         SpecTy::IntLiteral => false,
         SpecTy::Tuple(items) => items.iter().all(is_fully_inferred_spec_ty),
-        SpecTy::Ref(inner) | SpecTy::Mut(inner) => is_fully_inferred_spec_ty(inner),
+        SpecTy::List(inner) | SpecTy::Ref(inner) | SpecTy::Mut(inner) => {
+            is_fully_inferred_spec_ty(inner)
+        }
         _ => true,
+    }
+}
+
+fn is_vec_adt<'tcx>(tcx: TyCtxt<'tcx>, adt_def: ty::AdtDef<'tcx>) -> bool {
+    tcx.is_diagnostic_item(sym::Vec, adt_def.did())
+}
+
+pub(crate) fn vec_element_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
+    match ty.kind() {
+        TyKind::Adt(adt_def, args) if is_vec_adt(tcx, *adt_def) => Some(args.type_at(0)),
+        _ => None,
     }
 }
 
@@ -576,12 +594,19 @@ pub fn spec_ty_for_rust_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<Spec
             }
             Ok(SpecTy::Tuple(items))
         }
-        TyKind::Adt(adt_def, args) if adt_def.is_struct() => {
-            let mut items = Vec::new();
-            for field in adt_def.non_enum_variant().fields.iter() {
-                items.push(spec_ty_for_rust_ty(tcx, field.ty(tcx, args))?);
+        TyKind::Adt(adt_def, args) => {
+            if let Some(elem_ty) = vec_element_ty(tcx, ty) {
+                let inner = spec_ty_for_rust_ty(tcx, elem_ty)?;
+                Ok(SpecTy::List(Box::new(inner)))
+            } else if adt_def.is_struct() {
+                let mut items = Vec::new();
+                for field in adt_def.non_enum_variant().fields.iter() {
+                    items.push(spec_ty_for_rust_ty(tcx, field.ty(tcx, args))?);
+                }
+                Ok(SpecTy::Tuple(items))
+            } else {
+                Err(format!("unsupported type {ty:?}"))
             }
-            Ok(SpecTy::Tuple(items))
         }
         other => Err(format!("unsupported type {other:?}")),
     }
