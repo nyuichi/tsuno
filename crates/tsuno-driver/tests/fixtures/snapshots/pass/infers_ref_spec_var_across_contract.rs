@@ -1,6 +1,7 @@
+fn read_ref(x: &i32) -> i32
 //@ req "?V == *{x}"
 //@ ens "V == result"
-fn read_ref(x: &i32) -> i32 {
+{
     *x
 }
 

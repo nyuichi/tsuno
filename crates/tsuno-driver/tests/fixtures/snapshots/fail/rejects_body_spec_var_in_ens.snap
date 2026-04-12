@@ -1,14 +1,15 @@
 ---
 source: crates/tsuno-driver/tests/snapshot_tests.rs
+assertion_line: 85
 expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
 UNSUPPORTED rejects_body_spec_var_in_ens
   unresolved binding `Y` in function contract
-  src/main.rs:2:1: 2:26
+  src/main.rs:3:1: 3:26
 UNSUPPORTED main
   callee `rejects_body_spec_var_in_ens` has invalid contract: unresolved binding `Y` in function contract
-  src/main.rs:2:1: 2:26
+  src/main.rs:3:1: 3:26
 
 stderr:

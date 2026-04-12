@@ -1,5 +1,6 @@
 ---
 source: crates/tsuno-driver/tests/snapshot_tests.rs
+assertion_line: 85
 expression: snapshot_output(output)
 ---
 status: Some(1)
@@ -8,7 +9,7 @@ PASS id
   all assertions discharged
 FAIL rejects_equal_results_from_distinct_contract_binders
   assertion failed
-  src/main.rs:10:5: 10:32
+  src/main.rs:11:5: 11:32
 PASS main
   all assertions discharged
 

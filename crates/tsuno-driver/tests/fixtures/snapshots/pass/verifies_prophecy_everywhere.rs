@@ -12,9 +12,10 @@ fn mut_ref_model_everywhere(mut x: i32) {
     let _sink = helper(s);
 }
 
+fn helper(x: &mut i32) -> i32
 //@ req "*{x} == *{x} && {x}.fin == {x}.fin"
 //@ ens "*{x} == *{x} && {x}.fin == {x}.fin"
-fn helper(x: &mut i32) -> i32 {
+{
     *x
 }
 
