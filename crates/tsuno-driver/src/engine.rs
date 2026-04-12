@@ -1,5 +1,20 @@
 #![allow(clippy::result_large_err)]
 
+// Supported Rust types are reflected into the spec language and encoded in Z3 as follows:
+//
+// | Rust type                                | spec type           | Z3 representation                          | invariant |
+// | ---------------------------------------- | ------------------- | ------------------------------------------ | --------- |
+// | `bool`                                   | `bool`              | `value.bool(b)`                            | none |
+// | `i8`, `i16`, `i32`, `i64`, `isize`       | same as Rust        | `value.int(i)`                             | `MIN <= i <= MAX` for the Rust width |
+// | `u8`, `u16`, `u32`, `u64`, `usize`       | same as Rust        | `value.int(i)`                             | `0 <= i <= MAX` for the Rust width |
+// | `&T`                                     | `Ref<T>`            | same encoding as `T`                       | same invariant as `T` |
+// | `&mut T`                                 | `Mut<T>`            | `value.cons(current, value.cons(final, nil))` | invariant checked on `current` only |
+// | `(T0, .., Tn)`                           | `Tuple([T0, .., Tn])` | `value.cons(v0, .. value.cons(vn, nil))` | conjunction of each field invariant |
+// | `struct S { f0: T0, .., fn: Tn }`        | `Tuple([T0, .., Tn])` | same list encoding as tuples, in field order | conjunction of each field invariant |
+//
+// Notes:
+// - Nested references are rejected before encoding, and structs with `Drop` are unsupported.
+
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::str::FromStr;
