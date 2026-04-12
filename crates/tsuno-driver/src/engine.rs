@@ -9,11 +9,12 @@
 // | `u8`, `u16`, `u32`, `u64`, `usize`       | same as Rust        | `value.int(i)`                             | `0 <= i <= MAX` for the Rust width |
 // | `&T`                                     | `Ref<T>`            | same encoding as `T`                       | same invariant as `T` |
 // | `&mut T`                                 | `Mut<T>`            | `value.cons(current, value.cons(final, nil))` | invariant checked on `current` only |
+// | `Vec<T>`                                 | `List<T>`           | symbolic `value`, constrained by recursive list predicates | list shape plus element invariant when required |
 // | `(T0, .., Tn)`                           | `Tuple([T0, .., Tn])` | `value.cons(v0, .. value.cons(vn, nil))` | conjunction of each field invariant |
 // | `struct S { f0: T0, .., fn: Tn }`        | `Tuple([T0, .., Tn])` | same list encoding as tuples, in field order | conjunction of each field invariant |
 //
 // Notes:
-// - Nested references are rejected before encoding, and structs with `Drop` are unsupported.
+// - Structs with `Drop` are unsupported.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -36,7 +37,7 @@ use z3::{
 use crate::prepass::{
     AssertionContracts, AssumptionContracts, ContractParam, FunctionContract,
     FunctionContractEntry, LoopContract, LoopContracts, ResolvedExprEnv, compute_directives,
-    spec_ty_for_rust_ty,
+    spec_ty_for_rust_ty, vec_element_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{BinaryOp, SpecTy, TypedExpr, TypedExprKind, UnaryOp};
@@ -323,6 +324,28 @@ impl ValueEncoding {
 
     fn pair_second(&self, value: &Datatype) -> Datatype {
         self.nth(value, 1)
+    }
+
+    fn define_list_bool_rec<E>(
+        &self,
+        func_name: &str,
+        arg_name: &str,
+        value: &Datatype,
+        cons_case: impl FnOnce(&Datatype, Bool) -> Result<Bool, E>,
+    ) -> Result<Bool, E> {
+        let value_sort = self.sort.sort.clone();
+        let func = RecFuncDecl::new(func_name, &[&value_sort], &z3::Sort::bool());
+        let arg = Datatype::new_const(arg_name, &value_sort);
+        let head = self.car(&arg);
+        let tail = self.cdr(&arg);
+        let tail_formula = func.apply(&[&tail]).as_bool().unwrap();
+        let cons_body = cons_case(&head, tail_formula)?;
+        let body = self.is_nil(&arg).ite(
+            &Bool::from_bool(true),
+            &self.is_cons(&arg).ite(&cons_body, &Bool::from_bool(false)),
+        );
+        func.add_def(&[&arg], &body);
+        Ok(func.apply(&[value]).as_bool().unwrap())
     }
 
     fn define_functions(&self) {
@@ -774,6 +797,25 @@ impl<'tcx> Verifier<'tcx> {
                 )?;
                 self.goto_target(state, *target, term.source_info.span)
             }
+            TerminatorKind::Drop { place, target, .. } => {
+                if place.projection.is_empty() {
+                    if self.is_immediate_return_block(*target) {
+                        self.resolve_local(&mut state, place.local, term.source_info.span)?;
+                    } else {
+                        self.resolve_and_remove_local(
+                            &mut state,
+                            place.local,
+                            term.source_info.span,
+                        )?;
+                    }
+                    self.goto_target(state, *target, term.source_info.span)
+                } else {
+                    Err(self.unsupported_result(
+                        term.source_info.span,
+                        format!("unsupported MIR terminator {:?}", term.kind),
+                    ))
+                }
+            }
             TerminatorKind::Call {
                 func,
                 args,
@@ -1070,45 +1112,49 @@ impl<'tcx> Verifier<'tcx> {
         let Some(value) = state.model.remove(&local) else {
             return Ok(());
         };
+        self.require_resolve_formula(state, local, &value, span)
+    }
+
+    fn resolve_local(
+        &self,
+        state: &mut State,
+        local: Local,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        let Some(value) = state.model.get(&local).cloned() else {
+            return Ok(());
+        };
+        self.require_resolve_formula(state, local, &value, span)
+    }
+
+    fn require_resolve_formula(
+        &self,
+        state: &mut State,
+        local: Local,
+        value: &Datatype,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
         let ty = self.body.local_decls[local].ty;
-        let formulas = self.resolve_formulas(ty, &value, span)?;
-        for formula in formulas {
-            let formula = self.bool_expr_to_z3(&formula)?;
-            self.require_constraint(
-                state,
-                formula,
-                span,
-                span_text(self.tcx, span),
-                "mutable reference close failed".to_owned(),
-            )?;
-        }
+        let formula = self.resolve_formula(ty, value, span)?;
+        self.require_constraint(
+            state,
+            formula,
+            span,
+            span_text(self.tcx, span),
+            "mutable reference close failed".to_owned(),
+        )?;
         Ok(())
     }
 
-    fn resolve_formulas(
+    fn resolve_formula(
         &self,
         ty: Ty<'tcx>,
         value: &Datatype,
         span: Span,
-    ) -> Result<Vec<BoolExpr>, VerificationResult> {
-        if let Some(fields) = self.composite_field_tys(ty) {
-            let mut formulas = Vec::new();
-            for (index, field_ty) in fields.into_iter().enumerate() {
-                let field_value = self.project_field(value.clone(), index, span)?;
-                formulas.extend(self.resolve_formulas(field_ty, &field_value, span)?);
-            }
-            return Ok(formulas);
-        }
-        match ty.kind() {
-            TyKind::Ref(_, _inner, mutability) if mutability.is_mut() => {
-                let cur = self.value_pair_first(value);
-                let fin = self.value_pair_second(value);
-                Ok(vec![BoolExpr::Value(self.value_eqv(&cur, &fin))])
-            }
-            TyKind::Ref(_, _, _) => Ok(Vec::new()),
-            TyKind::Bool | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Never => Ok(Vec::new()),
-            other => Err(self.unsupported_result(span, format!("unsupported type {other:?}"))),
-        }
+    ) -> Result<Bool, VerificationResult> {
+        let spec_ty =
+            spec_ty_for_rust_ty(self.tcx, ty).map_err(|err| self.unsupported_result(span, err))?;
+        self.resolve_formula_for_spec_ty(&spec_ty, value, span)
     }
 
     fn eval_rvalue(
@@ -1628,6 +1674,7 @@ impl<'tcx> Verifier<'tcx> {
                 let fresh = self.fresh_for_rust_ty(*inner, "dangle")?;
                 Ok(self.value_list(&[fresh, self.value_pair_second(value)]))
             }
+            _ if vec_element_ty(self.tcx, ty).is_some() => self.fresh_for_rust_ty(ty, "dangle"),
             TyKind::Ref(_, _, _) => Ok(value.clone()),
             TyKind::Bool | TyKind::Int(_) | TyKind::Uint(_) => Ok(value.clone()),
             other => {
@@ -1949,6 +1996,11 @@ impl<'tcx> Verifier<'tcx> {
         target == loop_contract.header && loop_contract.body_blocks.contains(&source)
     }
 
+    fn is_immediate_return_block(&self, block: BasicBlock) -> bool {
+        let data = &self.body.basic_blocks[block];
+        data.statements.is_empty() && matches!(data.terminator().kind, TerminatorKind::Return)
+    }
+
     fn loop_marker(&self, header: BasicBlock) -> Bool {
         Bool::new_const(format!("loop_{}", header.index()))
     }
@@ -2140,22 +2192,10 @@ impl<'tcx> Verifier<'tcx> {
         if let TyKind::Ref(_, inner, mutability) = ty.kind()
             && mutability.is_mut()
         {
-            if self.ty_contains_ref(*inner) {
-                return Err(self.unsupported_result(
-                    self.tcx.def_span(self.def_id),
-                    "nested reference types are unsupported".to_owned(),
-                ));
-            }
             let current = self.fresh_for_rust_ty(*inner, &format!("{hint}_cur"))?;
             let final_value = self.fresh_for_rust_ty(*inner, &format!("{hint}_fin"))?;
             return Ok(self.value_list(&[current, final_value]));
         } else if let TyKind::Ref(_, inner, _) = ty.kind() {
-            if self.ty_contains_ref(*inner) {
-                return Err(self.unsupported_result(
-                    self.tcx.def_span(self.def_id),
-                    "nested reference types are unsupported".to_owned(),
-                ));
-            }
             return self.fresh_for_rust_ty(*inner, hint);
         }
         match ty.kind() {
@@ -2164,6 +2204,11 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(self.value_wrap_int(&Int::new_const(self.fresh_name(hint))))
             }
             TyKind::Never => Ok(self.value_error()),
+            _ if vec_element_ty(self.tcx, ty).is_some() => {
+                let spec_ty = spec_ty_for_rust_ty(self.tcx, ty)
+                    .map_err(|err| self.unsupported_result(self.tcx.def_span(self.def_id), err))?;
+                self.fresh_for_spec_ty(&spec_ty, hint)
+            }
             TyKind::Tuple(fields) => {
                 let mut items = Vec::with_capacity(fields.len());
                 for (index, field) in fields.iter().enumerate() {
@@ -2198,6 +2243,39 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
+    fn fresh_for_spec_ty(&self, ty: &SpecTy, hint: &str) -> Result<Datatype, VerificationResult> {
+        match ty {
+            SpecTy::Bool => Ok(self.value_wrap_bool(&Bool::new_const(self.fresh_name(hint)))),
+            SpecTy::IntLiteral
+            | SpecTy::I8
+            | SpecTy::I16
+            | SpecTy::I32
+            | SpecTy::I64
+            | SpecTy::Isize
+            | SpecTy::U8
+            | SpecTy::U16
+            | SpecTy::U32
+            | SpecTy::U64
+            | SpecTy::Usize => Ok(self.value_wrap_int(&Int::new_const(self.fresh_name(hint)))),
+            SpecTy::List(_) => Ok(with_value_encoding(|encoding| {
+                encoding.fresh(&self.fresh_name(hint))
+            })),
+            SpecTy::Tuple(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    values.push(self.fresh_for_spec_ty(item, &format!("{hint}_{index}"))?);
+                }
+                Ok(self.value_list(&values))
+            }
+            SpecTy::Ref(inner) => self.fresh_for_spec_ty(inner, hint),
+            SpecTy::Mut(inner) => {
+                let current = self.fresh_for_spec_ty(inner, &format!("{hint}_cur"))?;
+                let final_value = self.fresh_for_spec_ty(inner, &format!("{hint}_fin"))?;
+                Ok(self.value_list(&[current, final_value]))
+            }
+        }
+    }
+
     fn project_field(
         &self,
         value: Datatype,
@@ -2218,7 +2296,9 @@ impl<'tcx> Verifier<'tcx> {
         match ty.kind() {
             TyKind::Tuple(fields) => Some(fields.iter().collect()),
             TyKind::Adt(adt_def, args) => {
-                if adt_def.is_struct() {
+                if vec_element_ty(self.tcx, ty).is_some() {
+                    None
+                } else if adt_def.is_struct() {
                     Some(self.adt_field_tys(*adt_def, args))
                 } else {
                     None
@@ -2241,18 +2321,10 @@ impl<'tcx> Verifier<'tcx> {
             .collect()
     }
 
-    fn ty_contains_ref(&self, ty: Ty<'tcx>) -> bool {
-        if let Some(fields) = self.composite_field_tys(ty) {
-            return fields.iter().any(|field| self.ty_contains_ref(*field));
-        }
-        matches!(ty.kind(), TyKind::Ref(_, _, _))
-    }
-
     fn ty_contains_mut_ref(&self, ty: Ty<'tcx>) -> bool {
-        if let Some(fields) = self.composite_field_tys(ty) {
-            return fields.iter().any(|field| self.ty_contains_mut_ref(*field));
-        }
-        matches!(ty.kind(), TyKind::Ref(_, _, mutability) if mutability.is_mut())
+        spec_ty_for_rust_ty(self.tcx, ty)
+            .map(|ty| spec_ty_contains_mut_ref(&ty))
+            .unwrap_or(matches!(ty.kind(), TyKind::Ref(_, _, mutability) if mutability.is_mut()))
     }
 
     fn int_range_formula(
@@ -2417,6 +2489,7 @@ impl<'tcx> Verifier<'tcx> {
             SpecTy::Usize => Some(self.tcx.types.usize),
             SpecTy::Bool
             | SpecTy::IntLiteral
+            | SpecTy::List(_)
             | SpecTy::Tuple(_)
             | SpecTy::Ref(_)
             | SpecTy::Mut(_) => None,
@@ -2449,6 +2522,7 @@ impl<'tcx> Verifier<'tcx> {
                 let current = self.value_pair_first(value);
                 self.spec_ty_formula(inner, &current, span)
             }
+            SpecTy::List(item) => Ok(Some(self.list_type_invariant(item, value, span)?)),
             SpecTy::Tuple(items) => {
                 let mut formulas = Vec::new();
                 for (index, item) in items.iter().enumerate() {
@@ -2464,6 +2538,83 @@ impl<'tcx> Verifier<'tcx> {
                 }
             }
         }
+    }
+
+    fn resolve_formula_for_spec_ty(
+        &self,
+        ty: &SpecTy,
+        value: &Datatype,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        match ty {
+            SpecTy::Bool
+            | SpecTy::IntLiteral
+            | SpecTy::I8
+            | SpecTy::I16
+            | SpecTy::I32
+            | SpecTy::I64
+            | SpecTy::Isize
+            | SpecTy::U8
+            | SpecTy::U16
+            | SpecTy::U32
+            | SpecTy::U64
+            | SpecTy::Usize
+            | SpecTy::Ref(_) => Ok(Bool::from_bool(true)),
+            SpecTy::Mut(_) => {
+                let cur = self.value_pair_first(value);
+                let fin = self.value_pair_second(value);
+                Ok(self.value_is_true(&self.value_eqv(&cur, &fin)))
+            }
+            SpecTy::List(item) => self.list_resolve_formula(item, value, span),
+            SpecTy::Tuple(items) => {
+                let mut formulas = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    let field = self.project_field(value.clone(), index, span)?;
+                    formulas.push(self.resolve_formula_for_spec_ty(item, &field, span)?);
+                }
+                Ok(bool_and(formulas))
+            }
+        }
+    }
+
+    fn list_resolve_formula(
+        &self,
+        item: &SpecTy,
+        value: &Datatype,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        with_value_encoding(|encoding| {
+            encoding.define_list_bool_rec(
+                self.fresh_name("resolve_list").as_str(),
+                self.fresh_name("resolve_list_arg").as_str(),
+                value,
+                |head, tail_formula| {
+                    let head_formula = self.resolve_formula_for_spec_ty(item, head, span)?;
+                    Ok(bool_and(vec![head_formula, tail_formula]))
+                },
+            )
+        })
+    }
+
+    fn list_type_invariant(
+        &self,
+        item: &SpecTy,
+        value: &Datatype,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        with_value_encoding(|encoding| {
+            encoding.define_list_bool_rec(
+                self.fresh_name("list_inv").as_str(),
+                self.fresh_name("list_inv_arg").as_str(),
+                value,
+                |head, tail_formula| {
+                    let head_formula = self
+                        .spec_ty_formula(item, head, span)?
+                        .unwrap_or_else(|| Bool::from_bool(true));
+                    Ok(bool_and(vec![head_formula, tail_formula]))
+                },
+            )
+        })
     }
 
     fn require_type_invariant(
@@ -2732,6 +2883,15 @@ fn not_expr(expr: BoolExpr) -> BoolExpr {
         BoolExpr::Const(value) => BoolExpr::Const(!value),
         BoolExpr::Not(inner) => *inner,
         other => BoolExpr::Not(Box::new(other)),
+    }
+}
+
+fn spec_ty_contains_mut_ref(ty: &SpecTy) -> bool {
+    match ty {
+        SpecTy::Mut(_) => true,
+        SpecTy::List(inner) | SpecTy::Ref(inner) => spec_ty_contains_mut_ref(inner),
+        SpecTy::Tuple(items) => items.iter().any(spec_ty_contains_mut_ref),
+        _ => false,
     }
 }
 
