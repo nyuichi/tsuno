@@ -426,8 +426,8 @@ fn unify_spec_tys(lhs: &SpecTy, rhs: &SpecTy) -> Result<SpecTy, String> {
         (SpecTy::Mut(lhs), SpecTy::Mut(rhs)) => {
             Ok(SpecTy::Mut(Box::new(unify_spec_tys(lhs, rhs)?)))
         }
-        (SpecTy::List(lhs), SpecTy::List(rhs)) => {
-            Ok(SpecTy::List(Box::new(unify_spec_tys(lhs, rhs)?)))
+        (SpecTy::Seq(lhs), SpecTy::Seq(rhs)) => {
+            Ok(SpecTy::Seq(Box::new(unify_spec_tys(lhs, rhs)?)))
         }
         (SpecTy::Tuple(lhs), SpecTy::Tuple(rhs)) if lhs.len() == rhs.len() => {
             let mut items = Vec::with_capacity(lhs.len());
@@ -480,7 +480,7 @@ fn display_spec_ty(ty: &SpecTy) -> String {
         SpecTy::U32 => "u32".to_owned(),
         SpecTy::U64 => "u64".to_owned(),
         SpecTy::Usize => "usize".to_owned(),
-        SpecTy::List(inner) => format!("List<{}>", display_spec_ty(inner)),
+        SpecTy::Seq(inner) => format!("Seq<{}>", display_spec_ty(inner)),
         SpecTy::Ref(inner) => format!("Ref<{}>", display_spec_ty(inner)),
         SpecTy::Mut(inner) => format!("Mut<{}>", display_spec_ty(inner)),
         SpecTy::Tuple(items) => format!(
@@ -528,7 +528,7 @@ fn is_fully_inferred_spec_ty(ty: &SpecTy) -> bool {
             .fields
             .iter()
             .all(|field| is_fully_inferred_spec_ty(&field.ty)),
-        SpecTy::List(inner) | SpecTy::Ref(inner) | SpecTy::Mut(inner) => {
+        SpecTy::Seq(inner) | SpecTy::Ref(inner) | SpecTy::Mut(inner) => {
             is_fully_inferred_spec_ty(inner)
         }
         _ => true,
@@ -665,7 +665,7 @@ pub fn spec_ty_for_rust_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<Spec
         TyKind::Adt(adt_def, args) => {
             if let Some(elem_ty) = vec_element_ty(tcx, ty) {
                 let inner = spec_ty_for_rust_ty(tcx, elem_ty)?;
-                Ok(SpecTy::List(Box::new(inner)))
+                Ok(SpecTy::Seq(Box::new(inner)))
             } else if adt_def.is_struct() {
                 let mut fields = Vec::new();
                 let name = tcx.def_path_str(adt_def.did());

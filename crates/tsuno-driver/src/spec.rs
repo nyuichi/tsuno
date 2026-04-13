@@ -130,7 +130,7 @@ pub enum SpecTy {
     U32,
     U64,
     Usize,
-    List(Box<SpecTy>),
+    Seq(Box<SpecTy>),
     Tuple(Vec<SpecTy>),
     Struct(StructTy),
     Ref(Box<SpecTy>),

@@ -9,7 +9,7 @@
 // | `u8`, `u16`, `u32`, `u64`, `usize` | same as Rust        | `Int`             | width bounds |
 // | `&T`                               | `Ref<T>`            | datatype wrapper  | `inv<T>(deref(x))` |
 // | `&mut T`                           | `Mut<T>`            | datatype wrapper  | `inv<T>(cur(x))` |
-// | `Vec<T>`                           | `List<T>`           | `Seq<T>`          | each element satisfies `inv<T>` |
+// | `Vec<T>`                           | `Seq<T>`            | `Seq<T>`          | each element satisfies `inv<T>` |
 // | `(T0, .., Tn)`                     | `Tuple([T0, .., Tn])` | datatype        | conjunction of field invariants |
 // | `struct S { f0: T0, .., fn: Tn }`  | `S`                 | datatype          | conjunction of field invariants |
 //
@@ -1368,7 +1368,7 @@ impl<'tcx> Verifier<'tcx> {
                 let fin = self.mut_fin(value, inner, span)?;
                 self.construct_datatype(spec_ty, &[fresh, fin])
             }
-            SpecTy::List(_) => self.fresh_for_spec_ty(spec_ty, "dangle"),
+            SpecTy::Seq(_) => self.fresh_for_spec_ty(spec_ty, "dangle"),
             SpecTy::Ref(_)
             | SpecTy::Bool
             | SpecTy::IntLiteral
@@ -1958,7 +1958,7 @@ impl<'tcx> Verifier<'tcx> {
                 sort: Sort::int(),
                 kind: TypeEncodingKind::Int,
             },
-            SpecTy::List(inner) => {
+            SpecTy::Seq(inner) => {
                 let elem = self.type_encoding(inner)?;
                 TypeEncoding {
                     sort: Sort::seq(&elem.sort),
@@ -2054,7 +2054,7 @@ impl<'tcx> Verifier<'tcx> {
             SpecTy::U32 => "u32".to_owned(),
             SpecTy::U64 => "u64".to_owned(),
             SpecTy::Usize => "usize".to_owned(),
-            SpecTy::List(inner) => format!("seq_{}", self.sort_name(inner)),
+            SpecTy::Seq(inner) => format!("seq_{}", self.sort_name(inner)),
             SpecTy::Tuple(items) => format!(
                 "tuple_{}",
                 items
@@ -2153,7 +2153,7 @@ impl<'tcx> Verifier<'tcx> {
             | SpecTy::U32
             | SpecTy::U64
             | SpecTy::Usize => Ok(self.value_wrap_int(&Int::new_const(self.fresh_name(hint)))),
-            SpecTy::List(inner) => Ok(SymValue::Seq(Seq::new_const(
+            SpecTy::Seq(inner) => Ok(SymValue::Seq(Seq::new_const(
                 self.fresh_name(hint),
                 &self.sort_for_spec_ty(inner)?,
             ))),
@@ -2514,7 +2514,7 @@ impl<'tcx> Verifier<'tcx> {
                 let current = self.mut_cur(value, inner, span)?;
                 self.spec_ty_formula(inner, &current, span)
             }
-            SpecTy::List(item) => Ok(Some(self.list_type_invariant(item, value, span)?)),
+            SpecTy::Seq(item) => Ok(Some(self.list_type_invariant(item, value, span)?)),
             SpecTy::Tuple(items) => {
                 let mut formulas = Vec::new();
                 for (index, item) in items.iter().enumerate() {
@@ -2571,7 +2571,7 @@ impl<'tcx> Verifier<'tcx> {
                 let fin = self.mut_fin(value, inner, span)?;
                 self.eq_for_spec_ty(inner, &cur, &fin, span)
             }
-            SpecTy::List(item) => self.list_resolve_formula(item, value, span),
+            SpecTy::Seq(item) => self.list_resolve_formula(item, value, span),
             SpecTy::Tuple(items) => {
                 let mut formulas = Vec::with_capacity(items.len());
                 for (index, item) in items.iter().enumerate() {
@@ -2886,7 +2886,7 @@ fn not_expr(expr: BoolExpr) -> BoolExpr {
 fn spec_ty_contains_mut_ref(ty: &SpecTy) -> bool {
     match ty {
         SpecTy::Mut(_) => true,
-        SpecTy::List(inner) | SpecTy::Ref(inner) => spec_ty_contains_mut_ref(inner),
+        SpecTy::Seq(inner) | SpecTy::Ref(inner) => spec_ty_contains_mut_ref(inner),
         SpecTy::Tuple(items) => items.iter().any(spec_ty_contains_mut_ref),
         SpecTy::Struct(struct_ty) => struct_ty
             .fields
