@@ -7,7 +7,7 @@ struct Pair {
 fn reads_shared_struct_field(pair: Pair) {
     let left = pair.left;
     let right = pair.right;
-    //@ assert "{left} == {left} && {right} == {right}"
+    //@ assert "{pair}.left == {left} && {pair}.right == {right}"
 }
 
 fn main() {}

@@ -11,7 +11,7 @@
 // | `&mut T`                                 | `Mut<T>`            | `value.cons(current, value.cons(final, nil))` | invariant checked on `current` only |
 // | `Vec<T>`                                 | `List<T>`           | symbolic `value`, constrained by recursive list predicates | list shape plus element invariant when required |
 // | `(T0, .., Tn)`                           | `Tuple([T0, .., Tn])` | `value.cons(v0, .. value.cons(vn, nil))` | conjunction of each field invariant |
-// | `struct S { f0: T0, .., fn: Tn }`        | `Tuple([T0, .., Tn])` | same list encoding as tuples, in field order | conjunction of each field invariant |
+// | `struct S { f0: T0, .., fn: Tn }`        | `S`                  | same list encoding as tuples, in field order | conjunction of each field invariant |
 //
 // Notes:
 // - Structs with `Drop` are unsupported.
@@ -1739,6 +1739,10 @@ impl<'tcx> Verifier<'tcx> {
                     )
                 })
             }
+            TypedExprKind::Field { base, index, .. } => {
+                let value = self.spec_expr_to_value(state, base, resolved)?;
+                self.project_field(value, *index, self.control_span(state.ctrl))
+            }
             TypedExprKind::TupleField { base, index } => {
                 let value = self.spec_expr_to_value(state, base, resolved)?;
                 self.project_field(value, *index, self.control_span(state.ctrl))
@@ -1827,6 +1831,10 @@ impl<'tcx> Verifier<'tcx> {
                     format!("missing spec binding `{name}`"),
                 )
             }),
+            TypedExprKind::Field { base, index, .. } => {
+                let value = self.contract_expr_to_value(current, spec, base)?;
+                self.project_field(value, *index, self.tcx.def_span(self.def_id))
+            }
             TypedExprKind::TupleField { base, index } => {
                 let value = self.contract_expr_to_value(current, spec, base)?;
                 self.project_field(value, *index, self.tcx.def_span(self.def_id))
@@ -2267,6 +2275,15 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(self.value_list(&values))
             }
+            SpecTy::Struct(struct_ty) => {
+                let mut values = Vec::with_capacity(struct_ty.fields.len());
+                for field in &struct_ty.fields {
+                    values.push(
+                        self.fresh_for_spec_ty(&field.ty, &format!("{hint}_{}", field.name))?,
+                    );
+                }
+                Ok(self.value_list(&values))
+            }
             SpecTy::Ref(inner) => self.fresh_for_spec_ty(inner, hint),
             SpecTy::Mut(inner) => {
                 let current = self.fresh_for_spec_ty(inner, &format!("{hint}_cur"))?;
@@ -2491,6 +2508,7 @@ impl<'tcx> Verifier<'tcx> {
             | SpecTy::IntLiteral
             | SpecTy::List(_)
             | SpecTy::Tuple(_)
+            | SpecTy::Struct(_)
             | SpecTy::Ref(_)
             | SpecTy::Mut(_) => None,
         };
@@ -2537,6 +2555,20 @@ impl<'tcx> Verifier<'tcx> {
                     Ok(Some(bool_and(formulas)))
                 }
             }
+            SpecTy::Struct(struct_ty) => {
+                let mut formulas = Vec::new();
+                for (index, field_ty) in struct_ty.fields.iter().enumerate() {
+                    let field = self.project_field(value.clone(), index, span)?;
+                    if let Some(formula) = self.spec_ty_formula(&field_ty.ty, &field, span)? {
+                        formulas.push(formula);
+                    }
+                }
+                if formulas.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(bool_and(formulas)))
+                }
+            }
         }
     }
 
@@ -2571,6 +2603,14 @@ impl<'tcx> Verifier<'tcx> {
                 for (index, item) in items.iter().enumerate() {
                     let field = self.project_field(value.clone(), index, span)?;
                     formulas.push(self.resolve_formula_for_spec_ty(item, &field, span)?);
+                }
+                Ok(bool_and(formulas))
+            }
+            SpecTy::Struct(struct_ty) => {
+                let mut formulas = Vec::with_capacity(struct_ty.fields.len());
+                for (index, field_ty) in struct_ty.fields.iter().enumerate() {
+                    let field = self.project_field(value.clone(), index, span)?;
+                    formulas.push(self.resolve_formula_for_spec_ty(&field_ty.ty, &field, span)?);
                 }
                 Ok(bool_and(formulas))
             }
@@ -2891,6 +2931,10 @@ fn spec_ty_contains_mut_ref(ty: &SpecTy) -> bool {
         SpecTy::Mut(_) => true,
         SpecTy::List(inner) | SpecTy::Ref(inner) => spec_ty_contains_mut_ref(inner),
         SpecTy::Tuple(items) => items.iter().any(spec_ty_contains_mut_ref),
+        SpecTy::Struct(struct_ty) => struct_ty
+            .fields
+            .iter()
+            .any(|field| spec_ty_contains_mut_ref(&field.ty)),
         _ => false,
     }
 }
