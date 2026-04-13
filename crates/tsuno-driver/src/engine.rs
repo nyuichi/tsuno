@@ -1507,13 +1507,14 @@ impl<'tcx> Verifier<'tcx> {
             );
         };
         let root_ty = self.body.local_decls[place.local].ty;
-        self.read_projection(root, root_ty, place.as_ref().projection, mode, span)
+        let root_spec_ty = self.spec_ty_for_place_ty(root_ty, span)?;
+        self.read_projection(root, &root_spec_ty, place.as_ref().projection, mode, span)
     }
 
     fn read_projection(
         &self,
         value: Datatype,
-        ty: Ty<'tcx>,
+        spec_ty: &SpecTy,
         projection: &[PlaceElem<'tcx>],
         mode: ReadMode,
         span: Span,
@@ -1523,33 +1524,35 @@ impl<'tcx> Verifier<'tcx> {
         }
         match projection[0] {
             PlaceElem::Deref => {
-                let TyKind::Ref(_, inner, mutability) = ty.kind() else {
-                    return Err(
-                        self.unsupported_result(span, "deref of non-reference place".to_owned())
-                    );
-                };
-                let next = if mutability.is_mut() {
+                let next = if matches!(spec_ty, SpecTy::Mut(_)) {
                     match mode {
                         ReadMode::Current => self.value_pair_first(&value),
                         ReadMode::Final => self.value_pair_second(&value),
                     }
-                } else {
+                } else if matches!(spec_ty, SpecTy::Ref(_)) {
                     value
+                } else {
+                    return Err(
+                        self.unsupported_result(span, "deref of non-reference place".to_owned())
+                    );
                 };
-                self.read_projection(next, *inner, &projection[1..], mode, span)
+                let Some(inner_spec_ty) = self.deref_spec_ty(spec_ty) else {
+                    return Err(
+                        self.unsupported_result(span, "deref of non-reference place".to_owned())
+                    );
+                };
+                self.read_projection(next, inner_spec_ty, &projection[1..], mode, span)
             }
             PlaceElem::Field(field, _) => {
                 let next = self.project_field(value, field.index(), span)?;
-                let Some(fields) = self.composite_field_tys(ty) else {
+                let Some(field_spec_ty) = self.composite_spec_field_ty(spec_ty, field.index())
+                else {
                     return Err(self.unsupported_result(
                         span,
                         "field projection on non-composite place".to_owned(),
                     ));
                 };
-                let field_ty = fields.get(field.index()).ok_or_else(|| {
-                    self.unsupported_result(span, "field index out of range".to_owned())
-                })?;
-                self.read_projection(next, *field_ty, &projection[1..], mode, span)
+                self.read_projection(next, field_spec_ty, &projection[1..], mode, span)
             }
             other => {
                 Err(self
@@ -1571,8 +1574,9 @@ impl<'tcx> Verifier<'tcx> {
             .cloned()
             .unwrap_or_else(|| value.clone());
         let root_ty = self.body.local_decls[place.local].ty;
+        let root_spec_ty = self.spec_ty_for_place_ty(root_ty, span)?;
         let updated =
-            self.write_projection(root, root_ty, place.as_ref().projection, value, span)?;
+            self.write_projection(root, &root_spec_ty, place.as_ref().projection, value, span)?;
         state.model.insert(place.local, updated);
         Ok(())
     }
@@ -1580,7 +1584,7 @@ impl<'tcx> Verifier<'tcx> {
     fn write_projection(
         &self,
         value: Datatype,
-        ty: Ty<'tcx>,
+        spec_ty: &SpecTy,
         projection: &[PlaceElem<'tcx>],
         replacement: Datatype,
         span: Span,
@@ -1590,21 +1594,21 @@ impl<'tcx> Verifier<'tcx> {
         }
         match projection[0] {
             PlaceElem::Deref => {
-                let TyKind::Ref(_, inner, mutability) = ty.kind() else {
-                    return Err(self.unsupported_result(
-                        span,
-                        "deref assignment on non-reference place".to_owned(),
-                    ));
-                };
-                if !mutability.is_mut() {
+                if matches!(spec_ty, SpecTy::Ref(_)) {
                     return Err(self.unsupported_result(
                         span,
                         "assignment through shared reference is unsupported".to_owned(),
                     ));
                 }
+                let Some(inner_spec_ty) = self.deref_spec_ty(spec_ty) else {
+                    return Err(self.unsupported_result(
+                        span,
+                        "deref assignment on non-reference place".to_owned(),
+                    ));
+                };
                 let current = self.write_projection(
                     self.value_pair_first(&value),
-                    *inner,
+                    inner_spec_ty,
                     &projection[1..],
                     replacement,
                     span,
@@ -1613,22 +1617,24 @@ impl<'tcx> Verifier<'tcx> {
             }
             PlaceElem::Field(field, _) => {
                 let index = field.index();
-                let Some(fields) = self.composite_field_tys(ty) else {
-                    return Err(self.unsupported_result(
+                let field_count = self.composite_spec_field_count(spec_ty).ok_or_else(|| {
+                    self.unsupported_result(
                         span,
                         "field assignment on non-composite place".to_owned(),
-                    ));
-                };
-                let rust_field_ty = fields.get(index).ok_or_else(|| {
-                    self.unsupported_result(span, "field index out of range".to_owned())
+                    )
                 })?;
-                let mut items = Vec::with_capacity(fields.len());
-                for current_index in 0..fields.len() {
+                let Some(field_spec_ty) = self.composite_spec_field_ty(spec_ty, index) else {
+                    return Err(
+                        self.unsupported_result(span, "field index out of range".to_owned())
+                    );
+                };
+                let mut items = Vec::with_capacity(field_count);
+                for current_index in 0..field_count {
                     let field_value = self.project_field(value.clone(), current_index, span)?;
                     if current_index == index {
                         items.push(self.write_projection(
                             field_value,
-                            *rust_field_ty,
+                            field_spec_ty,
                             &projection[1..],
                             replacement.clone(),
                             span,
@@ -1651,36 +1657,52 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<(), VerificationResult> {
         let value = self.read_place(state, place, ReadMode::Current, span)?;
-        let updated = self.dangle_value(self.place_ty(place), &value, span)?;
+        let place_spec_ty = self.spec_ty_for_place_ty(self.place_ty(place), span)?;
+        let updated = self.dangle_value(&place_spec_ty, &value, span)?;
         self.write_place(state, place, updated, span)
     }
 
     fn dangle_value(
         &self,
-        ty: Ty<'tcx>,
+        spec_ty: &SpecTy,
         value: &Datatype,
         span: Span,
     ) -> Result<Datatype, VerificationResult> {
-        if let Some(fields) = self.composite_field_tys(ty) {
-            let mut updated = Vec::with_capacity(fields.len());
-            for (index, field_ty) in fields.into_iter().enumerate() {
-                let field_value = self.project_field(value.clone(), index, span)?;
-                updated.push(self.dangle_value(field_ty, &field_value, span)?);
+        match spec_ty {
+            SpecTy::Tuple(items) => {
+                let mut updated = Vec::with_capacity(items.len());
+                for (index, field_ty) in items.iter().enumerate() {
+                    let field_value = self.project_field(value.clone(), index, span)?;
+                    updated.push(self.dangle_value(field_ty, &field_value, span)?);
+                }
+                Ok(self.value_list(&updated))
             }
-            return Ok(self.value_list(&updated));
-        }
-        match ty.kind() {
-            TyKind::Ref(_, inner, mutability) if mutability.is_mut() => {
-                let fresh = self.fresh_for_rust_ty(*inner, "dangle")?;
+            SpecTy::Struct(struct_ty) => {
+                let mut updated = Vec::with_capacity(struct_ty.fields.len());
+                for (index, field_ty) in struct_ty.fields.iter().enumerate() {
+                    let field_value = self.project_field(value.clone(), index, span)?;
+                    updated.push(self.dangle_value(&field_ty.ty, &field_value, span)?);
+                }
+                Ok(self.value_list(&updated))
+            }
+            SpecTy::Mut(inner) => {
+                let fresh = self.fresh_for_spec_ty(inner, "dangle")?;
                 Ok(self.value_list(&[fresh, self.value_pair_second(value)]))
             }
-            _ if vec_element_ty(self.tcx, ty).is_some() => self.fresh_for_rust_ty(ty, "dangle"),
-            TyKind::Ref(_, _, _) => Ok(value.clone()),
-            TyKind::Bool | TyKind::Int(_) | TyKind::Uint(_) => Ok(value.clone()),
-            other => {
-                Err(self
-                    .unsupported_result(span, format!("unsupported type {other:?} during dangle")))
-            }
+            SpecTy::List(_) => self.fresh_for_spec_ty(spec_ty, "dangle"),
+            SpecTy::Ref(_)
+            | SpecTy::Bool
+            | SpecTy::IntLiteral
+            | SpecTy::I8
+            | SpecTy::I16
+            | SpecTy::I32
+            | SpecTy::I64
+            | SpecTy::Isize
+            | SpecTy::U8
+            | SpecTy::U16
+            | SpecTy::U32
+            | SpecTy::U64
+            | SpecTy::Usize => Ok(value.clone()),
         }
     }
 
@@ -2303,26 +2325,37 @@ impl<'tcx> Verifier<'tcx> {
         Ok(self.value_nth(&value, index))
     }
 
+    fn spec_ty_for_place_ty(&self, ty: Ty<'tcx>, span: Span) -> Result<SpecTy, VerificationResult> {
+        spec_ty_for_rust_ty(self.tcx, ty).map_err(|err| self.unsupported_result(span, err))
+    }
+
+    fn deref_spec_ty<'a>(&self, ty: &'a SpecTy) -> Option<&'a SpecTy> {
+        match ty {
+            SpecTy::Ref(inner) | SpecTy::Mut(inner) => Some(inner.as_ref()),
+            _ => None,
+        }
+    }
+
+    fn composite_spec_field_count(&self, ty: &SpecTy) -> Option<usize> {
+        match ty {
+            SpecTy::Tuple(items) => Some(items.len()),
+            SpecTy::Struct(struct_ty) => Some(struct_ty.fields.len()),
+            _ => None,
+        }
+    }
+
+    fn composite_spec_field_ty<'a>(&self, ty: &'a SpecTy, index: usize) -> Option<&'a SpecTy> {
+        match ty {
+            SpecTy::Tuple(items) => items.get(index),
+            SpecTy::Struct(struct_ty) => struct_ty.fields.get(index).map(|field| &field.ty),
+            _ => None,
+        }
+    }
+
     fn fresh_name(&self, hint: &str) -> String {
         let id = self.next_sym.get();
         self.next_sym.set(id + 1);
         format!("{hint}_{id}")
-    }
-
-    fn composite_field_tys(&self, ty: Ty<'tcx>) -> Option<Vec<Ty<'tcx>>> {
-        match ty.kind() {
-            TyKind::Tuple(fields) => Some(fields.iter().collect()),
-            TyKind::Adt(adt_def, args) => {
-                if vec_element_ty(self.tcx, ty).is_some() {
-                    None
-                } else if adt_def.is_struct() {
-                    Some(self.adt_field_tys(*adt_def, args))
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
     }
 
     fn adt_field_tys(
