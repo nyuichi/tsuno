@@ -1,0 +1,13 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+expression: snapshot_output(output)
+---
+status: Some(1)
+stdout:
+UNSUPPORTED rejects_numeric_projection_on_struct
+  tuple field access is not supported on struct types
+  src/main.rs:8:5: 8:38
+PASS main
+  all assertions discharged
+
+stderr:

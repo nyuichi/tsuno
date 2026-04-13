@@ -6,7 +6,7 @@ use crate::directive::{
     collect_function_directives,
 };
 use crate::report::{VerificationResult, VerificationStatus};
-use crate::spec::{Expr, SpecTy, TypedExpr, TypedExprKind};
+use crate::spec::{Expr, SpecTy, StructFieldTy, StructTy, TypedExpr, TypedExprKind};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{HirId, ItemKind, Pat, PatKind};
 use rustc_middle::mir::{BasicBlock, Body, Local, PlaceElem, StatementKind, TerminatorKind};
@@ -414,6 +414,28 @@ fn unify_spec_tys(lhs: &SpecTy, rhs: &SpecTy) -> Result<SpecTy, String> {
             }
             Ok(SpecTy::Tuple(items))
         }
+        (SpecTy::Struct(lhs), SpecTy::Struct(rhs))
+            if lhs.name == rhs.name && lhs.fields.len() == rhs.fields.len() =>
+        {
+            let mut fields = Vec::with_capacity(lhs.fields.len());
+            for (lhs, rhs) in lhs.fields.iter().zip(rhs.fields.iter()) {
+                if lhs.name != rhs.name {
+                    return Err(format!(
+                        "type mismatch between `{}` and `{}`",
+                        display_spec_field_ty(lhs),
+                        display_spec_field_ty(rhs)
+                    ));
+                }
+                fields.push(StructFieldTy {
+                    name: lhs.name.clone(),
+                    ty: unify_spec_tys(&lhs.ty, &rhs.ty)?,
+                });
+            }
+            Ok(SpecTy::Struct(StructTy {
+                name: lhs.name.clone(),
+                fields,
+            }))
+        }
         _ => Err(format!(
             "type mismatch between `{}` and `{}`",
             display_spec_ty(lhs),
@@ -447,7 +469,12 @@ fn display_spec_ty(ty: &SpecTy) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        SpecTy::Struct(struct_ty) => struct_ty.name.clone(),
     }
+}
+
+fn display_spec_field_ty(field: &StructFieldTy) -> String {
+    format!("{}.{}", field.name, display_spec_ty(&field.ty))
 }
 
 fn is_integer_spec_ty(ty: &SpecTy) -> bool {
@@ -475,6 +502,10 @@ fn is_fully_inferred_spec_ty(ty: &SpecTy) -> bool {
     match ty {
         SpecTy::IntLiteral => false,
         SpecTy::Tuple(items) => items.iter().all(is_fully_inferred_spec_ty),
+        SpecTy::Struct(struct_ty) => struct_ty
+            .fields
+            .iter()
+            .all(|field| is_fully_inferred_spec_ty(&field.ty)),
         SpecTy::List(inner) | SpecTy::Ref(inner) | SpecTy::Mut(inner) => {
             is_fully_inferred_spec_ty(inner)
         }
@@ -599,11 +630,15 @@ pub fn spec_ty_for_rust_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<Spec
                 let inner = spec_ty_for_rust_ty(tcx, elem_ty)?;
                 Ok(SpecTy::List(Box::new(inner)))
             } else if adt_def.is_struct() {
-                let mut items = Vec::new();
+                let mut fields = Vec::new();
+                let name = tcx.def_path_str(adt_def.did());
                 for field in adt_def.non_enum_variant().fields.iter() {
-                    items.push(spec_ty_for_rust_ty(tcx, field.ty(tcx, args))?);
+                    fields.push(StructFieldTy {
+                        name: field.name.to_string(),
+                        ty: spec_ty_for_rust_ty(tcx, field.ty(tcx, args))?,
+                    });
                 }
-                Ok(SpecTy::Tuple(items))
+                Ok(SpecTy::Struct(StructTy { name, fields }))
             } else {
                 Err(format!("unsupported type {ty:?}"))
             }
@@ -651,6 +686,17 @@ fn infer_contract_expr_types(
             inferred.ensure_var(name);
             Ok(InferredExprTy::SpecVar(name.clone()))
         }
+        Expr::Field { base, name } => {
+            let base_ty = infer_contract_expr_types(
+                base,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?;
+            infer_named_field_expr_type(base_ty, name)
+        }
         Expr::TupleField { base, .. } => {
             let base_ty = infer_contract_expr_types(
                 base,
@@ -660,14 +706,7 @@ fn infer_contract_expr_types(
                 result_ty,
                 inferred,
             )?;
-            match base_ty {
-                InferredExprTy::Known(SpecTy::Tuple(_)) => Ok(InferredExprTy::Unknown),
-                InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
-                InferredExprTy::Known(other) => Err(format!(
-                    "tuple field access requires a tuple, found `{}`",
-                    display_spec_ty(&other)
-                )),
-            }
+            infer_tuple_field_expr_type(base_ty)
         }
         Expr::Deref { base } => {
             let base_ty = infer_contract_expr_types(
@@ -684,24 +723,6 @@ fn infer_contract_expr_types(
                 InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
                 InferredExprTy::Known(other) => Err(format!(
                     "dereference requires Ref<T> or Mut<T>, found `{}`",
-                    display_spec_ty(&other)
-                )),
-            }
-        }
-        Expr::Fin { base } => {
-            let base_ty = infer_contract_expr_types(
-                base,
-                spec_scope,
-                params,
-                allow_result,
-                result_ty,
-                inferred,
-            )?;
-            match base_ty {
-                InferredExprTy::Known(SpecTy::Mut(inner)) => Ok(InferredExprTy::Known(*inner)),
-                InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
-                InferredExprTy::Known(other) => Err(format!(
-                    "`.fin` requires Mut<T>, found `{}`",
                     display_spec_ty(&other)
                 )),
             }
@@ -802,17 +823,15 @@ fn infer_body_expr_types(
             inferred.ensure_var(name);
             Ok(InferredExprTy::SpecVar(name.clone()))
         }
+        Expr::Field { base, name } => {
+            let base_ty =
+                infer_body_expr_types(expr_base(base), kind, spec_scope, local_tys, inferred)?;
+            infer_named_field_expr_type(base_ty, name)
+        }
         Expr::TupleField { base, .. } => {
             let base_ty =
                 infer_body_expr_types(expr_base(base), kind, spec_scope, local_tys, inferred)?;
-            match base_ty {
-                InferredExprTy::Known(SpecTy::Tuple(_)) => Ok(InferredExprTy::Unknown),
-                InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
-                InferredExprTy::Known(other) => Err(format!(
-                    "tuple field access requires a tuple, found `{}`",
-                    display_spec_ty(&other)
-                )),
-            }
+            infer_tuple_field_expr_type(base_ty)
         }
         Expr::Deref { base } => {
             let base_ty = infer_body_expr_types(base, kind, spec_scope, local_tys, inferred)?;
@@ -822,17 +841,6 @@ fn infer_body_expr_types(
                 InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
                 InferredExprTy::Known(other) => Err(format!(
                     "dereference requires Ref<T> or Mut<T>, found `{}`",
-                    display_spec_ty(&other)
-                )),
-            }
-        }
-        Expr::Fin { base } => {
-            let base_ty = infer_body_expr_types(base, kind, spec_scope, local_tys, inferred)?;
-            match base_ty {
-                InferredExprTy::Known(SpecTy::Mut(inner)) => Ok(InferredExprTy::Known(*inner)),
-                InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
-                InferredExprTy::Known(other) => Err(format!(
-                    "`.fin` requires Mut<T>, found `{}`",
                     display_spec_ty(&other)
                 )),
             }
@@ -886,6 +894,40 @@ fn infer_body_expr_types(
 
 fn expr_base(base: &Expr) -> &Expr {
     base
+}
+
+fn infer_named_field_expr_type(
+    base_ty: InferredExprTy,
+    name: &str,
+) -> Result<InferredExprTy, String> {
+    match base_ty {
+        InferredExprTy::Known(SpecTy::Struct(struct_ty)) => Ok(struct_ty
+            .field(name)
+            .map(|(_, field)| InferredExprTy::Known(field.ty.clone()))
+            .unwrap_or(InferredExprTy::Unknown)),
+        InferredExprTy::Known(SpecTy::Mut(inner)) if name == "fin" => {
+            Ok(InferredExprTy::Known(*inner))
+        }
+        InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
+        InferredExprTy::Known(other) => Err(format!(
+            "field access requires a struct or Mut<T>. found `{}`",
+            display_spec_ty(&other)
+        )),
+    }
+}
+
+fn infer_tuple_field_expr_type(base_ty: InferredExprTy) -> Result<InferredExprTy, String> {
+    match base_ty {
+        InferredExprTy::Known(SpecTy::Tuple(_)) => Ok(InferredExprTy::Unknown),
+        InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
+        InferredExprTy::Known(SpecTy::Struct(_)) => {
+            Err("tuple field access is not supported on struct types".to_owned())
+        }
+        InferredExprTy::Known(other) => Err(format!(
+            "tuple field access requires a tuple, found `{}`",
+            display_spec_ty(&other)
+        )),
+    }
 }
 
 fn local_spec_tys<'tcx>(
@@ -958,25 +1000,15 @@ fn typed_contract_expr(
                 kind: TypedExprKind::Bind(name.clone()),
             })
         }
+        Expr::Field { base, name } => {
+            let base =
+                typed_contract_expr(base, spec_scope, params, allow_result, result_ty, inferred)?;
+            type_named_field_expr(base, name)
+        }
         Expr::TupleField { base, index } => {
             let base =
                 typed_contract_expr(base, spec_scope, params, allow_result, result_ty, inferred)?;
-            let SpecTy::Tuple(items) = &base.ty else {
-                return Err(format!(
-                    "tuple field access requires a tuple, found `{}`",
-                    display_spec_ty(&base.ty)
-                ));
-            };
-            let Some(field_ty) = items.get(*index) else {
-                return Err(format!("tuple field .{index} is out of bounds"));
-            };
-            Ok(TypedExpr {
-                ty: field_ty.clone(),
-                kind: TypedExprKind::TupleField {
-                    base: Box::new(base),
-                    index: *index,
-                },
-            })
+            type_tuple_field_expr(base, *index)
         }
         Expr::Deref { base } => {
             let base =
@@ -990,22 +1022,6 @@ fn typed_contract_expr(
                 }),
                 other => Err(format!(
                     "dereference requires Ref<T> or Mut<T>, found `{}`",
-                    display_spec_ty(other)
-                )),
-            }
-        }
-        Expr::Fin { base } => {
-            let base =
-                typed_contract_expr(base, spec_scope, params, allow_result, result_ty, inferred)?;
-            match &base.ty {
-                SpecTy::Mut(inner) => Ok(TypedExpr {
-                    ty: (**inner).clone(),
-                    kind: TypedExprKind::Fin {
-                        base: Box::new(base),
-                    },
-                }),
-                other => Err(format!(
-                    "`.fin` requires Mut<T>, found `{}`",
                     display_spec_ty(other)
                 )),
             }
@@ -1099,24 +1115,13 @@ fn typed_body_expr(
                 kind: TypedExprKind::Bind(name.clone()),
             })
         }
+        Expr::Field { base, name } => {
+            let base = typed_body_expr(expr_base(base), kind, spec_scope, local_tys, inferred)?;
+            type_named_field_expr(base, name)
+        }
         Expr::TupleField { base, index } => {
             let base = typed_body_expr(expr_base(base), kind, spec_scope, local_tys, inferred)?;
-            let SpecTy::Tuple(items) = &base.ty else {
-                return Err(format!(
-                    "tuple field access requires a tuple, found `{}`",
-                    display_spec_ty(&base.ty)
-                ));
-            };
-            let Some(field_ty) = items.get(*index) else {
-                return Err(format!("tuple field .{index} is out of bounds"));
-            };
-            Ok(TypedExpr {
-                ty: field_ty.clone(),
-                kind: TypedExprKind::TupleField {
-                    base: Box::new(base),
-                    index: *index,
-                },
-            })
+            type_tuple_field_expr(base, *index)
         }
         Expr::Deref { base } => {
             let base = typed_body_expr(base, kind, spec_scope, local_tys, inferred)?;
@@ -1129,21 +1134,6 @@ fn typed_body_expr(
                 }),
                 other => Err(format!(
                     "dereference requires Ref<T> or Mut<T>, found `{}`",
-                    display_spec_ty(other)
-                )),
-            }
-        }
-        Expr::Fin { base } => {
-            let base = typed_body_expr(base, kind, spec_scope, local_tys, inferred)?;
-            match &base.ty {
-                SpecTy::Mut(inner) => Ok(TypedExpr {
-                    ty: (**inner).clone(),
-                    kind: TypedExprKind::Fin {
-                        base: Box::new(base),
-                    },
-                }),
-                other => Err(format!(
-                    "`.fin` requires Mut<T>, found `{}`",
                     display_spec_ty(other)
                 )),
             }
@@ -1271,6 +1261,61 @@ fn type_binary_expr(
             })
         }
     }
+}
+
+fn type_named_field_expr(base: TypedExpr, name: &str) -> Result<TypedExpr, String> {
+    if name == "fin" {
+        if let SpecTy::Mut(inner) = &base.ty {
+            return Ok(TypedExpr {
+                ty: (**inner).clone(),
+                kind: TypedExprKind::Fin {
+                    base: Box::new(base),
+                },
+            });
+        }
+    }
+    let SpecTy::Struct(struct_ty) = &base.ty else {
+        return Err(format!(
+            "field access requires a struct, found `{}`",
+            display_spec_ty(&base.ty)
+        ));
+    };
+    let Some((index, field_ty)) = struct_ty.field(name) else {
+        return Err(format!(
+            "struct `{}` does not have a field named `{name}`",
+            struct_ty.name
+        ));
+    };
+    Ok(TypedExpr {
+        ty: field_ty.ty.clone(),
+        kind: TypedExprKind::Field {
+            base: Box::new(base),
+            name: name.to_owned(),
+            index,
+        },
+    })
+}
+
+fn type_tuple_field_expr(base: TypedExpr, index: usize) -> Result<TypedExpr, String> {
+    let SpecTy::Tuple(items) = &base.ty else {
+        if matches!(base.ty, SpecTy::Struct(_)) {
+            return Err("tuple field access is not supported on struct types".to_owned());
+        }
+        return Err(format!(
+            "tuple field access requires a tuple, found `{}`",
+            display_spec_ty(&base.ty)
+        ));
+    };
+    let Some(field_ty) = items.get(index) else {
+        return Err(format!("tuple field .{index} is out of bounds"));
+    };
+    Ok(TypedExpr {
+        ty: field_ty.clone(),
+        kind: TypedExprKind::TupleField {
+            base: Box::new(base),
+            index,
+        },
+    })
 }
 
 pub fn compute_directives<'tcx>(
@@ -2099,7 +2144,7 @@ fn validate_contract_expr_core(
                 if allow_result { "ens" } else { "req" },
             )
             .map_err(|err| err.message),
-        Expr::TupleField { base, .. } | Expr::Deref { base } | Expr::Fin { base } => {
+        Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Deref { base } => {
             validate_contract_expr_core(base, spec_scope, params, allow_result)
         }
         Expr::Unary { arg, .. } => {
@@ -2171,7 +2216,7 @@ fn resolve_expr_env_into(
             resolved.spec_vars.insert(name.clone());
             Ok(())
         }
-        Expr::TupleField { base, .. } | Expr::Deref { base } | Expr::Fin { base } => {
+        Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Deref { base } => {
             resolve_expr_env_into(base, ctx, resolved)
         }
         Expr::Unary { arg, .. } => resolve_expr_env_into(arg, ctx, resolved),

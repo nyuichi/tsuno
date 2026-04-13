@@ -4,14 +4,15 @@ pub enum Expr {
     Int(IntLiteral),
     Var(String),
     Bind(String),
+    Field {
+        base: Box<Expr>,
+        name: String,
+    },
     TupleField {
         base: Box<Expr>,
         index: usize,
     },
     Deref {
-        base: Box<Expr>,
-    },
-    Fin {
         base: Box<Expr>,
     },
     Unary {
@@ -37,6 +38,11 @@ pub enum TypedExprKind {
     Int(IntLiteral),
     Var(String),
     Bind(String),
+    Field {
+        base: Box<TypedExpr>,
+        name: String,
+        index: usize,
+    },
     TupleField {
         base: Box<TypedExpr>,
         index: usize,
@@ -126,8 +132,30 @@ pub enum SpecTy {
     Usize,
     List(Box<SpecTy>),
     Tuple(Vec<SpecTy>),
+    Struct(StructTy),
     Ref(Box<SpecTy>),
     Mut(Box<SpecTy>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructTy {
+    pub name: String,
+    pub fields: Vec<StructFieldTy>,
+}
+
+impl StructTy {
+    pub fn field(&self, name: &str) -> Option<(usize, &StructFieldTy)> {
+        self.fields
+            .iter()
+            .enumerate()
+            .find(|(_, field)| field.name == name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructFieldTy {
+    pub name: String,
+    pub ty: SpecTy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -635,8 +663,9 @@ impl Parser {
                             .expect("checked tuple field index"),
                     }
                 }
-                Some(Token::Ident(ident)) if ident == "fin" => Expr::Fin {
+                Some(Token::Ident(ident)) => Expr::Field {
                     base: Box::new(expr),
+                    name: ident.clone(),
                 },
                 _ => {
                     return Err(ParseError::new(
@@ -708,8 +737,9 @@ mod tests {
                 lhs: Box::new(Expr::Deref {
                     base: Box::new(Expr::Var("x".to_owned())),
                 }),
-                rhs: Box::new(Expr::Fin {
+                rhs: Box::new(Expr::Field {
                     base: Box::new(Expr::Var("y".to_owned())),
+                    name: "fin".to_owned(),
                 }),
             }
         );
@@ -791,11 +821,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cur_accessor() {
-        let err = parse_expr("assert", r#""{x}.cur""#).expect_err("should fail");
-        assert!(
-            err.to_string()
-                .contains("unsupported field access in spec expression")
+    fn parses_named_field_accessor() {
+        let expr = parse_expr("assert", r#""{x}.left == 1i32""#).expect("expr");
+        assert_eq!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                lhs: Box::new(Expr::Field {
+                    base: Box::new(Expr::Var("x".to_owned())),
+                    name: "left".to_owned(),
+                }),
+                rhs: Box::new(Expr::Int(IntLiteral {
+                    digits: "1".to_owned(),
+                    suffix: Some(IntSuffix::I32),
+                })),
+            }
         );
     }
 
