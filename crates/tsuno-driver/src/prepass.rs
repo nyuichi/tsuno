@@ -695,20 +695,7 @@ fn infer_contract_expr_types(
                 result_ty,
                 inferred,
             )?;
-            match base_ty {
-                InferredExprTy::Known(SpecTy::Struct(struct_ty)) => Ok(struct_ty
-                    .field(name)
-                    .map(|(_, field)| InferredExprTy::Known(field.ty.clone()))
-                    .unwrap_or(InferredExprTy::Unknown)),
-                InferredExprTy::Known(SpecTy::Mut(inner)) if name == "fin" => {
-                    Ok(InferredExprTy::Known(*inner))
-                }
-                InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
-                InferredExprTy::Known(other) => Err(format!(
-                    "field access requires a struct or Mut<T>. found `{}`",
-                    display_spec_ty(&other)
-                )),
-            }
+            infer_named_field_expr_type(base_ty, name)
         }
         Expr::TupleField { base, .. } => {
             let base_ty = infer_contract_expr_types(
@@ -719,17 +706,7 @@ fn infer_contract_expr_types(
                 result_ty,
                 inferred,
             )?;
-            match base_ty {
-                InferredExprTy::Known(SpecTy::Tuple(_)) => Ok(InferredExprTy::Unknown),
-                InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
-                InferredExprTy::Known(SpecTy::Struct(_)) => {
-                    Err("tuple field access is not supported on struct types".to_owned())
-                }
-                InferredExprTy::Known(other) => Err(format!(
-                    "tuple field access requires a tuple, found `{}`",
-                    display_spec_ty(&other)
-                )),
-            }
+            infer_tuple_field_expr_type(base_ty)
         }
         Expr::Deref { base } => {
             let base_ty = infer_contract_expr_types(
@@ -849,35 +826,12 @@ fn infer_body_expr_types(
         Expr::Field { base, name } => {
             let base_ty =
                 infer_body_expr_types(expr_base(base), kind, spec_scope, local_tys, inferred)?;
-            match base_ty {
-                InferredExprTy::Known(SpecTy::Struct(struct_ty)) => Ok(struct_ty
-                    .field(name)
-                    .map(|(_, field)| InferredExprTy::Known(field.ty.clone()))
-                    .unwrap_or(InferredExprTy::Unknown)),
-                InferredExprTy::Known(SpecTy::Mut(inner)) if name == "fin" => {
-                    Ok(InferredExprTy::Known(*inner))
-                }
-                InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
-                InferredExprTy::Known(other) => Err(format!(
-                    "field access requires a struct or Mut<T>. found `{}`",
-                    display_spec_ty(&other)
-                )),
-            }
+            infer_named_field_expr_type(base_ty, name)
         }
         Expr::TupleField { base, .. } => {
             let base_ty =
                 infer_body_expr_types(expr_base(base), kind, spec_scope, local_tys, inferred)?;
-            match base_ty {
-                InferredExprTy::Known(SpecTy::Tuple(_)) => Ok(InferredExprTy::Unknown),
-                InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
-                InferredExprTy::Known(SpecTy::Struct(_)) => {
-                    Err("tuple field access is not supported on struct types".to_owned())
-                }
-                InferredExprTy::Known(other) => Err(format!(
-                    "tuple field access requires a tuple, found `{}`",
-                    display_spec_ty(&other)
-                )),
-            }
+            infer_tuple_field_expr_type(base_ty)
         }
         Expr::Deref { base } => {
             let base_ty = infer_body_expr_types(base, kind, spec_scope, local_tys, inferred)?;
@@ -940,6 +894,40 @@ fn infer_body_expr_types(
 
 fn expr_base(base: &Expr) -> &Expr {
     base
+}
+
+fn infer_named_field_expr_type(
+    base_ty: InferredExprTy,
+    name: &str,
+) -> Result<InferredExprTy, String> {
+    match base_ty {
+        InferredExprTy::Known(SpecTy::Struct(struct_ty)) => Ok(struct_ty
+            .field(name)
+            .map(|(_, field)| InferredExprTy::Known(field.ty.clone()))
+            .unwrap_or(InferredExprTy::Unknown)),
+        InferredExprTy::Known(SpecTy::Mut(inner)) if name == "fin" => {
+            Ok(InferredExprTy::Known(*inner))
+        }
+        InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
+        InferredExprTy::Known(other) => Err(format!(
+            "field access requires a struct or Mut<T>. found `{}`",
+            display_spec_ty(&other)
+        )),
+    }
+}
+
+fn infer_tuple_field_expr_type(base_ty: InferredExprTy) -> Result<InferredExprTy, String> {
+    match base_ty {
+        InferredExprTy::Known(SpecTy::Tuple(_)) => Ok(InferredExprTy::Unknown),
+        InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
+        InferredExprTy::Known(SpecTy::Struct(_)) => {
+            Err("tuple field access is not supported on struct types".to_owned())
+        }
+        InferredExprTy::Known(other) => Err(format!(
+            "tuple field access requires a tuple, found `{}`",
+            display_spec_ty(&other)
+        )),
+    }
 }
 
 fn local_spec_tys<'tcx>(
@@ -1015,59 +1003,12 @@ fn typed_contract_expr(
         Expr::Field { base, name } => {
             let base =
                 typed_contract_expr(base, spec_scope, params, allow_result, result_ty, inferred)?;
-            if name == "fin" {
-                if let SpecTy::Mut(inner) = &base.ty {
-                    return Ok(TypedExpr {
-                        ty: (**inner).clone(),
-                        kind: TypedExprKind::Fin {
-                            base: Box::new(base),
-                        },
-                    });
-                }
-            }
-            let SpecTy::Struct(struct_ty) = &base.ty else {
-                return Err(format!(
-                    "field access requires a struct, found `{}`",
-                    display_spec_ty(&base.ty)
-                ));
-            };
-            let Some((index, field_ty)) = struct_ty.field(name) else {
-                return Err(format!(
-                    "struct `{}` does not have a field named `{name}`",
-                    struct_ty.name
-                ));
-            };
-            Ok(TypedExpr {
-                ty: field_ty.ty.clone(),
-                kind: TypedExprKind::Field {
-                    base: Box::new(base),
-                    name: name.clone(),
-                    index,
-                },
-            })
+            type_named_field_expr(base, name)
         }
         Expr::TupleField { base, index } => {
             let base =
                 typed_contract_expr(base, spec_scope, params, allow_result, result_ty, inferred)?;
-            let SpecTy::Tuple(items) = &base.ty else {
-                if matches!(base.ty, SpecTy::Struct(_)) {
-                    return Err("tuple field access is not supported on struct types".to_owned());
-                }
-                return Err(format!(
-                    "tuple field access requires a tuple, found `{}`",
-                    display_spec_ty(&base.ty)
-                ));
-            };
-            let Some(field_ty) = items.get(*index) else {
-                return Err(format!("tuple field .{index} is out of bounds"));
-            };
-            Ok(TypedExpr {
-                ty: field_ty.clone(),
-                kind: TypedExprKind::TupleField {
-                    base: Box::new(base),
-                    index: *index,
-                },
-            })
+            type_tuple_field_expr(base, *index)
         }
         Expr::Deref { base } => {
             let base =
@@ -1176,58 +1117,11 @@ fn typed_body_expr(
         }
         Expr::Field { base, name } => {
             let base = typed_body_expr(expr_base(base), kind, spec_scope, local_tys, inferred)?;
-            if name == "fin" {
-                if let SpecTy::Mut(inner) = &base.ty {
-                    return Ok(TypedExpr {
-                        ty: (**inner).clone(),
-                        kind: TypedExprKind::Fin {
-                            base: Box::new(base),
-                        },
-                    });
-                }
-            }
-            let SpecTy::Struct(struct_ty) = &base.ty else {
-                return Err(format!(
-                    "field access requires a struct, found `{}`",
-                    display_spec_ty(&base.ty)
-                ));
-            };
-            let Some((index, field_ty)) = struct_ty.field(name) else {
-                return Err(format!(
-                    "struct `{}` does not have a field named `{name}`",
-                    struct_ty.name
-                ));
-            };
-            Ok(TypedExpr {
-                ty: field_ty.ty.clone(),
-                kind: TypedExprKind::Field {
-                    base: Box::new(base),
-                    name: name.clone(),
-                    index,
-                },
-            })
+            type_named_field_expr(base, name)
         }
         Expr::TupleField { base, index } => {
             let base = typed_body_expr(expr_base(base), kind, spec_scope, local_tys, inferred)?;
-            let SpecTy::Tuple(items) = &base.ty else {
-                if matches!(base.ty, SpecTy::Struct(_)) {
-                    return Err("tuple field access is not supported on struct types".to_owned());
-                }
-                return Err(format!(
-                    "tuple field access requires a tuple, found `{}`",
-                    display_spec_ty(&base.ty)
-                ));
-            };
-            let Some(field_ty) = items.get(*index) else {
-                return Err(format!("tuple field .{index} is out of bounds"));
-            };
-            Ok(TypedExpr {
-                ty: field_ty.clone(),
-                kind: TypedExprKind::TupleField {
-                    base: Box::new(base),
-                    index: *index,
-                },
-            })
+            type_tuple_field_expr(base, *index)
         }
         Expr::Deref { base } => {
             let base = typed_body_expr(base, kind, spec_scope, local_tys, inferred)?;
@@ -1367,6 +1261,61 @@ fn type_binary_expr(
             })
         }
     }
+}
+
+fn type_named_field_expr(base: TypedExpr, name: &str) -> Result<TypedExpr, String> {
+    if name == "fin" {
+        if let SpecTy::Mut(inner) = &base.ty {
+            return Ok(TypedExpr {
+                ty: (**inner).clone(),
+                kind: TypedExprKind::Fin {
+                    base: Box::new(base),
+                },
+            });
+        }
+    }
+    let SpecTy::Struct(struct_ty) = &base.ty else {
+        return Err(format!(
+            "field access requires a struct, found `{}`",
+            display_spec_ty(&base.ty)
+        ));
+    };
+    let Some((index, field_ty)) = struct_ty.field(name) else {
+        return Err(format!(
+            "struct `{}` does not have a field named `{name}`",
+            struct_ty.name
+        ));
+    };
+    Ok(TypedExpr {
+        ty: field_ty.ty.clone(),
+        kind: TypedExprKind::Field {
+            base: Box::new(base),
+            name: name.to_owned(),
+            index,
+        },
+    })
+}
+
+fn type_tuple_field_expr(base: TypedExpr, index: usize) -> Result<TypedExpr, String> {
+    let SpecTy::Tuple(items) = &base.ty else {
+        if matches!(base.ty, SpecTy::Struct(_)) {
+            return Err("tuple field access is not supported on struct types".to_owned());
+        }
+        return Err(format!(
+            "tuple field access requires a tuple, found `{}`",
+            display_spec_ty(&base.ty)
+        ));
+    };
+    let Some(field_ty) = items.get(index) else {
+        return Err(format!("tuple field .{index} is out of bounds"));
+    };
+    Ok(TypedExpr {
+        ty: field_ty.clone(),
+        kind: TypedExprKind::TupleField {
+            base: Box::new(base),
+            index,
+        },
+    })
 }
 
 pub fn compute_directives<'tcx>(
