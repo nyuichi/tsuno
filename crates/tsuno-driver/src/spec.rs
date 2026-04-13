@@ -4,6 +4,10 @@ pub enum Expr {
     Int(IntLiteral),
     Var(String),
     Bind(String),
+    Call {
+        func: String,
+        args: Vec<Expr>,
+    },
     Field {
         base: Box<Expr>,
         name: String,
@@ -38,6 +42,10 @@ pub enum TypedExprKind {
     Int(IntLiteral),
     Var(String),
     Bind(String),
+    BuiltinCall {
+        func: BuiltinFn,
+        args: Vec<TypedExpr>,
+    },
     Field {
         base: Box<TypedExpr>,
         name: String,
@@ -137,6 +145,44 @@ pub enum SpecTy {
     Mut(Box<SpecTy>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BuiltinFn {
+    SeqConcat,
+    SeqExtract,
+    SeqLen,
+    SeqNth,
+    SeqRev,
+    SeqUnit,
+}
+
+impl BuiltinFn {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "seq_concat" => Some(Self::SeqConcat),
+            "seq_extract" => Some(Self::SeqExtract),
+            "seq_len" => Some(Self::SeqLen),
+            "seq_nth" => Some(Self::SeqNth),
+            "seq_rev" => Some(Self::SeqRev),
+            "seq_unit" => Some(Self::SeqUnit),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PureFnParam {
+    pub name: String,
+    pub ty: SpecTy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PureFnDef {
+    pub name: String,
+    pub params: Vec<PureFnParam>,
+    pub result_ty: SpecTy,
+    pub body: Expr,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StructTy {
     pub name: String,
@@ -203,7 +249,11 @@ impl std::error::Error for ParseError {}
 pub fn parse_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
     let decoded = decode_string_literal(kind, text)?;
     let expanded = expand_template(kind, &decoded)?;
-    let mut parser = Parser::new(&expanded)?;
+    parse_raw_expr(kind, &expanded)
+}
+
+pub fn parse_raw_expr(_kind: &str, text: &str) -> Result<Expr, ParseError> {
+    let mut parser = Parser::new(text)?;
     let expr = parser.parse_expr()?;
     parser.expect_end()?;
     Ok(expr)
@@ -312,6 +362,7 @@ enum Token {
     Bool(bool),
     LParen,
     RParen,
+    Comma,
     Dot,
     Question,
     Plus,
@@ -391,6 +442,10 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
             ')' => {
                 chars.next();
                 tokens.push(Token::RParen);
+            }
+            ',' => {
+                chars.next();
+                tokens.push(Token::Comma);
             }
             '.' => {
                 chars.next();
@@ -678,16 +733,32 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
-        match self.next() {
-            Some(Token::Bool(value)) => Ok(Expr::Bool(*value)),
-            Some(Token::Int(value)) => Ok(Expr::Int(value.clone())),
+        match self.next().cloned() {
+            Some(Token::Bool(value)) => Ok(Expr::Bool(value)),
+            Some(Token::Int(value)) => Ok(Expr::Int(value)),
             Some(Token::Question) => {
-                let Some(Token::Ident(ident)) = self.next() else {
+                let Some(Token::Ident(ident)) = self.next().cloned() else {
                     return Err(ParseError::new("expected identifier after `?`"));
                 };
-                Ok(Expr::Bind(ident.clone()))
+                Ok(Expr::Bind(ident))
             }
-            Some(Token::Ident(ident)) => Ok(Expr::Var(ident.clone())),
+            Some(Token::Ident(ident)) => {
+                if !ident.starts_with("__") && self.eat(&Token::LParen) {
+                    let mut args = Vec::new();
+                    if !self.eat(&Token::RParen) {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if self.eat(&Token::RParen) {
+                                break;
+                            }
+                            self.expect(&Token::Comma)?;
+                        }
+                    }
+                    Ok(Expr::Call { func: ident, args })
+                } else {
+                    Ok(Expr::Var(ident))
+                }
+            }
             Some(Token::LParen) => {
                 let expr = self.parse_expr()?;
                 self.expect(&Token::RParen)?;
@@ -723,9 +794,192 @@ impl Parser {
     }
 }
 
+pub fn parse_pure_fn_block(text: &str) -> Result<Vec<PureFnDef>, ParseError> {
+    let mut parser = PureFnParser::new(text);
+    let mut defs = Vec::new();
+    while parser.skip_ws() {
+        defs.push(parser.parse_fn_def()?);
+    }
+    Ok(defs)
+}
+
+struct PureFnParser<'a> {
+    text: &'a str,
+    cursor: usize,
+}
+
+impl<'a> PureFnParser<'a> {
+    fn new(text: &'a str) -> Self {
+        Self { text, cursor: 0 }
+    }
+
+    fn skip_ws(&mut self) -> bool {
+        while let Some(ch) = self.peek_char() {
+            if ch.is_whitespace() {
+                self.cursor += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        self.cursor < self.text.len()
+    }
+
+    fn parse_fn_def(&mut self) -> Result<PureFnDef, ParseError> {
+        self.expect_keyword("fn")?;
+        let name = self.parse_ident()?;
+        self.expect_char('(')?;
+        let mut params = Vec::new();
+        self.skip_ws();
+        if !self.eat_char(')') {
+            loop {
+                let param_name = self.parse_ident()?;
+                self.expect_char(':')?;
+                let ty = self.parse_spec_ty()?;
+                params.push(PureFnParam {
+                    name: param_name,
+                    ty,
+                });
+                self.skip_ws();
+                if self.eat_char(')') {
+                    break;
+                }
+                self.expect_char(',')?;
+            }
+        }
+        self.expect_arrow()?;
+        let result_ty = self.parse_spec_ty()?;
+        self.expect_char('{')?;
+        let body = self.parse_braced_body()?;
+        Ok(PureFnDef {
+            name,
+            params,
+            result_ty,
+            body: parse_raw_expr("pure function body", body.trim())?,
+        })
+    }
+
+    fn parse_spec_ty(&mut self) -> Result<SpecTy, ParseError> {
+        let ident = self.parse_ident()?;
+        match ident.as_str() {
+            "bool" => Ok(SpecTy::Bool),
+            "i8" => Ok(SpecTy::I8),
+            "i16" => Ok(SpecTy::I16),
+            "i32" => Ok(SpecTy::I32),
+            "i64" => Ok(SpecTy::I64),
+            "isize" => Ok(SpecTy::Isize),
+            "u8" => Ok(SpecTy::U8),
+            "u16" => Ok(SpecTy::U16),
+            "u32" => Ok(SpecTy::U32),
+            "u64" => Ok(SpecTy::U64),
+            "usize" => Ok(SpecTy::Usize),
+            "Seq" => {
+                self.expect_char('<')?;
+                let inner = self.parse_spec_ty()?;
+                self.expect_char('>')?;
+                Ok(SpecTy::Seq(Box::new(inner)))
+            }
+            _ => Err(ParseError::new(format!(
+                "unsupported pure function type `{ident}`"
+            ))),
+        }
+    }
+
+    fn parse_braced_body(&mut self) -> Result<&'a str, ParseError> {
+        let body_start = self.cursor;
+        let mut depth = 1usize;
+        while let Some(ch) = self.peek_char() {
+            self.cursor += ch.len_utf8();
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let end = self.cursor - 1;
+                        return Ok(&self.text[body_start..end]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err(ParseError::new("unclosed `{` in pure function block"))
+    }
+
+    fn parse_ident(&mut self) -> Result<String, ParseError> {
+        self.skip_ws();
+        let start = self.cursor;
+        let mut chars = self.text[self.cursor..].chars();
+        let Some(first) = chars.next() else {
+            return Err(ParseError::new("unexpected end of pure function block"));
+        };
+        if !(first.is_ascii_alphabetic() || first == '_') {
+            return Err(ParseError::new(
+                "expected identifier in pure function block",
+            ));
+        }
+        self.cursor += first.len_utf8();
+        while let Some(ch) = self.peek_char() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                self.cursor += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        Ok(self.text[start..self.cursor].to_owned())
+    }
+
+    fn expect_keyword(&mut self, keyword: &str) -> Result<(), ParseError> {
+        self.skip_ws();
+        if self.text[self.cursor..].starts_with(keyword) {
+            self.cursor += keyword.len();
+            Ok(())
+        } else {
+            Err(ParseError::new(format!(
+                "expected keyword `{keyword}` in pure function block"
+            )))
+        }
+    }
+
+    fn expect_arrow(&mut self) -> Result<(), ParseError> {
+        self.skip_ws();
+        if self.text[self.cursor..].starts_with("->") {
+            self.cursor += 2;
+            Ok(())
+        } else {
+            Err(ParseError::new("expected `->` in pure function block"))
+        }
+    }
+
+    fn expect_char(&mut self, ch: char) -> Result<(), ParseError> {
+        self.skip_ws();
+        if self.eat_char(ch) {
+            Ok(())
+        } else {
+            Err(ParseError::new(format!(
+                "expected `{ch}` in pure function block"
+            )))
+        }
+    }
+
+    fn eat_char(&mut self, ch: char) -> bool {
+        if self.peek_char() == Some(ch) {
+            self.cursor += ch.len_utf8();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek_char(&self) -> Option<char> {
+        self.text[self.cursor..].chars().next()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BinaryOp, Expr, IntLiteral, IntSuffix, UnaryOp, parse_expr};
+    use super::{
+        BinaryOp, Expr, IntLiteral, IntSuffix, PureFnDef, PureFnParam, SpecTy, UnaryOp, parse_expr,
+        parse_pure_fn_block,
+    };
 
     #[test]
     fn parses_deref_and_fin() {
@@ -855,6 +1109,59 @@ mod tests {
                     suffix: Some(IntSuffix::Usize),
                 })),
             }
+        );
+    }
+
+    #[test]
+    fn parses_function_call_expression() {
+        let expr = parse_expr("assert", r#""seq_rev({xs}) == {ys}""#).expect("expr");
+        assert_eq!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                lhs: Box::new(Expr::Call {
+                    func: "seq_rev".to_owned(),
+                    args: vec![Expr::Var("xs".to_owned())],
+                }),
+                rhs: Box::new(Expr::Var("ys".to_owned())),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_pure_function_block() {
+        let defs = parse_pure_fn_block(
+            r#"
+fn is_rev(x: Seq<i32>, y: Seq<i32>) -> bool {
+    seq_rev(x) == y
+}
+"#,
+        )
+        .expect("pure fn block");
+        assert_eq!(
+            defs,
+            vec![PureFnDef {
+                name: "is_rev".to_owned(),
+                params: vec![
+                    PureFnParam {
+                        name: "x".to_owned(),
+                        ty: SpecTy::Seq(Box::new(SpecTy::I32)),
+                    },
+                    PureFnParam {
+                        name: "y".to_owned(),
+                        ty: SpecTy::Seq(Box::new(SpecTy::I32)),
+                    },
+                ],
+                result_ty: SpecTy::Bool,
+                body: Expr::Binary {
+                    op: BinaryOp::Eq,
+                    lhs: Box::new(Expr::Call {
+                        func: "seq_rev".to_owned(),
+                        args: vec![Expr::Var("x".to_owned())],
+                    }),
+                    rhs: Box::new(Expr::Var("y".to_owned())),
+                },
+            }]
         );
     }
 }

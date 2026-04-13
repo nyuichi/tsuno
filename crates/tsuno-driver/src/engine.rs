@@ -32,7 +32,9 @@ use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::Span;
 use rustc_span::source_map::Spanned;
 use z3::ast::{Ast, Bool, Datatype, Dynamic, Int, Seq};
-use z3::{DatatypeAccessor, DatatypeBuilder, DatatypeSort, SatResult, Solver, Sort, SortKind};
+use z3::{
+    DatatypeAccessor, DatatypeBuilder, DatatypeSort, FuncDecl, SatResult, Solver, Sort, SortKind,
+};
 
 use crate::prepass::{
     AssertionContracts, AssumptionContracts, ContractParam, FunctionContract,
@@ -40,7 +42,7 @@ use crate::prepass::{
     compute_directives, spec_ty_for_rust_ty, vec_element_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
-use crate::spec::{BinaryOp, SpecTy, TypedExpr, TypedExprKind, UnaryOp};
+use crate::spec::{BinaryOp, BuiltinFn, SpecTy, TypedExpr, TypedExprKind, UnaryOp};
 
 thread_local! {
     static GLOBAL_SOLVER: Solver = {
@@ -1440,6 +1442,13 @@ impl<'tcx> Verifier<'tcx> {
                     )
                 })
             }
+            TypedExprKind::BuiltinCall { func, args } => {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.spec_expr_to_value(state, arg, resolved)?);
+                }
+                self.eval_builtin_call(*func, args, values, self.control_span(state.ctrl))
+            }
             TypedExprKind::Field { base, index, .. } => {
                 let value = self.spec_expr_to_value(state, base, resolved)?;
                 self.project_field(value, &base.ty, *index, self.control_span(state.ctrl))
@@ -1530,6 +1539,13 @@ impl<'tcx> Verifier<'tcx> {
                     format!("missing spec binding `{name}`"),
                 )
             }),
+            TypedExprKind::BuiltinCall { func, args } => {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.contract_expr_to_value(current, spec, arg)?);
+                }
+                self.eval_builtin_call(*func, args, values, self.tcx.def_span(self.def_id))
+            }
             TypedExprKind::Field { base, index, .. } => {
                 let value = self.contract_expr_to_value(current, spec, base)?;
                 self.project_field(value, &base.ty, *index, self.tcx.def_span(self.def_id))
@@ -1573,6 +1589,182 @@ impl<'tcx> Verifier<'tcx> {
                 )
             }
         }
+    }
+
+    fn eval_builtin_call(
+        &self,
+        func: BuiltinFn,
+        args: &[TypedExpr],
+        values: Vec<SymValue>,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        match func {
+            BuiltinFn::SeqLen => {
+                let SymValue::Seq(seq) = &values[0] else {
+                    return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
+                };
+                Ok(self.value_wrap_int(&seq.length()))
+            }
+            BuiltinFn::SeqExtract => {
+                let SymValue::Seq(seq) = &values[0] else {
+                    return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
+                };
+                let SpecTy::Seq(inner) = &args[0].ty else {
+                    unreachable!("typed seq_extract base");
+                };
+                let start = self.value_int_data(&values[1]);
+                let len = self.value_int_data(&values[2]);
+                Ok(SymValue::Seq(self.seq_extract(seq, inner, &start, &len)))
+            }
+            BuiltinFn::SeqConcat => {
+                let (SymValue::Seq(lhs), SymValue::Seq(rhs)) = (&values[0], &values[1]) else {
+                    return Err(self.unsupported_result(
+                        span,
+                        "expected sequence values for concatenation".to_owned(),
+                    ));
+                };
+                Ok(SymValue::Seq(Seq::concat(&[lhs, rhs])))
+            }
+            BuiltinFn::SeqNth => {
+                let SymValue::Seq(seq) = &values[0] else {
+                    return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
+                };
+                let SpecTy::Seq(inner) = &args[0].ty else {
+                    unreachable!("typed seq_nth base");
+                };
+                let index = self.value_int_data(&values[1]);
+                let dyn_value = seq.nth(index);
+                let encoding = self.type_encoding(inner)?;
+                let elem = self.decode_value(&encoding, dyn_value, span)?;
+                Ok(elem)
+            }
+            BuiltinFn::SeqRev => {
+                let SymValue::Seq(seq) = &values[0] else {
+                    return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
+                };
+                let SpecTy::Seq(inner) = &args[0].ty else {
+                    unreachable!("typed seq_rev base");
+                };
+                Ok(SymValue::Seq(self.seq_rev(seq, inner)))
+            }
+            BuiltinFn::SeqUnit => Ok(SymValue::Seq(match &values[0] {
+                SymValue::Bool(value) => Seq::unit(value),
+                SymValue::Int(value) => Seq::unit(value),
+                SymValue::Seq(value) => Seq::unit(value),
+                SymValue::Datatype(value) => Seq::unit(value),
+            })),
+        }
+    }
+
+    fn seq_extract(&self, seq: &Seq, inner: &SpecTy, start: &Int, len: &Int) -> Seq {
+        let elem = self
+            .type_encoding(inner)
+            .expect("sequence element encoding for seq_extract");
+        let seq_sort = Sort::seq(&elem.sort);
+        let decl = FuncDecl::new(
+            format!("seq_extract_{}", self.sort_name(inner)),
+            &[&seq_sort, &Sort::int(), &Sort::int()],
+            &seq_sort,
+        );
+        let input = Seq::fresh_const("seq_extract_input", &elem.sort);
+        let start_var = Int::fresh_const("seq_extract_start");
+        let len_var = Int::fresh_const("seq_extract_len");
+        let output = decl
+            .apply(&[&input, &start_var, &len_var])
+            .as_seq()
+            .expect("seq_extract result");
+        let idx = Int::fresh_const("seq_extract_idx");
+        let input_len = input.length();
+        let in_bounds = bool_and(vec![
+            start_var.ge(0),
+            len_var.ge(0),
+            start_var.le(input_len.clone()),
+            len_var.le(input_len.clone() - start_var.clone()),
+        ]);
+        GLOBAL_SOLVER.with(|solver| {
+            solver.assert(&z3::ast::forall_const(
+                &[&input, &start_var, &len_var],
+                &[],
+                &in_bounds.clone().implies(output.length().eq(&len_var)),
+            ));
+            solver.assert(&z3::ast::forall_const(
+                &[&input, &start_var, &len_var, &idx],
+                &[],
+                &bool_and(vec![in_bounds.clone(), idx.ge(0), idx.lt(len_var.clone())]).implies(
+                    output
+                        .nth(idx.clone())
+                        .eq(input.nth(start_var.clone() + idx.clone())),
+                ),
+            ));
+            let zero = Int::from_i64(0);
+            let prefix = decl
+                .apply(&[&input, &zero, &start_var])
+                .as_seq()
+                .expect("seq_extract prefix");
+            let suffix_start = start_var.clone() + len_var.clone();
+            let suffix_len = input_len.clone() - start_var.clone() - len_var.clone();
+            let suffix = decl
+                .apply(&[&input, &suffix_start, &suffix_len])
+                .as_seq()
+                .expect("seq_extract suffix");
+            solver.assert(&z3::ast::forall_const(
+                &[&input, &start_var, &len_var],
+                &[],
+                &in_bounds.implies(input.eq(Seq::concat(&[&prefix, &output, &suffix]))),
+            ));
+        });
+        decl.apply(&[seq, start, len])
+            .as_seq()
+            .expect("seq_extract application")
+    }
+
+    fn seq_rev(&self, seq: &Seq, inner: &SpecTy) -> Seq {
+        let elem = self
+            .type_encoding(inner)
+            .expect("sequence element encoding for seq_rev");
+        let seq_sort = Sort::seq(&elem.sort);
+        let decl = FuncDecl::new(
+            format!("seq_rev_{}", self.sort_name(inner)),
+            &[&seq_sort],
+            &seq_sort,
+        );
+        let input = Seq::fresh_const("seq_rev_input", &elem.sort);
+        let output = decl.apply(&[&input]).as_seq().expect("seq_rev result");
+        let index = Int::fresh_const("seq_rev_idx");
+        let len = input.length();
+        GLOBAL_SOLVER.with(|solver| {
+            solver.assert(&z3::ast::forall_const(
+                &[&input],
+                &[],
+                &output.length().eq(&len),
+            ));
+            solver.assert(&z3::ast::forall_const(
+                &[&input, &index],
+                &[],
+                &bool_and(vec![
+                    index.ge(0),
+                    index.lt(len.clone()),
+                    output
+                        .nth(index.clone())
+                        .eq(input.nth(len.clone() - index.clone() - 1)),
+                ]),
+            ));
+            let left = Seq::fresh_const("seq_rev_left", &elem.sort);
+            let right = Seq::fresh_const("seq_rev_right", &elem.sort);
+            let left_rev = decl.apply(&[&left]).as_seq().expect("seq_rev left");
+            let right_rev = decl.apply(&[&right]).as_seq().expect("seq_rev right");
+            let both = Seq::concat(&[&left, &right]);
+            solver.assert(&z3::ast::forall_const(
+                &[&left, &right],
+                &[],
+                &decl
+                    .apply(&[&both])
+                    .as_seq()
+                    .expect("seq_rev concat")
+                    .eq(Seq::concat(&[&right_rev, &left_rev])),
+            ));
+        });
+        decl.apply(&[seq]).as_seq().expect("seq_rev application")
     }
 
     fn function_postcondition_to_z3(
