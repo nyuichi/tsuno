@@ -64,7 +64,7 @@ pub enum TypedExprKind {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IntSuffix {
     I8,
     I16,
@@ -95,7 +95,7 @@ impl IntSuffix {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IntLiteral {
     pub digits: String,
     pub suffix: Option<IntSuffix>,
@@ -116,7 +116,7 @@ impl IntLiteral {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SpecTy {
     Bool,
     IntLiteral,
@@ -137,7 +137,7 @@ pub enum SpecTy {
     Mut(Box<SpecTy>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StructTy {
     pub name: String,
     pub fields: Vec<StructFieldTy>,
@@ -152,7 +152,7 @@ impl StructTy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StructFieldTy {
     pub name: String,
     pub ty: SpecTy,

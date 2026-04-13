@@ -75,6 +75,12 @@ pub struct ContractParam {
     pub ty: SpecTy,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecVarBinding {
+    pub name: String,
+    pub ty: SpecTy,
+}
+
 #[derive(Debug, Clone)]
 pub struct FunctionContract {
     pub params: Vec<ContractParam>,
@@ -83,7 +89,7 @@ pub struct FunctionContract {
     pub req_span: String,
     pub ens: TypedExpr,
     pub ens_span: String,
-    pub spec_vars: Vec<String>,
+    pub spec_vars: Vec<SpecVarBinding>,
     pub result: SpecTy,
 }
 
@@ -123,7 +129,7 @@ pub struct DirectivePrepass {
     pub assertion_contracts: AssertionContracts,
     pub assumption_contracts: AssumptionContracts,
     pub function_contract: Option<FunctionContract>,
-    pub spec_vars: Vec<String>,
+    pub spec_vars: Vec<SpecVarBinding>,
 }
 
 impl LoopContracts {
@@ -303,6 +309,22 @@ impl SpecScope {
             }
         }
         names
+    }
+
+    fn typed_ordered(
+        &self,
+        inferred: &mut SpecTypeInference,
+    ) -> Result<Vec<SpecVarBinding>, String> {
+        typed_spec_vars_for_names(&self.ordered, inferred)
+    }
+
+    fn typed_ordered_with(
+        &self,
+        other: &Self,
+        inferred: &mut SpecTypeInference,
+    ) -> Result<Vec<SpecVarBinding>, String> {
+        let names = self.ordered_with(other);
+        typed_spec_vars_for_names(&names, inferred)
     }
 }
 
@@ -532,6 +554,21 @@ fn inferred_spec_var_ty(inferred: &mut SpecTypeInference, name: &str) -> Result<
         return Err(format!("could not infer a type for `?{name}`"));
     }
     Ok(ty)
+}
+
+fn typed_spec_vars_for_names(
+    names: &[String],
+    inferred: &mut SpecTypeInference,
+) -> Result<Vec<SpecVarBinding>, String> {
+    names
+        .iter()
+        .map(|name| {
+            Ok(SpecVarBinding {
+                name: name.clone(),
+                ty: inferred_spec_var_ty(inferred, name)?,
+            })
+        })
+        .collect()
 }
 
 fn constrain_expr_ty(
@@ -1599,7 +1636,7 @@ pub fn compute_directives<'tcx>(
                 kind: TypedExprKind::Bool(true),
             },
             ens_span: def_span,
-            spec_vars: contract_scope.ordered.clone(),
+            spec_vars: Vec::new(),
             result,
         }),
         (Some(req), Some(ens)) => Some(FunctionContract {
@@ -1608,7 +1645,13 @@ pub fn compute_directives<'tcx>(
             req_span: req.span_text.clone(),
             ens: typed_ens.expect("typed ens"),
             ens_span: ens.span_text.clone(),
-            spec_vars: contract_scope.ordered.clone(),
+            spec_vars: contract_scope
+                .typed_ordered(&mut inferred)
+                .map_err(|message| LoopPrepassError {
+                    span: tcx.def_span(def_id.to_def_id()),
+                    display_span: None,
+                    message,
+                })?,
             result,
         }),
         _ => {
@@ -1761,7 +1804,13 @@ pub fn compute_directives<'tcx>(
         assertion_contracts,
         assumption_contracts,
         function_contract,
-        spec_vars: body_scope.ordered_with(&contract_scope),
+        spec_vars: body_scope
+            .typed_ordered_with(&contract_scope, &mut inferred)
+            .map_err(|message| LoopPrepassError {
+                span: tcx.def_span(def_id.to_def_id()),
+                display_span: None,
+                message,
+            })?,
     })
 }
 
@@ -2036,7 +2085,7 @@ fn build_contract_only<'tcx>(
                 kind: TypedExprKind::Bool(true),
             },
             ens_span: def_span,
-            spec_vars: validate_scope.ordered,
+            spec_vars: Vec::new(),
             result,
         }),
         (Some(req), Some(ens)) => {
@@ -2086,7 +2135,10 @@ fn build_contract_only<'tcx>(
                 req_span: req.span_text.clone(),
                 ens: typed_ens,
                 ens_span: ens.span_text.clone(),
-                spec_vars: validate_scope.ordered,
+                spec_vars: typed_spec_vars_for_names(&validate_scope.ordered, &mut inferred)
+                    .map_err(|message| {
+                        function_contract_error(tcx, def_id, &ens.span_text, message)
+                    })?,
                 result,
             })
         }
