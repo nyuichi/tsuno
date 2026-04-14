@@ -8,7 +8,5 @@ stdout:
 UNSUPPORTED rejects_mut_ref_equality
   `==` and `!=` are not supported for `Mut<i32>`
   src/main.rs:3:5: 3:31
-PASS main
-  all assertions discharged
 
 stderr:

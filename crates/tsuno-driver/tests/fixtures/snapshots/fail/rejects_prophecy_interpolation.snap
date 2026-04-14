@@ -8,7 +8,5 @@ stdout:
 UNSUPPORTED set_to_two
   unexpected trailing tokens in //@ ens predicate
   src/main.rs:1:1: 6:2
-PASS main
-  all assertions discharged
 
 stderr:

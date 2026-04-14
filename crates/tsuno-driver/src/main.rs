@@ -16,7 +16,7 @@ mod spec;
 use std::env;
 
 use crate::engine::Verifier;
-use crate::prepass::{compute_function_contracts, compute_global_ghost_prepass};
+use crate::prepass::{compute_function_prepass, compute_global_ghost_prepass};
 use crate::report::{VerificationResult, print_report};
 use rustc_driver::{Callbacks, Compilation, run_compiler};
 use rustc_hir::ItemKind;
@@ -65,10 +65,9 @@ impl Callbacks for VerifyCallbacks {
                     }),
                     message: error.message,
                 });
-                return Compilation::Continue;
+                return Compilation::Stop;
             }
         };
-        let contracts = compute_function_contracts(tcx, None, &ghosts);
         let mut items = Vec::new();
         for item_id in tcx.hir_free_items() {
             let item = tcx.hir_item(item_id);
@@ -77,40 +76,63 @@ impl Callbacks for VerifyCallbacks {
             }
             items.push((item.owner_id.def_id, item.span));
         }
-        let Some((anchor_def_id, anchor_span)) = items.first().copied() else {
-            return Compilation::Continue;
+        let Some((first_def_id, _first_span)) = items.first().copied() else {
+            return Compilation::Stop;
         };
-        let anchor_verifier = Verifier::new(
-            tcx,
-            anchor_def_id,
-            anchor_span,
-            tcx.mir_drops_elaborated_and_const_checked(anchor_def_id)
-                .steal(),
-            contracts.clone(),
-            &ghosts,
-            false,
-        );
-        let anchor_result = anchor_verifier.verify();
-        let stop_after_anchor = anchor_result.function == "prepass";
-        self.results.push(anchor_result);
-        if stop_after_anchor {
-            return Compilation::Continue;
+        let mut prepasses = Vec::with_capacity(items.len());
+        let mut contracts = std::collections::HashMap::with_capacity(items.len());
+        for (def_id, span) in &items {
+            let body = tcx.mir_drops_elaborated_and_const_checked(*def_id);
+            let prepass =
+                match compute_function_prepass(tcx, *def_id, *span, &body.borrow(), &ghosts) {
+                    Ok(prepass) => prepass,
+                    Err(error) => {
+                        self.results.push(error);
+                        return Compilation::Stop;
+                    }
+                };
+            let contract = prepass
+                .function_contract
+                .clone()
+                .expect("successful function prepass must yield contract");
+            contracts.insert(*def_id, contract);
+            prepasses.push(prepass);
         }
-        for (local_def_id, span) in items.into_iter().skip(1) {
+        let first_body = tcx
+            .mir_drops_elaborated_and_const_checked(first_def_id)
+            .steal();
+        let mut verifier = Verifier::new(tcx, first_def_id, first_body.clone(), contracts);
+        for pure_fn in &ghosts.typed_pure_fns {
+            if let Err(error) = verifier.load_ghost_function(pure_fn) {
+                self.results.push(VerificationResult {
+                    function: "prepass".to_owned(),
+                    ..error
+                });
+                return Compilation::Stop;
+            }
+        }
+        for lemma in &ghosts.typed_lemmas {
+            if let Err(error) = verifier.load_ghost_lemma(lemma) {
+                self.results.push(VerificationResult {
+                    function: "prepass".to_owned(),
+                    ..error
+                });
+                return Compilation::Stop;
+            }
+        }
+        let mut prepass_iter = prepasses.into_iter();
+        let first_prepass = prepass_iter
+            .next()
+            .expect("non-empty function list must yield first prepass");
+        self.results
+            .push(verifier.verify_function(first_def_id, first_body, first_prepass));
+        for ((local_def_id, _span), prepass) in items.into_iter().skip(1).zip(prepass_iter) {
             let body = tcx
                 .mir_drops_elaborated_and_const_checked(local_def_id)
                 .steal();
-            let verifier = Verifier::new(
-                tcx,
-                local_def_id,
-                span,
-                body,
-                contracts.clone(),
-                &ghosts,
-                true,
-            );
-            self.results.push(verifier.verify());
+            self.results
+                .push(verifier.verify_function(local_def_id, body, prepass));
         }
-        Compilation::Continue
+        Compilation::Stop
     }
 }

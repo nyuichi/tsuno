@@ -8,7 +8,5 @@ stdout:
 UNSUPPORTED rejects_tuple_projection_on_mut_ref
   tuple field access requires a tuple, found `Mut<i32>`
   src/main.rs:3:5: 3:31
-PASS main
-  all assertions discharged
 
 stderr:

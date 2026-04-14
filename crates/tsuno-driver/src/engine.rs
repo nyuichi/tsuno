@@ -37,10 +37,10 @@ use z3::{
 };
 
 use crate::prepass::{
-    AssertionContracts, AssumptionContracts, ContractParam, FunctionContract,
-    FunctionContractEntry, GlobalGhostPrepass, LemmaCallContract, LemmaCallContracts, LoopContract,
-    LoopContracts, ResolvedExprEnv, SpecVarBinding, TypedGhostStmt, TypedLemmaDef, TypedPureFnDef,
-    compute_directives, spec_ty_for_rust_ty, vec_element_ty,
+    AssertionContracts, AssumptionContracts, ContractParam, DirectivePrepass, FunctionContract,
+    LemmaCallContract, LemmaCallContracts, LoopContract, LoopContracts, ResolvedExprEnv,
+    SpecVarBinding, TypedGhostStmt, TypedLemmaDef, TypedPureFnDef, spec_ty_for_rust_ty,
+    vec_element_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{BinaryOp, BuiltinFn, SpecTy, TypedExpr, TypedExprKind, UnaryOp};
@@ -121,7 +121,7 @@ pub struct Verifier<'tcx> {
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     body: Body<'tcx>,
-    contracts: HashMap<LocalDefId, FunctionContractEntry>,
+    contracts: HashMap<LocalDefId, FunctionContract>,
     function_spec_vars: HashMap<String, SymValue>,
     loop_contracts: LoopContracts,
     assertion_contracts: AssertionContracts,
@@ -129,7 +129,6 @@ pub struct Verifier<'tcx> {
     lemma_call_contracts: LemmaCallContracts,
     pure_fns: HashMap<String, TypedPureFnDef>,
     lemmas: HashMap<String, TypedLemmaDef>,
-    prepass_error: Option<VerificationResult>,
     next_sym: Cell<usize>,
     type_encodings: RefCell<BTreeMap<SpecTy, Rc<TypeEncoding>>>,
 }
@@ -138,92 +137,63 @@ impl<'tcx> Verifier<'tcx> {
     pub fn new(
         tcx: TyCtxt<'tcx>,
         def_id: LocalDefId,
-        item_span: Span,
         body: Body<'tcx>,
-        contracts: HashMap<LocalDefId, FunctionContractEntry>,
-        ghosts: &GlobalGhostPrepass,
-        preloaded: bool,
+        contracts: HashMap<LocalDefId, FunctionContract>,
     ) -> Self {
-        let (
-            loop_contracts,
-            assertion_contracts,
-            assumption_contracts,
-            lemma_call_contracts,
-            function_contract,
-            spec_vars,
-            prepass_error,
-        ) = match compute_directives(tcx, def_id, item_span, &body, ghosts) {
-            Ok(prepass) => (
-                prepass.loop_contracts,
-                prepass.assertion_contracts,
-                prepass.assumption_contracts,
-                prepass.lemma_call_contracts,
-                prepass.function_contract,
-                prepass.spec_vars,
-                None,
-            ),
-            Err(error) => (
-                LoopContracts::empty(),
-                AssertionContracts::empty(),
-                AssumptionContracts::empty(),
-                LemmaCallContracts::empty(),
-                None,
-                Vec::new(),
-                Some(VerificationResult {
-                    function: tcx.def_path_str(def_id.to_def_id()),
-                    status: VerificationStatus::Unsupported,
-                    span: error
-                        .display_span
-                        .unwrap_or_else(|| span_text(tcx, error.span)),
-                    message: error.message,
-                }),
-            ),
-        };
-        let next_sym = Cell::new(0);
-        let mut contracts = contracts;
-        if let Some(contract) = function_contract {
-            contracts.insert(def_id, FunctionContractEntry::Ready(contract));
-        } else if let Some(error) = prepass_error.clone() {
-            contracts.insert(def_id, FunctionContractEntry::Invalid(error));
-        }
-        let mut verifier = Self {
+        reset_solver();
+        Self {
             tcx,
             def_id,
             body,
             contracts,
             function_spec_vars: HashMap::new(),
-            loop_contracts,
-            assertion_contracts,
-            assumption_contracts,
-            lemma_call_contracts,
+            loop_contracts: LoopContracts::empty(),
+            assertion_contracts: AssertionContracts::empty(),
+            assumption_contracts: AssumptionContracts::empty(),
+            lemma_call_contracts: LemmaCallContracts::empty(),
             pure_fns: HashMap::new(),
             lemmas: HashMap::new(),
-            prepass_error,
-            next_sym,
+            next_sym: Cell::new(0),
             type_encodings: RefCell::new(BTreeMap::new()),
-        };
-        if !preloaded {
-            reset_solver();
-            if let Err(error) = verifier.prepare(&ghosts.typed_pure_fns, &ghosts.typed_lemmas) {
-                verifier.prepass_error = Some(VerificationResult {
-                    function: "prepass".to_owned(),
-                    ..error
-                });
-            }
-        } else {
-            verifier.load_all_ghosts(&ghosts.typed_pure_fns, &ghosts.typed_lemmas);
-        }
-        let function_spec_vars = verifier.instantiate_spec_vars(&spec_vars);
-        Self {
-            function_spec_vars,
-            ..verifier
         }
     }
 
-    pub fn verify(&self) -> VerificationResult {
-        if let Some(result) = self.prepass_error.clone() {
-            return result;
-        }
+    pub fn verify_function(
+        &mut self,
+        def_id: LocalDefId,
+        body: Body<'tcx>,
+        prepass: DirectivePrepass,
+    ) -> VerificationResult {
+        self.def_id = def_id;
+        self.body = body;
+        self.load_function_prepass(prepass);
+        self.verify_loaded_function()
+    }
+
+    pub fn load_ghost_function(
+        &mut self,
+        pure_fn: &TypedPureFnDef,
+    ) -> Result<(), VerificationResult> {
+        self.register_pure_fn(pure_fn)?;
+        let inserted = self
+            .pure_fns
+            .insert(pure_fn.name.clone(), pure_fn.clone())
+            .is_none();
+        assert!(inserted, "duplicate pure function `{}`", pure_fn.name);
+        Ok(())
+    }
+
+    pub fn load_ghost_lemma(&mut self, lemma: &TypedLemmaDef) -> Result<(), VerificationResult> {
+        let inserted = self
+            .lemmas
+            .insert(lemma.name.clone(), lemma.clone())
+            .is_none();
+        assert!(inserted, "duplicate lemma `{}`", lemma.name);
+        let mut stack = Vec::new();
+        self.verify_lemma(lemma, &mut stack)
+    }
+
+    fn verify_loaded_function(&self) -> VerificationResult {
         let initial_state = match self.initial_state() {
             Ok(state) => state,
             Err(err) => return err,
@@ -231,30 +201,23 @@ impl<'tcx> Verifier<'tcx> {
         self.verify_from_initial_state(initial_state)
     }
 
-    fn prepare(
-        &mut self,
-        pure_fn_defs: &[TypedPureFnDef],
-        lemma_defs: &[TypedLemmaDef],
-    ) -> Result<(), VerificationResult> {
-        self.register_pure_fns(pure_fn_defs)?;
-        self.verify_lemmas(lemma_defs)
-    }
-
-    fn load_all_ghosts(&mut self, pure_fn_defs: &[TypedPureFnDef], lemma_defs: &[TypedLemmaDef]) {
-        for pure_fn in pure_fn_defs {
-            let inserted = self
-                .pure_fns
-                .insert(pure_fn.name.clone(), pure_fn.clone())
-                .is_none();
-            assert!(inserted, "duplicate pure function `{}`", pure_fn.name);
-        }
-        for lemma in lemma_defs {
-            let inserted = self
-                .lemmas
-                .insert(lemma.name.clone(), lemma.clone())
-                .is_none();
-            assert!(inserted, "duplicate lemma `{}`", lemma.name);
-        }
+    fn load_function_prepass(&mut self, prepass: DirectivePrepass) {
+        let DirectivePrepass {
+            directives: _,
+            loop_contracts,
+            assertion_contracts,
+            assumption_contracts,
+            lemma_call_contracts,
+            function_contract,
+            spec_vars,
+        } = prepass;
+        let contract = function_contract.expect("successful function prepass must yield contract");
+        self.contracts.insert(self.def_id, contract);
+        self.loop_contracts = loop_contracts;
+        self.assertion_contracts = assertion_contracts;
+        self.assumption_contracts = assumption_contracts;
+        self.lemma_call_contracts = lemma_call_contracts;
+        self.function_spec_vars = self.instantiate_spec_vars(&spec_vars);
     }
 
     fn verify_from_initial_state(&self, initial_state: State) -> VerificationResult {
@@ -416,9 +379,7 @@ impl<'tcx> Verifier<'tcx> {
                 self.goto_target(state, *target, term.source_info.span)
             }
             TerminatorKind::Return => {
-                if let Some(FunctionContractEntry::Ready(contract)) =
-                    self.contracts.get(&self.def_id)
-                {
+                if let Some(contract) = self.contracts.get(&self.def_id) {
                     let formula = self.function_postcondition_to_z3(&state, contract)?;
                     self.require_constraint(
                         &mut state,
@@ -551,13 +512,10 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<Vec<State>, VerificationResult> {
         let callee = self.called_def_id(func);
         if let Some(def_id) = callee {
-            let contract = match self.contracts.get(&def_id) {
-                Some(FunctionContractEntry::Ready(contract)) => contract,
-                Some(FunctionContractEntry::Invalid(error)) => {
-                    return Err(self.invalid_local_contract_result(def_id, error));
-                }
-                None => return Err(self.missing_local_contract_result(def_id, span)),
-            };
+            let contract = self
+                .contracts
+                .get(&def_id)
+                .ok_or_else(|| self.missing_local_contract_result(def_id, span))?;
             let spec = self.instantiate_contract_spec_vars(contract);
             let env = self.call_env(&state, args, contract, span, spec.clone())?;
             let req = self.contract_req_to_z3(contract, &env, span)?;
@@ -803,41 +761,13 @@ impl<'tcx> Verifier<'tcx> {
             let value = self.fresh_for_rust_ty(ty, &format!("arg_{}", local.as_usize()))?;
             state.model.insert(local, value);
         }
-        if let Some(FunctionContractEntry::Ready(contract)) = self.contracts.get(&self.def_id) {
+        if let Some(contract) = self.contracts.get(&self.def_id) {
             let env =
                 CallEnv::for_function(self, &state, contract, self.function_spec_vars.clone())?;
             let req = self.contract_req_to_z3(contract, &env, self.tcx.def_span(self.def_id))?;
             self.assume_constraint(&mut state, req);
         }
         Ok(state)
-    }
-
-    fn verify_lemmas(&mut self, lemma_defs: &[TypedLemmaDef]) -> Result<(), VerificationResult> {
-        let mut stack = Vec::new();
-        for lemma in lemma_defs {
-            let inserted = self
-                .lemmas
-                .insert(lemma.name.clone(), lemma.clone())
-                .is_none();
-            assert!(inserted, "duplicate lemma `{}`", lemma.name);
-            self.verify_lemma(lemma, &mut stack)?;
-        }
-        Ok(())
-    }
-
-    fn register_pure_fns(
-        &mut self,
-        pure_fn_defs: &[TypedPureFnDef],
-    ) -> Result<(), VerificationResult> {
-        for pure_fn in pure_fn_defs {
-            self.register_pure_fn(pure_fn)?;
-            let inserted = self
-                .pure_fns
-                .insert(pure_fn.name.clone(), pure_fn.clone())
-                .is_none();
-            assert!(inserted, "duplicate pure function `{}`", pure_fn.name);
-        }
-        Ok(())
     }
 
     fn register_pure_fn(&self, pure_fn: &TypedPureFnDef) -> Result<(), VerificationResult> {
@@ -2326,20 +2256,6 @@ impl<'tcx> Verifier<'tcx> {
             span,
             format!("missing local function contract for `{callee}`"),
         )
-    }
-
-    fn invalid_local_contract_result(
-        &self,
-        def_id: LocalDefId,
-        err: &VerificationResult,
-    ) -> VerificationResult {
-        let callee = self.tcx.def_path_str(def_id.to_def_id());
-        VerificationResult {
-            function: self.tcx.def_path_str(self.def_id.to_def_id()),
-            status: err.status.clone(),
-            span: err.span.clone(),
-            message: format!("callee `{callee}` has invalid contract: {}", err.message),
-        }
     }
 
     fn place_ty(&self, place: Place<'tcx>) -> Ty<'tcx> {

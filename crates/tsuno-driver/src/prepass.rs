@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::ControlFlow;
 
 use crate::directive::{
-    CollectedFunctionDirectives, DirectiveAttach, DirectiveError, DirectiveKind, FunctionDirective,
+    CollectedFunctionDirectives, DirectiveAttach, DirectiveError, DirectiveKind,
     collect_function_directives,
 };
 use crate::report::{VerificationResult, VerificationStatus};
@@ -11,7 +11,7 @@ use crate::spec::{
     TypedExprKind, parse_ghost_block,
 };
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::{HirId, ItemKind, Pat, PatKind};
+use rustc_hir::{HirId, Pat, PatKind};
 use rustc_middle::mir::{BasicBlock, Body, Local, PlaceElem, StatementKind, TerminatorKind};
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::def_id::LocalDefId;
@@ -137,12 +137,6 @@ pub struct FunctionContract {
     pub result: SpecTy,
 }
 
-#[derive(Debug, Clone)]
-pub enum FunctionContractEntry {
-    Ready(FunctionContract),
-    Invalid(VerificationResult),
-}
-
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum LoweredDirectiveTarget {
@@ -250,61 +244,21 @@ impl LemmaCallContracts {
     }
 }
 
-pub fn compute_function_contracts<'tcx>(
+pub fn compute_function_prepass<'tcx>(
     tcx: TyCtxt<'tcx>,
-    skip_def_id: Option<LocalDefId>,
+    def_id: LocalDefId,
+    item_span: Span,
+    body: &Body<'tcx>,
     ghosts: &GlobalGhostPrepass,
-) -> HashMap<LocalDefId, FunctionContractEntry> {
-    let mut contracts = HashMap::new();
-    for item_id in tcx.hir_free_items() {
-        let item = tcx.hir_item(item_id);
-        let ItemKind::Fn { .. } = item.kind else {
-            continue;
-        };
-        let def_id = item.owner_id.def_id;
-        if skip_def_id == Some(def_id) {
-            continue;
-        }
-        let entry = match collect_function_directives(tcx, def_id, item.span) {
-            Ok(directives) => {
-                let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
-                match compute_directives(tcx, def_id, item.span, &body.borrow(), ghosts) {
-                    Ok(prepass) => match prepass.function_contract {
-                        Some(contract) => FunctionContractEntry::Ready(contract),
-                        None => FunctionContractEntry::Invalid(function_contract_error(
-                            tcx,
-                            def_id,
-                            &tcx.sess
-                                .source_map()
-                                .span_to_diagnostic_string(tcx.def_span(def_id.to_def_id())),
-                            "missing function contract".to_owned(),
-                        )),
-                    },
-                    Err(_) => {
-                        match build_contract_only(
-                            tcx,
-                            def_id,
-                            &directives.directives,
-                            &ghosts.pure_fns,
-                        ) {
-                            Ok(contract) => FunctionContractEntry::Ready(contract),
-                            Err(err) => FunctionContractEntry::Invalid(err),
-                        }
-                    }
-                }
-            }
-            Err(err) => FunctionContractEntry::Invalid(
-                LoopPrepassError {
-                    span: err.span,
-                    display_span: None,
-                    message: err.message,
-                }
-                .into_verification_result(tcx, def_id),
-            ),
-        };
-        contracts.insert(def_id, entry);
-    }
-    contracts
+) -> Result<DirectivePrepass, VerificationResult> {
+    compute_directives(tcx, def_id, item_span, body, ghosts).map_err(|error| VerificationResult {
+        function: tcx.def_path_str(def_id.to_def_id()),
+        status: VerificationStatus::Unsupported,
+        span: error
+            .display_span
+            .unwrap_or_else(|| tcx.sess.source_map().span_to_diagnostic_string(error.span)),
+        message: error.message,
+    })
 }
 
 pub fn compute_global_ghost_prepass<'tcx>(
@@ -406,19 +360,6 @@ pub struct LoopPrepassError {
     pub span: Span,
     pub display_span: Option<String>,
     pub message: String,
-}
-
-impl LoopPrepassError {
-    fn into_verification_result(self, tcx: TyCtxt<'_>, def_id: LocalDefId) -> VerificationResult {
-        VerificationResult {
-            function: tcx.def_path_str(def_id.to_def_id()),
-            status: VerificationStatus::Unsupported,
-            span: self
-                .display_span
-                .unwrap_or_else(|| tcx.sess.source_map().span_to_diagnostic_string(self.span)),
-            message: self.message,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3278,164 +3219,6 @@ fn collect_ghost_items_in_source(
         cursor = end + 2;
     }
     Ok(())
-}
-
-fn build_contract_only<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-    directives: &[FunctionDirective],
-    pure_fns: &HashMap<String, PureFnDef>,
-) -> Result<FunctionContract, VerificationResult> {
-    let has_manual_contract = directives
-        .iter()
-        .any(|directive| matches!(directive.kind, DirectiveKind::Req | DirectiveKind::Ens));
-    let param_names = if has_manual_contract {
-        function_param_names(tcx, def_id)?
-    } else {
-        function_param_names_relaxed(tcx, def_id)
-    };
-    let (params, result) =
-        function_contract_signature_with_names(tcx, def_id, param_names.clone())?;
-    let param_tys: HashMap<_, _> = params
-        .iter()
-        .map(|param| (param.name.clone(), param.ty.clone()))
-        .collect();
-    let result_ty = result.clone();
-    let mut req = None;
-    let mut ens = None;
-    let mut validate_scope = SpecScope::default();
-    for directive in directives {
-        match directive.kind {
-            DirectiveKind::Req => {
-                if req.is_some() {
-                    return Err(function_contract_error(
-                        tcx,
-                        def_id,
-                        &directive.span_text,
-                        "multiple //@ req directives for a function".to_owned(),
-                    ));
-                }
-                validate_contract_expr_core(
-                    &directive.expr,
-                    &pure_fns,
-                    &mut validate_scope,
-                    &param_names,
-                    false,
-                )
-                .map_err(|message| {
-                    function_contract_error(tcx, def_id, &directive.span_text, message)
-                })?;
-                req = Some(directive);
-            }
-            DirectiveKind::Ens => {
-                if ens.is_some() {
-                    return Err(function_contract_error(
-                        tcx,
-                        def_id,
-                        &directive.span_text,
-                        "multiple //@ ens directives for a function".to_owned(),
-                    ));
-                }
-                validate_contract_expr_core(
-                    &directive.expr,
-                    &pure_fns,
-                    &mut validate_scope,
-                    &param_names,
-                    true,
-                )
-                .map_err(|message| {
-                    function_contract_error(tcx, def_id, &directive.span_text, message)
-                })?;
-                ens = Some(directive);
-            }
-            _ => {}
-        }
-    }
-    let def_span = tcx
-        .sess
-        .source_map()
-        .span_to_diagnostic_string(tcx.def_span(def_id.to_def_id()));
-    match (req, ens) {
-        (None, None) => Ok(FunctionContract {
-            params,
-            req: TypedExpr {
-                ty: SpecTy::Bool,
-                kind: TypedExprKind::Bool(true),
-            },
-            req_span: def_span.clone(),
-            ens: TypedExpr {
-                ty: SpecTy::Bool,
-                kind: TypedExprKind::Bool(true),
-            },
-            ens_span: def_span,
-            spec_vars: Vec::new(),
-            result,
-        }),
-        (Some(req), Some(ens)) => {
-            let mut inferred = SpecTypeInference::default();
-            let mut infer_scope = SpecScope::default();
-            infer_contract_expr_types(
-                &req.expr,
-                &pure_fns,
-                &mut infer_scope,
-                &param_tys,
-                false,
-                &result_ty,
-                &mut inferred,
-            )
-            .map_err(|message| function_contract_error(tcx, def_id, &req.span_text, message))?;
-            infer_contract_expr_types(
-                &ens.expr,
-                &pure_fns,
-                &mut infer_scope,
-                &param_tys,
-                true,
-                &result_ty,
-                &mut inferred,
-            )
-            .map_err(|message| function_contract_error(tcx, def_id, &ens.span_text, message))?;
-
-            let mut req_scope = SpecScope::default();
-            let typed_req = typed_contract_expr(
-                &req.expr,
-                &pure_fns,
-                &mut req_scope,
-                &param_tys,
-                false,
-                &result_ty,
-                &mut inferred,
-            )
-            .map_err(|message| function_contract_error(tcx, def_id, &req.span_text, message))?;
-            let typed_ens = typed_contract_expr(
-                &ens.expr,
-                &pure_fns,
-                &mut req_scope,
-                &param_tys,
-                true,
-                &result_ty,
-                &mut inferred,
-            )
-            .map_err(|message| function_contract_error(tcx, def_id, &ens.span_text, message))?;
-            Ok(FunctionContract {
-                params,
-                req: typed_req,
-                req_span: req.span_text.clone(),
-                ens: typed_ens,
-                ens_span: ens.span_text.clone(),
-                spec_vars: typed_spec_vars_for_names(&validate_scope.ordered, &mut inferred)
-                    .map_err(|message| {
-                        function_contract_error(tcx, def_id, &ens.span_text, message)
-                    })?,
-                result,
-            })
-        }
-        _ => Err(function_contract_error(
-            tcx,
-            def_id,
-            &def_span,
-            "function contract requires exactly one //@ req and one //@ ens".to_owned(),
-        )),
-    }
 }
 
 fn validate_function_contract_expr_prepass(
