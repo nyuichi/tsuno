@@ -5,11 +5,9 @@ expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
-FAIL assume_prunes_when_not_entailed
-  precondition failed
-  src/main.rs:7:1: 7:14
-PASS impossible
-  all assertions discharged
+FAIL dangles_projected_move_mutable_reference
+  mutable reference close failed
+  src/main.rs:8:1: 8:2
 PASS main
   all assertions discharged
 

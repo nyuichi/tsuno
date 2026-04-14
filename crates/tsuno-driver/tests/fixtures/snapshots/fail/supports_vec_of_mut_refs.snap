@@ -5,8 +5,10 @@ expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
-FAIL main
-  assertion failed
-  src/main.rs:4:5: 4:31
+FAIL supports_vec_of_mut_refs
+  mutable reference close failed
+  src/main.rs:1:50: 1:51
+PASS main
+  all assertions discharged
 
 stderr:

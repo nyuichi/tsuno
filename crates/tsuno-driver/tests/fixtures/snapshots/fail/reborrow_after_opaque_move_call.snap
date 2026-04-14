@@ -5,9 +5,12 @@ expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
-FAIL set_to_two
-  postcondition failed
-  src/main.rs:3:1: 3:21
+FAIL opaque
+  mutable reference close failed
+  src/main.rs:1:26: 1:26
+FAIL reborrow_after_opaque_move_call
+  mutable reference close failed
+  src/main.rs:8:1: 8:2
 PASS main
   all assertions discharged
 

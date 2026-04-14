@@ -5,9 +5,12 @@ expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
-FAIL set_to_two
-  postcondition failed
-  src/main.rs:3:1: 3:21
+FAIL mut_ref_model_everywhere
+  mutable reference close failed
+  src/main.rs:9:5: 9:6
+FAIL helper
+  mutable reference close failed
+  src/main.rs:20:2: 20:2
 PASS main
   all assertions discharged
 

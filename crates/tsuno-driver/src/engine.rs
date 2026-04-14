@@ -363,7 +363,6 @@ impl<'tcx> Verifier<'tcx> {
                     continue;
                 }
             }
-
             let data = &self.body().basic_blocks[ctrl.basic_block];
             if ctrl.statement_index < data.statements.len() {
                 let stmt = &data.statements[ctrl.statement_index];

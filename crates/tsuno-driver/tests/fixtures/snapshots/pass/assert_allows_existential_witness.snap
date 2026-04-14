@@ -5,9 +5,7 @@ expression: snapshot_output(output)
 ---
 status: Some(0)
 stdout:
-PASS opaque
-  all assertions discharged
-PASS close_ok
+PASS foo
   all assertions discharged
 PASS main
   all assertions discharged

@@ -7,8 +7,9 @@ status: Some(0)
 stdout:
 PASS caller
   all assertions discharged
-PASS callee
-  all assertions discharged
+FAIL callee
+  postcondition failed
+  src/main.rs:10:1: 10:22
 PASS main
   all assertions discharged
 

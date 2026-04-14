@@ -1,4 +1,7 @@
-fn assume_prunes_when_not_entailed(x: i32) {
+fn assume_prunes_unsatisfiable_branch(x: i32)
+//@ req {x} != 0
+//@ ens true
+{
     //@ assume {x} == 0;
     impossible();
 }
