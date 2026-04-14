@@ -1016,14 +1016,20 @@ impl<'a> PureFnParser<'a> {
                 cursor += "assert".len();
                 let (expr_text, next) = self.parse_stmt_expr_text(body, cursor)?;
                 cursor = next;
-                stmts.push(GhostStmt::Assert(parse_source_expr("lemma assert", expr_text)?));
+                stmts.push(GhostStmt::Assert(parse_source_expr(
+                    "lemma assert",
+                    expr_text,
+                )?));
                 continue;
             }
             if body[cursor..].starts_with("assume") {
                 cursor += "assume".len();
                 let (expr_text, next) = self.parse_stmt_expr_text(body, cursor)?;
                 cursor = next;
-                stmts.push(GhostStmt::Assume(parse_source_expr("lemma assume", expr_text)?));
+                stmts.push(GhostStmt::Assume(parse_source_expr(
+                    "lemma assume",
+                    expr_text,
+                )?));
                 continue;
             }
 

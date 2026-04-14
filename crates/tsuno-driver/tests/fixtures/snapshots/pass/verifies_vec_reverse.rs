@@ -20,8 +20,7 @@ fn vec_len(v: &Vec<i32>) -> usize
 //@ ens {result} == seq_len(*{v})
 {
     //@ assume false;
-    let _ = 0usize;
-    0
+    return v.len();
 }
 
 fn vec_swap(v: &mut Vec<i32>, i: usize, j: usize)
@@ -29,7 +28,7 @@ fn vec_swap(v: &mut Vec<i32>, i: usize, j: usize)
 //@ ens {v}.fin == seq_concat(seq_concat(seq_concat(seq_extract(old, 0usize, {i}), seq_unit(seq_nth(old, {j}))), seq_concat(seq_extract(old, {i} + 1usize, {j} - {i} - 1usize), seq_unit(seq_nth(old, {i})))), seq_extract(old, {j} + 1usize, seq_len(old) - {j} - 1usize))
 {
     //@ assume false;
-    let _ = ();
+    v.swap(i, j);
 }
 
 fn rev(v: &mut Vec<i32>)

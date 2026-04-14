@@ -145,11 +145,12 @@ fn parse_directive_expr(
     span: Span,
 ) -> Result<spec::Expr, DirectiveError> {
     if kind == DirectiveKind::LemmaCall {
-        return spec::parse_statement_expr("lemma call", text.trim())
-            .map_err(|err| DirectiveError {
+        return spec::parse_statement_expr("lemma call", text.trim()).map_err(|err| {
+            DirectiveError {
                 span,
                 message: err.to_string().replace("spec expression", "//@ lemma call"),
-            });
+            }
+        });
     }
     let parsed = match kind {
         DirectiveKind::Assert | DirectiveKind::Assume => {
@@ -779,23 +780,27 @@ mod tests {
 
     #[test]
     fn collects_function_contract_lines_before_body() {
-        let source =
-            "fn callee() -> i32\n//@ req true\n//@ ens {result} == 3\n{\n    2\n}\n";
+        let source = "fn callee() -> i32\n//@ req true\n//@ ens {result} == 3\n{\n    2\n}\n";
         let lines = function_contract_lines_before_body(source, 4).unwrap();
         assert_eq!(
             lines,
-            vec!["//@ req true".to_owned(), "//@ ens {result} == 3".to_owned()]
+            vec![
+                "//@ req true".to_owned(),
+                "//@ ens {result} == 3".to_owned()
+            ]
         );
     }
 
     #[test]
     fn collects_function_contract_lines_before_item() {
-        let source =
-            "\n//@ req true\n//@ ens {result} == 3\nfn callee() -> i32 {\n    2\n}\n";
+        let source = "\n//@ req true\n//@ ens {result} == 3\nfn callee() -> i32 {\n    2\n}\n";
         let lines = function_contract_lines_before_item(source, 4).unwrap();
         assert_eq!(
             lines,
-            vec!["//@ req true".to_owned(), "//@ ens {result} == 3".to_owned()]
+            vec![
+                "//@ req true".to_owned(),
+                "//@ ens {result} == 3".to_owned()
+            ]
         );
     }
 }
