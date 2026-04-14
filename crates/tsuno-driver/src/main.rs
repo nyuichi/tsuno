@@ -15,11 +15,10 @@ mod spec;
 
 use std::env;
 
-use crate::engine::Verifier;
-use crate::prepass::compute_function_contracts;
+use crate::engine::verify;
+use crate::prepass::compute_program_prepass;
 use crate::report::{VerificationResult, print_report};
 use rustc_driver::{Callbacks, Compilation, run_compiler};
-use rustc_hir::ItemKind;
 use rustc_middle::ty::TyCtxt;
 
 fn main() {
@@ -54,19 +53,14 @@ impl Callbacks for VerifyCallbacks {
             return Compilation::Continue;
         }
         self.done = true;
-        let contracts = compute_function_contracts(tcx, None);
-        for item_id in tcx.hir_free_items() {
-            let item = tcx.hir_item(item_id);
-            if !matches!(item.kind, ItemKind::Fn { .. }) {
-                continue;
+        let prepass = match compute_program_prepass(tcx) {
+            Ok(prepass) => prepass,
+            Err(errors) => {
+                self.results.extend(errors);
+                return Compilation::Stop;
             }
-            let local_def_id = item.owner_id.def_id;
-            let body = tcx
-                .mir_drops_elaborated_and_const_checked(local_def_id)
-                .steal();
-            let verifier = Verifier::new(tcx, local_def_id, item.span, body, contracts.clone());
-            self.results.push(verifier.verify());
-        }
-        Compilation::Continue
+        };
+        self.results.extend(verify(tcx, prepass));
+        Compilation::Stop
     }
 }

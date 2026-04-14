@@ -5,13 +5,8 @@ expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
-UNSUPPORTED caller
-  callee `callee` has invalid contract: //@ assume must be placed immediately before the statement
-  src/main.rs:14:2: 14:2
 UNSUPPORTED callee
   //@ assume must be placed immediately before the statement
   src/main.rs:14:2: 14:2
-PASS main
-  all assertions discharged
 
 stderr:

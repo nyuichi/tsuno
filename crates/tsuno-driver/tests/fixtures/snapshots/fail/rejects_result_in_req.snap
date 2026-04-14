@@ -8,7 +8,5 @@ stdout:
 UNSUPPORTED bad
   `result` is only supported in //@ ens predicates
   src/main.rs:2:1: 2:22
-PASS main
-  all assertions discharged
 
 stderr:

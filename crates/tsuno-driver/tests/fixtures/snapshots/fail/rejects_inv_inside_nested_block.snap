@@ -8,7 +8,5 @@ stdout:
 UNSUPPORTED bad_loop
   loop body starting at src/main.rs:2:17: 8:6 requires exactly one //@ inv <expr> before the body
   src/main.rs:2:5: 8:6
-PASS main
-  all assertions discharged
 
 stderr:

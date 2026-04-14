@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::ControlFlow;
 
 use crate::directive::{
-    CollectedFunctionDirectives, DirectiveAttach, DirectiveError, DirectiveKind, FunctionDirective,
+    CollectedFunctionDirectives, DirectiveAttach, DirectiveError, DirectiveKind,
     collect_function_directives,
 };
 use crate::report::{VerificationResult, VerificationStatus};
@@ -11,12 +11,12 @@ use crate::spec::{
     TypedExprKind, parse_ghost_block,
 };
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::{HirId, ItemKind, Pat, PatKind};
+use rustc_hir::{HirId, Pat, PatKind};
 use rustc_middle::mir::{BasicBlock, Body, Local, PlaceElem, StatementKind, TerminatorKind};
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::symbol::sym;
-use rustc_span::{Span, Symbol};
+use rustc_span::{DUMMY_SP, Span, Symbol};
 
 #[derive(Debug, Clone, Default)]
 pub struct HirBindingInfo {
@@ -137,12 +137,6 @@ pub struct FunctionContract {
     pub result: SpecTy,
 }
 
-#[derive(Debug, Clone)]
-pub enum FunctionContractEntry {
-    Ready(FunctionContract),
-    Invalid(VerificationResult),
-}
-
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum LoweredDirectiveTarget {
@@ -173,10 +167,29 @@ pub struct DirectivePrepass {
     pub assertion_contracts: AssertionContracts,
     pub assumption_contracts: AssumptionContracts,
     pub lemma_call_contracts: LemmaCallContracts,
-    pub pure_fns: HashMap<String, TypedPureFnDef>,
     pub function_contract: Option<FunctionContract>,
     pub spec_vars: Vec<SpecVarBinding>,
-    pub lemmas: HashMap<String, TypedLemmaDef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GlobalGhostPrepass {
+    pub pure_fns: HashMap<String, PureFnDef>,
+    pub lemmas: HashMap<String, LemmaDef>,
+    pub typed_pure_fns: Vec<TypedPureFnDef>,
+    pub typed_lemmas: Vec<TypedLemmaDef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionPrepass {
+    pub def_id: LocalDefId,
+    pub prepass: DirectivePrepass,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProgramPrepass {
+    pub ghosts: GlobalGhostPrepass,
+    pub functions: Vec<FunctionPrepass>,
+    pub contracts: HashMap<LocalDefId, FunctionContract>,
 }
 
 impl LoopContracts {
@@ -244,55 +257,143 @@ impl LemmaCallContracts {
     }
 }
 
-pub fn compute_function_contracts<'tcx>(
+pub fn compute_function_prepass<'tcx>(
     tcx: TyCtxt<'tcx>,
-    skip_def_id: Option<LocalDefId>,
-) -> HashMap<LocalDefId, FunctionContractEntry> {
+    def_id: LocalDefId,
+    item_span: Span,
+    body: &Body<'tcx>,
+    ghosts: &GlobalGhostPrepass,
+) -> Result<DirectivePrepass, VerificationResult> {
+    compute_directives(tcx, def_id, item_span, body, ghosts).map_err(|error| VerificationResult {
+        function: tcx.def_path_str(def_id.to_def_id()),
+        status: VerificationStatus::Unsupported,
+        span: error
+            .display_span
+            .unwrap_or_else(|| tcx.sess.source_map().span_to_diagnostic_string(error.span)),
+        message: error.message,
+    })
+}
+
+pub fn compute_program_prepass<'tcx>(
+    tcx: TyCtxt<'tcx>,
+) -> Result<ProgramPrepass, Vec<VerificationResult>> {
+    let ghosts = match compute_global_ghost_prepass(tcx) {
+        Ok(ghosts) => ghosts,
+        Err(error) => {
+            return Err(vec![VerificationResult {
+                function: "prepass".to_owned(),
+                status: VerificationStatus::Unsupported,
+                span: error
+                    .display_span
+                    .unwrap_or_else(|| tcx.sess.source_map().span_to_diagnostic_string(error.span)),
+                message: error.message,
+            }]);
+        }
+    };
+    let mut functions = Vec::new();
     let mut contracts = HashMap::new();
+    let mut errors = Vec::new();
+
     for item_id in tcx.hir_free_items() {
         let item = tcx.hir_item(item_id);
-        let ItemKind::Fn { .. } = item.kind else {
+        let rustc_hir::ItemKind::Fn { .. } = item.kind else {
             continue;
         };
         let def_id = item.owner_id.def_id;
-        if skip_def_id == Some(def_id) {
-            continue;
-        }
-        let entry = match collect_function_directives(tcx, def_id, item.span) {
-            Ok(directives) => {
-                let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
-                match compute_directives(tcx, def_id, item.span, &body.borrow()) {
-                    Ok(prepass) => match prepass.function_contract {
-                        Some(contract) => FunctionContractEntry::Ready(contract),
-                        None => FunctionContractEntry::Invalid(function_contract_error(
-                            tcx,
-                            def_id,
-                            &tcx.sess
-                                .source_map()
-                                .span_to_diagnostic_string(tcx.def_span(def_id.to_def_id())),
-                            "missing function contract".to_owned(),
-                        )),
-                    },
-                    Err(_) => {
-                        match build_contract_only(tcx, def_id, item.span, &directives.directives) {
-                            Ok(contract) => FunctionContractEntry::Ready(contract),
-                            Err(err) => FunctionContractEntry::Invalid(err),
-                        }
-                    }
-                }
+        let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
+        match compute_function_prepass(tcx, def_id, item.span, &body.borrow(), &ghosts) {
+            Ok(prepass) => {
+                let contract = prepass
+                    .function_contract
+                    .clone()
+                    .expect("successful function prepass must yield contract");
+                contracts.insert(def_id, contract);
+                functions.push(FunctionPrepass { def_id, prepass });
             }
-            Err(err) => FunctionContractEntry::Invalid(
-                LoopPrepassError {
-                    span: err.span,
-                    display_span: None,
-                    message: err.message,
-                }
-                .into_verification_result(tcx, def_id),
-            ),
-        };
-        contracts.insert(def_id, entry);
+            Err(error) => errors.push(error),
+        }
     }
-    contracts
+
+    if errors.is_empty() {
+        Ok(ProgramPrepass {
+            ghosts,
+            functions,
+            contracts,
+        })
+    } else {
+        Err(errors)
+    }
+}
+
+pub fn compute_global_ghost_prepass<'tcx>(
+    tcx: TyCtxt<'tcx>,
+) -> Result<GlobalGhostPrepass, LoopPrepassError> {
+    let mut sources = Vec::new();
+    let mut seen_sources = HashSet::new();
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
+        let loc = tcx.sess.source_map().lookup_char_pos(item.span.lo());
+        let key = loc.file.start_pos;
+        if seen_sources.insert(key) {
+            sources.push((
+                item.span,
+                loc.file
+                    .src
+                    .as_ref()
+                    .map_or_else(String::new, |src| src.as_str().to_owned()),
+            ));
+        }
+    }
+
+    let mut pure_fn_defs = Vec::new();
+    let mut lemma_defs = Vec::new();
+    for (span, source) in sources {
+        collect_ghost_items_in_source(&source, span, &mut pure_fn_defs, &mut lemma_defs)?;
+    }
+
+    let anchor_span = tcx
+        .hir_free_items()
+        .next()
+        .map(|item_id| tcx.hir_item(item_id).span)
+        .unwrap_or(DUMMY_SP);
+
+    let mut pure_fns = HashMap::new();
+    let mut pure_fn_order = Vec::with_capacity(pure_fn_defs.len());
+    for def in pure_fn_defs {
+        if pure_fns.insert(def.name.clone(), def.clone()).is_some() {
+            return Err(LoopPrepassError {
+                span: anchor_span,
+                display_span: None,
+                message: "duplicate pure function name".to_owned(),
+            });
+        }
+        pure_fn_order.push(def.name);
+    }
+
+    let mut lemmas = HashMap::new();
+    let mut lemma_order = Vec::with_capacity(lemma_defs.len());
+    for lemma in lemma_defs {
+        if pure_fns.contains_key(&lemma.name)
+            || lemmas.insert(lemma.name.clone(), lemma.clone()).is_some()
+        {
+            return Err(LoopPrepassError {
+                span: anchor_span,
+                display_span: None,
+                message: "duplicate lemma name".to_owned(),
+            });
+        }
+        lemma_order.push(lemma.name);
+    }
+
+    let typed_pure_fn_map = type_pure_fns(&pure_fns, anchor_span)?;
+    let typed_lemma_map = type_lemmas(&lemmas, &pure_fns, anchor_span)?;
+
+    Ok(GlobalGhostPrepass {
+        pure_fns,
+        lemmas,
+        typed_pure_fns: order_pure_fns(&typed_pure_fn_map, &pure_fn_order),
+        typed_lemmas: order_lemmas(&typed_lemma_map, &lemma_order),
+    })
 }
 
 pub fn compute_hir_locals<'tcx>(
@@ -323,19 +424,6 @@ pub struct LoopPrepassError {
     pub span: Span,
     pub display_span: Option<String>,
     pub message: String,
-}
-
-impl LoopPrepassError {
-    fn into_verification_result(self, tcx: TyCtxt<'_>, def_id: LocalDefId) -> VerificationResult {
-        VerificationResult {
-            function: tcx.def_path_str(def_id.to_def_id()),
-            status: VerificationStatus::Unsupported,
-            span: self
-                .display_span
-                .unwrap_or_else(|| tcx.sess.source_map().span_to_diagnostic_string(self.span)),
-            message: self.message,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1796,12 +1884,10 @@ pub fn compute_directives<'tcx>(
     def_id: LocalDefId,
     item_span: Span,
     body: &Body<'tcx>,
+    ghosts: &GlobalGhostPrepass,
 ) -> Result<DirectivePrepass, LoopPrepassError> {
-    let (pure_fns, raw_lemmas) = collect_ghost_items(tcx, item_span)?;
-    let lemma_defs: HashMap<_, _> = raw_lemmas
-        .into_iter()
-        .map(|lemma| (lemma.name.clone(), lemma))
-        .collect();
+    let pure_fns = &ghosts.pure_fns;
+    let lemma_defs = &ghosts.lemmas;
     let binding_info = collect_hir_binding_info(tcx, def_id)?;
     let hir_locals = compute_hir_locals(tcx, body, &binding_info);
     let directives =
@@ -2099,8 +2185,6 @@ pub fn compute_directives<'tcx>(
             }
         }
     }
-    let typed_pure_fns = type_pure_fns(&pure_fns, tcx.def_span(def_id.to_def_id()))?;
-    let lemmas = type_lemmas(&lemma_defs, &pure_fns, tcx.def_span(def_id.to_def_id()))?;
     let typed_ens = match ens_directive {
         Some(directive) => {
             let mut scope = SpecScope::default();
@@ -2362,7 +2446,6 @@ pub fn compute_directives<'tcx>(
         assertion_contracts,
         assumption_contracts,
         lemma_call_contracts,
-        pure_fns: typed_pure_fns,
         function_contract,
         spec_vars: body_scope
             .typed_ordered_with(&contract_scope, &mut inferred)
@@ -2371,7 +2454,6 @@ pub fn compute_directives<'tcx>(
                 display_span: None,
                 message,
             })?,
-        lemmas,
     })
 }
 
@@ -2874,6 +2956,111 @@ fn type_lemmas(
     Ok(typed)
 }
 
+fn order_pure_fns(
+    pure_fns: &HashMap<String, TypedPureFnDef>,
+    declaration_order: &[String],
+) -> Vec<TypedPureFnDef> {
+    let mut ordered = Vec::new();
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    for name in declaration_order {
+        visit_pure_fn(name, pure_fns, &mut visiting, &mut visited, &mut ordered);
+    }
+    ordered
+}
+
+fn visit_pure_fn(
+    name: &str,
+    pure_fns: &HashMap<String, TypedPureFnDef>,
+    visiting: &mut HashSet<String>,
+    visited: &mut HashSet<String>,
+    ordered: &mut Vec<TypedPureFnDef>,
+) {
+    if visited.contains(name) || !visiting.insert(name.to_owned()) {
+        return;
+    }
+    if let Some(pure_fn) = pure_fns.get(name) {
+        visit_pure_fn_expr(&pure_fn.body, pure_fns, visiting, visited, ordered);
+    }
+    visiting.remove(name);
+    if visited.insert(name.to_owned()) {
+        ordered.push(pure_fns.get(name).expect("typed pure fn").clone());
+    }
+}
+
+fn visit_pure_fn_expr(
+    expr: &TypedExpr,
+    pure_fns: &HashMap<String, TypedPureFnDef>,
+    visiting: &mut HashSet<String>,
+    visited: &mut HashSet<String>,
+    ordered: &mut Vec<TypedPureFnDef>,
+) {
+    match &expr.kind {
+        TypedExprKind::PureCall { func, args } => {
+            visit_pure_fn(func, pure_fns, visiting, visited, ordered);
+            for arg in args {
+                visit_pure_fn_expr(arg, pure_fns, visiting, visited, ordered);
+            }
+        }
+        TypedExprKind::BuiltinCall { args, .. } => {
+            for arg in args {
+                visit_pure_fn_expr(arg, pure_fns, visiting, visited, ordered);
+            }
+        }
+        TypedExprKind::Field { base, .. }
+        | TypedExprKind::TupleField { base, .. }
+        | TypedExprKind::Deref { base }
+        | TypedExprKind::Fin { base }
+        | TypedExprKind::Unary { arg: base, .. } => {
+            visit_pure_fn_expr(base, pure_fns, visiting, visited, ordered);
+        }
+        TypedExprKind::Binary { lhs, rhs, .. } => {
+            visit_pure_fn_expr(lhs, pure_fns, visiting, visited, ordered);
+            visit_pure_fn_expr(rhs, pure_fns, visiting, visited, ordered);
+        }
+        TypedExprKind::Bool(_)
+        | TypedExprKind::Int(_)
+        | TypedExprKind::Var(_)
+        | TypedExprKind::Bind(_) => {}
+    }
+}
+
+fn order_lemmas(
+    lemmas: &HashMap<String, TypedLemmaDef>,
+    declaration_order: &[String],
+) -> Vec<TypedLemmaDef> {
+    let mut ordered = Vec::new();
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    for name in declaration_order {
+        visit_lemma(name, lemmas, &mut visiting, &mut visited, &mut ordered);
+    }
+    ordered
+}
+
+fn visit_lemma(
+    name: &str,
+    lemmas: &HashMap<String, TypedLemmaDef>,
+    visiting: &mut HashSet<String>,
+    visited: &mut HashSet<String>,
+    ordered: &mut Vec<TypedLemmaDef>,
+) {
+    if visited.contains(name) || !visiting.insert(name.to_owned()) {
+        return;
+    }
+    if let Some(lemma) = lemmas.get(name) {
+        for stmt in &lemma.body {
+            if let TypedGhostStmt::Call { lemma_name, .. } = stmt {
+                visit_lemma(lemma_name, lemmas, visiting, visited, ordered);
+            }
+        }
+    }
+    visiting.remove(name);
+    if visited.insert(name.to_owned()) {
+        ordered.push(lemmas.get(name).expect("typed lemma").clone());
+    }
+}
+
 fn lemma_call_parts(expr: &Expr) -> Result<(&str, &[Expr]), String> {
     match expr {
         Expr::Call { func, args } => Ok((func, args)),
@@ -3067,24 +3254,19 @@ fn collect_loop_contracts<'tcx>(
     })
 }
 
-fn collect_ghost_items<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    item_span: Span,
-) -> Result<(HashMap<String, PureFnDef>, Vec<LemmaDef>), LoopPrepassError> {
-    let loc = tcx.sess.source_map().lookup_char_pos(item_span.lo());
-    let Some(source) = loc.file.src.as_deref() else {
-        return Ok((HashMap::new(), Vec::new()));
-    };
-
-    let mut pure_fns = HashMap::new();
-    let mut lemmas = Vec::new();
+fn collect_ghost_items_in_source(
+    source: &str,
+    error_span: Span,
+    pure_fns: &mut Vec<PureFnDef>,
+    lemmas: &mut Vec<LemmaDef>,
+) -> Result<(), LoopPrepassError> {
     let mut cursor = 0usize;
     while let Some(start) = source[cursor..].find("/*@") {
         let start = cursor + start;
         let body_start = start + 3;
         let Some(end_rel) = source[body_start..].find("*/") else {
             return Err(LoopPrepassError {
-                span: item_span,
+                span: error_span,
                 display_span: None,
                 message: "unclosed /*@ ghost block".to_owned(),
             });
@@ -3092,210 +3274,15 @@ fn collect_ghost_items<'tcx>(
         let end = body_start + end_rel;
         let block = &source[body_start..end];
         let parsed = parse_ghost_block(block).map_err(|err| LoopPrepassError {
-            span: item_span,
+            span: error_span,
             display_span: None,
             message: err.to_string(),
         })?;
-        for def in parsed.pure_fns {
-            if pure_fns.insert(def.name.clone(), def).is_some() {
-                return Err(LoopPrepassError {
-                    span: item_span,
-                    display_span: None,
-                    message: "duplicate pure function name".to_owned(),
-                });
-            }
-        }
-        for lemma in parsed.lemmas {
-            if lemmas
-                .iter()
-                .any(|existing: &LemmaDef| existing.name == lemma.name)
-                || pure_fns.contains_key(&lemma.name)
-            {
-                return Err(LoopPrepassError {
-                    span: item_span,
-                    display_span: None,
-                    message: "duplicate lemma name".to_owned(),
-                });
-            }
-            lemmas.push(lemma);
-        }
+        pure_fns.extend(parsed.pure_fns);
+        lemmas.extend(parsed.lemmas);
         cursor = end + 2;
     }
-
-    Ok((pure_fns, lemmas))
-}
-
-fn collect_pure_fns<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    item_span: Span,
-) -> Result<HashMap<String, PureFnDef>, LoopPrepassError> {
-    Ok(collect_ghost_items(tcx, item_span)?.0)
-}
-
-fn build_contract_only<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-    item_span: Span,
-    directives: &[FunctionDirective],
-) -> Result<FunctionContract, VerificationResult> {
-    let pure_fns = collect_pure_fns(tcx, item_span).map_err(|error| VerificationResult {
-        function: tcx.def_path_str(def_id.to_def_id()),
-        status: VerificationStatus::Unsupported,
-        span: error
-            .display_span
-            .unwrap_or_else(|| tcx.sess.source_map().span_to_diagnostic_string(error.span)),
-        message: error.message,
-    })?;
-    let has_manual_contract = directives
-        .iter()
-        .any(|directive| matches!(directive.kind, DirectiveKind::Req | DirectiveKind::Ens));
-    let param_names = if has_manual_contract {
-        function_param_names(tcx, def_id)?
-    } else {
-        function_param_names_relaxed(tcx, def_id)
-    };
-    let (params, result) =
-        function_contract_signature_with_names(tcx, def_id, param_names.clone())?;
-    let param_tys: HashMap<_, _> = params
-        .iter()
-        .map(|param| (param.name.clone(), param.ty.clone()))
-        .collect();
-    let result_ty = result.clone();
-    let mut req = None;
-    let mut ens = None;
-    let mut validate_scope = SpecScope::default();
-    for directive in directives {
-        match directive.kind {
-            DirectiveKind::Req => {
-                if req.is_some() {
-                    return Err(function_contract_error(
-                        tcx,
-                        def_id,
-                        &directive.span_text,
-                        "multiple //@ req directives for a function".to_owned(),
-                    ));
-                }
-                validate_contract_expr_core(
-                    &directive.expr,
-                    &pure_fns,
-                    &mut validate_scope,
-                    &param_names,
-                    false,
-                )
-                .map_err(|message| {
-                    function_contract_error(tcx, def_id, &directive.span_text, message)
-                })?;
-                req = Some(directive);
-            }
-            DirectiveKind::Ens => {
-                if ens.is_some() {
-                    return Err(function_contract_error(
-                        tcx,
-                        def_id,
-                        &directive.span_text,
-                        "multiple //@ ens directives for a function".to_owned(),
-                    ));
-                }
-                validate_contract_expr_core(
-                    &directive.expr,
-                    &pure_fns,
-                    &mut validate_scope,
-                    &param_names,
-                    true,
-                )
-                .map_err(|message| {
-                    function_contract_error(tcx, def_id, &directive.span_text, message)
-                })?;
-                ens = Some(directive);
-            }
-            _ => {}
-        }
-    }
-    let def_span = tcx
-        .sess
-        .source_map()
-        .span_to_diagnostic_string(tcx.def_span(def_id.to_def_id()));
-    match (req, ens) {
-        (None, None) => Ok(FunctionContract {
-            params,
-            req: TypedExpr {
-                ty: SpecTy::Bool,
-                kind: TypedExprKind::Bool(true),
-            },
-            req_span: def_span.clone(),
-            ens: TypedExpr {
-                ty: SpecTy::Bool,
-                kind: TypedExprKind::Bool(true),
-            },
-            ens_span: def_span,
-            spec_vars: Vec::new(),
-            result,
-        }),
-        (Some(req), Some(ens)) => {
-            let mut inferred = SpecTypeInference::default();
-            let mut infer_scope = SpecScope::default();
-            infer_contract_expr_types(
-                &req.expr,
-                &pure_fns,
-                &mut infer_scope,
-                &param_tys,
-                false,
-                &result_ty,
-                &mut inferred,
-            )
-            .map_err(|message| function_contract_error(tcx, def_id, &req.span_text, message))?;
-            infer_contract_expr_types(
-                &ens.expr,
-                &pure_fns,
-                &mut infer_scope,
-                &param_tys,
-                true,
-                &result_ty,
-                &mut inferred,
-            )
-            .map_err(|message| function_contract_error(tcx, def_id, &ens.span_text, message))?;
-
-            let mut req_scope = SpecScope::default();
-            let typed_req = typed_contract_expr(
-                &req.expr,
-                &pure_fns,
-                &mut req_scope,
-                &param_tys,
-                false,
-                &result_ty,
-                &mut inferred,
-            )
-            .map_err(|message| function_contract_error(tcx, def_id, &req.span_text, message))?;
-            let typed_ens = typed_contract_expr(
-                &ens.expr,
-                &pure_fns,
-                &mut req_scope,
-                &param_tys,
-                true,
-                &result_ty,
-                &mut inferred,
-            )
-            .map_err(|message| function_contract_error(tcx, def_id, &ens.span_text, message))?;
-            Ok(FunctionContract {
-                params,
-                req: typed_req,
-                req_span: req.span_text.clone(),
-                ens: typed_ens,
-                ens_span: ens.span_text.clone(),
-                spec_vars: typed_spec_vars_for_names(&validate_scope.ordered, &mut inferred)
-                    .map_err(|message| {
-                        function_contract_error(tcx, def_id, &ens.span_text, message)
-                    })?,
-                result,
-            })
-        }
-        _ => Err(function_contract_error(
-            tcx,
-            def_id,
-            &def_span,
-            "function contract requires exactly one //@ req and one //@ ens".to_owned(),
-        )),
-    }
+    Ok(())
 }
 
 fn validate_function_contract_expr_prepass(
