@@ -9,7 +9,6 @@ fn callee() -> i32
 //@ req true
 //@ ens {result} == 3
 {
-    //@ assume false;
     2
 }
 

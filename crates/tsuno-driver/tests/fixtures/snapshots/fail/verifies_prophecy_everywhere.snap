@@ -5,9 +5,12 @@ expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
-FAIL rejects_symbolic_i32_add_overflow
-  type invariant does not hold
-  src/main.rs:2:14: 2:19
+FAIL mut_ref_model_everywhere
+  mutable reference close failed
+  src/main.rs:9:5: 9:6
+FAIL helper
+  mutable reference close failed
+  src/main.rs:20:2: 20:2
 PASS main
   all assertions discharged
 

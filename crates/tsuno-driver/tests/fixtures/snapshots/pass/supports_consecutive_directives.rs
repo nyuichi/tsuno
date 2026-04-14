@@ -9,7 +9,10 @@ fn proves_42(x: i32)
 
 fn helper() {}
 
-fn tail_value(x: i32) -> i32 {
+fn tail_value(x: i32) -> i32
+//@ req {x} == 42
+//@ ens {result} == 42
+{
     helper();
     //@ assume {x} == 42;
     //@ assert {x} == 42;

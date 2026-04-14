@@ -658,10 +658,10 @@ fn trim_terminal_anchor_suffix(source: &str) -> &str {
     source.trim_end_matches(|c: char| c.is_whitespace() || c == '}')
 }
 
-fn directive_lines<'a>(
-    source: &'a str,
+fn directive_lines(
+    source: &str,
     position_error: DirectiveError,
-) -> Result<Vec<(usize, &'a str)>, DirectiveError> {
+) -> Result<Vec<(usize, &str)>, DirectiveError> {
     let mut directives = Vec::new();
     let mut offset = 0;
     for line in source.split_inclusive('\n') {

@@ -1,0 +1,19 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+assertion_line: 85
+expression: snapshot_output(output)
+---
+status: Some(1)
+stdout:
+PASS vec_len
+  all assertions discharged
+PASS vec_swap
+  all assertions discharged
+UNKNOWN rev
+  solver returned unknown while checking assumption
+  src/main.rs:34:1: 34:25
+UNKNOWN main
+  solver returned unknown while checking assumption
+  src/main.rs:52:1: 52:10
+
+stderr:

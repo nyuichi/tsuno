@@ -3,12 +3,11 @@ source: crates/tsuno-driver/tests/snapshot_tests.rs
 assertion_line: 85
 expression: snapshot_output(output)
 ---
-status: Some(0)
+status: Some(1)
 stdout:
-PASS allows_mutable_reference_field_splitting
-  all assertions discharged
-PASS allows_mutable_reference_field_splitting_three
-  all assertions discharged
+FAIL set_to_two
+  postcondition failed
+  src/main.rs:3:1: 3:21
 PASS main
   all assertions discharged
 
