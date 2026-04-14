@@ -3,8 +3,14 @@ source: crates/tsuno-driver/tests/snapshot_tests.rs
 assertion_line: 85
 expression: snapshot_output(output)
 ---
-status: Some(0)
+status: Some(1)
 stdout:
+FAIL helper
+  type invariant does not hold
+  src/main.rs:2:5: 2:10
+FAIL caller
+  assertion failed
+  src/main.rs:7:5: 7:29
 PASS main
   all assertions discharged
 

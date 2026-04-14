@@ -3,10 +3,11 @@ source: crates/tsuno-driver/tests/snapshot_tests.rs
 assertion_line: 85
 expression: snapshot_output(output)
 ---
-status: Some(0)
+status: Some(1)
 stdout:
-PASS solver_returns_unknown
-  all assertions discharged
+FAIL loop_ok
+  loop invariant does not hold
+  src/main.rs:3:1: 3:43
 PASS main
   all assertions discharged
 

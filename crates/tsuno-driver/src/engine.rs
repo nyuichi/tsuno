@@ -105,7 +105,6 @@ pub struct ControlPoint {
 #[derive(Debug, Clone)]
 pub struct State {
     pc: Bool,
-    assertion: Bool,
     model: BTreeMap<Local, SymValue>,
     ctrl: ControlPoint,
 }
@@ -115,6 +114,12 @@ enum BoolExpr {
     Const(bool),
     Value(SymValue),
     Not(Box<BoolExpr>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssertionKind {
+    Universal,
+    Existential,
 }
 
 pub struct Verifier<'tcx> {
@@ -242,7 +247,8 @@ impl<'tcx> Verifier<'tcx> {
 
     fn verify_loaded_function(&self) -> VerificationResult {
         let initial_state = match self.initial_state() {
-            Ok(state) => state,
+            Ok(Some(state)) => state,
+            Ok(None) => return self.pass_result("all assertions discharged"),
             Err(err) => return err,
         };
         self.verify_from_initial_state(initial_state)
@@ -284,12 +290,8 @@ impl<'tcx> Verifier<'tcx> {
                 .control_point_directives
                 .directives_at(ctrl.basic_block, ctrl.statement_index)
             {
+                let mut pruned = false;
                 for directive in directives {
-                    match self.state_is_feasible(&state, self.control_span(ctrl)) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(err) => return err,
-                    }
                     match directive {
                         ControlPointDirective::Assert(assertion) => {
                             let formula = match self.spec_expr_to_bool(
@@ -304,8 +306,9 @@ impl<'tcx> Verifier<'tcx> {
                                 Ok(formula) => formula,
                                 Err(err) => return err,
                             };
-                            if let Err(err) = self.require_constraint(
+                            if let Err(err) = self.assert_expr_constraint(
                                 &mut state,
+                                &assertion.assertion,
                                 formula,
                                 self.control_span(ctrl),
                                 assertion.assertion_span.clone(),
@@ -327,28 +330,37 @@ impl<'tcx> Verifier<'tcx> {
                                 Ok(formula) => formula,
                                 Err(err) => return err,
                             };
-                            self.assume_constraint(&mut state, formula);
+                            match self.assume_constraint(
+                                &mut state,
+                                formula,
+                                self.control_span(ctrl),
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    pruned = true;
+                                    break;
+                                }
+                                Err(err) => return err,
+                            }
                         }
                         ControlPointDirective::LemmaCall(lemma_call) => {
-                            if let Err(err) = self.execute_lemma_call(
+                            match self.execute_lemma_call(
                                 &mut state,
                                 lemma_call,
                                 self.control_span(ctrl),
                             ) {
-                                return err;
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    pruned = true;
+                                    break;
+                                }
+                                Err(err) => return err,
                             }
                         }
                     }
                 }
-            }
-            match self.check_sat(std::slice::from_ref(&state.pc)) {
-                SatResult::Sat => {}
-                SatResult::Unsat => continue,
-                SatResult::Unknown => {
-                    return self.unknown_result(
-                        self.control_span(ctrl),
-                        "solver returned unknown while checking assumption".to_owned(),
-                    );
+                if pruned {
+                    continue;
                 }
             }
 
@@ -431,8 +443,9 @@ impl<'tcx> Verifier<'tcx> {
             TerminatorKind::Return => {
                 if let Some(contract) = self.contracts.get(&self.current_def_id()) {
                     let formula = self.function_postcondition_to_z3(&state, contract)?;
-                    self.require_constraint(
+                    self.assert_expr_constraint(
                         &mut state,
+                        &contract.ens,
                         formula,
                         term.source_info.span,
                         contract.ens_span.clone(),
@@ -472,17 +485,19 @@ impl<'tcx> Verifier<'tcx> {
                     };
                     let branch = self.bool_expr_to_z3(&branch)?;
                     seen_conditions.push(branch.clone());
-                    let mut next = state.clone();
-                    next.pc = bool_and(vec![next.pc, branch]);
-                    if let Some(loop_state) =
-                        self.transition_to_block(next, target, term.source_info.span)?
+                    if let Some(next) =
+                        self.prune_state(state.clone(), branch, term.source_info.span)?
+                        && let Some(loop_state) =
+                            self.transition_to_block(next, target, term.source_info.span)?
                     {
                         next_states.push(loop_state);
                     }
                 }
-                let mut otherwise = state;
-                otherwise.pc = bool_and(vec![otherwise.pc, bool_not(bool_or(seen_conditions))]);
-                if let Some(loop_state) =
+                if let Some(otherwise) = self.prune_state(
+                    state,
+                    bool_not(bool_or(seen_conditions)),
+                    term.source_info.span,
+                )? && let Some(loop_state) =
                     self.transition_to_block(otherwise, targets.otherwise(), term.source_info.span)?
                 {
                     next_states.push(loop_state);
@@ -502,9 +517,10 @@ impl<'tcx> Verifier<'tcx> {
                     formula = not_expr(formula);
                 }
                 let formula = self.bool_expr_to_z3(&formula)?;
-                self.require_constraint(
+                self.assert_constraint(
                     &mut state,
                     formula,
+                    AssertionKind::Universal,
                     term.source_info.span,
                     span_text(self.tcx, term.source_info.span),
                     format!("assertion failed: {msg:?}"),
@@ -569,8 +585,9 @@ impl<'tcx> Verifier<'tcx> {
             let spec = self.instantiate_contract_spec_vars(contract);
             let env = self.call_env(&state, args, contract, span, spec.clone())?;
             let req = self.contract_req_to_z3(contract, &env, span)?;
-            self.require_constraint(
+            self.assert_expr_constraint(
                 &mut state,
+                &contract.req,
                 req,
                 span,
                 contract.req_span.clone(),
@@ -584,7 +601,9 @@ impl<'tcx> Verifier<'tcx> {
             self.consume_call_move_args(&mut state, args, span)?;
             env.current.insert("result".to_owned(), result_value);
             let ens = self.contract_ens_to_z3(contract, &env, span)?;
-            self.assume_constraint(&mut state, ens);
+            if !self.assume_constraint(&mut state, ens, span)? {
+                return Ok(Vec::new());
+            }
         } else {
             let result_ty = self.place_ty(destination);
             let result_value = self.fresh_for_rust_ty(result_ty, "opaque_result")?;
@@ -630,8 +649,9 @@ impl<'tcx> Verifier<'tcx> {
                 &loop_contract.resolution,
             )?;
             let invariant = self.bool_expr_to_z3(&invariant)?;
-            self.require_constraint(
+            self.assert_expr_constraint(
                 &mut state,
+                &loop_contract.invariant,
                 invariant.clone(),
                 span,
                 loop_contract.invariant_span.clone(),
@@ -643,7 +663,9 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 let mut abstract_state = state;
                 self.havoc_loop_written_locals(&mut abstract_state, loop_contract)?;
-                self.assume_constraint(&mut abstract_state, invariant);
+                if !self.assume_constraint(&mut abstract_state, invariant, span)? {
+                    return Ok(None);
+                }
                 abstract_state.pc = bool_and(vec![abstract_state.pc, self.loop_marker(target)]);
                 abstract_state.ctrl = ControlPoint {
                     basic_block: target,
@@ -651,7 +673,6 @@ impl<'tcx> Verifier<'tcx> {
                 };
                 return Ok(Some(abstract_state));
             }
-            self.assume_constraint(&mut state, invariant);
         }
 
         if let Some(header) = self.loop_contracts.header_for_invariant_block(target)
@@ -663,7 +684,9 @@ impl<'tcx> Verifier<'tcx> {
                 &loop_contract.resolution,
             )?;
             let invariant = self.bool_expr_to_z3(&invariant)?;
-            self.assume_constraint(&mut state, invariant);
+            if !self.assume_constraint(&mut state, invariant, span)? {
+                return Ok(None);
+            }
         }
 
         state.ctrl = ControlPoint {
@@ -699,7 +722,6 @@ impl<'tcx> Verifier<'tcx> {
         let ctrl = states[0].ctrl;
         let mut merged = State {
             pc: Bool::from_bool(false),
-            assertion: Bool::from_bool(true),
             model: BTreeMap::new(),
             ctrl,
         };
@@ -708,24 +730,6 @@ impl<'tcx> Verifier<'tcx> {
             .map(|state| state.pc.clone())
             .collect::<Vec<_>>();
         merged.pc = Bool::or(&pcs);
-
-        let first_assertion = states
-            .first()
-            .map(|state| state.assertion.clone())
-            .expect("non-empty states");
-        if states
-            .iter()
-            .all(|state| state.assertion == first_assertion)
-        {
-            merged.assertion = first_assertion;
-        } else {
-            merged.assertion = bool_and(
-                states
-                    .iter()
-                    .map(|state| state.pc.clone().implies(state.assertion.clone()))
-                    .collect(),
-            );
-        }
 
         for local in shared {
             let ty = self.body().local_decls[local].ty;
@@ -758,13 +762,19 @@ impl<'tcx> Verifier<'tcx> {
                     &incoming,
                     self.control_span(state.ctrl),
                 )?;
-                merged.assertion =
-                    bool_and(vec![merged.assertion, state.pc.clone().implies(equality)]);
+                self.add_path_condition(&mut merged, state.pc.clone().implies(equality));
             }
             merged.model.insert(local, merged_value);
         }
 
-        Ok(Some(merged))
+        match self.check_sat(std::slice::from_ref(&merged.pc)) {
+            SatResult::Sat => Ok(Some(merged)),
+            SatResult::Unsat => Ok(None),
+            SatResult::Unknown => Err(self.unknown_result(
+                self.control_span(ctrl),
+                "solver returned unknown while checking merged path feasibility".to_owned(),
+            )),
+        }
     }
 
     fn enqueue_state(
@@ -773,28 +783,18 @@ impl<'tcx> Verifier<'tcx> {
         worklist: &mut VecDeque<ControlPoint>,
         state: State,
     ) -> Option<VerificationResult> {
-        match self.check_sat(std::slice::from_ref(&state.pc)) {
-            SatResult::Unsat => None,
-            SatResult::Sat => {
-                let ctrl = state.ctrl;
-                let bucket = pending.entry(ctrl).or_default();
-                if bucket.is_empty() {
-                    worklist.push_back(ctrl);
-                }
-                bucket.push(state);
-                None
-            }
-            SatResult::Unknown => Some(self.unknown_result(
-                self.control_span(state.ctrl),
-                "solver returned unknown while checking path feasibility".to_owned(),
-            )),
+        let ctrl = state.ctrl;
+        let bucket = pending.entry(ctrl).or_default();
+        if bucket.is_empty() {
+            worklist.push_back(ctrl);
         }
+        bucket.push(state);
+        None
     }
 
-    fn initial_state(&self) -> Result<State, VerificationResult> {
+    fn initial_state(&self) -> Result<Option<State>, VerificationResult> {
         let mut state = State {
             pc: Bool::from_bool(true),
-            assertion: Bool::from_bool(true),
             model: BTreeMap::new(),
             ctrl: ControlPoint {
                 basic_block: BasicBlock::from_usize(0),
@@ -815,9 +815,11 @@ impl<'tcx> Verifier<'tcx> {
             let env =
                 CallEnv::for_function(self, &state, contract, self.function_spec_vars.clone())?;
             let req = self.contract_req_to_z3(contract, &env, self.report_span())?;
-            self.assume_constraint(&mut state, req);
+            if !self.assume_constraint(&mut state, req, self.report_span())? {
+                return Ok(None);
+            }
         }
-        Ok(state)
+        Ok(Some(state))
     }
 
     fn register_pure_fn(&self, pure_fn: &TypedPureFnDef) -> Result<(), VerificationResult> {
@@ -880,7 +882,6 @@ impl<'tcx> Verifier<'tcx> {
         let spec = self.instantiate_spec_vars(&lemma.spec_vars);
         let mut state = State {
             pc: Bool::from_bool(true),
-            assertion: Bool::from_bool(true),
             model: BTreeMap::new(),
             ctrl: ControlPoint {
                 basic_block: BasicBlock::from_usize(0),
@@ -888,23 +889,26 @@ impl<'tcx> Verifier<'tcx> {
             },
         };
         let req = self.contract_expr_to_bool(&current, &spec, &lemma.req)?;
-        self.assume_constraint(&mut state, self.bool_expr_to_z3(&req)?);
+        if !self.assume_constraint(&mut state, self.bool_expr_to_z3(&req)?, self.report_span())? {
+            stack.pop();
+            return Ok(());
+        }
         for param in &lemma.params {
             let value = current.get(&param.name).expect("lemma parameter value");
-            if let Some(formula) = self.spec_ty_formula(&param.ty, value, self.report_span())? {
-                self.assume_constraint(&mut state, formula);
-            }
-        }
-        for stmt in &lemma.body {
-            if !self.state_is_feasible(&state, self.report_span())? {
+            if let Some(formula) = self.spec_ty_formula(&param.ty, value, self.report_span())?
+                && !self.assume_constraint(&mut state, formula, self.report_span())?
+            {
                 stack.pop();
                 return Ok(());
             }
+        }
+        for stmt in &lemma.body {
             match stmt {
                 TypedGhostStmt::Assert(expr) => {
                     let formula = self.contract_expr_to_bool(&current, &spec, expr)?;
-                    self.require_constraint(
+                    self.assert_expr_constraint(
                         &mut state,
+                        expr,
                         self.bool_expr_to_z3(&formula)?,
                         self.report_span(),
                         format!("lemma `{}`", lemma.name),
@@ -913,7 +917,14 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 TypedGhostStmt::Assume(expr) => {
                     let formula = self.contract_expr_to_bool(&current, &spec, expr)?;
-                    self.assume_constraint(&mut state, self.bool_expr_to_z3(&formula)?);
+                    if !self.assume_constraint(
+                        &mut state,
+                        self.bool_expr_to_z3(&formula)?,
+                        self.report_span(),
+                    )? {
+                        stack.pop();
+                        return Ok(());
+                    }
                 }
                 TypedGhostStmt::Call { lemma_name, args } => {
                     let callee = self.lemmas.get(lemma_name).ok_or_else(|| {
@@ -925,25 +936,30 @@ impl<'tcx> Verifier<'tcx> {
                     self.verify_lemma(callee, stack)?;
                     let env = self.lemma_env_from_contract_args(args, &current, &spec, callee)?;
                     let req = self.contract_expr_to_bool(&env.current, &env.spec, &callee.req)?;
-                    self.require_constraint(
+                    self.assert_expr_constraint(
                         &mut state,
+                        &callee.req,
                         self.bool_expr_to_z3(&req)?,
                         self.report_span(),
                         format!("lemma `{}`", lemma.name),
                         format!("lemma `{}` precondition failed", callee.name),
                     )?;
                     let ens = self.contract_expr_to_bool(&env.current, &env.spec, &callee.ens)?;
-                    self.assume_constraint(&mut state, self.bool_expr_to_z3(&ens)?);
+                    if !self.assume_constraint(
+                        &mut state,
+                        self.bool_expr_to_z3(&ens)?,
+                        self.report_span(),
+                    )? {
+                        stack.pop();
+                        return Ok(());
+                    }
                 }
             }
         }
-        if !self.state_is_feasible(&state, self.report_span())? {
-            stack.pop();
-            return Ok(());
-        }
         let ens = self.contract_expr_to_bool(&current, &spec, &lemma.ens)?;
-        let result = self.require_constraint(
+        let result = self.assert_expr_constraint(
             &mut state,
+            &lemma.ens,
             self.bool_expr_to_z3(&ens)?,
             self.report_span(),
             format!("lemma `{}`", lemma.name),
@@ -953,38 +969,27 @@ impl<'tcx> Verifier<'tcx> {
         result
     }
 
-    fn state_is_feasible(&self, state: &State, span: Span) -> Result<bool, VerificationResult> {
-        match self.check_sat(std::slice::from_ref(&state.pc)) {
-            SatResult::Sat => Ok(true),
-            SatResult::Unsat => Ok(false),
-            SatResult::Unknown => Err(self.unknown_result(
-                span,
-                "solver returned unknown while checking path feasibility".to_owned(),
-            )),
-        }
-    }
-
     fn execute_lemma_call(
         &self,
         state: &mut State,
         call: &LemmaCallContract,
         span: Span,
-    ) -> Result<(), VerificationResult> {
+    ) -> Result<bool, VerificationResult> {
         let lemma = self.lemmas.get(&call.lemma_name).ok_or_else(|| {
             self.unsupported_result(span, format!("unknown lemma `{}`", call.lemma_name))
         })?;
         let env = self.lemma_env_from_call(state, call, lemma)?;
         let req = self.contract_expr_to_bool(&env.current, &env.spec, &lemma.req)?;
-        self.require_constraint(
+        self.assert_expr_constraint(
             state,
+            &lemma.req,
             self.bool_expr_to_z3(&req)?,
             span,
             call.span_text.clone(),
             format!("lemma `{}` precondition failed", lemma.name),
         )?;
         let ens = self.contract_expr_to_bool(&env.current, &env.spec, &lemma.ens)?;
-        self.assume_constraint(state, self.bool_expr_to_z3(&ens)?);
-        Ok(())
+        self.assume_constraint(state, self.bool_expr_to_z3(&ens)?, span)
     }
 
     fn lemma_env_from_call(
@@ -1087,9 +1092,10 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<(), VerificationResult> {
         let ty = self.body().local_decls[local].ty;
         let formula = self.resolve_formula(ty, value, span)?;
-        self.require_constraint(
+        self.assert_constraint(
             state,
             formula,
+            AssertionKind::Universal,
             span,
             span_text(self.tcx, span),
             "mutable reference close failed".to_owned(),
@@ -2131,36 +2137,105 @@ impl<'tcx> Verifier<'tcx> {
         self.contract_ens_to_z3(contract, &env, self.report_span())
     }
 
-    fn require_constraint(
+    fn assert_constraint(
         &self,
         state: &mut State,
+        constraint: Bool,
+        kind: AssertionKind,
+        span: Span,
+        diagnostic_span: String,
+        message: String,
+    ) -> Result<(), VerificationResult> {
+        match kind {
+            AssertionKind::Universal => match self.check_sat(&[state.pc.clone(), constraint.not()])
+            {
+                SatResult::Sat => Err(VerificationResult {
+                    function: self.report_function(),
+                    status: VerificationStatus::Fail,
+                    span: diagnostic_span,
+                    message,
+                }),
+                SatResult::Unsat => {
+                    self.add_path_condition(state, constraint);
+                    Ok(())
+                }
+                SatResult::Unknown => Err(self.unknown_result(
+                    span,
+                    "solver returned unknown while checking assertion".to_owned(),
+                )),
+            },
+            AssertionKind::Existential => match self.check_sat(&[state.pc.clone(), constraint.clone()]) {
+                SatResult::Sat => {
+                    self.add_path_condition(state, constraint);
+                    Ok(())
+                }
+                SatResult::Unsat => Err(VerificationResult {
+                    function: self.report_function(),
+                    status: VerificationStatus::Fail,
+                    span: diagnostic_span,
+                    message,
+                }),
+                SatResult::Unknown => Err(self.unknown_result(
+                    span,
+                    "solver returned unknown while checking assertion".to_owned(),
+                )),
+            }
+        }
+    }
+
+    fn assert_expr_constraint(
+        &self,
+        state: &mut State,
+        expr: &TypedExpr,
         constraint: Bool,
         span: Span,
         diagnostic_span: String,
         message: String,
     ) -> Result<(), VerificationResult> {
-        self.assert_constraint(state, constraint);
-        match self.check_sat(&[state.pc.clone(), state.assertion.clone()]) {
-            SatResult::Sat => Ok(()),
-            SatResult::Unsat => Err(VerificationResult {
-                function: self.report_function(),
-                status: VerificationStatus::Fail,
-                span: diagnostic_span,
-                message,
-            }),
+        self.assert_constraint(
+            state,
+            constraint,
+            Self::assertion_kind_for_expr(expr),
+            span,
+            diagnostic_span,
+            message,
+        )
+    }
+
+    fn assume_constraint(
+        &self,
+        state: &mut State,
+        constraint: Bool,
+        span: Span,
+    ) -> Result<bool, VerificationResult> {
+        match self.check_sat(&[state.pc.clone(), constraint.clone()]) {
+            SatResult::Sat => {
+                self.add_path_condition(state, constraint);
+                Ok(true)
+            }
+            SatResult::Unsat => Ok(false),
             SatResult::Unknown => Err(self.unknown_result(
                 span,
-                "solver returned unknown while checking assertion".to_owned(),
+                "solver returned unknown while checking assumption".to_owned(),
             )),
         }
     }
 
-    fn assume_constraint(&self, state: &mut State, constraint: Bool) {
-        state.pc = bool_and(vec![state.pc.clone(), constraint]);
+    fn prune_state(
+        &self,
+        mut state: State,
+        constraint: Bool,
+        span: Span,
+    ) -> Result<Option<State>, VerificationResult> {
+        if self.assume_constraint(&mut state, constraint, span)? {
+            Ok(Some(state))
+        } else {
+            Ok(None)
+        }
     }
 
-    fn assert_constraint(&self, state: &mut State, constraint: Bool) {
-        state.assertion = bool_and(vec![state.assertion.clone(), constraint]);
+    fn add_path_condition(&self, state: &mut State, constraint: Bool) {
+        state.pc = bool_and(vec![state.pc.clone(), constraint]);
     }
 
     fn check_sat(&self, assumptions: &[Bool]) -> SatResult {
@@ -2172,6 +2247,32 @@ impl<'tcx> Verifier<'tcx> {
             BoolExpr::Const(value) => Ok(Bool::from_bool(*value)),
             BoolExpr::Value(value) => Ok(self.value_is_true(value)),
             BoolExpr::Not(arg) => Ok(self.bool_expr_to_z3(arg)?.not()),
+        }
+    }
+
+    fn expr_has_bind(expr: &TypedExpr) -> bool {
+        match &expr.kind {
+            TypedExprKind::Bind(_) => true,
+            TypedExprKind::Bool(_) | TypedExprKind::Int(_) | TypedExprKind::Var(_) => false,
+            TypedExprKind::PureCall { args, .. } | TypedExprKind::BuiltinCall { args, .. } => {
+                args.iter().any(Self::expr_has_bind)
+            }
+            TypedExprKind::Field { base, .. }
+            | TypedExprKind::TupleField { base, .. }
+            | TypedExprKind::Deref { base }
+            | TypedExprKind::Fin { base }
+            | TypedExprKind::Unary { arg: base, .. } => Self::expr_has_bind(base),
+            TypedExprKind::Binary { lhs, rhs, .. } => {
+                Self::expr_has_bind(lhs) || Self::expr_has_bind(rhs)
+            }
+        }
+    }
+
+    fn assertion_kind_for_expr(expr: &TypedExpr) -> AssertionKind {
+        if Self::expr_has_bind(expr) {
+            AssertionKind::Existential
+        } else {
+            AssertionKind::Universal
         }
     }
 
@@ -3163,7 +3264,14 @@ impl<'tcx> Verifier<'tcx> {
         let Some(formula) = self.spec_ty_formula(&spec_ty, value, span)? else {
             return Ok(());
         };
-        self.require_constraint(state, formula, span, span_text(self.tcx, span), message)
+        self.assert_constraint(
+            state,
+            formula,
+            AssertionKind::Universal,
+            span,
+            span_text(self.tcx, span),
+            message,
+        )
     }
 
     fn require_int_invariant(
@@ -3177,9 +3285,10 @@ impl<'tcx> Verifier<'tcx> {
         let Some((lower, upper)) = self.int_bounds_for_rust_ty(ty, span)? else {
             return Ok(());
         };
-        self.require_constraint(
+        self.assert_constraint(
             state,
             bool_and(vec![value.ge(lower), value.le(upper)]),
+            AssertionKind::Universal,
             span,
             span_text(self.tcx, span),
             message,
