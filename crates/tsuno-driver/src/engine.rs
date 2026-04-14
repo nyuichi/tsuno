@@ -37,8 +37,8 @@ use z3::{
 };
 
 use crate::prepass::{
-    AssertionContracts, AssumptionContracts, ContractParam, DirectivePrepass, FunctionContract,
-    LemmaCallContract, LemmaCallContracts, LoopContract, LoopContracts, ProgramPrepass,
+    ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
+    FunctionContract, LemmaCallContract, LoopContract, LoopContracts, ProgramPrepass,
     ResolvedExprEnv, SpecVarBinding, TypedGhostStmt, TypedLemmaDef, TypedPureFnDef,
     spec_ty_for_rust_ty, vec_element_ty,
 };
@@ -124,9 +124,7 @@ pub struct Verifier<'tcx> {
     contracts: HashMap<LocalDefId, FunctionContract>,
     function_spec_vars: HashMap<String, SymValue>,
     loop_contracts: LoopContracts,
-    assertion_contracts: AssertionContracts,
-    assumption_contracts: AssumptionContracts,
-    lemma_call_contracts: LemmaCallContracts,
+    control_point_directives: ControlPointDirectives,
     pure_fns: HashMap<String, TypedPureFnDef>,
     lemmas: HashMap<String, TypedLemmaDef>,
     next_sym: Cell<usize>,
@@ -176,9 +174,7 @@ impl<'tcx> Verifier<'tcx> {
             contracts,
             function_spec_vars: HashMap::new(),
             loop_contracts: LoopContracts::empty(),
-            assertion_contracts: AssertionContracts::empty(),
-            assumption_contracts: AssumptionContracts::empty(),
-            lemma_call_contracts: LemmaCallContracts::empty(),
+            control_point_directives: ControlPointDirectives::empty(),
             pure_fns: HashMap::new(),
             lemmas: HashMap::new(),
             next_sym: Cell::new(0),
@@ -256,18 +252,14 @@ impl<'tcx> Verifier<'tcx> {
         let DirectivePrepass {
             directives: _,
             loop_contracts,
-            assertion_contracts,
-            assumption_contracts,
-            lemma_call_contracts,
+            control_point_directives,
             function_contract,
             spec_vars,
         } = prepass;
         let contract = function_contract.expect("successful function prepass must yield contract");
         self.contracts.insert(self.current_def_id(), contract);
         self.loop_contracts = loop_contracts;
-        self.assertion_contracts = assertion_contracts;
-        self.assumption_contracts = assumption_contracts;
-        self.lemma_call_contracts = lemma_call_contracts;
+        self.control_point_directives = control_point_directives;
         self.function_spec_vars = self.instantiate_spec_vars(&spec_vars);
     }
 
@@ -288,57 +280,66 @@ impl<'tcx> Verifier<'tcx> {
                 Err(err) => return err,
             };
             let mut state = state;
-            if let Some(assertion) = self
-                .assertion_contracts
-                .assertion_at(ctrl.basic_block, ctrl.statement_index)
+            if let Some(directives) = self
+                .control_point_directives
+                .directives_at(ctrl.basic_block, ctrl.statement_index)
             {
-                let formula = match self.spec_expr_to_bool(
-                    &state,
-                    &assertion.assertion,
-                    &assertion.resolution,
-                ) {
-                    Ok(formula) => formula,
-                    Err(err) => return err,
-                };
-                let formula = match self.bool_expr_to_z3(&formula) {
-                    Ok(formula) => formula,
-                    Err(err) => return err,
-                };
-                if let Err(err) = self.require_constraint(
-                    &mut state,
-                    formula,
-                    self.control_span(ctrl),
-                    assertion.assertion_span.clone(),
-                    "assertion failed".to_owned(),
-                ) {
-                    return err;
+                for directive in directives {
+                    match self.state_is_feasible(&state, self.control_span(ctrl)) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(err) => return err,
+                    }
+                    match directive {
+                        ControlPointDirective::Assert(assertion) => {
+                            let formula = match self.spec_expr_to_bool(
+                                &state,
+                                &assertion.assertion,
+                                &assertion.resolution,
+                            ) {
+                                Ok(formula) => formula,
+                                Err(err) => return err,
+                            };
+                            let formula = match self.bool_expr_to_z3(&formula) {
+                                Ok(formula) => formula,
+                                Err(err) => return err,
+                            };
+                            if let Err(err) = self.require_constraint(
+                                &mut state,
+                                formula,
+                                self.control_span(ctrl),
+                                assertion.assertion_span.clone(),
+                                "assertion failed".to_owned(),
+                            ) {
+                                return err;
+                            }
+                        }
+                        ControlPointDirective::Assume(assumption) => {
+                            let formula = match self.spec_expr_to_bool(
+                                &state,
+                                &assumption.assumption,
+                                &assumption.resolution,
+                            ) {
+                                Ok(formula) => formula,
+                                Err(err) => return err,
+                            };
+                            let formula = match self.bool_expr_to_z3(&formula) {
+                                Ok(formula) => formula,
+                                Err(err) => return err,
+                            };
+                            self.assume_constraint(&mut state, formula);
+                        }
+                        ControlPointDirective::LemmaCall(lemma_call) => {
+                            if let Err(err) = self.execute_lemma_call(
+                                &mut state,
+                                lemma_call,
+                                self.control_span(ctrl),
+                            ) {
+                                return err;
+                            }
+                        }
+                    }
                 }
-            }
-            if let Some(assumption) = self
-                .assumption_contracts
-                .assumption_at(ctrl.basic_block, ctrl.statement_index)
-            {
-                let formula = match self.spec_expr_to_bool(
-                    &state,
-                    &assumption.assumption,
-                    &assumption.resolution,
-                ) {
-                    Ok(formula) => formula,
-                    Err(err) => return err,
-                };
-                let formula = match self.bool_expr_to_z3(&formula) {
-                    Ok(formula) => formula,
-                    Err(err) => return err,
-                };
-                self.assume_constraint(&mut state, formula);
-            }
-            if let Some(lemma_call) = self
-                .lemma_call_contracts
-                .lemma_call_at(ctrl.basic_block, ctrl.statement_index)
-                && let Err(err) =
-                    self.execute_lemma_call(&mut state, lemma_call, self.control_span(ctrl))
-            {
-                return err;
             }
             match self.check_sat(std::slice::from_ref(&state.pc)) {
                 SatResult::Sat => {}

@@ -50,6 +50,7 @@ pub struct FunctionDirective {
     pub kind: DirectiveKind,
     pub span: Span,
     pub span_text: String,
+    pub line_no: usize,
     pub attach: DirectiveAttach,
     pub expr: spec::Expr,
 }
@@ -79,7 +80,7 @@ pub fn collect_function_directives<'tcx>(
     match intravisit::walk_body(&mut collector, body) {
         ControlFlow::Continue(()) => {
             directives.extend(collector.directives);
-            directives.sort_by_key(|directive| directive.span.lo());
+            directives.sort_by_key(|directive| directive.line_no);
             Ok(CollectedFunctionDirectives { directives })
         }
         ControlFlow::Break(err) => Err(err),
@@ -132,6 +133,7 @@ fn collect_contract_directives<'tcx>(
             kind,
             span: item_span,
             span_text: display_line_span(&file_name, line_no, raw_line),
+            line_no,
             attach: DirectiveAttach::Function,
             expr,
         });
@@ -291,6 +293,7 @@ impl<'a> FunctionDirectiveCollector<'a> {
             kind: DirectiveKind::Inv,
             span: entry_span,
             span_text,
+            line_no,
             attach: DirectiveAttach::Loop {
                 loop_expr_id: loop_expr.hir_id,
                 loop_span: loop_expr.span,
@@ -317,34 +320,25 @@ impl<'a> FunctionDirectiveCollector<'a> {
             .to_string();
         let mut cursor = 0;
         for stmt in block.stmts {
-            let stmt_source = self
-                .tcx
-                .sess
-                .source_map()
-                .span_to_snippet(stmt.span)
-                .map_err(|_| {
-                    self.invalid_statement_directive_error(stmt.span, DirectiveKind::Assert)
-                })?;
-            let Some(stmt_offset) = block_source[cursor..].find(&stmt_source) else {
-                continue;
-            };
-            let stmt_start = cursor + stmt_offset;
-            let prefix_source = &block_source[cursor..stmt_start];
-            let line_anchor = self
-                .tcx
-                .sess
-                .source_map()
-                .lookup_char_pos(stmt.span.lo())
-                .line;
-            let mut directives = self.collect_statement_directives(
-                prefix_source,
+            cursor = self.collect_anchor_directives(
+                &block_source,
+                block.span,
+                cursor,
                 stmt.span,
-                line_anchor,
                 &file_name,
                 false,
             )?;
-            self.directives.append(&mut directives);
-            cursor = stmt_start + stmt_source.len();
+        }
+
+        if let Some(expr) = block.expr {
+            cursor = self.collect_anchor_directives(
+                &block_source,
+                block.span,
+                cursor,
+                expr.span,
+                &file_name,
+                false,
+            )?;
         }
 
         let tail_source = &block_source[cursor..];
@@ -355,7 +349,7 @@ impl<'a> FunctionDirectiveCollector<'a> {
             .lookup_char_pos(block.span.hi())
             .line;
         let anchor_span = block.span.shrink_to_hi();
-        let mut directives = self.collect_statement_directives(
+        let mut directives = self.collect_anchor_directive_lines(
             tail_source,
             anchor_span,
             line_anchor,
@@ -366,7 +360,55 @@ impl<'a> FunctionDirectiveCollector<'a> {
         Ok(())
     }
 
-    fn collect_statement_directives(
+    fn collect_anchor_directives(
+        &mut self,
+        block_source: &str,
+        block_span: Span,
+        cursor: usize,
+        anchor_span: Span,
+        file_name: &str,
+        allow_terminal: bool,
+    ) -> Result<usize, DirectiveError> {
+        let anchor_start = anchor_span
+            .lo()
+            .0
+            .checked_sub(block_span.lo().0)
+            .map(|offset| offset as usize)
+            .filter(|offset| *offset <= block_source.len())
+            .ok_or_else(|| {
+                self.invalid_statement_directive_error(anchor_span, DirectiveKind::Assert)
+            })?;
+        let anchor_end = anchor_span
+            .hi()
+            .0
+            .checked_sub(block_span.lo().0)
+            .map(|offset| offset as usize)
+            .filter(|offset| *offset <= block_source.len())
+            .ok_or_else(|| {
+                self.invalid_statement_directive_error(anchor_span, DirectiveKind::Assert)
+            })?;
+        if anchor_start < cursor || anchor_end < anchor_start {
+            return Ok(cursor);
+        }
+        let prefix_source = &block_source[cursor..anchor_start];
+        let line_anchor = self
+            .tcx
+            .sess
+            .source_map()
+            .lookup_char_pos(anchor_span.lo())
+            .line;
+        let mut directives = self.collect_anchor_directive_lines(
+            prefix_source,
+            anchor_span,
+            line_anchor,
+            file_name,
+            allow_terminal,
+        )?;
+        self.directives.append(&mut directives);
+        Ok(anchor_end)
+    }
+
+    fn collect_anchor_directive_lines(
         &self,
         source: &str,
         anchor_span: Span,
@@ -374,72 +416,63 @@ impl<'a> FunctionDirectiveCollector<'a> {
         file_name: &str,
         allow_terminal: bool,
     ) -> Result<Vec<FunctionDirective>, DirectiveError> {
+        let body = if allow_terminal {
+            trim_terminal_anchor_suffix(source)
+        } else {
+            source.trim_end_matches(char::is_whitespace)
+        };
+        let Some(first_directive) = body.find("//@") else {
+            return Ok(Vec::new());
+        };
+        let body = &body[first_directive..];
+
         let mut found = Vec::new();
-        for kind in [DirectiveKind::Assert, DirectiveKind::Assume] {
-            let directive = format!("//@ {}", kind.keyword());
-            if let Some((directive_pos, directive_line)) = spec_directive_line(
-                source,
-                &directive,
-                false,
-                allow_terminal,
-                self.multiple_statement_directive_error(anchor_span, kind),
-                self.statement_directive_position_error(anchor_span, kind),
-            )? {
-                let predicate_text = directive_line
-                    .strip_prefix(&directive)
-                    .expect("directive line starts with keyword")
-                    .trim();
-                let expr = parse_directive_expr(kind, predicate_text, anchor_span)?;
-                let line_no = directive_line_number(line_anchor, source, directive_pos);
-                let span_text = display_line_span(
-                    file_name,
-                    line_no,
-                    directive_line_text(source, directive_pos),
-                );
-                found.push((
-                    directive_pos,
-                    FunctionDirective {
-                        kind,
-                        span: anchor_span,
-                        span_text,
-                        attach: DirectiveAttach::Statement { anchor_span },
-                        expr,
-                    },
-                ));
-            }
-        }
-        if found.is_empty()
-            && let Some((directive_pos, directive_line)) = generic_ghost_statement_line(
-                source,
-                allow_terminal,
-                self.multiple_statement_directive_error(anchor_span, DirectiveKind::LemmaCall),
-                self.statement_directive_position_error(anchor_span, DirectiveKind::LemmaCall),
-            )?
-        {
+        for (directive_pos, directive_line) in directive_lines(
+            body,
+            self.statement_directive_position_error(anchor_span, DirectiveKind::LemmaCall),
+        )? {
+            let directive_pos = first_directive + directive_pos;
             let predicate_text = directive_line
                 .strip_prefix("//@")
                 .expect("directive line starts with //@")
                 .trim();
-            let expr = parse_directive_expr(DirectiveKind::LemmaCall, predicate_text, anchor_span)?;
+            if matches_reserved_statement_directive(predicate_text)
+                && !matches!(
+                    classify_statement_directive(predicate_text),
+                    Some(DirectiveKind::Assert | DirectiveKind::Assume)
+                )
+            {
+                return Err(
+                    self.statement_directive_position_error(anchor_span, DirectiveKind::LemmaCall)
+                );
+            }
+            let kind =
+                classify_statement_directive(predicate_text).unwrap_or(DirectiveKind::LemmaCall);
+            let expr_text = match kind {
+                DirectiveKind::Assert => predicate_text
+                    .strip_prefix("assert")
+                    .expect("assert directive")
+                    .trim(),
+                DirectiveKind::Assume => predicate_text
+                    .strip_prefix("assume")
+                    .expect("assume directive")
+                    .trim(),
+                DirectiveKind::LemmaCall => predicate_text,
+                _ => unreachable!("unexpected statement directive kind"),
+            };
+            let expr = parse_directive_expr(kind, expr_text, anchor_span)?;
             let line_no = directive_line_number(line_anchor, source, directive_pos);
-            let span_text = display_line_span(
-                file_name,
+            let span_text = display_line_span(file_name, line_no, directive_line);
+            found.push(FunctionDirective {
+                kind,
+                span: anchor_span,
+                span_text,
                 line_no,
-                directive_line_text(source, directive_pos),
-            );
-            found.push((
-                directive_pos,
-                FunctionDirective {
-                    kind: DirectiveKind::LemmaCall,
-                    span: anchor_span,
-                    span_text,
-                    attach: DirectiveAttach::Statement { anchor_span },
-                    expr,
-                },
-            ));
+                attach: DirectiveAttach::Statement { anchor_span },
+                expr,
+            });
         }
-        found.sort_by_key(|(directive_pos, _)| *directive_pos);
-        Ok(found.into_iter().map(|(_, directive)| directive).collect())
+        Ok(found)
     }
 
     fn loop_body_block(
@@ -546,28 +579,6 @@ impl<'a> FunctionDirectiveCollector<'a> {
         }
     }
 
-    fn multiple_statement_directive_error(
-        &self,
-        span: Span,
-        kind: DirectiveKind,
-    ) -> DirectiveError {
-        DirectiveError {
-            span,
-            message: match kind {
-                DirectiveKind::Assert => {
-                    "statement may contain exactly one //@ assert before it".to_owned()
-                }
-                DirectiveKind::Assume => {
-                    "statement may contain exactly one //@ assume before it".to_owned()
-                }
-                DirectiveKind::LemmaCall => {
-                    "statement may contain exactly one ghost statement before it".to_owned()
-                }
-                _ => "statement may contain exactly one directive before it".to_owned(),
-            },
-        }
-    }
-
     fn statement_directive_position_error(
         &self,
         span: Span,
@@ -643,6 +654,48 @@ fn directive_line_text(source: &str, directive_pos: usize) -> &str {
     &source[line_start..line_end]
 }
 
+fn trim_terminal_anchor_suffix(source: &str) -> &str {
+    source.trim_end_matches(|c: char| c.is_whitespace() || c == '}')
+}
+
+fn directive_lines<'a>(
+    source: &'a str,
+    position_error: DirectiveError,
+) -> Result<Vec<(usize, &'a str)>, DirectiveError> {
+    let mut directives = Vec::new();
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let line_end = line.trim_end_matches(['\n', '\r']);
+        let trimmed = line_end.trim();
+        if trimmed.is_empty() {
+            offset += line.len();
+            continue;
+        }
+        let Some(directive_col) = line_end.find("//@") else {
+            return Err(position_error.clone());
+        };
+        if !line_end[..directive_col].trim().is_empty() {
+            return Err(position_error.clone());
+        }
+        directives.push((
+            offset + directive_col,
+            line_end[directive_col..].trim_end_matches([' ', '\t']),
+        ));
+        offset += line.len();
+    }
+    Ok(directives)
+}
+
+fn classify_statement_directive(text: &str) -> Option<DirectiveKind> {
+    if text.starts_with("assert") {
+        Some(DirectiveKind::Assert)
+    } else if text.starts_with("assume") {
+        Some(DirectiveKind::Assume)
+    } else {
+        None
+    }
+}
+
 fn spec_directive_line<'a>(
     prefix_source: &'a str,
     directive: &str,
@@ -678,69 +731,6 @@ fn spec_directive_line<'a>(
         .unwrap_or(prefix_source.len());
     let directive_line = prefix_source[directive_pos..line_end].trim_end_matches(['\r', ' ', '\t']);
     let after_line = &prefix_source[line_end..];
-    if after_line.is_empty() {
-        return if allow_terminal {
-            Ok(Some((directive_pos, directive_line)))
-        } else {
-            Err(position_error)
-        };
-    }
-    if allow_terminal && after_line.chars().all(|c| c.is_whitespace() || c == '}') {
-        return Ok(Some((directive_pos, directive_line)));
-    }
-    let Some(after_newline) = after_line.strip_prefix('\n') else {
-        return Err(position_error);
-    };
-    if after_newline.contains('\n') {
-        return Err(position_error);
-    }
-    if !after_newline
-        .chars()
-        .all(|c| matches!(c, ' ' | '\t' | '\r'))
-    {
-        return Err(position_error);
-    }
-    Ok(Some((directive_pos, directive_line)))
-}
-
-fn generic_ghost_statement_line(
-    source: &str,
-    allow_terminal: bool,
-    multiple_error: DirectiveError,
-    position_error: DirectiveError,
-) -> Result<Option<(usize, &str)>, DirectiveError> {
-    let mut candidate = None;
-    for (directive_pos, _) in source.match_indices("//@") {
-        let line_start = source[..directive_pos]
-            .rfind('\n')
-            .map(|idx| idx + 1)
-            .unwrap_or(0);
-        let line_end = source[directive_pos..]
-            .find('\n')
-            .map(|idx| directive_pos + idx)
-            .unwrap_or(source.len());
-        let directive_line = source[directive_pos..line_end].trim_end_matches(['\r', ' ', '\t']);
-        let predicate_text = directive_line
-            .strip_prefix("//@")
-            .expect("directive line starts with //@")
-            .trim();
-        if matches_reserved_statement_directive(predicate_text) {
-            continue;
-        }
-        if candidate
-            .replace((directive_pos, directive_line, line_start, line_end))
-            .is_some()
-        {
-            return Err(multiple_error);
-        }
-    }
-    let Some((directive_pos, directive_line, line_start, line_end)) = candidate else {
-        return Ok(None);
-    };
-    if !source[line_start..directive_pos].trim().is_empty() {
-        return Err(position_error);
-    }
-    let after_line = &source[line_end..];
     if after_line.is_empty() {
         return if allow_terminal {
             Ok(Some((directive_pos, directive_line)))

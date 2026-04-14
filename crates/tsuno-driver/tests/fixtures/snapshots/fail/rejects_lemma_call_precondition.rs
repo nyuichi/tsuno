@@ -10,5 +10,4 @@ fn need_zero(x: i32)
 fn main() {
     let x = 1_i32;
     //@ need_zero({x});
-    let _ = ();
 }

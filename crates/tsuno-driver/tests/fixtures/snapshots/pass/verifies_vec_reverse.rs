@@ -38,7 +38,6 @@ fn rev(v: &mut Vec<i32>)
     let n = vec_len(v);
     let mut i = 0usize;
     //@ assert {n} == seq_len(orig) && rev_inv(orig, *{v}, 0usize);
-    let _ = ();
     while i + i + 1usize < n
       //@ inv {n} == seq_len(orig) && rev_inv(orig, *{v}, {i})
     {
@@ -46,11 +45,8 @@ fn rev(v: &mut Vec<i32>)
         vec_swap(v, i, j);
         i = i + 1usize;
     }
-    let _ = ();
     //@ assert {n} <= {i} + {i} + 1usize;
-    let _ = ();
     //@ assert is_rev(orig, *{v});
-    let _ = ();
 }
 
 fn main() {}

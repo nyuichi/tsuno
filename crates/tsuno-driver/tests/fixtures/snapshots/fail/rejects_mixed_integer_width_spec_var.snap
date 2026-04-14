@@ -7,6 +7,6 @@ status: Some(1)
 stdout:
 UNSUPPORTED rejects_mixed_integer_width_spec_var
   type mismatch between `i32` and `i64`
-  src/main.rs:2:5: 2:31
+  src/main.rs:2:1: 2:23
 
 stderr:

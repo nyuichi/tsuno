@@ -19,5 +19,4 @@ fn main() {
     let x = 42_i32;
     //@ nested({x});
     //@ assert {x} == 42;
-    let _ = ();
 }

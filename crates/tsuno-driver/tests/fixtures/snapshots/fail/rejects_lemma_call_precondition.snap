@@ -7,6 +7,6 @@ status: Some(1)
 stdout:
 FAIL main
   lemma `need_zero` precondition failed
-  src/main.rs:12:5: 12:28
+  src/main.rs:12:1: 12:20
 
 stderr:
