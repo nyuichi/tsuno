@@ -210,18 +210,6 @@ impl<'tcx> Verifier<'tcx> {
             .unwrap_or_else(|| "prepass".to_owned())
     }
 
-    pub fn verify_function(
-        &mut self,
-        def_id: LocalDefId,
-        body: Body<'tcx>,
-        prepass: DirectivePrepass,
-    ) -> VerificationResult {
-        self.def_id = Some(def_id);
-        self.body = Some(body);
-        self.load_function_prepass(prepass);
-        self.verify_loaded_function()
-    }
-
     pub fn load_ghost_function(
         &mut self,
         pure_fn: &TypedPureFnDef,
@@ -245,16 +233,14 @@ impl<'tcx> Verifier<'tcx> {
         self.verify_lemma(lemma, &mut stack)
     }
 
-    fn verify_loaded_function(&self) -> VerificationResult {
-        let initial_state = match self.initial_state() {
-            Ok(Some(state)) => state,
-            Ok(None) => return self.pass_result("all assertions discharged"),
-            Err(err) => return err,
-        };
-        self.verify_from_initial_state(initial_state)
-    }
-
-    fn load_function_prepass(&mut self, prepass: DirectivePrepass) {
+    pub fn verify_function(
+        &mut self,
+        def_id: LocalDefId,
+        body: Body<'tcx>,
+        prepass: DirectivePrepass,
+    ) -> VerificationResult {
+        self.def_id = Some(def_id);
+        self.body = Some(body);
         let DirectivePrepass {
             directives: _,
             loop_contracts,
@@ -267,9 +253,12 @@ impl<'tcx> Verifier<'tcx> {
         self.loop_contracts = loop_contracts;
         self.control_point_directives = control_point_directives;
         self.function_spec_vars = self.instantiate_spec_vars(&spec_vars);
-    }
 
-    fn verify_from_initial_state(&self, initial_state: State) -> VerificationResult {
+        let initial_state = match self.initial_state() {
+            Ok(Some(state)) => state,
+            Ok(None) => return self.pass_result("all assertions discharged"),
+            Err(err) => return err,
+        };
         let mut pending: BTreeMap<ControlPoint, Vec<State>> = BTreeMap::new();
         let mut worklist = VecDeque::new();
         if let Some(err) = self.enqueue_state(&mut pending, &mut worklist, initial_state) {
@@ -388,6 +377,36 @@ impl<'tcx> Verifier<'tcx> {
         }
 
         self.pass_result("all assertions discharged")
+    }
+
+    fn initial_state(&self) -> Result<Option<State>, VerificationResult> {
+        let mut state = State {
+            pc: Bool::from_bool(true),
+            model: BTreeMap::new(),
+            ctrl: ControlPoint {
+                basic_block: BasicBlock::from_usize(0),
+                statement_index: 0,
+            },
+        };
+        for local in self
+            .body()
+            .local_decls
+            .indices()
+            .take(self.body().arg_count + 1)
+        {
+            let ty = self.body().local_decls[local].ty;
+            let value = self.fresh_for_rust_ty(ty, &format!("arg_{}", local.as_usize()))?;
+            state.model.insert(local, value);
+        }
+        if let Some(contract) = self.contracts.get(&self.current_def_id()) {
+            let env =
+                CallEnv::for_function(self, &state, contract, self.function_spec_vars.clone())?;
+            let req = self.contract_req_to_z3(contract, &env, self.report_span())?;
+            if !self.assume_constraint(&mut state, req, self.report_span())? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(state))
     }
 
     fn step_statement(
@@ -977,7 +996,7 @@ impl<'tcx> Verifier<'tcx> {
         let lemma = self.lemmas.get(&call.lemma_name).ok_or_else(|| {
             self.unsupported_result(span, format!("unknown lemma `{}`", call.lemma_name))
         })?;
-        let env = self.lemma_env_from_call(state, call, lemma)?;
+        let env = self.lemma_env_from_state_exprs(state, &call.args, &call.resolution, lemma)?;
         let req = self.contract_expr_to_bool(&env.current, &env.spec, &lemma.req)?;
         self.assert_expr_constraint(
             state,
@@ -989,15 +1008,6 @@ impl<'tcx> Verifier<'tcx> {
         )?;
         let ens = self.contract_expr_to_bool(&env.current, &env.spec, &lemma.ens)?;
         self.assume_constraint(state, self.bool_expr_to_z3(&ens)?, span)
-    }
-
-    fn lemma_env_from_call(
-        &self,
-        state: &State,
-        call: &LemmaCallContract,
-        lemma: &TypedLemmaDef,
-    ) -> Result<CallEnv, VerificationResult> {
-        self.lemma_env_from_state_exprs(state, &call.args, &call.resolution, lemma)
     }
 
     fn lemma_env_from_state_exprs(
