@@ -7,6 +7,6 @@ status: Some(1)
 stdout:
 UNSUPPORTED rejects_unbound_spec_var_use
   unresolved binding `X` in //@ assert
-  src/main.rs:3:5: 3:16
+  src/main.rs:3:2: 3:2
 
 stderr:

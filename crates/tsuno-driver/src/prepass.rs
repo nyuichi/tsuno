@@ -57,19 +57,9 @@ pub struct AssertionContract {
 }
 
 #[derive(Debug, Clone)]
-pub struct AssertionContracts {
-    pub by_control_point: HashMap<(BasicBlock, usize), AssertionContract>,
-}
-
-#[derive(Debug, Clone)]
 pub struct AssumptionContract {
     pub assumption: TypedExpr,
     pub resolution: ResolvedExprEnv,
-}
-
-#[derive(Debug, Clone)]
-pub struct AssumptionContracts {
-    pub by_control_point: HashMap<(BasicBlock, usize), AssumptionContract>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,8 +71,15 @@ pub struct LemmaCallContract {
 }
 
 #[derive(Debug, Clone)]
-pub struct LemmaCallContracts {
-    pub by_control_point: HashMap<(BasicBlock, usize), LemmaCallContract>,
+pub enum ControlPointDirective {
+    Assert(AssertionContract),
+    Assume(AssumptionContract),
+    LemmaCall(LemmaCallContract),
+}
+
+#[derive(Debug, Clone)]
+pub struct ControlPointDirectives {
+    pub by_control_point: HashMap<(BasicBlock, usize), Vec<ControlPointDirective>>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,9 +161,7 @@ pub struct LoweredDirective {
 pub struct DirectivePrepass {
     pub directives: Vec<LoweredDirective>,
     pub loop_contracts: LoopContracts,
-    pub assertion_contracts: AssertionContracts,
-    pub assumption_contracts: AssumptionContracts,
-    pub lemma_call_contracts: LemmaCallContracts,
+    pub control_point_directives: ControlPointDirectives,
     pub function_contract: Option<FunctionContract>,
     pub spec_vars: Vec<SpecVarBinding>,
 }
@@ -209,51 +204,21 @@ impl LoopContracts {
     }
 }
 
-impl AssertionContracts {
+impl ControlPointDirectives {
     pub fn empty() -> Self {
         Self {
             by_control_point: HashMap::new(),
         }
     }
 
-    pub fn assertion_at(
+    pub fn directives_at(
         &self,
         block: BasicBlock,
         statement_index: usize,
-    ) -> Option<&AssertionContract> {
-        self.by_control_point.get(&(block, statement_index))
-    }
-}
-
-impl AssumptionContracts {
-    pub fn empty() -> Self {
-        Self {
-            by_control_point: HashMap::new(),
-        }
-    }
-
-    pub fn assumption_at(
-        &self,
-        block: BasicBlock,
-        statement_index: usize,
-    ) -> Option<&AssumptionContract> {
-        self.by_control_point.get(&(block, statement_index))
-    }
-}
-
-impl LemmaCallContracts {
-    pub fn empty() -> Self {
-        Self {
-            by_control_point: HashMap::new(),
-        }
-    }
-
-    pub fn lemma_call_at(
-        &self,
-        block: BasicBlock,
-        statement_index: usize,
-    ) -> Option<&LemmaCallContract> {
-        self.by_control_point.get(&(block, statement_index))
+    ) -> Option<&[ControlPointDirective]> {
+        self.by_control_point
+            .get(&(block, statement_index))
+            .map(Vec::as_slice)
     }
 }
 
@@ -2265,9 +2230,7 @@ pub fn compute_directives<'tcx>(
     };
     let loop_contracts =
         collect_loop_contracts(tcx, body, &directives, &resolved_exprs, &typed_body_exprs)?;
-    let mut assertion_contracts = AssertionContracts::empty();
-    let mut assumption_contracts = AssumptionContracts::empty();
-    let mut lemma_call_contracts = LemmaCallContracts::empty();
+    let mut control_point_directives = ControlPointDirectives::empty();
     let mut lowered = Vec::with_capacity(directives.directives.len());
 
     for directive in directives.directives {
@@ -2302,28 +2265,18 @@ pub fn compute_directives<'tcx>(
                     .get(&directive.span_text)
                     .cloned()
                     .expect("resolved assertion expression");
-                if assertion_contracts
+                control_point_directives
                     .by_control_point
-                    .insert(
-                        control,
-                        AssertionContract {
-                            assertion: typed_body_exprs
-                                .get(&directive.span_text)
-                                .cloned()
-                                .expect("typed assertion expression"),
-                            resolution,
-                            assertion_span: directive.span_text.clone(),
-                        },
-                    )
-                    .is_some()
-                {
-                    return Err(LoopPrepassError {
-                        span: directive.span,
-                        display_span: Some(directive.span_text.clone()),
-                        message: "multiple //@ assert directives map to the same control point"
-                            .to_owned(),
-                    });
-                }
+                    .entry(control)
+                    .or_default()
+                    .push(ControlPointDirective::Assert(AssertionContract {
+                        assertion: typed_body_exprs
+                            .get(&directive.span_text)
+                            .cloned()
+                            .expect("typed assertion expression"),
+                        resolution,
+                        assertion_span: directive.span_text.clone(),
+                    }));
                 lowered.push(LoweredDirective {
                     span: directive.span,
                     span_text: directive.span_text,
@@ -2348,27 +2301,17 @@ pub fn compute_directives<'tcx>(
                     .get(&directive.span_text)
                     .cloned()
                     .expect("resolved assumption expression");
-                if assumption_contracts
+                control_point_directives
                     .by_control_point
-                    .insert(
-                        control,
-                        AssumptionContract {
-                            assumption: typed_body_exprs
-                                .get(&directive.span_text)
-                                .cloned()
-                                .expect("typed assumption expression"),
-                            resolution,
-                        },
-                    )
-                    .is_some()
-                {
-                    return Err(LoopPrepassError {
-                        span: directive.span,
-                        display_span: Some(directive.span_text.clone()),
-                        message: "multiple //@ assume directives map to the same control point"
-                            .to_owned(),
-                    });
-                }
+                    .entry(control)
+                    .or_default()
+                    .push(ControlPointDirective::Assume(AssumptionContract {
+                        assumption: typed_body_exprs
+                            .get(&directive.span_text)
+                            .cloned()
+                            .expect("typed assumption expression"),
+                        resolution,
+                    }));
                 lowered.push(LoweredDirective {
                     span: directive.span,
                     span_text: directive.span_text,
@@ -2417,18 +2360,11 @@ pub fn compute_directives<'tcx>(
                     .cloned()
                     .expect("typed lemma call expression");
                 contract.resolution = resolution;
-                if lemma_call_contracts
+                control_point_directives
                     .by_control_point
-                    .insert(control, contract)
-                    .is_some()
-                {
-                    return Err(LoopPrepassError {
-                        span: directive.span,
-                        display_span: Some(directive.span_text.clone()),
-                        message: "multiple //@ lemma calls map to the same control point"
-                            .to_owned(),
-                    });
-                }
+                    .entry(control)
+                    .or_default()
+                    .push(ControlPointDirective::LemmaCall(contract));
                 lowered.push(LoweredDirective {
                     span: directive.span,
                     span_text: directive.span_text,
@@ -2443,9 +2379,7 @@ pub fn compute_directives<'tcx>(
     Ok(DirectivePrepass {
         directives: lowered,
         loop_contracts,
-        assertion_contracts,
-        assumption_contracts,
-        lemma_call_contracts,
+        control_point_directives,
         function_contract,
         spec_vars: body_scope
             .typed_ordered_with(&contract_scope, &mut inferred)

@@ -7,6 +7,6 @@ status: Some(1)
 stdout:
 UNSUPPORTED rejects_numeric_projection_on_struct
   tuple field access is not supported on struct types
-  src/main.rs:8:5: 8:37
+  src/main.rs:8:1: 8:29
 
 stderr:
