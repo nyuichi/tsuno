@@ -8,4 +8,8 @@ fn bad(x: i32)
 }
 */
 
-fn main() {}
+fn main() {
+    let x = 0_i32;
+    //@ bad(x);
+    let _ = ();
+}

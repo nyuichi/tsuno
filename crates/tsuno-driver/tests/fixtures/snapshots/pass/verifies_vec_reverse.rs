@@ -2,6 +2,14 @@
 fn is_rev(x: Seq<i32>, y: Seq<i32>) -> bool {
     seq_rev(x) == y
 }
+
+fn rev_state(orig: Seq<i32>, i: usize) -> Seq<i32> {
+    seq_concat(seq_concat(seq_rev(seq_extract(orig, seq_len(orig) - i, i)), seq_extract(orig, i, seq_len(orig) - i - i)), seq_rev(seq_extract(orig, 0usize, i)))
+}
+
+fn rev_inv(orig: Seq<i32>, cur: Seq<i32>, i: usize) -> bool {
+    cur == rev_state(orig, i) && i + i <= seq_len(orig) && (seq_len(orig) > i + i + 1usize || is_rev(orig, cur))
+}
 */
 
 fn vec_len(v: &Vec<i32>) -> usize
@@ -25,7 +33,21 @@ fn rev(v: &mut Vec<i32>)
 //@ req "?orig == *{v}"
 //@ ens "is_rev(orig, {v}.fin)"
 {
-    //@ assume "false"
+    let n = vec_len(v);
+    let mut i = 0usize;
+    //@ assert "{n} == seq_len(orig) && rev_inv(orig, *{v}, 0usize)"
+    let _ = ();
+    while i + i + 1usize < n
+      //@ inv "{n} == seq_len(orig) && rev_inv(orig, *{v}, {i})"
+    {
+        let j = n - i - 1usize;
+        vec_swap(v, i, j);
+        i = i + 1usize;
+    }
+    let _ = ();
+    //@ assert "{n} <= {i} + {i} + 1usize"
+    let _ = ();
+    //@ assert "is_rev(orig, *{v})"
     let _ = ();
 }
 

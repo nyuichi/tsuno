@@ -218,10 +218,12 @@ impl<'tcx> Verifier<'tcx> {
             return result;
         }
         reset_solver();
-        if let Err(err) = self.register_pure_fns() {
+        let reachable_lemmas = self.reachable_lemmas();
+        let reachable_pure_fns = self.reachable_pure_fns(&reachable_lemmas);
+        if let Err(err) = self.register_pure_fns(&reachable_pure_fns) {
             return err;
         }
-        if let Err(err) = self.verify_lemmas() {
+        if let Err(err) = self.verify_lemmas(&reachable_lemmas) {
             return err;
         }
         let initial_state = match self.initial_state() {
@@ -782,19 +784,121 @@ impl<'tcx> Verifier<'tcx> {
         Ok(state)
     }
 
-    fn verify_lemmas(&self) -> Result<(), VerificationResult> {
+    fn verify_lemmas(&self, reachable: &BTreeSet<String>) -> Result<(), VerificationResult> {
         let mut stack = Vec::new();
-        for lemma in self.lemmas.values() {
-            self.verify_lemma(lemma, &mut stack)?;
+        for lemma_name in reachable {
+            if let Some(lemma) = self.lemmas.get(lemma_name) {
+                self.verify_lemma(lemma, &mut stack)?;
+            }
         }
         Ok(())
     }
 
-    fn register_pure_fns(&self) -> Result<(), VerificationResult> {
-        for pure_fn in self.pure_fns.values() {
-            self.register_pure_fn(pure_fn)?;
+    fn register_pure_fns(&self, reachable: &BTreeSet<String>) -> Result<(), VerificationResult> {
+        for pure_fn_name in reachable {
+            if let Some(pure_fn) = self.pure_fns.get(pure_fn_name) {
+                self.register_pure_fn(pure_fn)?;
+            }
         }
         Ok(())
+    }
+
+    fn reachable_lemmas(&self) -> BTreeSet<String> {
+        let mut reachable = BTreeSet::new();
+        for call in self.lemma_call_contracts.by_control_point.values() {
+            self.collect_lemma_closure(&call.lemma_name, &mut reachable);
+        }
+        reachable
+    }
+
+    fn collect_lemma_closure(&self, lemma_name: &str, reachable: &mut BTreeSet<String>) {
+        if !reachable.insert(lemma_name.to_owned()) {
+            return;
+        }
+        let Some(lemma) = self.lemmas.get(lemma_name) else {
+            return;
+        };
+        for stmt in &lemma.body {
+            if let TypedGhostStmt::Call { lemma_name, .. } = stmt {
+                self.collect_lemma_closure(lemma_name, reachable);
+            }
+        }
+    }
+
+    fn reachable_pure_fns(&self, reachable_lemmas: &BTreeSet<String>) -> BTreeSet<String> {
+        let mut reachable = BTreeSet::new();
+        if let Some(FunctionContractEntry::Ready(contract)) = self.contracts.get(&self.def_id) {
+            self.collect_pure_fns_in_expr(&contract.req, &mut reachable);
+            self.collect_pure_fns_in_expr(&contract.ens, &mut reachable);
+        }
+        for contract in self.assertion_contracts.by_control_point.values() {
+            self.collect_pure_fns_in_expr(&contract.assertion, &mut reachable);
+        }
+        for contract in self.assumption_contracts.by_control_point.values() {
+            self.collect_pure_fns_in_expr(&contract.assumption, &mut reachable);
+        }
+        for contract in self.loop_contracts.by_header.values() {
+            self.collect_pure_fns_in_expr(&contract.invariant, &mut reachable);
+        }
+        for call in self.lemma_call_contracts.by_control_point.values() {
+            for arg in &call.args {
+                self.collect_pure_fns_in_expr(arg, &mut reachable);
+            }
+        }
+        for lemma_name in reachable_lemmas {
+            if let Some(lemma) = self.lemmas.get(lemma_name) {
+                self.collect_pure_fns_in_expr(&lemma.req, &mut reachable);
+                self.collect_pure_fns_in_expr(&lemma.ens, &mut reachable);
+                for stmt in &lemma.body {
+                    match stmt {
+                        TypedGhostStmt::Assert(expr) | TypedGhostStmt::Assume(expr) => {
+                            self.collect_pure_fns_in_expr(expr, &mut reachable);
+                        }
+                        TypedGhostStmt::Call { args, .. } => {
+                            for arg in args {
+                                self.collect_pure_fns_in_expr(arg, &mut reachable);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        reachable
+    }
+
+    fn collect_pure_fns_in_expr(&self, expr: &TypedExpr, reachable: &mut BTreeSet<String>) {
+        match &expr.kind {
+            TypedExprKind::PureCall { func, args } => {
+                if reachable.insert(func.clone())
+                    && let Some(pure_fn) = self.pure_fns.get(func)
+                {
+                    self.collect_pure_fns_in_expr(&pure_fn.body, reachable);
+                }
+                for arg in args {
+                    self.collect_pure_fns_in_expr(arg, reachable);
+                }
+            }
+            TypedExprKind::BuiltinCall { args, .. } => {
+                for arg in args {
+                    self.collect_pure_fns_in_expr(arg, reachable);
+                }
+            }
+            TypedExprKind::Field { base, .. }
+            | TypedExprKind::TupleField { base, .. }
+            | TypedExprKind::Deref { base }
+            | TypedExprKind::Fin { base }
+            | TypedExprKind::Unary { arg: base, .. } => {
+                self.collect_pure_fns_in_expr(base, reachable);
+            }
+            TypedExprKind::Binary { lhs, rhs, .. } => {
+                self.collect_pure_fns_in_expr(lhs, reachable);
+                self.collect_pure_fns_in_expr(rhs, reachable);
+            }
+            TypedExprKind::Bool(_)
+            | TypedExprKind::Int(_)
+            | TypedExprKind::Var(_)
+            | TypedExprKind::Bind(_) => {}
+        }
     }
 
     fn register_pure_fn(&self, pure_fn: &TypedPureFnDef) -> Result<(), VerificationResult> {
