@@ -810,36 +810,6 @@ impl<'tcx> Verifier<'tcx> {
         None
     }
 
-    fn initial_state(&self) -> Result<Option<State>, VerificationResult> {
-        let mut state = State {
-            pc: Bool::from_bool(true),
-            model: BTreeMap::new(),
-            ctrl: ControlPoint {
-                basic_block: BasicBlock::from_usize(0),
-                statement_index: 0,
-            },
-        };
-        for local in self
-            .body()
-            .local_decls
-            .indices()
-            .take(self.body().arg_count + 1)
-        {
-            let ty = self.body().local_decls[local].ty;
-            let value = self.fresh_for_rust_ty(ty, &format!("arg_{}", local.as_usize()))?;
-            state.model.insert(local, value);
-        }
-        if let Some(contract) = self.contracts.get(&self.current_def_id()) {
-            let env =
-                CallEnv::for_function(self, &state, contract, self.function_spec_vars.clone())?;
-            let req = self.contract_req_to_z3(contract, &env, self.report_span())?;
-            if !self.assume_constraint(&mut state, req, self.report_span())? {
-                return Ok(None);
-            }
-        }
-        Ok(Some(state))
-    }
-
     fn register_pure_fn(&self, pure_fn: &TypedPureFnDef) -> Result<(), VerificationResult> {
         let decl = self.pure_fn_decl(pure_fn)?;
         let mut current = HashMap::new();
@@ -2173,21 +2143,23 @@ impl<'tcx> Verifier<'tcx> {
                     "solver returned unknown while checking assertion".to_owned(),
                 )),
             },
-            AssertionKind::Existential => match self.check_sat(&[state.pc.clone(), constraint.clone()]) {
-                SatResult::Sat => {
-                    self.add_path_condition(state, constraint);
-                    Ok(())
+            AssertionKind::Existential => {
+                match self.check_sat(&[state.pc.clone(), constraint.clone()]) {
+                    SatResult::Sat => {
+                        self.add_path_condition(state, constraint);
+                        Ok(())
+                    }
+                    SatResult::Unsat => Err(VerificationResult {
+                        function: self.report_function(),
+                        status: VerificationStatus::Fail,
+                        span: diagnostic_span,
+                        message,
+                    }),
+                    SatResult::Unknown => Err(self.unknown_result(
+                        span,
+                        "solver returned unknown while checking assertion".to_owned(),
+                    )),
                 }
-                SatResult::Unsat => Err(VerificationResult {
-                    function: self.report_function(),
-                    status: VerificationStatus::Fail,
-                    span: diagnostic_span,
-                    message,
-                }),
-                SatResult::Unknown => Err(self.unknown_result(
-                    span,
-                    "solver returned unknown while checking assertion".to_owned(),
-                )),
             }
         }
     }

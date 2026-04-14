@@ -10,7 +10,7 @@ FAIL helper
   src/main.rs:2:5: 2:10
 FAIL caller
   assertion failed
-  src/main.rs:7:5: 7:29
+  src/main.rs:7:1: 7:21
 PASS main
   all assertions discharged
 

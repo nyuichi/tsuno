@@ -14,6 +14,6 @@ UNKNOWN rev
   src/main.rs:34:1: 34:25
 UNKNOWN main
   solver returned unknown while checking assumption
-  src/main.rs:56:1: 56:10
+  src/main.rs:52:1: 52:10
 
 stderr:
