@@ -42,6 +42,10 @@ pub enum TypedExprKind {
     Int(IntLiteral),
     Var(String),
     Bind(String),
+    PureCall {
+        func: String,
+        args: Vec<TypedExpr>,
+    },
     BuiltinCall {
         func: BuiltinFn,
         args: Vec<TypedExpr>,
@@ -183,6 +187,28 @@ pub struct PureFnDef {
     pub body: Expr,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GhostStmt {
+    Assert(Expr),
+    Assume(Expr),
+    Call { name: String, args: Vec<Expr> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LemmaDef {
+    pub name: String,
+    pub params: Vec<PureFnParam>,
+    pub req: Expr,
+    pub ens: Expr,
+    pub body: Vec<GhostStmt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GhostBlock {
+    pub pure_fns: Vec<PureFnDef>,
+    pub lemmas: Vec<LemmaDef>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StructTy {
     pub name: String,
@@ -248,7 +274,11 @@ impl std::error::Error for ParseError {}
 
 pub fn parse_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
     let decoded = decode_string_literal(kind, text)?;
-    let expanded = expand_template(kind, &decoded)?;
+    parse_templated_expr(kind, &decoded)
+}
+
+pub fn parse_templated_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
+    let expanded = expand_template(kind, text)?;
     parse_raw_expr(kind, &expanded)
 }
 
@@ -794,13 +824,26 @@ impl Parser {
     }
 }
 
+#[cfg(test)]
 pub fn parse_pure_fn_block(text: &str) -> Result<Vec<PureFnDef>, ParseError> {
+    Ok(parse_ghost_block(text)?.pure_fns)
+}
+
+pub fn parse_ghost_block(text: &str) -> Result<GhostBlock, ParseError> {
     let mut parser = PureFnParser::new(text);
-    let mut defs = Vec::new();
+    let mut block = GhostBlock::default();
     while parser.skip_ws() {
-        defs.push(parser.parse_fn_def()?);
+        match parser.parse_item()? {
+            GhostItem::PureFn(def) => block.pure_fns.push(def),
+            GhostItem::Lemma(def) => block.lemmas.push(def),
+        }
     }
-    Ok(defs)
+    Ok(block)
+}
+
+enum GhostItem {
+    PureFn(PureFnDef),
+    Lemma(LemmaDef),
 }
 
 struct PureFnParser<'a> {
@@ -824,7 +867,7 @@ impl<'a> PureFnParser<'a> {
         self.cursor < self.text.len()
     }
 
-    fn parse_fn_def(&mut self) -> Result<PureFnDef, ParseError> {
+    fn parse_item(&mut self) -> Result<GhostItem, ParseError> {
         self.expect_keyword("fn")?;
         let name = self.parse_ident()?;
         self.expect_char('(')?;
@@ -846,6 +889,18 @@ impl<'a> PureFnParser<'a> {
                 self.expect_char(',')?;
             }
         }
+        self.skip_ws();
+        if self.text[self.cursor..].starts_with("->") {
+            return Ok(GhostItem::PureFn(self.parse_pure_fn_def(name, params)?));
+        }
+        Ok(GhostItem::Lemma(self.parse_lemma_def(name, params)?))
+    }
+
+    fn parse_pure_fn_def(
+        &mut self,
+        name: String,
+        params: Vec<PureFnParam>,
+    ) -> Result<PureFnDef, ParseError> {
         self.expect_arrow()?;
         let result_ty = self.parse_spec_ty()?;
         self.expect_char('{')?;
@@ -855,6 +910,26 @@ impl<'a> PureFnParser<'a> {
             params,
             result_ty,
             body: parse_raw_expr("pure function body", body.trim())?,
+        })
+    }
+
+    fn parse_lemma_def(
+        &mut self,
+        name: String,
+        params: Vec<PureFnParam>,
+    ) -> Result<LemmaDef, ParseError> {
+        self.expect_keyword("req")?;
+        let req = self.parse_quoted_expr("lemma req")?;
+        self.expect_keyword("ens")?;
+        let ens = self.parse_quoted_expr("lemma ens")?;
+        self.expect_char('{')?;
+        let body = self.parse_braced_body()?;
+        Ok(LemmaDef {
+            name,
+            params,
+            req,
+            ens,
+            body: self.parse_lemma_body(body)?,
         })
     }
 
@@ -902,6 +977,185 @@ impl<'a> PureFnParser<'a> {
             }
         }
         Err(ParseError::new("unclosed `{` in pure function block"))
+    }
+
+    fn parse_lemma_body(&self, body: &str) -> Result<Vec<GhostStmt>, ParseError> {
+        let mut stmts = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < body.len() {
+            while let Some(ch) = body[cursor..].chars().next() {
+                if ch.is_whitespace() {
+                    cursor += ch.len_utf8();
+                } else {
+                    break;
+                }
+                if cursor >= body.len() {
+                    return Ok(stmts);
+                }
+            }
+            if cursor >= body.len() {
+                break;
+            }
+            if body[cursor..].starts_with("assert") {
+                cursor += "assert".len();
+                let (expr_text, next) = self.parse_quoted_literal(body, cursor)?;
+                cursor = self.expect_stmt_terminator(body, next)?;
+                let expanded = expand_template("lemma assert", &expr_text)?;
+                stmts.push(GhostStmt::Assert(parse_raw_expr(
+                    "lemma assert",
+                    &expanded,
+                )?));
+                continue;
+            }
+            if body[cursor..].starts_with("assume") {
+                cursor += "assume".len();
+                let (expr_text, next) = self.parse_quoted_literal(body, cursor)?;
+                cursor = self.expect_stmt_terminator(body, next)?;
+                let expanded = expand_template("lemma assume", &expr_text)?;
+                stmts.push(GhostStmt::Assume(parse_raw_expr(
+                    "lemma assume",
+                    &expanded,
+                )?));
+                continue;
+            }
+
+            let name_start = cursor;
+            let mut chars = body[cursor..].chars();
+            let Some(first) = chars.next() else {
+                break;
+            };
+            if !(first.is_ascii_alphabetic() || first == '_') {
+                return Err(ParseError::new("expected lemma statement"));
+            }
+            cursor += first.len_utf8();
+            while let Some(ch) = body[cursor..].chars().next() {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    cursor += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let name = body[name_start..cursor].to_owned();
+            while let Some(ch) = body[cursor..].chars().next() {
+                if ch.is_whitespace() {
+                    cursor += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            if body[cursor..].chars().next() != Some('(') {
+                return Err(ParseError::new("expected `(` in lemma call"));
+            }
+            let (args_body, next) = self.parse_paren_body(body, cursor)?;
+            cursor = self.expect_stmt_terminator(body, next)?;
+            let args = self.parse_call_args(args_body)?;
+            stmts.push(GhostStmt::Call { name, args });
+        }
+        Ok(stmts)
+    }
+
+    fn parse_call_args(&self, text: &str) -> Result<Vec<Expr>, ParseError> {
+        let mut args = Vec::new();
+        let mut cursor = 0usize;
+        let mut current_start = 0usize;
+        let mut depth = 0usize;
+        while cursor < text.len() {
+            let ch = text[cursor..].chars().next().expect("char");
+            match ch {
+                '(' | '{' | '[' | '<' => depth += 1,
+                ')' | '}' | ']' | '>' => {
+                    depth = depth.saturating_sub(1);
+                }
+                ',' if depth == 0 => {
+                    let arg = text[current_start..cursor].trim();
+                    if !arg.is_empty() {
+                        args.push(parse_raw_expr("lemma call argument", arg)?);
+                    }
+                    cursor += ch.len_utf8();
+                    current_start = cursor;
+                    continue;
+                }
+                _ => {}
+            }
+            cursor += ch.len_utf8();
+        }
+        let tail = text[current_start..].trim();
+        if !tail.is_empty() {
+            args.push(parse_raw_expr("lemma call argument", tail)?);
+        }
+        Ok(args)
+    }
+
+    fn parse_quoted_expr(&mut self, kind: &str) -> Result<Expr, ParseError> {
+        let (text, next) = self.parse_quoted_literal(self.text, self.cursor)?;
+        self.cursor = next;
+        let expanded = expand_template(kind, &text)?;
+        parse_raw_expr(kind, &expanded)
+    }
+
+    fn parse_quoted_literal(
+        &self,
+        text: &'a str,
+        mut cursor: usize,
+    ) -> Result<(String, usize), ParseError> {
+        while let Some(ch) = text[cursor..].chars().next() {
+            if ch.is_whitespace() {
+                cursor += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if text[cursor..].chars().next() != Some('"') {
+            return Err(ParseError::new("expected string literal"));
+        }
+        cursor += 1;
+        let start = cursor;
+        while let Some(ch) = text[cursor..].chars().next() {
+            if ch == '"' {
+                return Ok((text[start..cursor].to_owned(), cursor + 1));
+            }
+            cursor += ch.len_utf8();
+        }
+        Err(ParseError::new("unterminated string literal"))
+    }
+
+    fn parse_paren_body(
+        &self,
+        text: &'a str,
+        open_paren: usize,
+    ) -> Result<(&'a str, usize), ParseError> {
+        let mut cursor = open_paren;
+        let mut depth = 0usize;
+        let body_start = open_paren + 1;
+        while cursor < text.len() {
+            let ch = text[cursor..].chars().next().expect("char");
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok((&text[body_start..cursor], cursor + 1));
+                    }
+                }
+                _ => {}
+            }
+            cursor += ch.len_utf8();
+        }
+        Err(ParseError::new("unclosed `(` in lemma call"))
+    }
+
+    fn expect_stmt_terminator(&self, text: &str, mut cursor: usize) -> Result<usize, ParseError> {
+        while let Some(ch) = text[cursor..].chars().next() {
+            if ch.is_whitespace() {
+                cursor += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if text[cursor..].chars().next() != Some(';') {
+            return Err(ParseError::new("expected `;` after lemma statement"));
+        }
+        Ok(cursor + 1)
     }
 
     fn parse_ident(&mut self) -> Result<String, ParseError> {
@@ -977,8 +1231,8 @@ impl<'a> PureFnParser<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BinaryOp, Expr, IntLiteral, IntSuffix, PureFnDef, PureFnParam, SpecTy, UnaryOp, parse_expr,
-        parse_pure_fn_block,
+        BinaryOp, Expr, GhostBlock, GhostStmt, IntLiteral, IntSuffix, LemmaDef, PureFnDef,
+        PureFnParam, SpecTy, UnaryOp, parse_expr, parse_ghost_block, parse_pure_fn_block,
     };
 
     #[test]
@@ -1162,6 +1416,74 @@ fn is_rev(x: Seq<i32>, y: Seq<i32>) -> bool {
                     rhs: Box::new(Expr::Var("y".to_owned())),
                 },
             }]
+        );
+    }
+
+    #[test]
+    fn parses_lemma_block() {
+        let block = parse_ghost_block(
+            r#"
+fn is_rev(x: Seq<i32>, y: Seq<i32>) -> bool {
+    seq_rev(x) == y
+}
+
+fn rev_done(orig: Seq<i32>, cur: Seq<i32>)
+  req "true"
+  ens "is_rev(orig, cur)"
+{
+    assert "is_rev(orig, cur)";
+}
+"#,
+        )
+        .expect("ghost block");
+        assert_eq!(
+            block,
+            GhostBlock {
+                pure_fns: vec![PureFnDef {
+                    name: "is_rev".to_owned(),
+                    params: vec![
+                        PureFnParam {
+                            name: "x".to_owned(),
+                            ty: SpecTy::Seq(Box::new(SpecTy::I32)),
+                        },
+                        PureFnParam {
+                            name: "y".to_owned(),
+                            ty: SpecTy::Seq(Box::new(SpecTy::I32)),
+                        },
+                    ],
+                    result_ty: SpecTy::Bool,
+                    body: Expr::Binary {
+                        op: BinaryOp::Eq,
+                        lhs: Box::new(Expr::Call {
+                            func: "seq_rev".to_owned(),
+                            args: vec![Expr::Var("x".to_owned())],
+                        }),
+                        rhs: Box::new(Expr::Var("y".to_owned())),
+                    },
+                }],
+                lemmas: vec![LemmaDef {
+                    name: "rev_done".to_owned(),
+                    params: vec![
+                        PureFnParam {
+                            name: "orig".to_owned(),
+                            ty: SpecTy::Seq(Box::new(SpecTy::I32)),
+                        },
+                        PureFnParam {
+                            name: "cur".to_owned(),
+                            ty: SpecTy::Seq(Box::new(SpecTy::I32)),
+                        },
+                    ],
+                    req: Expr::Bool(true),
+                    ens: Expr::Call {
+                        func: "is_rev".to_owned(),
+                        args: vec![Expr::Var("orig".to_owned()), Expr::Var("cur".to_owned())],
+                    },
+                    body: vec![GhostStmt::Assert(Expr::Call {
+                        func: "is_rev".to_owned(),
+                        args: vec![Expr::Var("orig".to_owned()), Expr::Var("cur".to_owned())],
+                    })],
+                }],
+            }
         );
     }
 }

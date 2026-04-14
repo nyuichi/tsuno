@@ -15,6 +15,7 @@ pub enum DirectiveKind {
     Inv,
     Assert,
     Assume,
+    LemmaCall,
 }
 
 impl DirectiveKind {
@@ -25,6 +26,7 @@ impl DirectiveKind {
             Self::Inv => "inv",
             Self::Assert => "assert",
             Self::Assume => "assume",
+            Self::LemmaCall => "lemma_call",
         }
     }
 }
@@ -142,6 +144,13 @@ fn parse_directive_expr(
     text: &str,
     span: Span,
 ) -> Result<spec::Expr, DirectiveError> {
+    if kind == DirectiveKind::LemmaCall {
+        return spec::parse_templated_expr("lemma call", text.trim_end_matches(';').trim())
+            .map_err(|err| DirectiveError {
+                span,
+                message: err.to_string().replace("spec expression", "//@ lemma call"),
+            });
+    }
     spec::parse_expr(kind.keyword(), text).map_err(|err| DirectiveError {
         span,
         message: render_parse_error(kind, err),
@@ -392,6 +401,36 @@ impl<'a> FunctionDirectiveCollector<'a> {
                 ));
             }
         }
+        if found.is_empty()
+            && let Some((directive_pos, directive_line)) = generic_ghost_statement_line(
+                source,
+                allow_terminal,
+                self.multiple_statement_directive_error(anchor_span, DirectiveKind::LemmaCall),
+                self.statement_directive_position_error(anchor_span, DirectiveKind::LemmaCall),
+            )?
+        {
+            let predicate_text = directive_line
+                .strip_prefix("//@")
+                .expect("directive line starts with //@")
+                .trim();
+            let expr = parse_directive_expr(DirectiveKind::LemmaCall, predicate_text, anchor_span)?;
+            let line_no = directive_line_number(line_anchor, source, directive_pos);
+            let span_text = display_line_span(
+                file_name,
+                line_no,
+                directive_line_text(source, directive_pos),
+            );
+            found.push((
+                directive_pos,
+                FunctionDirective {
+                    kind: DirectiveKind::LemmaCall,
+                    span: anchor_span,
+                    span_text,
+                    attach: DirectiveAttach::Statement { anchor_span },
+                    expr,
+                },
+            ));
+        }
         found.sort_by_key(|(directive_pos, _)| *directive_pos);
         Ok(found.into_iter().map(|(_, directive)| directive).collect())
     }
@@ -492,6 +531,9 @@ impl<'a> FunctionDirectiveCollector<'a> {
                 DirectiveKind::Assume => {
                     "assumption directive must be attached to a statement".to_owned()
                 }
+                DirectiveKind::LemmaCall => {
+                    "lemma call directive must be attached to a statement".to_owned()
+                }
                 _ => "directive must be attached to a statement".to_owned(),
             },
         }
@@ -511,6 +553,9 @@ impl<'a> FunctionDirectiveCollector<'a> {
                 DirectiveKind::Assume => {
                     "statement may contain exactly one //@ assume before it".to_owned()
                 }
+                DirectiveKind::LemmaCall => {
+                    "statement may contain exactly one ghost statement before it".to_owned()
+                }
                 _ => "statement may contain exactly one directive before it".to_owned(),
             },
         }
@@ -529,6 +574,9 @@ impl<'a> FunctionDirectiveCollector<'a> {
                 }
                 DirectiveKind::Assume => {
                     "//@ assume must be placed immediately before the statement".to_owned()
+                }
+                DirectiveKind::LemmaCall => {
+                    "ghost statement must be placed immediately before the statement".to_owned()
                 }
                 _ => "directive must be placed immediately before the statement".to_owned(),
             },
@@ -646,6 +694,77 @@ fn spec_directive_line<'a>(
         return Err(position_error);
     }
     Ok(Some((directive_pos, directive_line)))
+}
+
+fn generic_ghost_statement_line<'a>(
+    source: &'a str,
+    allow_terminal: bool,
+    multiple_error: DirectiveError,
+    position_error: DirectiveError,
+) -> Result<Option<(usize, &'a str)>, DirectiveError> {
+    let mut candidate = None;
+    for (directive_pos, _) in source.match_indices("//@") {
+        let line_start = source[..directive_pos]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let line_end = source[directive_pos..]
+            .find('\n')
+            .map(|idx| directive_pos + idx)
+            .unwrap_or(source.len());
+        let directive_line = source[directive_pos..line_end].trim_end_matches(['\r', ' ', '\t']);
+        let predicate_text = directive_line
+            .strip_prefix("//@")
+            .expect("directive line starts with //@")
+            .trim();
+        if matches_reserved_statement_directive(predicate_text) {
+            continue;
+        }
+        if candidate
+            .replace((directive_pos, directive_line, line_start, line_end))
+            .is_some()
+        {
+            return Err(multiple_error);
+        }
+    }
+    let Some((directive_pos, directive_line, line_start, line_end)) = candidate else {
+        return Ok(None);
+    };
+    if !source[line_start..directive_pos].trim().is_empty() {
+        return Err(position_error);
+    }
+    let after_line = &source[line_end..];
+    if after_line.is_empty() {
+        return if allow_terminal {
+            Ok(Some((directive_pos, directive_line)))
+        } else {
+            Err(position_error)
+        };
+    }
+    if allow_terminal && after_line.chars().all(|c| c.is_whitespace() || c == '}') {
+        return Ok(Some((directive_pos, directive_line)));
+    }
+    let Some(after_newline) = after_line.strip_prefix('\n') else {
+        return Err(position_error);
+    };
+    if after_newline.contains('\n') {
+        return Err(position_error);
+    }
+    if !after_newline
+        .chars()
+        .all(|c| matches!(c, ' ' | '\t' | '\r'))
+    {
+        return Err(position_error);
+    }
+    Ok(Some((directive_pos, directive_line)))
+}
+
+fn matches_reserved_statement_directive(text: &str) -> bool {
+    text.starts_with("assert")
+        || text.starts_with("assume")
+        || text.starts_with("inv")
+        || text.starts_with("req")
+        || text.starts_with("ens")
 }
 
 #[cfg(test)]
