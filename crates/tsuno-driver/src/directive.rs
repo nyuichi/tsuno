@@ -703,12 +703,12 @@ fn spec_directive_line<'a>(
     Ok(Some((directive_pos, directive_line)))
 }
 
-fn generic_ghost_statement_line<'a>(
-    source: &'a str,
+fn generic_ghost_statement_line(
+    source: &str,
     allow_terminal: bool,
     multiple_error: DirectiveError,
     position_error: DirectiveError,
-) -> Result<Option<(usize, &'a str)>, DirectiveError> {
+) -> Result<Option<(usize, &str)>, DirectiveError> {
     let mut candidate = None;
     for (directive_pos, _) in source.match_indices("//@") {
         let line_start = source[..directive_pos]

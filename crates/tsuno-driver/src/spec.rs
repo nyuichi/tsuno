@@ -150,6 +150,7 @@ pub enum SpecTy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[allow(clippy::enum_variant_names)]
 pub enum BuiltinFn {
     SeqConcat,
     SeqExtract,
@@ -323,9 +324,9 @@ fn decode_legacy_string_literal(text: &str) -> Result<Option<String>, ParseError
             continue;
         }
         let Some(esc) = chars.next() else {
-            return Err(ParseError::new(format!(
-                "failed to parse spec expression: trailing escape in string literal"
-            )));
+            return Err(ParseError::new(
+                "failed to parse spec expression: trailing escape in string literal".to_string(),
+            ));
         };
         match esc {
             '\\' => out.push('\\'),
@@ -1057,7 +1058,7 @@ impl<'a> PureFnParser<'a> {
                     break;
                 }
             }
-            if body[cursor..].chars().next() != Some('(') {
+            if !body[cursor..].starts_with('(') {
                 return Err(ParseError::new("expected `(` in lemma call"));
             }
             let (args_body, next) = self.parse_paren_body(body, cursor)?;
@@ -1191,7 +1192,7 @@ impl<'a> PureFnParser<'a> {
                 break;
             }
         }
-        if text[cursor..].chars().next() != Some(';') {
+        if !text[cursor..].starts_with(';') {
             return Err(ParseError::new("expected `;` after lemma statement"));
         }
         Ok(cursor + 1)

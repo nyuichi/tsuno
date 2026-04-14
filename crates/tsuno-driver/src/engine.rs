@@ -335,12 +335,10 @@ impl<'tcx> Verifier<'tcx> {
             if let Some(lemma_call) = self
                 .lemma_call_contracts
                 .lemma_call_at(ctrl.basic_block, ctrl.statement_index)
-            {
-                if let Err(err) =
+                && let Err(err) =
                     self.execute_lemma_call(&mut state, lemma_call, self.control_span(ctrl))
-                {
-                    return err;
-                }
+            {
+                return err;
             }
             match self.check_sat(std::slice::from_ref(&state.pc)) {
                 SatResult::Sat => {}
@@ -855,7 +853,7 @@ impl<'tcx> Verifier<'tcx> {
         };
         let asts: Vec<&dyn Ast> = vars.iter().map(sym_value_ast).collect();
         with_solver(|solver| {
-            solver.assert(&z3::ast::forall_const(&asts, &[], &body));
+            solver.assert(z3::ast::forall_const(&asts, &[], &body));
         });
         Ok(())
     }
@@ -2038,12 +2036,12 @@ impl<'tcx> Verifier<'tcx> {
             len_var.le(input_len.clone() - start_var.clone()),
         ]);
         GLOBAL_SOLVER.with(|solver| {
-            solver.assert(&z3::ast::forall_const(
+            solver.assert(z3::ast::forall_const(
                 &[&input, &start_var, &len_var],
                 &[],
                 &in_bounds.clone().implies(output.length().eq(&len_var)),
             ));
-            solver.assert(&z3::ast::forall_const(
+            solver.assert(z3::ast::forall_const(
                 &[&input, &start_var, &len_var, &idx],
                 &[],
                 &bool_and(vec![in_bounds.clone(), idx.ge(0), idx.lt(len_var.clone())]).implies(
@@ -2063,7 +2061,7 @@ impl<'tcx> Verifier<'tcx> {
                 .apply(&[&input, &suffix_start, &suffix_len])
                 .as_seq()
                 .expect("seq_extract suffix");
-            solver.assert(&z3::ast::forall_const(
+            solver.assert(z3::ast::forall_const(
                 &[&input, &start_var, &len_var],
                 &[],
                 &in_bounds.implies(input.eq(Seq::concat(&[&prefix, &output, &suffix]))),
@@ -2089,12 +2087,12 @@ impl<'tcx> Verifier<'tcx> {
         let index = Int::fresh_const("seq_rev_idx");
         let len = input.length();
         GLOBAL_SOLVER.with(|solver| {
-            solver.assert(&z3::ast::forall_const(
+            solver.assert(z3::ast::forall_const(
                 &[&input],
                 &[],
                 &output.length().eq(&len),
             ));
-            solver.assert(&z3::ast::forall_const(
+            solver.assert(z3::ast::forall_const(
                 &[&input, &index],
                 &[],
                 &bool_and(vec![
@@ -2110,7 +2108,7 @@ impl<'tcx> Verifier<'tcx> {
             let left_rev = decl.apply(&[&left]).as_seq().expect("seq_rev left");
             let right_rev = decl.apply(&[&right]).as_seq().expect("seq_rev right");
             let both = Seq::concat(&[&left, &right]);
-            solver.assert(&z3::ast::forall_const(
+            solver.assert(z3::ast::forall_const(
                 &[&left, &right],
                 &[],
                 &decl

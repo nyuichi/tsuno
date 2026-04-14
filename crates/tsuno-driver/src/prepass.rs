@@ -1825,15 +1825,15 @@ fn type_binary_expr(
 }
 
 fn type_named_field_expr(base: TypedExpr, name: &str) -> Result<TypedExpr, String> {
-    if name == "fin" {
-        if let SpecTy::Mut(inner) = &base.ty {
-            return Ok(TypedExpr {
-                ty: (**inner).clone(),
-                kind: TypedExprKind::Fin {
-                    base: Box::new(base),
-                },
-            });
-        }
+    if name == "fin"
+        && let SpecTy::Mut(inner) = &base.ty
+    {
+        return Ok(TypedExpr {
+            ty: (**inner).clone(),
+            kind: TypedExprKind::Fin {
+                base: Box::new(base),
+            },
+        });
     }
     let SpecTy::Struct(struct_ty) = &base.ty else {
         return Err(format!(
@@ -1943,11 +1943,11 @@ pub fn compute_directives<'tcx>(
             directive.span,
             &directive.span_text,
             &directive.expr,
-            &pure_fns,
+            pure_fns,
             &param_names,
             false,
             &mut contract_scope,
-        )?;
+        )?
     }
     let mut body_scope = contract_scope.clone();
     let mut resolved_exprs = HashMap::new();
@@ -1963,17 +1963,17 @@ pub fn compute_directives<'tcx>(
         let resolution = match directive.kind {
             DirectiveKind::LemmaCall => resolve_lemma_call_expr_env(
                 &directive.expr,
-                &pure_fns,
+                pure_fns,
                 &binding_info,
                 &hir_locals,
                 directive.span,
                 directive_anchor_span(&directive.attach),
-                &lemma_defs,
+                lemma_defs,
                 &mut body_scope,
             )?,
             _ => resolve_expr_env(
                 &directive.expr,
-                &pure_fns,
+                pure_fns,
                 &binding_info,
                 &hir_locals,
                 directive.span,
@@ -1989,18 +1989,18 @@ pub fn compute_directives<'tcx>(
             directive.span,
             &directive.span_text,
             &directive.expr,
-            &pure_fns,
+            pure_fns,
             &param_names,
             true,
             &mut contract_scope,
-        )?;
+        )?
     }
     let mut inferred = SpecTypeInference::default();
     let mut contract_infer_scope = SpecScope::default();
     if let Some(directive) = req_directive {
         infer_contract_expr_types(
             &directive.expr,
-            &pure_fns,
+            pure_fns,
             &mut contract_infer_scope,
             &param_tys,
             false,
@@ -2037,8 +2037,8 @@ pub fn compute_directives<'tcx>(
             DirectiveKind::LemmaCall => {
                 infer_lemma_call(
                     &directive.expr,
-                    &lemma_defs,
-                    &pure_fns,
+                    lemma_defs,
+                    pure_fns,
                     &mut body_infer_scope,
                     &local_tys,
                     &mut inferred,
@@ -2052,7 +2052,7 @@ pub fn compute_directives<'tcx>(
             _ => {
                 infer_body_expr_types(
                     &directive.expr,
-                    &pure_fns,
+                    pure_fns,
                     directive.kind,
                     &mut body_infer_scope,
                     &local_tys,
@@ -2069,7 +2069,7 @@ pub fn compute_directives<'tcx>(
     if let Some(directive) = ens_directive {
         infer_contract_expr_types(
             &directive.expr,
-            &pure_fns,
+            pure_fns,
             &mut contract_infer_scope,
             &param_tys,
             true,
@@ -2092,7 +2092,7 @@ pub fn compute_directives<'tcx>(
             Some(
                 typed_contract_expr(
                     &directive.expr,
-                    &pure_fns,
+                    pure_fns,
                     &mut scope,
                     &param_tys,
                     false,
@@ -2114,7 +2114,7 @@ pub fn compute_directives<'tcx>(
         if let Some(directive) = req_directive {
             let _ = typed_contract_expr(
                 &directive.expr,
-                &pure_fns,
+                pure_fns,
                 &mut scope,
                 &param_tys,
                 false,
@@ -2154,8 +2154,8 @@ pub fn compute_directives<'tcx>(
                 let contract = typed_lemma_call(
                     &directive.expr,
                     &directive.span_text,
-                    &lemma_defs,
-                    &pure_fns,
+                    lemma_defs,
+                    pure_fns,
                     &mut body_type_scope,
                     &local_tys,
                     &mut inferred,
@@ -2170,7 +2170,7 @@ pub fn compute_directives<'tcx>(
             _ => {
                 let typed = typed_body_expr(
                     &directive.expr,
-                    &pure_fns,
+                    pure_fns,
                     directive.kind,
                     &mut body_type_scope,
                     &local_tys,
@@ -2191,7 +2191,7 @@ pub fn compute_directives<'tcx>(
             if let Some(req) = req_directive {
                 let _ = typed_contract_expr(
                     &req.expr,
-                    &pure_fns,
+                    pure_fns,
                     &mut scope,
                     &param_tys,
                     false,
@@ -2207,7 +2207,7 @@ pub fn compute_directives<'tcx>(
             Some(
                 typed_contract_expr(
                     &directive.expr,
-                    &pure_fns,
+                    pure_fns,
                     &mut scope,
                     &param_tys,
                     true,
@@ -2457,6 +2457,7 @@ pub fn compute_directives<'tcx>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_lemma_call_expr_env(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
@@ -3368,6 +3369,7 @@ fn validate_contract_expr_core(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_expr_env(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
