@@ -25,6 +25,21 @@ fn run_prepass_fixture(name: &str) -> std::process::Output {
 }
 
 fn run_fixture_file(path: PathBuf) -> std::process::Output {
+    run_fixture_file_with_args(
+        path,
+        &[
+            "--crate-name",
+            "fixture",
+            "--edition=2024",
+            "--crate-type",
+            "bin",
+            "--emit=metadata",
+            "src/main.rs",
+        ],
+    )
+}
+
+fn run_fixture_file_with_args(path: PathBuf, args: &[&str]) -> std::process::Output {
     let tmp = tempdir().expect("tempdir");
     let root = tmp.path();
     fs::create_dir(root.join("src")).expect("src dir");
@@ -34,15 +49,7 @@ fn run_fixture_file(path: PathBuf) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_tsuno-driver"))
         .current_dir(root)
         .arg(rustc)
-        .args([
-            "--crate-name",
-            "fixture",
-            "--edition=2024",
-            "--crate-type",
-            "bin",
-            "--emit=metadata",
-            "src/main.rs",
-        ])
+        .args(args)
         .output()
         .expect("driver output")
 }
@@ -82,5 +89,27 @@ fn reports_multiple_function_prepass_errors_before_verification() {
     assert!(
         !stdout.contains("PASS main"),
         "verification should not run after prepass errors:\n{stdout}"
+    );
+}
+
+#[test]
+fn rejects_invalid_ghosts_without_toplevel_functions() {
+    let output = run_fixture_file_with_args(
+        prepass_fixture_file("rejects_invalid_ghosts_without_toplevel_functions"),
+        &[
+            "--crate-name",
+            "fixture",
+            "--edition=2024",
+            "--crate-type",
+            "lib",
+            "--emit=metadata",
+            "src/main.rs",
+        ],
+    );
+    assert!(!output.status.success(), "fixture unexpectedly passed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("lemma `bad` assertion failed"),
+        "unexpected stdout:\n{stdout}"
     );
 }

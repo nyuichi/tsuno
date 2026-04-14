@@ -29,8 +29,8 @@ use rustc_middle::mir::{
     Operand, Place, PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnOp,
 };
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
-use rustc_span::Span;
 use rustc_span::source_map::Spanned;
+use rustc_span::{DUMMY_SP, Span};
 use z3::ast::{Ast, Bool, Datatype, Dynamic, Int, Seq};
 use z3::{
     DatatypeAccessor, DatatypeBuilder, DatatypeSort, FuncDecl, SatResult, Solver, Sort, SortKind,
@@ -119,8 +119,8 @@ enum BoolExpr {
 
 pub struct Verifier<'tcx> {
     tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-    body: Body<'tcx>,
+    def_id: Option<LocalDefId>,
+    body: Option<Body<'tcx>>,
     contracts: HashMap<LocalDefId, FunctionContract>,
     function_spec_vars: HashMap<String, SymValue>,
     loop_contracts: LoopContracts,
@@ -139,14 +139,7 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
         functions,
         contracts,
     } = program;
-    let mut functions = functions.into_iter();
-    let Some(first) = functions.next() else {
-        return Vec::new();
-    };
-    let first_body = tcx
-        .mir_drops_elaborated_and_const_checked(first.def_id)
-        .steal();
-    let mut verifier = Verifier::new(tcx, first.def_id, first_body.clone(), contracts);
+    let mut verifier = Verifier::new(tcx, contracts);
     for pure_fn in &ghosts.typed_pure_fns {
         if let Err(error) = verifier.load_ghost_function(pure_fn) {
             return vec![VerificationResult {
@@ -164,7 +157,6 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
         }
     }
     let mut results = Vec::new();
-    results.push(verifier.verify_function(first.def_id, first_body, first.prepass));
     for function in functions {
         let body = tcx
             .mir_drops_elaborated_and_const_checked(function.def_id)
@@ -175,17 +167,12 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
 }
 
 impl<'tcx> Verifier<'tcx> {
-    pub fn new(
-        tcx: TyCtxt<'tcx>,
-        def_id: LocalDefId,
-        body: Body<'tcx>,
-        contracts: HashMap<LocalDefId, FunctionContract>,
-    ) -> Self {
+    pub fn new(tcx: TyCtxt<'tcx>, contracts: HashMap<LocalDefId, FunctionContract>) -> Self {
         reset_solver();
         Self {
             tcx,
-            def_id,
-            body,
+            def_id: None,
+            body: None,
             contracts,
             function_spec_vars: HashMap::new(),
             loop_contracts: LoopContracts::empty(),
@@ -199,14 +186,37 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
+    fn current_def_id(&self) -> LocalDefId {
+        self.def_id
+            .expect("function verifier must load a function before use")
+    }
+
+    fn body(&self) -> &Body<'tcx> {
+        self.body
+            .as_ref()
+            .expect("function verifier must load a body before use")
+    }
+
+    fn report_span(&self) -> Span {
+        self.def_id
+            .map(|def_id| self.tcx.def_span(def_id))
+            .unwrap_or(DUMMY_SP)
+    }
+
+    fn report_function(&self) -> String {
+        self.def_id
+            .map(|def_id| self.tcx.def_path_str(def_id.to_def_id()))
+            .unwrap_or_else(|| "prepass".to_owned())
+    }
+
     pub fn verify_function(
         &mut self,
         def_id: LocalDefId,
         body: Body<'tcx>,
         prepass: DirectivePrepass,
     ) -> VerificationResult {
-        self.def_id = def_id;
-        self.body = body;
+        self.def_id = Some(def_id);
+        self.body = Some(body);
         self.load_function_prepass(prepass);
         self.verify_loaded_function()
     }
@@ -253,7 +263,7 @@ impl<'tcx> Verifier<'tcx> {
             spec_vars,
         } = prepass;
         let contract = function_contract.expect("successful function prepass must yield contract");
-        self.contracts.insert(self.def_id, contract);
+        self.contracts.insert(self.current_def_id(), contract);
         self.loop_contracts = loop_contracts;
         self.assertion_contracts = assertion_contracts;
         self.assumption_contracts = assumption_contracts;
@@ -343,7 +353,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
             }
 
-            let data = &self.body.basic_blocks[ctrl.basic_block];
+            let data = &self.body().basic_blocks[ctrl.basic_block];
             if ctrl.statement_index < data.statements.len() {
                 let stmt = &data.statements[ctrl.statement_index];
                 let next = match self.step_statement(state, stmt) {
@@ -377,12 +387,12 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<State, VerificationResult> {
         match &stmt.kind {
             StatementKind::StorageLive(local) => {
-                let ty = self.body.local_decls[*local].ty;
+                let ty = self.body().local_decls[*local].ty;
                 let value = self.fresh_for_rust_ty(ty, &format!("live_{}", local.as_usize()))?;
                 state.model.insert(*local, value);
             }
             StatementKind::StorageDead(local) => {
-                let ty = self.body.local_decls[*local].ty;
+                let ty = self.body().local_decls[*local].ty;
                 if self.ty_contains_mut_ref(ty) {
                     self.resolve_and_remove_local(&mut state, *local, stmt.source_info.span)?;
                 }
@@ -420,7 +430,7 @@ impl<'tcx> Verifier<'tcx> {
                 self.goto_target(state, *target, term.source_info.span)
             }
             TerminatorKind::Return => {
-                if let Some(contract) = self.contracts.get(&self.def_id) {
+                if let Some(contract) = self.contracts.get(&self.current_def_id()) {
                     let formula = self.function_postcondition_to_z3(&state, contract)?;
                     self.require_constraint(
                         &mut state,
@@ -443,7 +453,7 @@ impl<'tcx> Verifier<'tcx> {
                 let mut next_states = Vec::new();
                 let mut seen_conditions = Vec::new();
                 for (value, target) in targets.iter() {
-                    let branch = match discr.ty(&self.body, self.tcx).kind() {
+                    let branch = match discr.ty(self.body(), self.tcx).kind() {
                         TyKind::Bool => {
                             if value == 0 {
                                 not_expr(BoolExpr::Value(discr_value.clone()))
@@ -453,7 +463,7 @@ impl<'tcx> Verifier<'tcx> {
                         }
                         _ => BoolExpr::Value(self.value_wrap_bool(&self.eq_for_spec_ty(
                             &self.spec_ty_for_place_ty(
-                                discr.ty(&self.body.local_decls, self.tcx),
+                                discr.ty(&self.body().local_decls, self.tcx),
                                 term.source_info.span,
                             )?,
                             &discr_value,
@@ -719,7 +729,7 @@ impl<'tcx> Verifier<'tcx> {
         }
 
         for local in shared {
-            let ty = self.body.local_decls[local].ty;
+            let ty = self.body().local_decls[local].ty;
             let spec_ty = self.spec_ty_for_place_ty(ty, self.control_span(ctrl))?;
             let mut incoming_values = states
                 .iter()
@@ -793,19 +803,19 @@ impl<'tcx> Verifier<'tcx> {
             },
         };
         for local in self
-            .body
+            .body()
             .local_decls
             .indices()
-            .take(self.body.arg_count + 1)
+            .take(self.body().arg_count + 1)
         {
-            let ty = self.body.local_decls[local].ty;
+            let ty = self.body().local_decls[local].ty;
             let value = self.fresh_for_rust_ty(ty, &format!("arg_{}", local.as_usize()))?;
             state.model.insert(local, value);
         }
-        if let Some(contract) = self.contracts.get(&self.def_id) {
+        if let Some(contract) = self.contracts.get(&self.current_def_id()) {
             let env =
                 CallEnv::for_function(self, &state, contract, self.function_spec_vars.clone())?;
-            let req = self.contract_req_to_z3(contract, &env, self.tcx.def_span(self.def_id))?;
+            let req = self.contract_req_to_z3(contract, &env, self.report_span())?;
             self.assume_constraint(&mut state, req);
         }
         Ok(state)
@@ -823,30 +833,18 @@ impl<'tcx> Verifier<'tcx> {
         }
         let spec = HashMap::new();
         let body = self.contract_expr_to_value(&current, &spec, &pure_fn.body)?;
-        let fn_value = self.apply_pure_fn_decl(
-            &decl,
-            &pure_fn.result_ty,
-            &vars,
-            self.tcx.def_span(self.def_id),
-        )?;
-        let mut consequent = vec![self.eq_for_spec_ty(
-            &pure_fn.result_ty,
-            &fn_value,
-            &body,
-            self.tcx.def_span(self.def_id),
-        )?];
-        if let Some(formula) = self.spec_ty_formula(
-            &pure_fn.result_ty,
-            &fn_value,
-            self.tcx.def_span(self.def_id),
-        )? {
+        let fn_value =
+            self.apply_pure_fn_decl(&decl, &pure_fn.result_ty, &vars, self.report_span())?;
+        let mut consequent =
+            vec![self.eq_for_spec_ty(&pure_fn.result_ty, &fn_value, &body, self.report_span())?];
+        if let Some(formula) =
+            self.spec_ty_formula(&pure_fn.result_ty, &fn_value, self.report_span())?
+        {
             consequent.push(formula);
         }
         let mut antecedent = Vec::new();
         for (param, value) in pure_fn.params.iter().zip(vars.iter()) {
-            if let Some(formula) =
-                self.spec_ty_formula(&param.ty, value, self.tcx.def_span(self.def_id))?
-            {
+            if let Some(formula) = self.spec_ty_formula(&param.ty, value, self.report_span())? {
                 antecedent.push(formula);
             }
         }
@@ -869,7 +867,7 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<(), VerificationResult> {
         if stack.iter().any(|name| name == &lemma.name) {
             return Err(self.unsupported_result(
-                self.tcx.def_span(self.def_id),
+                self.report_span(),
                 format!("recursive lemma `{}` is not supported", lemma.name),
             ));
         }
@@ -894,14 +892,12 @@ impl<'tcx> Verifier<'tcx> {
         self.assume_constraint(&mut state, self.bool_expr_to_z3(&req)?);
         for param in &lemma.params {
             let value = current.get(&param.name).expect("lemma parameter value");
-            if let Some(formula) =
-                self.spec_ty_formula(&param.ty, value, self.tcx.def_span(self.def_id))?
-            {
+            if let Some(formula) = self.spec_ty_formula(&param.ty, value, self.report_span())? {
                 self.assume_constraint(&mut state, formula);
             }
         }
         for stmt in &lemma.body {
-            if !self.state_is_feasible(&state, self.tcx.def_span(self.def_id))? {
+            if !self.state_is_feasible(&state, self.report_span())? {
                 stack.pop();
                 return Ok(());
             }
@@ -911,7 +907,7 @@ impl<'tcx> Verifier<'tcx> {
                     self.require_constraint(
                         &mut state,
                         self.bool_expr_to_z3(&formula)?,
-                        self.tcx.def_span(self.def_id),
+                        self.report_span(),
                         format!("lemma `{}`", lemma.name),
                         format!("lemma `{}` assertion failed", lemma.name),
                     )?;
@@ -923,7 +919,7 @@ impl<'tcx> Verifier<'tcx> {
                 TypedGhostStmt::Call { lemma_name, args } => {
                     let callee = self.lemmas.get(lemma_name).ok_or_else(|| {
                         self.unsupported_result(
-                            self.tcx.def_span(self.def_id),
+                            self.report_span(),
                             format!("unknown lemma `{lemma_name}`"),
                         )
                     })?;
@@ -933,7 +929,7 @@ impl<'tcx> Verifier<'tcx> {
                     self.require_constraint(
                         &mut state,
                         self.bool_expr_to_z3(&req)?,
-                        self.tcx.def_span(self.def_id),
+                        self.report_span(),
                         format!("lemma `{}`", lemma.name),
                         format!("lemma `{}` precondition failed", callee.name),
                     )?;
@@ -942,7 +938,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
             }
         }
-        if !self.state_is_feasible(&state, self.tcx.def_span(self.def_id))? {
+        if !self.state_is_feasible(&state, self.report_span())? {
             stack.pop();
             return Ok(());
         }
@@ -950,7 +946,7 @@ impl<'tcx> Verifier<'tcx> {
         let result = self.require_constraint(
             &mut state,
             self.bool_expr_to_z3(&ens)?,
-            self.tcx.def_span(self.def_id),
+            self.report_span(),
             format!("lemma `{}`", lemma.name),
             format!("lemma `{}` postcondition failed", lemma.name),
         );
@@ -1039,7 +1035,7 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<CallEnv, VerificationResult> {
         if lemma.params.len() != args.len() {
             return Err(self.unsupported_result(
-                self.tcx.def_span(self.def_id),
+                self.report_span(),
                 format!(
                     "lemma `{}` parameter count mismatch: expected {}, found {}",
                     lemma.name,
@@ -1090,7 +1086,7 @@ impl<'tcx> Verifier<'tcx> {
         value: &SymValue,
         span: Span,
     ) -> Result<(), VerificationResult> {
-        let ty = self.body.local_decls[local].ty;
+        let ty = self.body().local_decls[local].ty;
         let formula = self.resolve_formula(ty, value, span)?;
         self.require_constraint(
             state,
@@ -1135,8 +1131,10 @@ impl<'tcx> Verifier<'tcx> {
             Rvalue::UnaryOp(op, operand) => self.eval_unary_op(state, *op, operand, span),
             Rvalue::Aggregate(kind, operands) => match **kind {
                 AggregateKind::Tuple => {
-                    let result_ty = self
-                        .spec_ty_for_place_ty(rvalue.ty(&self.body.local_decls, self.tcx), span)?;
+                    let result_ty = self.spec_ty_for_place_ty(
+                        rvalue.ty(&self.body().local_decls, self.tcx),
+                        span,
+                    )?;
                     let mut values = Vec::with_capacity(operands.len());
                     for operand in operands {
                         values.push(self.eval_operand(state, operand, span)?);
@@ -1154,9 +1152,11 @@ impl<'tcx> Verifier<'tcx> {
                     for operand in operands {
                         values.push(self.eval_operand(state, operand, span)?);
                     }
-                    let result_ty =
-                        spec_ty_for_rust_ty(self.tcx, rvalue.ty(&self.body.local_decls, self.tcx))
-                            .map_err(|err| self.unsupported_result(span, err))?;
+                    let result_ty = spec_ty_for_rust_ty(
+                        self.tcx,
+                        rvalue.ty(&self.body().local_decls, self.tcx),
+                    )
+                    .map_err(|err| self.unsupported_result(span, err))?;
                     self.construct_datatype(&result_ty, &values)
                 }
                 _ => Err(self.unsupported_result(span, format!("unsupported aggregate {kind:?}"))),
@@ -1204,7 +1204,7 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<SymValue, VerificationResult> {
         let lhs_value = self.eval_operand(state, lhs, span)?;
         let rhs_value = self.eval_operand(state, rhs, span)?;
-        let lhs_ty = lhs.ty(&self.body.local_decls, self.tcx);
+        let lhs_ty = lhs.ty(&self.body().local_decls, self.tcx);
         let lhs_spec_ty = self.spec_ty_for_place_ty(lhs_ty, span)?;
         let result = match op {
             BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow => {
@@ -1291,7 +1291,7 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<SymValue, VerificationResult> {
         let lhs_value = self.eval_operand(state, lhs, span)?;
         let rhs_value = self.eval_operand(state, rhs, span)?;
-        let result_ty = lhs.ty(&self.body.local_decls, self.tcx);
+        let result_ty = lhs.ty(&self.body().local_decls, self.tcx);
         let tuple_ty = SpecTy::Tuple(vec![
             self.spec_ty_for_place_ty(result_ty, span)?,
             SpecTy::Bool,
@@ -1349,7 +1349,7 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
         let value = self.eval_operand(state, operand, span)?;
-        let operand_ty = operand.ty(&self.body.local_decls, self.tcx);
+        let operand_ty = operand.ty(&self.body().local_decls, self.tcx);
         let result = match op {
             UnOp::Not => match operand_ty.kind() {
                 TyKind::Bool => Ok(self.value_wrap_bool(&self.value_bool_data(&value).not())),
@@ -1488,7 +1488,7 @@ impl<'tcx> Verifier<'tcx> {
                 self.unsupported_result(span, format!("missing local {}", place.local.as_usize()))
             );
         };
-        let root_ty = self.body.local_decls[place.local].ty;
+        let root_ty = self.body().local_decls[place.local].ty;
         let root_spec_ty = self.spec_ty_for_place_ty(root_ty, span)?;
         self.read_projection(root, &root_spec_ty, place.as_ref().projection, mode, span)
     }
@@ -1557,7 +1557,7 @@ impl<'tcx> Verifier<'tcx> {
             .get(&place.local)
             .cloned()
             .unwrap_or_else(|| value.clone());
-        let root_ty = self.body.local_decls[place.local].ty;
+        let root_ty = self.body().local_decls[place.local].ty;
         let root_spec_ty = self.spec_ty_for_place_ty(root_ty, span)?;
         let updated =
             self.write_projection(root, &root_spec_ty, place.as_ref().projection, value, span)?;
@@ -1832,26 +1832,24 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<SymValue, VerificationResult> {
         match &expr.kind {
             TypedExprKind::Bool(value) => Ok(self.value_bool(*value)),
-            TypedExprKind::Int(value) => {
-                self.value_decimal_int(&value.digits, self.tcx.def_span(self.def_id))
-            }
+            TypedExprKind::Int(value) => self.value_decimal_int(&value.digits, self.report_span()),
             TypedExprKind::Var(name) if spec.contains_key(name) => {
                 spec.get(name).cloned().ok_or_else(|| {
                     self.unsupported_result(
-                        self.tcx.def_span(self.def_id),
+                        self.report_span(),
                         format!("missing spec binding `{name}`"),
                     )
                 })
             }
             TypedExprKind::Var(name) => current.get(name).cloned().ok_or_else(|| {
                 self.unsupported_result(
-                    self.tcx.def_span(self.def_id),
+                    self.report_span(),
                     format!("missing contract binding `{name}`"),
                 )
             }),
             TypedExprKind::Bind(name) => spec.get(name).cloned().ok_or_else(|| {
                 self.unsupported_result(
-                    self.tcx.def_span(self.def_id),
+                    self.report_span(),
                     format!("missing spec binding `{name}`"),
                 )
             }),
@@ -1860,31 +1858,31 @@ impl<'tcx> Verifier<'tcx> {
                 for arg in args {
                     values.push(self.contract_expr_to_value(current, spec, arg)?);
                 }
-                self.eval_pure_call(func, &expr.ty, values, self.tcx.def_span(self.def_id))
+                self.eval_pure_call(func, &expr.ty, values, self.report_span())
             }
             TypedExprKind::BuiltinCall { func, args } => {
                 let mut values = Vec::with_capacity(args.len());
                 for arg in args {
                     values.push(self.contract_expr_to_value(current, spec, arg)?);
                 }
-                self.eval_builtin_call(*func, args, values, self.tcx.def_span(self.def_id))
+                self.eval_builtin_call(*func, args, values, self.report_span())
             }
             TypedExprKind::Field { base, index, .. } => {
                 let value = self.contract_expr_to_value(current, spec, base)?;
-                self.project_field(value, &base.ty, *index, self.tcx.def_span(self.def_id))
+                self.project_field(value, &base.ty, *index, self.report_span())
             }
             TypedExprKind::TupleField { base, index } => {
                 let value = self.contract_expr_to_value(current, spec, base)?;
-                self.project_field(value, &base.ty, *index, self.tcx.def_span(self.def_id))
+                self.project_field(value, &base.ty, *index, self.report_span())
             }
             TypedExprKind::Deref { base } => {
                 let value = self.contract_expr_to_value(current, spec, base)?;
                 match &base.ty {
                     crate::spec::SpecTy::Ref(inner) => {
-                        self.ref_deref(&value, inner, self.tcx.def_span(self.def_id))
+                        self.ref_deref(&value, inner, self.report_span())
                     }
                     crate::spec::SpecTy::Mut(inner) => {
-                        self.mut_cur(&value, inner, self.tcx.def_span(self.def_id))
+                        self.mut_cur(&value, inner, self.report_span())
                     }
                     _ => unreachable!("typed deref base"),
                 }
@@ -1894,7 +1892,7 @@ impl<'tcx> Verifier<'tcx> {
                 let SpecTy::Mut(inner) = &base.ty else {
                     unreachable!("typed fin base");
                 };
-                self.mut_fin(&value, inner, self.tcx.def_span(self.def_id))
+                self.mut_fin(&value, inner, self.report_span())
             }
             TypedExprKind::Unary { op, arg } => {
                 let value = self.contract_expr_to_value(current, spec, arg)?;
@@ -1903,13 +1901,7 @@ impl<'tcx> Verifier<'tcx> {
             TypedExprKind::Binary { op, lhs, rhs } => {
                 let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
                 let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
-                self.lower_binary_value(
-                    *op,
-                    &lhs.ty,
-                    &lhs_value,
-                    &rhs_value,
-                    self.tcx.def_span(self.def_id),
-                )
+                self.lower_binary_value(*op, &lhs.ty, &lhs_value, &rhs_value, self.report_span())
             }
         }
     }
@@ -2137,7 +2129,7 @@ impl<'tcx> Verifier<'tcx> {
         contract: &FunctionContract,
     ) -> Result<Bool, VerificationResult> {
         let env = CallEnv::for_function(self, state, contract, self.function_spec_vars.clone())?;
-        self.contract_ens_to_z3(contract, &env, self.tcx.def_span(self.def_id))
+        self.contract_ens_to_z3(contract, &env, self.report_span())
     }
 
     fn require_constraint(
@@ -2152,7 +2144,7 @@ impl<'tcx> Verifier<'tcx> {
         match self.check_sat(&[state.pc.clone(), state.assertion.clone()]) {
             SatResult::Sat => Ok(()),
             SatResult::Unsat => Err(VerificationResult {
-                function: self.tcx.def_path_str(self.def_id.to_def_id()),
+                function: self.report_function(),
                 status: VerificationStatus::Fail,
                 span: diagnostic_span,
                 message,
@@ -2227,8 +2219,8 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: Ty<'tcx>,
         _span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let inner_spec_ty = self.spec_ty_for_place_ty(inner_ty, self.tcx.def_span(self.def_id))?;
-        let final_value = self.mut_fin(value, &inner_spec_ty, self.tcx.def_span(self.def_id))?;
+        let inner_spec_ty = self.spec_ty_for_place_ty(inner_ty, self.report_span())?;
+        let final_value = self.mut_fin(value, &inner_spec_ty, self.report_span())?;
         let fresh = self.fresh_for_rust_ty(inner_ty, "opaque_cur")?;
         self.construct_datatype(&SpecTy::Mut(Box::new(inner_spec_ty)), &[fresh, final_value])
     }
@@ -2242,7 +2234,7 @@ impl<'tcx> Verifier<'tcx> {
             if !state.model.contains_key(local) {
                 continue;
             }
-            let ty = self.body.local_decls[*local].ty;
+            let ty = self.body().local_decls[*local].ty;
             let fresh = self.fresh_for_rust_ty(ty, &format!("loop_{}", local.as_usize()))?;
             state.model.insert(*local, fresh);
         }
@@ -2259,7 +2251,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn is_immediate_return_block(&self, block: BasicBlock) -> bool {
-        let data = &self.body.basic_blocks[block];
+        let data = &self.body().basic_blocks[block];
         data.statements.is_empty() && matches!(data.terminator().kind, TerminatorKind::Return)
     }
 
@@ -2300,7 +2292,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn place_ty(&self, place: Place<'tcx>) -> Ty<'tcx> {
-        place.ty(&self.body.local_decls, self.tcx).ty
+        place.ty(&self.body().local_decls, self.tcx).ty
     }
 
     fn is_reborrow(&self, place: Place<'tcx>) -> bool {
@@ -2312,7 +2304,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn control_span(&self, ctrl: ControlPoint) -> Span {
-        let data = &self.body.basic_blocks[ctrl.basic_block];
+        let data = &self.body().basic_blocks[ctrl.basic_block];
         if ctrl.statement_index < data.statements.len() {
             data.statements[ctrl.statement_index].source_info.span
         } else {
@@ -2474,7 +2466,7 @@ impl<'tcx> Verifier<'tcx> {
         match &encoding.kind {
             TypeEncodingKind::Datatype(encoding) => Ok(encoding.clone()),
             _ => Err(self.unsupported_result(
-                self.tcx.def_span(self.def_id),
+                self.report_span(),
                 format!("expected datatype-backed spec type, found {ty:?}"),
             )),
         }
@@ -2548,7 +2540,7 @@ impl<'tcx> Verifier<'tcx> {
                 .map(|field| field.name.clone())
                 .collect()),
             other => Err(self.unsupported_result(
-                self.tcx.def_span(self.def_id),
+                self.report_span(),
                 format!("expected datatype-backed spec type, found {other:?}"),
             )),
         }
@@ -2571,7 +2563,7 @@ impl<'tcx> Verifier<'tcx> {
                 .map(|field| self.type_encoding(&field.ty))
                 .collect(),
             other => Err(self.unsupported_result(
-                self.tcx.def_span(self.def_id),
+                self.report_span(),
                 format!("expected datatype-backed spec type, found {other:?}"),
             )),
         }
@@ -2658,26 +2650,25 @@ impl<'tcx> Verifier<'tcx> {
             && vec_element_ty(self.tcx, ty).is_none()
         {
             if !adt_def.is_struct() {
-                return Err(self.unsupported_result(
-                    self.tcx.def_span(self.def_id),
-                    format!("unsupported type {ty:?}"),
-                ));
+                return Err(
+                    self.unsupported_result(self.report_span(), format!("unsupported type {ty:?}"))
+                );
             }
             if !args.is_empty() {
                 return Err(self.unsupported_result(
-                    self.tcx.def_span(self.def_id),
+                    self.report_span(),
                     format!("generic structs are unsupported: {ty:?}"),
                 ));
             }
             if adt_def.has_dtor(self.tcx) {
                 return Err(self.unsupported_result(
-                    self.tcx.def_span(self.def_id),
+                    self.report_span(),
                     format!("structs with Drop are unsupported: {ty:?}"),
                 ));
             }
         }
         let spec_ty = spec_ty_for_rust_ty(self.tcx, ty)
-            .map_err(|err| self.unsupported_result(self.tcx.def_span(self.def_id), err))?;
+            .map_err(|err| self.unsupported_result(self.report_span(), err))?;
         self.fresh_for_spec_ty(&spec_ty, hint)
     }
 
@@ -2927,25 +2918,16 @@ impl<'tcx> Verifier<'tcx> {
             let lower = -(1_i128 << (bits - 1));
             let upper = (1_i128 << (bits - 1)) - 1;
             let lower = Int::from_str(&lower.to_string()).map_err(|()| {
-                self.unsupported_result(
-                    self.tcx.def_span(self.def_id),
-                    "invalid isize lower bound".to_owned(),
-                )
+                self.unsupported_result(self.report_span(), "invalid isize lower bound".to_owned())
             })?;
             let upper = Int::from_str(&upper.to_string()).map_err(|()| {
-                self.unsupported_result(
-                    self.tcx.def_span(self.def_id),
-                    "invalid isize upper bound".to_owned(),
-                )
+                self.unsupported_result(self.report_span(), "invalid isize upper bound".to_owned())
             })?;
             Ok((lower, upper))
         } else {
             let upper = (1_u128 << bits) - 1;
             let upper = Int::from_str(&upper.to_string()).map_err(|()| {
-                self.unsupported_result(
-                    self.tcx.def_span(self.def_id),
-                    "invalid usize upper bound".to_owned(),
-                )
+                self.unsupported_result(self.report_span(), "invalid usize upper bound".to_owned())
             })?;
             Ok((Int::from_u64(0), upper))
         }
@@ -3207,7 +3189,7 @@ impl<'tcx> Verifier<'tcx> {
 
     fn unsupported_result(&self, span: Span, message: String) -> VerificationResult {
         VerificationResult {
-            function: self.tcx.def_path_str(self.def_id.to_def_id()),
+            function: self.report_function(),
             status: VerificationStatus::Unsupported,
             span: span_text(self.tcx, span),
             message,
@@ -3216,7 +3198,7 @@ impl<'tcx> Verifier<'tcx> {
 
     fn unknown_result(&self, span: Span, message: String) -> VerificationResult {
         VerificationResult {
-            function: self.tcx.def_path_str(self.def_id.to_def_id()),
+            function: self.report_function(),
             status: VerificationStatus::Unknown,
             span: span_text(self.tcx, span),
             message,
@@ -3225,9 +3207,9 @@ impl<'tcx> Verifier<'tcx> {
 
     fn pass_result(&self, message: &str) -> VerificationResult {
         VerificationResult {
-            function: self.tcx.def_path_str(self.def_id.to_def_id()),
+            function: self.report_function(),
             status: VerificationStatus::Pass,
-            span: span_text(self.tcx, self.tcx.def_span(self.def_id)),
+            span: span_text(self.tcx, self.report_span()),
             message: message.to_owned(),
         }
     }
@@ -3364,7 +3346,7 @@ impl CallEnv {
         for (param, local) in contract
             .params
             .iter()
-            .zip(verifier.body.local_decls.indices().skip(1))
+            .zip(verifier.body().local_decls.indices().skip(1))
         {
             let value = state.model.get(&local).cloned().ok_or_else(|| {
                 verifier.unsupported_result(
