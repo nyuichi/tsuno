@@ -5,7 +5,7 @@ struct Pair {
 }
 
 fn rejects_numeric_projection_on_struct(pair: Pair) {
-    //@ assert "{pair}.0 == 0i32"
+    //@ assert {pair}.0 == 0i32;
 }
 
 fn main() {

@@ -12,42 +12,45 @@ fn rev_inv(orig: Seq<i32>, cur: Seq<i32>, i: usize) -> bool {
 }
 */
 
+// TODO: Define seq_extract and seq_rev in spec code once recursive pure functions are supported.
+// For now they remain built-ins.
+
 fn vec_len(v: &Vec<i32>) -> usize
-//@ req "true"
-//@ ens "{result} == seq_len(*{v})"
+//@ req true
+//@ ens {result} == seq_len(*{v})
 {
-    //@ assume "false"
+    //@ assume false;
     let _ = 0usize;
     0
 }
 
 fn vec_swap(v: &mut Vec<i32>, i: usize, j: usize)
-//@ req "?old == *{v} && {i} < {j} && {j} < seq_len(old)"
-//@ ens "{v}.fin == seq_concat(seq_concat(seq_concat(seq_extract(old, 0usize, {i}), seq_unit(seq_nth(old, {j}))), seq_concat(seq_extract(old, {i} + 1usize, {j} - {i} - 1usize), seq_unit(seq_nth(old, {i})))), seq_extract(old, {j} + 1usize, seq_len(old) - {j} - 1usize))"
+//@ req ?old == *{v} && {i} < {j} && {j} < seq_len(old)
+//@ ens {v}.fin == seq_concat(seq_concat(seq_concat(seq_extract(old, 0usize, {i}), seq_unit(seq_nth(old, {j}))), seq_concat(seq_extract(old, {i} + 1usize, {j} - {i} - 1usize), seq_unit(seq_nth(old, {i})))), seq_extract(old, {j} + 1usize, seq_len(old) - {j} - 1usize))
 {
-    //@ assume "false"
+    //@ assume false;
     let _ = ();
 }
 
 fn rev(v: &mut Vec<i32>)
-//@ req "?orig == *{v}"
-//@ ens "is_rev(orig, {v}.fin)"
+//@ req ?orig == *{v}
+//@ ens is_rev(orig, {v}.fin)
 {
     let n = vec_len(v);
     let mut i = 0usize;
-    //@ assert "{n} == seq_len(orig) && rev_inv(orig, *{v}, 0usize)"
+    //@ assert {n} == seq_len(orig) && rev_inv(orig, *{v}, 0usize);
     let _ = ();
     while i + i + 1usize < n
-      //@ inv "{n} == seq_len(orig) && rev_inv(orig, *{v}, {i})"
+      //@ inv {n} == seq_len(orig) && rev_inv(orig, *{v}, {i})
     {
         let j = n - i - 1usize;
         vec_swap(v, i, j);
         i = i + 1usize;
     }
     let _ = ();
-    //@ assert "{n} <= {i} + {i} + 1usize"
+    //@ assert {n} <= {i} + {i} + 1usize;
     let _ = ();
-    //@ assert "is_rev(orig, *{v})"
+    //@ assert is_rev(orig, *{v});
     let _ = ();
 }
 

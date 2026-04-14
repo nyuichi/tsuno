@@ -1,6 +1,6 @@
 fn rejects_uninferred_spec_var_type()
-//@ req "?X == ?Y"
-//@ ens "true"
+//@ req ?X == ?Y
+//@ ens true
 {
 }
 

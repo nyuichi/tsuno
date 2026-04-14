@@ -1,15 +1,15 @@
 /*@
 fn bad(x: i32)
-  req "true"
-  ens "true"
+  req true
+  ens true
 {
-    assume "true";
-    assert "false";
+    assume true;
+    assert false;
 }
 */
 
 fn main() {
     let x = 0_i32;
-    //@ bad(x);
+    //@ bad({x});
     let _ = ();
 }

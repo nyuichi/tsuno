@@ -73,7 +73,7 @@ fn branch_merge_explosion(
     } else {
         value += 2;
     }
-    //@ assert "{value} >= 0"
+    //@ assert {value} >= 0;
 }
 
 fn main() {}

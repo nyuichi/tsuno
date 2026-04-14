@@ -272,9 +272,26 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+#[cfg(test)]
 pub fn parse_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
-    let decoded = decode_string_literal(kind, text)?;
-    parse_templated_expr(kind, &decoded)
+    parse_source_expr(kind, text)
+}
+
+pub fn parse_source_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
+    if let Some(decoded) = decode_legacy_string_literal(text)? {
+        return parse_templated_expr(kind, &decoded);
+    }
+    parse_templated_expr(kind, text.trim())
+}
+
+pub fn parse_statement_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
+    let text = text.trim();
+    let Some(text) = text.strip_suffix(';') else {
+        return Err(ParseError::new(format!(
+            "failed to parse //@ {kind} predicate: expected trailing `;`"
+        )));
+    };
+    parse_source_expr(kind, text.trim_end())
 }
 
 pub fn parse_templated_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
@@ -289,14 +306,13 @@ pub fn parse_raw_expr(_kind: &str, text: &str) -> Result<Expr, ParseError> {
     Ok(expr)
 }
 
-fn decode_string_literal(kind: &str, text: &str) -> Result<String, ParseError> {
+fn decode_legacy_string_literal(text: &str) -> Result<Option<String>, ParseError> {
     let Some(inner) = text
+        .trim()
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'))
     else {
-        return Err(ParseError::new(format!(
-            "failed to parse //@ {kind} predicate: expected string literal"
-        )));
+        return Ok(None);
     };
 
     let mut out = String::new();
@@ -308,7 +324,7 @@ fn decode_string_literal(kind: &str, text: &str) -> Result<String, ParseError> {
         }
         let Some(esc) = chars.next() else {
             return Err(ParseError::new(format!(
-                "failed to parse //@ {kind} predicate: trailing escape in string literal"
+                "failed to parse spec expression: trailing escape in string literal"
             )));
         };
         match esc {
@@ -320,13 +336,13 @@ fn decode_string_literal(kind: &str, text: &str) -> Result<String, ParseError> {
             '0' => out.push('\0'),
             _ => {
                 return Err(ParseError::new(format!(
-                    "failed to parse //@ {kind} predicate: unsupported escape `\\{esc}`"
+                    "failed to parse spec expression: unsupported escape `\\{esc}`"
                 )));
             }
         }
     }
 
-    Ok(out)
+    Ok(Some(out))
 }
 
 fn expand_template(kind: &str, raw: &str) -> Result<String, ParseError> {
@@ -919,9 +935,9 @@ impl<'a> PureFnParser<'a> {
         params: Vec<PureFnParam>,
     ) -> Result<LemmaDef, ParseError> {
         self.expect_keyword("req")?;
-        let req = self.parse_quoted_expr("lemma req")?;
+        let req = self.parse_line_expr("lemma req")?;
         self.expect_keyword("ens")?;
-        let ens = self.parse_quoted_expr("lemma ens")?;
+        let ens = self.parse_line_expr("lemma ens")?;
         self.expect_char('{')?;
         let body = self.parse_braced_body()?;
         Ok(LemmaDef {
@@ -998,24 +1014,16 @@ impl<'a> PureFnParser<'a> {
             }
             if body[cursor..].starts_with("assert") {
                 cursor += "assert".len();
-                let (expr_text, next) = self.parse_quoted_literal(body, cursor)?;
-                cursor = self.expect_stmt_terminator(body, next)?;
-                let expanded = expand_template("lemma assert", &expr_text)?;
-                stmts.push(GhostStmt::Assert(parse_raw_expr(
-                    "lemma assert",
-                    &expanded,
-                )?));
+                let (expr_text, next) = self.parse_stmt_expr_text(body, cursor)?;
+                cursor = next;
+                stmts.push(GhostStmt::Assert(parse_source_expr("lemma assert", expr_text)?));
                 continue;
             }
             if body[cursor..].starts_with("assume") {
                 cursor += "assume".len();
-                let (expr_text, next) = self.parse_quoted_literal(body, cursor)?;
-                cursor = self.expect_stmt_terminator(body, next)?;
-                let expanded = expand_template("lemma assume", &expr_text)?;
-                stmts.push(GhostStmt::Assume(parse_raw_expr(
-                    "lemma assume",
-                    &expanded,
-                )?));
+                let (expr_text, next) = self.parse_stmt_expr_text(body, cursor)?;
+                cursor = next;
+                stmts.push(GhostStmt::Assume(parse_source_expr("lemma assume", expr_text)?));
                 continue;
             }
 
@@ -1069,7 +1077,7 @@ impl<'a> PureFnParser<'a> {
                 ',' if depth == 0 => {
                     let arg = text[current_start..cursor].trim();
                     if !arg.is_empty() {
-                        args.push(parse_raw_expr("lemma call argument", arg)?);
+                        args.push(parse_source_expr("lemma call argument", arg)?);
                     }
                     cursor += ch.len_utf8();
                     current_start = cursor;
@@ -1081,23 +1089,22 @@ impl<'a> PureFnParser<'a> {
         }
         let tail = text[current_start..].trim();
         if !tail.is_empty() {
-            args.push(parse_raw_expr("lemma call argument", tail)?);
+            args.push(parse_source_expr("lemma call argument", tail)?);
         }
         Ok(args)
     }
 
-    fn parse_quoted_expr(&mut self, kind: &str) -> Result<Expr, ParseError> {
-        let (text, next) = self.parse_quoted_literal(self.text, self.cursor)?;
+    fn parse_line_expr(&mut self, kind: &str) -> Result<Expr, ParseError> {
+        let (text, next) = self.parse_line_expr_text(self.text, self.cursor)?;
         self.cursor = next;
-        let expanded = expand_template(kind, &text)?;
-        parse_raw_expr(kind, &expanded)
+        parse_source_expr(kind, text)
     }
 
-    fn parse_quoted_literal(
+    fn parse_line_expr_text(
         &self,
         text: &'a str,
         mut cursor: usize,
-    ) -> Result<(String, usize), ParseError> {
+    ) -> Result<(&'a str, usize), ParseError> {
         while let Some(ch) = text[cursor..].chars().next() {
             if ch.is_whitespace() {
                 cursor += ch.len_utf8();
@@ -1105,18 +1112,44 @@ impl<'a> PureFnParser<'a> {
                 break;
             }
         }
-        if text[cursor..].chars().next() != Some('"') {
-            return Err(ParseError::new("expected string literal"));
-        }
-        cursor += 1;
         let start = cursor;
         while let Some(ch) = text[cursor..].chars().next() {
-            if ch == '"' {
-                return Ok((text[start..cursor].to_owned(), cursor + 1));
+            if ch == '\n' || ch == '\r' {
+                break;
             }
             cursor += ch.len_utf8();
         }
-        Err(ParseError::new("unterminated string literal"))
+        let expr = text[start..cursor].trim_end();
+        if expr.is_empty() {
+            return Err(ParseError::new("expected spec expression"));
+        }
+        Ok((expr, cursor))
+    }
+
+    fn parse_stmt_expr_text(
+        &self,
+        text: &'a str,
+        mut cursor: usize,
+    ) -> Result<(&'a str, usize), ParseError> {
+        while let Some(ch) = text[cursor..].chars().next() {
+            if ch.is_whitespace() {
+                cursor += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let start = cursor;
+        while let Some(ch) = text[cursor..].chars().next() {
+            if ch == ';' {
+                let expr = text[start..cursor].trim_end();
+                if expr.is_empty() {
+                    return Err(ParseError::new("expected spec expression"));
+                }
+                return Ok((expr, cursor + 1));
+            }
+            cursor += ch.len_utf8();
+        }
+        Err(ParseError::new("expected `;` after ghost statement"))
     }
 
     fn parse_paren_body(
@@ -1237,7 +1270,7 @@ mod tests {
 
     #[test]
     fn parses_deref_and_fin() {
-        let expr = parse_expr("assert", r#""*{x} == {y}.fin""#).expect("expr");
+        let expr = parse_expr("assert", r#"*{x} == {y}.fin"#).expect("expr");
         assert_eq!(
             expr,
             Expr::Binary {
@@ -1255,7 +1288,7 @@ mod tests {
 
     #[test]
     fn parses_tuple_projection() {
-        let expr = parse_expr("assert", r#""{x}.0 == 1i32""#).expect("expr");
+        let expr = parse_expr("assert", r#"{x}.0 == 1i32"#).expect("expr");
         assert_eq!(
             expr,
             Expr::Binary {
@@ -1274,7 +1307,7 @@ mod tests {
 
     #[test]
     fn parses_bind_expression() {
-        let expr = parse_expr("assert", r#""?x == 3""#).expect("expr");
+        let expr = parse_expr("assert", r#"?x == 3"#).expect("expr");
         assert_eq!(
             expr,
             Expr::Binary {
@@ -1290,7 +1323,7 @@ mod tests {
 
     #[test]
     fn keeps_operator_precedence() {
-        let expr = parse_expr("assert", r#""!false || 1 + 2 * 3 == 7""#).expect("expr");
+        let expr = parse_expr("assert", r#"!false || 1 + 2 * 3 == 7"#).expect("expr");
         assert_eq!(
             expr,
             Expr::Binary {
@@ -1330,7 +1363,7 @@ mod tests {
 
     #[test]
     fn parses_named_field_accessor() {
-        let expr = parse_expr("assert", r#""{x}.left == 1i32""#).expect("expr");
+        let expr = parse_expr("assert", r#"{x}.left == 1i32"#).expect("expr");
         assert_eq!(
             expr,
             Expr::Binary {
@@ -1349,7 +1382,7 @@ mod tests {
 
     #[test]
     fn parses_large_integer_suffixes() {
-        let expr = parse_expr("assert", r#""18446744073709551615u64 == 0usize""#).expect("expr");
+        let expr = parse_expr("assert", r#"18446744073709551615u64 == 0usize"#).expect("expr");
         assert_eq!(
             expr,
             Expr::Binary {
@@ -1368,7 +1401,7 @@ mod tests {
 
     #[test]
     fn parses_function_call_expression() {
-        let expr = parse_expr("assert", r#""seq_rev({xs}) == {ys}""#).expect("expr");
+        let expr = parse_expr("assert", r#"seq_rev({xs}) == {ys}"#).expect("expr");
         assert_eq!(
             expr,
             Expr::Binary {
@@ -1378,6 +1411,22 @@ mod tests {
                     args: vec![Expr::Var("xs".to_owned())],
                 }),
                 rhs: Box::new(Expr::Var("ys".to_owned())),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_statement_expression_with_trailing_semicolon() {
+        let expr = super::parse_statement_expr("assert", r#"{x} == 1i32;"#).expect("expr");
+        assert_eq!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                lhs: Box::new(Expr::Var("x".to_owned())),
+                rhs: Box::new(Expr::Int(IntLiteral {
+                    digits: "1".to_owned(),
+                    suffix: Some(IntSuffix::I32),
+                })),
             }
         );
     }
@@ -1428,10 +1477,10 @@ fn is_rev(x: Seq<i32>, y: Seq<i32>) -> bool {
 }
 
 fn rev_done(orig: Seq<i32>, cur: Seq<i32>)
-  req "true"
-  ens "is_rev(orig, cur)"
+  req true
+  ens is_rev(orig, cur)
 {
-    assert "is_rev(orig, cur)";
+    assert is_rev(orig, cur);
 }
 "#,
         )

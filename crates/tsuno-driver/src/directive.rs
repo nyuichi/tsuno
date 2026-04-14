@@ -145,13 +145,19 @@ fn parse_directive_expr(
     span: Span,
 ) -> Result<spec::Expr, DirectiveError> {
     if kind == DirectiveKind::LemmaCall {
-        return spec::parse_templated_expr("lemma call", text.trim_end_matches(';').trim())
+        return spec::parse_statement_expr("lemma call", text.trim())
             .map_err(|err| DirectiveError {
                 span,
                 message: err.to_string().replace("spec expression", "//@ lemma call"),
             });
     }
-    spec::parse_expr(kind.keyword(), text).map_err(|err| DirectiveError {
+    let parsed = match kind {
+        DirectiveKind::Assert | DirectiveKind::Assume => {
+            spec::parse_statement_expr(kind.keyword(), text)
+        }
+        _ => spec::parse_source_expr(kind.keyword(), text),
+    };
+    parsed.map_err(|err| DirectiveError {
         span,
         message: render_parse_error(kind, err),
     })
@@ -491,7 +497,7 @@ impl<'a> FunctionDirectiveCollector<'a> {
         DirectiveError {
             span: loop_expr.span,
             message: format!(
-                "loop body starting at {} requires exactly one //@ inv \"...\" before the body",
+                "loop body starting at {} requires exactly one //@ inv <expr> before the body",
                 self.tcx
                     .sess
                     .source_map()
@@ -774,28 +780,22 @@ mod tests {
     #[test]
     fn collects_function_contract_lines_before_body() {
         let source =
-            "fn callee() -> i32\n//@ req \"true\"\n//@ ens \"{result} == 3\"\n{\n    2\n}\n";
+            "fn callee() -> i32\n//@ req true\n//@ ens {result} == 3\n{\n    2\n}\n";
         let lines = function_contract_lines_before_body(source, 4).unwrap();
         assert_eq!(
             lines,
-            vec![
-                "//@ req \"true\"".to_owned(),
-                "//@ ens \"{result} == 3\"".to_owned()
-            ]
+            vec!["//@ req true".to_owned(), "//@ ens {result} == 3".to_owned()]
         );
     }
 
     #[test]
     fn collects_function_contract_lines_before_item() {
         let source =
-            "\n//@ req \"true\"\n//@ ens \"{result} == 3\"\nfn callee() -> i32 {\n    2\n}\n";
+            "\n//@ req true\n//@ ens {result} == 3\nfn callee() -> i32 {\n    2\n}\n";
         let lines = function_contract_lines_before_item(source, 4).unwrap();
         assert_eq!(
             lines,
-            vec![
-                "//@ req \"true\"".to_owned(),
-                "//@ ens \"{result} == 3\"".to_owned()
-            ]
+            vec!["//@ req true".to_owned(), "//@ ens {result} == 3".to_owned()]
         );
     }
 }

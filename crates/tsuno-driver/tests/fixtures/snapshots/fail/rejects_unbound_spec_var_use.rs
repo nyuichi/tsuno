@@ -1,5 +1,5 @@
 fn rejects_unbound_spec_var_use() {
-    //@ assert "X == 0"
+    //@ assert X == 0;
     let _ = ();
 }
 

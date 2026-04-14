@@ -7,7 +7,7 @@ impl Drop for Droppy {
 }
 
 fn rejects_drop_struct_initial_state(value: Droppy) {
-    //@ assert "true"
+    //@ assert true;
 }
 
 fn main() {}
