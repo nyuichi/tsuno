@@ -4,6 +4,10 @@ pub enum Expr {
     Int(IntLiteral),
     Var(String),
     Bind(String),
+    Call {
+        func: String,
+        args: Vec<Expr>,
+    },
     Field {
         base: Box<Expr>,
         name: String,
@@ -38,6 +42,14 @@ pub enum TypedExprKind {
     Int(IntLiteral),
     Var(String),
     Bind(String),
+    PureCall {
+        func: String,
+        args: Vec<TypedExpr>,
+    },
+    BuiltinCall {
+        func: BuiltinFn,
+        args: Vec<TypedExpr>,
+    },
     Field {
         base: Box<TypedExpr>,
         name: String,
@@ -130,11 +142,71 @@ pub enum SpecTy {
     U32,
     U64,
     Usize,
-    List(Box<SpecTy>),
+    Seq(Box<SpecTy>),
     Tuple(Vec<SpecTy>),
     Struct(StructTy),
     Ref(Box<SpecTy>),
     Mut(Box<SpecTy>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BuiltinFn {
+    SeqConcat,
+    SeqExtract,
+    SeqLen,
+    SeqNth,
+    SeqRev,
+    SeqUnit,
+}
+
+impl BuiltinFn {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "seq_concat" => Some(Self::SeqConcat),
+            "seq_extract" => Some(Self::SeqExtract),
+            "seq_len" => Some(Self::SeqLen),
+            "seq_nth" => Some(Self::SeqNth),
+            "seq_rev" => Some(Self::SeqRev),
+            "seq_unit" => Some(Self::SeqUnit),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PureFnParam {
+    pub name: String,
+    pub ty: SpecTy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PureFnDef {
+    pub name: String,
+    pub params: Vec<PureFnParam>,
+    pub result_ty: SpecTy,
+    pub body: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GhostStmt {
+    Assert(Expr),
+    Assume(Expr),
+    Call { name: String, args: Vec<Expr> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LemmaDef {
+    pub name: String,
+    pub params: Vec<PureFnParam>,
+    pub req: Expr,
+    pub ens: Expr,
+    pub body: Vec<GhostStmt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GhostBlock {
+    pub pure_fns: Vec<PureFnDef>,
+    pub lemmas: Vec<LemmaDef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -200,23 +272,47 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+#[cfg(test)]
 pub fn parse_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
-    let decoded = decode_string_literal(kind, text)?;
-    let expanded = expand_template(kind, &decoded)?;
-    let mut parser = Parser::new(&expanded)?;
+    parse_source_expr(kind, text)
+}
+
+pub fn parse_source_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
+    if let Some(decoded) = decode_legacy_string_literal(text)? {
+        return parse_templated_expr(kind, &decoded);
+    }
+    parse_templated_expr(kind, text.trim())
+}
+
+pub fn parse_statement_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
+    let text = text.trim();
+    let Some(text) = text.strip_suffix(';') else {
+        return Err(ParseError::new(format!(
+            "failed to parse //@ {kind} predicate: expected trailing `;`"
+        )));
+    };
+    parse_source_expr(kind, text.trim_end())
+}
+
+pub fn parse_templated_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
+    let expanded = expand_template(kind, text)?;
+    parse_raw_expr(kind, &expanded)
+}
+
+pub fn parse_raw_expr(_kind: &str, text: &str) -> Result<Expr, ParseError> {
+    let mut parser = Parser::new(text)?;
     let expr = parser.parse_expr()?;
     parser.expect_end()?;
     Ok(expr)
 }
 
-fn decode_string_literal(kind: &str, text: &str) -> Result<String, ParseError> {
+fn decode_legacy_string_literal(text: &str) -> Result<Option<String>, ParseError> {
     let Some(inner) = text
+        .trim()
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'))
     else {
-        return Err(ParseError::new(format!(
-            "failed to parse //@ {kind} predicate: expected string literal"
-        )));
+        return Ok(None);
     };
 
     let mut out = String::new();
@@ -228,7 +324,7 @@ fn decode_string_literal(kind: &str, text: &str) -> Result<String, ParseError> {
         }
         let Some(esc) = chars.next() else {
             return Err(ParseError::new(format!(
-                "failed to parse //@ {kind} predicate: trailing escape in string literal"
+                "failed to parse spec expression: trailing escape in string literal"
             )));
         };
         match esc {
@@ -240,13 +336,13 @@ fn decode_string_literal(kind: &str, text: &str) -> Result<String, ParseError> {
             '0' => out.push('\0'),
             _ => {
                 return Err(ParseError::new(format!(
-                    "failed to parse //@ {kind} predicate: unsupported escape `\\{esc}`"
+                    "failed to parse spec expression: unsupported escape `\\{esc}`"
                 )));
             }
         }
     }
 
-    Ok(out)
+    Ok(Some(out))
 }
 
 fn expand_template(kind: &str, raw: &str) -> Result<String, ParseError> {
@@ -312,6 +408,7 @@ enum Token {
     Bool(bool),
     LParen,
     RParen,
+    Comma,
     Dot,
     Question,
     Plus,
@@ -391,6 +488,10 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
             ')' => {
                 chars.next();
                 tokens.push(Token::RParen);
+            }
+            ',' => {
+                chars.next();
+                tokens.push(Token::Comma);
             }
             '.' => {
                 chars.next();
@@ -678,16 +779,32 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
-        match self.next() {
-            Some(Token::Bool(value)) => Ok(Expr::Bool(*value)),
-            Some(Token::Int(value)) => Ok(Expr::Int(value.clone())),
+        match self.next().cloned() {
+            Some(Token::Bool(value)) => Ok(Expr::Bool(value)),
+            Some(Token::Int(value)) => Ok(Expr::Int(value)),
             Some(Token::Question) => {
-                let Some(Token::Ident(ident)) = self.next() else {
+                let Some(Token::Ident(ident)) = self.next().cloned() else {
                     return Err(ParseError::new("expected identifier after `?`"));
                 };
-                Ok(Expr::Bind(ident.clone()))
+                Ok(Expr::Bind(ident))
             }
-            Some(Token::Ident(ident)) => Ok(Expr::Var(ident.clone())),
+            Some(Token::Ident(ident)) => {
+                if !ident.starts_with("__") && self.eat(&Token::LParen) {
+                    let mut args = Vec::new();
+                    if !self.eat(&Token::RParen) {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if self.eat(&Token::RParen) {
+                                break;
+                            }
+                            self.expect(&Token::Comma)?;
+                        }
+                    }
+                    Ok(Expr::Call { func: ident, args })
+                } else {
+                    Ok(Expr::Var(ident))
+                }
+            }
             Some(Token::LParen) => {
                 let expr = self.parse_expr()?;
                 self.expect(&Token::RParen)?;
@@ -724,12 +841,442 @@ impl Parser {
 }
 
 #[cfg(test)]
+pub fn parse_pure_fn_block(text: &str) -> Result<Vec<PureFnDef>, ParseError> {
+    Ok(parse_ghost_block(text)?.pure_fns)
+}
+
+pub fn parse_ghost_block(text: &str) -> Result<GhostBlock, ParseError> {
+    let mut parser = PureFnParser::new(text);
+    let mut block = GhostBlock::default();
+    while parser.skip_ws() {
+        match parser.parse_item()? {
+            GhostItem::PureFn(def) => block.pure_fns.push(def),
+            GhostItem::Lemma(def) => block.lemmas.push(def),
+        }
+    }
+    Ok(block)
+}
+
+enum GhostItem {
+    PureFn(PureFnDef),
+    Lemma(LemmaDef),
+}
+
+struct PureFnParser<'a> {
+    text: &'a str,
+    cursor: usize,
+}
+
+impl<'a> PureFnParser<'a> {
+    fn new(text: &'a str) -> Self {
+        Self { text, cursor: 0 }
+    }
+
+    fn skip_ws(&mut self) -> bool {
+        while let Some(ch) = self.peek_char() {
+            if ch.is_whitespace() {
+                self.cursor += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        self.cursor < self.text.len()
+    }
+
+    fn parse_item(&mut self) -> Result<GhostItem, ParseError> {
+        self.expect_keyword("fn")?;
+        let name = self.parse_ident()?;
+        self.expect_char('(')?;
+        let mut params = Vec::new();
+        self.skip_ws();
+        if !self.eat_char(')') {
+            loop {
+                let param_name = self.parse_ident()?;
+                self.expect_char(':')?;
+                let ty = self.parse_spec_ty()?;
+                params.push(PureFnParam {
+                    name: param_name,
+                    ty,
+                });
+                self.skip_ws();
+                if self.eat_char(')') {
+                    break;
+                }
+                self.expect_char(',')?;
+            }
+        }
+        self.skip_ws();
+        if self.text[self.cursor..].starts_with("->") {
+            return Ok(GhostItem::PureFn(self.parse_pure_fn_def(name, params)?));
+        }
+        Ok(GhostItem::Lemma(self.parse_lemma_def(name, params)?))
+    }
+
+    fn parse_pure_fn_def(
+        &mut self,
+        name: String,
+        params: Vec<PureFnParam>,
+    ) -> Result<PureFnDef, ParseError> {
+        self.expect_arrow()?;
+        let result_ty = self.parse_spec_ty()?;
+        self.expect_char('{')?;
+        let body = self.parse_braced_body()?;
+        Ok(PureFnDef {
+            name,
+            params,
+            result_ty,
+            body: parse_raw_expr("pure function body", body.trim())?,
+        })
+    }
+
+    fn parse_lemma_def(
+        &mut self,
+        name: String,
+        params: Vec<PureFnParam>,
+    ) -> Result<LemmaDef, ParseError> {
+        self.expect_keyword("req")?;
+        let req = self.parse_line_expr("lemma req")?;
+        self.expect_keyword("ens")?;
+        let ens = self.parse_line_expr("lemma ens")?;
+        self.expect_char('{')?;
+        let body = self.parse_braced_body()?;
+        Ok(LemmaDef {
+            name,
+            params,
+            req,
+            ens,
+            body: self.parse_lemma_body(body)?,
+        })
+    }
+
+    fn parse_spec_ty(&mut self) -> Result<SpecTy, ParseError> {
+        let ident = self.parse_ident()?;
+        match ident.as_str() {
+            "bool" => Ok(SpecTy::Bool),
+            "i8" => Ok(SpecTy::I8),
+            "i16" => Ok(SpecTy::I16),
+            "i32" => Ok(SpecTy::I32),
+            "i64" => Ok(SpecTy::I64),
+            "isize" => Ok(SpecTy::Isize),
+            "u8" => Ok(SpecTy::U8),
+            "u16" => Ok(SpecTy::U16),
+            "u32" => Ok(SpecTy::U32),
+            "u64" => Ok(SpecTy::U64),
+            "usize" => Ok(SpecTy::Usize),
+            "Seq" => {
+                self.expect_char('<')?;
+                let inner = self.parse_spec_ty()?;
+                self.expect_char('>')?;
+                Ok(SpecTy::Seq(Box::new(inner)))
+            }
+            _ => Err(ParseError::new(format!(
+                "unsupported pure function type `{ident}`"
+            ))),
+        }
+    }
+
+    fn parse_braced_body(&mut self) -> Result<&'a str, ParseError> {
+        let body_start = self.cursor;
+        let mut depth = 1usize;
+        while let Some(ch) = self.peek_char() {
+            self.cursor += ch.len_utf8();
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let end = self.cursor - 1;
+                        return Ok(&self.text[body_start..end]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err(ParseError::new("unclosed `{` in pure function block"))
+    }
+
+    fn parse_lemma_body(&self, body: &str) -> Result<Vec<GhostStmt>, ParseError> {
+        let mut stmts = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < body.len() {
+            while let Some(ch) = body[cursor..].chars().next() {
+                if ch.is_whitespace() {
+                    cursor += ch.len_utf8();
+                } else {
+                    break;
+                }
+                if cursor >= body.len() {
+                    return Ok(stmts);
+                }
+            }
+            if cursor >= body.len() {
+                break;
+            }
+            if body[cursor..].starts_with("assert") {
+                cursor += "assert".len();
+                let (expr_text, next) = self.parse_stmt_expr_text(body, cursor)?;
+                cursor = next;
+                stmts.push(GhostStmt::Assert(parse_source_expr(
+                    "lemma assert",
+                    expr_text,
+                )?));
+                continue;
+            }
+            if body[cursor..].starts_with("assume") {
+                cursor += "assume".len();
+                let (expr_text, next) = self.parse_stmt_expr_text(body, cursor)?;
+                cursor = next;
+                stmts.push(GhostStmt::Assume(parse_source_expr(
+                    "lemma assume",
+                    expr_text,
+                )?));
+                continue;
+            }
+
+            let name_start = cursor;
+            let mut chars = body[cursor..].chars();
+            let Some(first) = chars.next() else {
+                break;
+            };
+            if !(first.is_ascii_alphabetic() || first == '_') {
+                return Err(ParseError::new("expected lemma statement"));
+            }
+            cursor += first.len_utf8();
+            while let Some(ch) = body[cursor..].chars().next() {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    cursor += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let name = body[name_start..cursor].to_owned();
+            while let Some(ch) = body[cursor..].chars().next() {
+                if ch.is_whitespace() {
+                    cursor += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            if body[cursor..].chars().next() != Some('(') {
+                return Err(ParseError::new("expected `(` in lemma call"));
+            }
+            let (args_body, next) = self.parse_paren_body(body, cursor)?;
+            cursor = self.expect_stmt_terminator(body, next)?;
+            let args = self.parse_call_args(args_body)?;
+            stmts.push(GhostStmt::Call { name, args });
+        }
+        Ok(stmts)
+    }
+
+    fn parse_call_args(&self, text: &str) -> Result<Vec<Expr>, ParseError> {
+        let mut args = Vec::new();
+        let mut cursor = 0usize;
+        let mut current_start = 0usize;
+        let mut depth = 0usize;
+        while cursor < text.len() {
+            let ch = text[cursor..].chars().next().expect("char");
+            match ch {
+                '(' | '{' | '[' | '<' => depth += 1,
+                ')' | '}' | ']' | '>' => {
+                    depth = depth.saturating_sub(1);
+                }
+                ',' if depth == 0 => {
+                    let arg = text[current_start..cursor].trim();
+                    if !arg.is_empty() {
+                        args.push(parse_source_expr("lemma call argument", arg)?);
+                    }
+                    cursor += ch.len_utf8();
+                    current_start = cursor;
+                    continue;
+                }
+                _ => {}
+            }
+            cursor += ch.len_utf8();
+        }
+        let tail = text[current_start..].trim();
+        if !tail.is_empty() {
+            args.push(parse_source_expr("lemma call argument", tail)?);
+        }
+        Ok(args)
+    }
+
+    fn parse_line_expr(&mut self, kind: &str) -> Result<Expr, ParseError> {
+        let (text, next) = self.parse_line_expr_text(self.text, self.cursor)?;
+        self.cursor = next;
+        parse_source_expr(kind, text)
+    }
+
+    fn parse_line_expr_text(
+        &self,
+        text: &'a str,
+        mut cursor: usize,
+    ) -> Result<(&'a str, usize), ParseError> {
+        while let Some(ch) = text[cursor..].chars().next() {
+            if ch.is_whitespace() {
+                cursor += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let start = cursor;
+        while let Some(ch) = text[cursor..].chars().next() {
+            if ch == '\n' || ch == '\r' {
+                break;
+            }
+            cursor += ch.len_utf8();
+        }
+        let expr = text[start..cursor].trim_end();
+        if expr.is_empty() {
+            return Err(ParseError::new("expected spec expression"));
+        }
+        Ok((expr, cursor))
+    }
+
+    fn parse_stmt_expr_text(
+        &self,
+        text: &'a str,
+        mut cursor: usize,
+    ) -> Result<(&'a str, usize), ParseError> {
+        while let Some(ch) = text[cursor..].chars().next() {
+            if ch.is_whitespace() {
+                cursor += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let start = cursor;
+        while let Some(ch) = text[cursor..].chars().next() {
+            if ch == ';' {
+                let expr = text[start..cursor].trim_end();
+                if expr.is_empty() {
+                    return Err(ParseError::new("expected spec expression"));
+                }
+                return Ok((expr, cursor + 1));
+            }
+            cursor += ch.len_utf8();
+        }
+        Err(ParseError::new("expected `;` after ghost statement"))
+    }
+
+    fn parse_paren_body(
+        &self,
+        text: &'a str,
+        open_paren: usize,
+    ) -> Result<(&'a str, usize), ParseError> {
+        let mut cursor = open_paren;
+        let mut depth = 0usize;
+        let body_start = open_paren + 1;
+        while cursor < text.len() {
+            let ch = text[cursor..].chars().next().expect("char");
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok((&text[body_start..cursor], cursor + 1));
+                    }
+                }
+                _ => {}
+            }
+            cursor += ch.len_utf8();
+        }
+        Err(ParseError::new("unclosed `(` in lemma call"))
+    }
+
+    fn expect_stmt_terminator(&self, text: &str, mut cursor: usize) -> Result<usize, ParseError> {
+        while let Some(ch) = text[cursor..].chars().next() {
+            if ch.is_whitespace() {
+                cursor += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if text[cursor..].chars().next() != Some(';') {
+            return Err(ParseError::new("expected `;` after lemma statement"));
+        }
+        Ok(cursor + 1)
+    }
+
+    fn parse_ident(&mut self) -> Result<String, ParseError> {
+        self.skip_ws();
+        let start = self.cursor;
+        let mut chars = self.text[self.cursor..].chars();
+        let Some(first) = chars.next() else {
+            return Err(ParseError::new("unexpected end of pure function block"));
+        };
+        if !(first.is_ascii_alphabetic() || first == '_') {
+            return Err(ParseError::new(
+                "expected identifier in pure function block",
+            ));
+        }
+        self.cursor += first.len_utf8();
+        while let Some(ch) = self.peek_char() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                self.cursor += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        Ok(self.text[start..self.cursor].to_owned())
+    }
+
+    fn expect_keyword(&mut self, keyword: &str) -> Result<(), ParseError> {
+        self.skip_ws();
+        if self.text[self.cursor..].starts_with(keyword) {
+            self.cursor += keyword.len();
+            Ok(())
+        } else {
+            Err(ParseError::new(format!(
+                "expected keyword `{keyword}` in pure function block"
+            )))
+        }
+    }
+
+    fn expect_arrow(&mut self) -> Result<(), ParseError> {
+        self.skip_ws();
+        if self.text[self.cursor..].starts_with("->") {
+            self.cursor += 2;
+            Ok(())
+        } else {
+            Err(ParseError::new("expected `->` in pure function block"))
+        }
+    }
+
+    fn expect_char(&mut self, ch: char) -> Result<(), ParseError> {
+        self.skip_ws();
+        if self.eat_char(ch) {
+            Ok(())
+        } else {
+            Err(ParseError::new(format!(
+                "expected `{ch}` in pure function block"
+            )))
+        }
+    }
+
+    fn eat_char(&mut self, ch: char) -> bool {
+        if self.peek_char() == Some(ch) {
+            self.cursor += ch.len_utf8();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek_char(&self) -> Option<char> {
+        self.text[self.cursor..].chars().next()
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    use super::{BinaryOp, Expr, IntLiteral, IntSuffix, UnaryOp, parse_expr};
+    use super::{
+        BinaryOp, Expr, GhostBlock, GhostStmt, IntLiteral, IntSuffix, LemmaDef, PureFnDef,
+        PureFnParam, SpecTy, UnaryOp, parse_expr, parse_ghost_block, parse_pure_fn_block,
+    };
 
     #[test]
     fn parses_deref_and_fin() {
-        let expr = parse_expr("assert", r#""*{x} == {y}.fin""#).expect("expr");
+        let expr = parse_expr("assert", r#"*{x} == {y}.fin"#).expect("expr");
         assert_eq!(
             expr,
             Expr::Binary {
@@ -747,7 +1294,7 @@ mod tests {
 
     #[test]
     fn parses_tuple_projection() {
-        let expr = parse_expr("assert", r#""{x}.0 == 1i32""#).expect("expr");
+        let expr = parse_expr("assert", r#"{x}.0 == 1i32"#).expect("expr");
         assert_eq!(
             expr,
             Expr::Binary {
@@ -766,7 +1313,7 @@ mod tests {
 
     #[test]
     fn parses_bind_expression() {
-        let expr = parse_expr("assert", r#""?x == 3""#).expect("expr");
+        let expr = parse_expr("assert", r#"?x == 3"#).expect("expr");
         assert_eq!(
             expr,
             Expr::Binary {
@@ -782,7 +1329,7 @@ mod tests {
 
     #[test]
     fn keeps_operator_precedence() {
-        let expr = parse_expr("assert", r#""!false || 1 + 2 * 3 == 7""#).expect("expr");
+        let expr = parse_expr("assert", r#"!false || 1 + 2 * 3 == 7"#).expect("expr");
         assert_eq!(
             expr,
             Expr::Binary {
@@ -822,7 +1369,7 @@ mod tests {
 
     #[test]
     fn parses_named_field_accessor() {
-        let expr = parse_expr("assert", r#""{x}.left == 1i32""#).expect("expr");
+        let expr = parse_expr("assert", r#"{x}.left == 1i32"#).expect("expr");
         assert_eq!(
             expr,
             Expr::Binary {
@@ -841,7 +1388,7 @@ mod tests {
 
     #[test]
     fn parses_large_integer_suffixes() {
-        let expr = parse_expr("assert", r#""18446744073709551615u64 == 0usize""#).expect("expr");
+        let expr = parse_expr("assert", r#"18446744073709551615u64 == 0usize"#).expect("expr");
         assert_eq!(
             expr,
             Expr::Binary {
@@ -854,6 +1401,143 @@ mod tests {
                     digits: "0".to_owned(),
                     suffix: Some(IntSuffix::Usize),
                 })),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_function_call_expression() {
+        let expr = parse_expr("assert", r#"seq_rev({xs}) == {ys}"#).expect("expr");
+        assert_eq!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                lhs: Box::new(Expr::Call {
+                    func: "seq_rev".to_owned(),
+                    args: vec![Expr::Var("xs".to_owned())],
+                }),
+                rhs: Box::new(Expr::Var("ys".to_owned())),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_statement_expression_with_trailing_semicolon() {
+        let expr = super::parse_statement_expr("assert", r#"{x} == 1i32;"#).expect("expr");
+        assert_eq!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                lhs: Box::new(Expr::Var("x".to_owned())),
+                rhs: Box::new(Expr::Int(IntLiteral {
+                    digits: "1".to_owned(),
+                    suffix: Some(IntSuffix::I32),
+                })),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_pure_function_block() {
+        let defs = parse_pure_fn_block(
+            r#"
+fn is_rev(x: Seq<i32>, y: Seq<i32>) -> bool {
+    seq_rev(x) == y
+}
+"#,
+        )
+        .expect("pure fn block");
+        assert_eq!(
+            defs,
+            vec![PureFnDef {
+                name: "is_rev".to_owned(),
+                params: vec![
+                    PureFnParam {
+                        name: "x".to_owned(),
+                        ty: SpecTy::Seq(Box::new(SpecTy::I32)),
+                    },
+                    PureFnParam {
+                        name: "y".to_owned(),
+                        ty: SpecTy::Seq(Box::new(SpecTy::I32)),
+                    },
+                ],
+                result_ty: SpecTy::Bool,
+                body: Expr::Binary {
+                    op: BinaryOp::Eq,
+                    lhs: Box::new(Expr::Call {
+                        func: "seq_rev".to_owned(),
+                        args: vec![Expr::Var("x".to_owned())],
+                    }),
+                    rhs: Box::new(Expr::Var("y".to_owned())),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_lemma_block() {
+        let block = parse_ghost_block(
+            r#"
+fn is_rev(x: Seq<i32>, y: Seq<i32>) -> bool {
+    seq_rev(x) == y
+}
+
+fn rev_done(orig: Seq<i32>, cur: Seq<i32>)
+  req true
+  ens is_rev(orig, cur)
+{
+    assert is_rev(orig, cur);
+}
+"#,
+        )
+        .expect("ghost block");
+        assert_eq!(
+            block,
+            GhostBlock {
+                pure_fns: vec![PureFnDef {
+                    name: "is_rev".to_owned(),
+                    params: vec![
+                        PureFnParam {
+                            name: "x".to_owned(),
+                            ty: SpecTy::Seq(Box::new(SpecTy::I32)),
+                        },
+                        PureFnParam {
+                            name: "y".to_owned(),
+                            ty: SpecTy::Seq(Box::new(SpecTy::I32)),
+                        },
+                    ],
+                    result_ty: SpecTy::Bool,
+                    body: Expr::Binary {
+                        op: BinaryOp::Eq,
+                        lhs: Box::new(Expr::Call {
+                            func: "seq_rev".to_owned(),
+                            args: vec![Expr::Var("x".to_owned())],
+                        }),
+                        rhs: Box::new(Expr::Var("y".to_owned())),
+                    },
+                }],
+                lemmas: vec![LemmaDef {
+                    name: "rev_done".to_owned(),
+                    params: vec![
+                        PureFnParam {
+                            name: "orig".to_owned(),
+                            ty: SpecTy::Seq(Box::new(SpecTy::I32)),
+                        },
+                        PureFnParam {
+                            name: "cur".to_owned(),
+                            ty: SpecTy::Seq(Box::new(SpecTy::I32)),
+                        },
+                    ],
+                    req: Expr::Bool(true),
+                    ens: Expr::Call {
+                        func: "is_rev".to_owned(),
+                        args: vec![Expr::Var("orig".to_owned()), Expr::Var("cur".to_owned())],
+                    },
+                    body: vec![GhostStmt::Assert(Expr::Call {
+                        func: "is_rev".to_owned(),
+                        args: vec![Expr::Var("orig".to_owned()), Expr::Var("cur".to_owned())],
+                    })],
+                }],
             }
         );
     }

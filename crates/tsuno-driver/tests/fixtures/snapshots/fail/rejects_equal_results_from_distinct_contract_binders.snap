@@ -9,7 +9,7 @@ PASS id
   all assertions discharged
 FAIL rejects_equal_results_from_distinct_contract_binders
   assertion failed
-  src/main.rs:11:5: 11:32
+  src/main.rs:11:5: 11:31
 PASS main
   all assertions discharged
 

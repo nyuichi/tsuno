@@ -7,9 +7,9 @@ status: Some(1)
 stdout:
 UNSUPPORTED rejects_uninferred_spec_var_type
   could not infer a type for `?X`
-  src/main.rs:2:1: 2:19
+  src/main.rs:2:1: 2:17
 UNSUPPORTED main
   callee `rejects_uninferred_spec_var_type` has invalid contract: could not infer a type for `?X`
-  src/main.rs:2:1: 2:19
+  src/main.rs:2:1: 2:17
 
 stderr:

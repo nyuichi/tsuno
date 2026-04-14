@@ -3,7 +3,7 @@ fn partial_move_then_remaining_field_write() {
     let _taken = pair.0;
     pair.1 = true;
     let y = pair.1;
-    //@ assert "{y} == true"
+    //@ assert {y} == true;
 }
 
 fn partial_move_then_remaining_field_write_three() {
@@ -14,7 +14,7 @@ fn partial_move_then_remaining_field_write_three() {
     triple.2 = true;
     let y = triple.1;
     let _z = triple.2;
-    //@ assert "{y} == true"
+    //@ assert {y} == true;
 }
 
 fn main() {}

@@ -5,10 +5,8 @@ expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
-UNSUPPORTED rejects_mut_ref_equality
-  `==` and `!=` are not supported for `Mut<i32>`
-  src/main.rs:3:5: 3:31
-PASS main
-  all assertions discharged
+FAIL main
+  lemma `need_zero` precondition failed
+  src/main.rs:12:5: 12:28
 
 stderr:
