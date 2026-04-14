@@ -38,9 +38,9 @@ use z3::{
 
 use crate::prepass::{
     AssertionContracts, AssumptionContracts, ContractParam, DirectivePrepass, FunctionContract,
-    LemmaCallContract, LemmaCallContracts, LoopContract, LoopContracts, ResolvedExprEnv,
-    SpecVarBinding, TypedGhostStmt, TypedLemmaDef, TypedPureFnDef, spec_ty_for_rust_ty,
-    vec_element_ty,
+    LemmaCallContract, LemmaCallContracts, LoopContract, LoopContracts, ProgramPrepass,
+    ResolvedExprEnv, SpecVarBinding, TypedGhostStmt, TypedLemmaDef, TypedPureFnDef,
+    spec_ty_for_rust_ty, vec_element_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{BinaryOp, BuiltinFn, SpecTy, TypedExpr, TypedExprKind, UnaryOp};
@@ -131,6 +131,47 @@ pub struct Verifier<'tcx> {
     lemmas: HashMap<String, TypedLemmaDef>,
     next_sym: Cell<usize>,
     type_encodings: RefCell<BTreeMap<SpecTy, Rc<TypeEncoding>>>,
+}
+
+pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<VerificationResult> {
+    let ProgramPrepass {
+        ghosts,
+        functions,
+        contracts,
+    } = program;
+    let mut functions = functions.into_iter();
+    let Some(first) = functions.next() else {
+        return Vec::new();
+    };
+    let first_body = tcx
+        .mir_drops_elaborated_and_const_checked(first.def_id)
+        .steal();
+    let mut verifier = Verifier::new(tcx, first.def_id, first_body.clone(), contracts);
+    for pure_fn in &ghosts.typed_pure_fns {
+        if let Err(error) = verifier.load_ghost_function(pure_fn) {
+            return vec![VerificationResult {
+                function: "prepass".to_owned(),
+                ..error
+            }];
+        }
+    }
+    for lemma in &ghosts.typed_lemmas {
+        if let Err(error) = verifier.load_ghost_lemma(lemma) {
+            return vec![VerificationResult {
+                function: "prepass".to_owned(),
+                ..error
+            }];
+        }
+    }
+    let mut results = Vec::new();
+    results.push(verifier.verify_function(first.def_id, first_body, first.prepass));
+    for function in functions {
+        let body = tcx
+            .mir_drops_elaborated_and_const_checked(function.def_id)
+            .steal();
+        results.push(verifier.verify_function(function.def_id, body, function.prepass));
+    }
+    results
 }
 
 impl<'tcx> Verifier<'tcx> {

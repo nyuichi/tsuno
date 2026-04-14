@@ -179,6 +179,19 @@ pub struct GlobalGhostPrepass {
     pub typed_lemmas: Vec<TypedLemmaDef>,
 }
 
+#[derive(Debug, Clone)]
+pub struct FunctionPrepass {
+    pub def_id: LocalDefId,
+    pub prepass: DirectivePrepass,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProgramPrepass {
+    pub ghosts: GlobalGhostPrepass,
+    pub functions: Vec<FunctionPrepass>,
+    pub contracts: HashMap<LocalDefId, FunctionContract>,
+}
+
 impl LoopContracts {
     pub fn empty() -> Self {
         Self {
@@ -259,6 +272,57 @@ pub fn compute_function_prepass<'tcx>(
             .unwrap_or_else(|| tcx.sess.source_map().span_to_diagnostic_string(error.span)),
         message: error.message,
     })
+}
+
+pub fn compute_program_prepass<'tcx>(
+    tcx: TyCtxt<'tcx>,
+) -> Result<ProgramPrepass, Vec<VerificationResult>> {
+    let ghosts = match compute_global_ghost_prepass(tcx) {
+        Ok(ghosts) => ghosts,
+        Err(error) => {
+            return Err(vec![VerificationResult {
+                function: "prepass".to_owned(),
+                status: VerificationStatus::Unsupported,
+                span: error
+                    .display_span
+                    .unwrap_or_else(|| tcx.sess.source_map().span_to_diagnostic_string(error.span)),
+                message: error.message,
+            }]);
+        }
+    };
+    let mut functions = Vec::new();
+    let mut contracts = HashMap::new();
+    let mut errors = Vec::new();
+
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
+        let rustc_hir::ItemKind::Fn { .. } = item.kind else {
+            continue;
+        };
+        let def_id = item.owner_id.def_id;
+        let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
+        match compute_function_prepass(tcx, def_id, item.span, &body.borrow(), &ghosts) {
+            Ok(prepass) => {
+                let contract = prepass
+                    .function_contract
+                    .clone()
+                    .expect("successful function prepass must yield contract");
+                contracts.insert(def_id, contract);
+                functions.push(FunctionPrepass { def_id, prepass });
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(ProgramPrepass {
+            ghosts,
+            functions,
+            contracts,
+        })
+    } else {
+        Err(errors)
+    }
 }
 
 pub fn compute_global_ghost_prepass<'tcx>(
