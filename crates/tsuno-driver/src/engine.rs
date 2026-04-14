@@ -38,8 +38,8 @@ use z3::{
 
 use crate::prepass::{
     AssertionContracts, AssumptionContracts, ContractParam, FunctionContract,
-    FunctionContractEntry, LemmaCallContract, LemmaCallContracts, LoopContract, LoopContracts,
-    ResolvedExprEnv, SpecVarBinding, TypedGhostStmt, TypedLemmaDef, TypedPureFnDef,
+    FunctionContractEntry, GlobalGhostPrepass, LemmaCallContract, LemmaCallContracts, LoopContract,
+    LoopContracts, ResolvedExprEnv, SpecVarBinding, TypedGhostStmt, TypedLemmaDef, TypedPureFnDef,
     compute_directives, spec_ty_for_rust_ty, vec_element_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
@@ -129,7 +129,10 @@ pub struct Verifier<'tcx> {
     lemma_call_contracts: LemmaCallContracts,
     pure_fns: HashMap<String, TypedPureFnDef>,
     lemmas: HashMap<String, TypedLemmaDef>,
+    ordered_pure_fns: Vec<String>,
+    ordered_lemmas: Vec<String>,
     prepass_error: Option<VerificationResult>,
+    preloaded: bool,
     next_sym: Cell<usize>,
     type_encodings: RefCell<BTreeMap<SpecTy, Rc<TypeEncoding>>>,
 }
@@ -141,27 +144,25 @@ impl<'tcx> Verifier<'tcx> {
         item_span: Span,
         body: Body<'tcx>,
         contracts: HashMap<LocalDefId, FunctionContractEntry>,
+        ghosts: &GlobalGhostPrepass,
+        preloaded: bool,
     ) -> Self {
         let (
             loop_contracts,
             assertion_contracts,
             assumption_contracts,
             lemma_call_contracts,
-            pure_fns,
             function_contract,
             spec_vars,
-            lemmas,
             prepass_error,
-        ) = match compute_directives(tcx, def_id, item_span, &body) {
+        ) = match compute_directives(tcx, def_id, item_span, &body, ghosts) {
             Ok(prepass) => (
                 prepass.loop_contracts,
                 prepass.assertion_contracts,
                 prepass.assumption_contracts,
                 prepass.lemma_call_contracts,
-                prepass.pure_fns,
                 prepass.function_contract,
                 prepass.spec_vars,
-                prepass.lemmas,
                 None,
             ),
             Err(error) => (
@@ -169,10 +170,8 @@ impl<'tcx> Verifier<'tcx> {
                 AssertionContracts::empty(),
                 AssumptionContracts::empty(),
                 LemmaCallContracts::empty(),
-                HashMap::new(),
                 None,
                 Vec::new(),
-                HashMap::new(),
                 Some(VerificationResult {
                     function: tcx.def_path_str(def_id.to_def_id()),
                     status: VerificationStatus::Unsupported,
@@ -200,9 +199,12 @@ impl<'tcx> Verifier<'tcx> {
             assertion_contracts,
             assumption_contracts,
             lemma_call_contracts,
-            pure_fns,
-            lemmas,
+            pure_fns: ghosts.typed_pure_fns.clone(),
+            lemmas: ghosts.typed_lemmas.clone(),
+            ordered_pure_fns: ghosts.ordered_pure_fns.clone(),
+            ordered_lemmas: ghosts.ordered_lemmas.clone(),
             prepass_error,
+            preloaded,
             next_sym,
             type_encodings: RefCell::new(BTreeMap::new()),
         };
@@ -217,19 +219,25 @@ impl<'tcx> Verifier<'tcx> {
         if let Some(result) = self.prepass_error.clone() {
             return result;
         }
-        reset_solver();
-        let reachable_lemmas = self.reachable_lemmas();
-        let reachable_pure_fns = self.reachable_pure_fns(&reachable_lemmas);
-        if let Err(err) = self.register_pure_fns(&reachable_pure_fns) {
-            return err;
-        }
-        if let Err(err) = self.verify_lemmas(&reachable_lemmas) {
-            return err;
+        if !self.preloaded {
+            reset_solver();
+            if let Err(err) = self.prepare() {
+                return err;
+            }
         }
         let initial_state = match self.initial_state() {
             Ok(state) => state,
             Err(err) => return err,
         };
+        self.verify_from_initial_state(initial_state)
+    }
+
+    pub fn prepare(&self) -> Result<(), VerificationResult> {
+        self.register_pure_fns()?;
+        self.verify_lemmas()
+    }
+
+    fn verify_from_initial_state(&self, initial_state: State) -> VerificationResult {
         let mut pending: BTreeMap<ControlPoint, Vec<State>> = BTreeMap::new();
         let mut worklist = VecDeque::new();
         if let Some(err) = self.enqueue_state(&mut pending, &mut worklist, initial_state) {
@@ -784,121 +792,24 @@ impl<'tcx> Verifier<'tcx> {
         Ok(state)
     }
 
-    fn verify_lemmas(&self, reachable: &BTreeSet<String>) -> Result<(), VerificationResult> {
+    fn verify_lemmas(&self) -> Result<(), VerificationResult> {
         let mut stack = Vec::new();
-        for lemma_name in reachable {
+        let mut verified = BTreeSet::new();
+        for lemma_name in &self.ordered_lemmas {
             if let Some(lemma) = self.lemmas.get(lemma_name) {
-                self.verify_lemma(lemma, &mut stack)?;
+                self.verify_lemma(lemma, &mut stack, &mut verified)?;
             }
         }
         Ok(())
     }
 
-    fn register_pure_fns(&self, reachable: &BTreeSet<String>) -> Result<(), VerificationResult> {
-        for pure_fn_name in reachable {
+    fn register_pure_fns(&self) -> Result<(), VerificationResult> {
+        for pure_fn_name in &self.ordered_pure_fns {
             if let Some(pure_fn) = self.pure_fns.get(pure_fn_name) {
                 self.register_pure_fn(pure_fn)?;
             }
         }
         Ok(())
-    }
-
-    fn reachable_lemmas(&self) -> BTreeSet<String> {
-        let mut reachable = BTreeSet::new();
-        for call in self.lemma_call_contracts.by_control_point.values() {
-            self.collect_lemma_closure(&call.lemma_name, &mut reachable);
-        }
-        reachable
-    }
-
-    fn collect_lemma_closure(&self, lemma_name: &str, reachable: &mut BTreeSet<String>) {
-        if !reachable.insert(lemma_name.to_owned()) {
-            return;
-        }
-        let Some(lemma) = self.lemmas.get(lemma_name) else {
-            return;
-        };
-        for stmt in &lemma.body {
-            if let TypedGhostStmt::Call { lemma_name, .. } = stmt {
-                self.collect_lemma_closure(lemma_name, reachable);
-            }
-        }
-    }
-
-    fn reachable_pure_fns(&self, reachable_lemmas: &BTreeSet<String>) -> BTreeSet<String> {
-        let mut reachable = BTreeSet::new();
-        if let Some(FunctionContractEntry::Ready(contract)) = self.contracts.get(&self.def_id) {
-            self.collect_pure_fns_in_expr(&contract.req, &mut reachable);
-            self.collect_pure_fns_in_expr(&contract.ens, &mut reachable);
-        }
-        for contract in self.assertion_contracts.by_control_point.values() {
-            self.collect_pure_fns_in_expr(&contract.assertion, &mut reachable);
-        }
-        for contract in self.assumption_contracts.by_control_point.values() {
-            self.collect_pure_fns_in_expr(&contract.assumption, &mut reachable);
-        }
-        for contract in self.loop_contracts.by_header.values() {
-            self.collect_pure_fns_in_expr(&contract.invariant, &mut reachable);
-        }
-        for call in self.lemma_call_contracts.by_control_point.values() {
-            for arg in &call.args {
-                self.collect_pure_fns_in_expr(arg, &mut reachable);
-            }
-        }
-        for lemma_name in reachable_lemmas {
-            if let Some(lemma) = self.lemmas.get(lemma_name) {
-                self.collect_pure_fns_in_expr(&lemma.req, &mut reachable);
-                self.collect_pure_fns_in_expr(&lemma.ens, &mut reachable);
-                for stmt in &lemma.body {
-                    match stmt {
-                        TypedGhostStmt::Assert(expr) | TypedGhostStmt::Assume(expr) => {
-                            self.collect_pure_fns_in_expr(expr, &mut reachable);
-                        }
-                        TypedGhostStmt::Call { args, .. } => {
-                            for arg in args {
-                                self.collect_pure_fns_in_expr(arg, &mut reachable);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        reachable
-    }
-
-    fn collect_pure_fns_in_expr(&self, expr: &TypedExpr, reachable: &mut BTreeSet<String>) {
-        match &expr.kind {
-            TypedExprKind::PureCall { func, args } => {
-                if reachable.insert(func.clone())
-                    && let Some(pure_fn) = self.pure_fns.get(func)
-                {
-                    self.collect_pure_fns_in_expr(&pure_fn.body, reachable);
-                }
-                for arg in args {
-                    self.collect_pure_fns_in_expr(arg, reachable);
-                }
-            }
-            TypedExprKind::BuiltinCall { args, .. } => {
-                for arg in args {
-                    self.collect_pure_fns_in_expr(arg, reachable);
-                }
-            }
-            TypedExprKind::Field { base, .. }
-            | TypedExprKind::TupleField { base, .. }
-            | TypedExprKind::Deref { base }
-            | TypedExprKind::Fin { base }
-            | TypedExprKind::Unary { arg: base, .. } => {
-                self.collect_pure_fns_in_expr(base, reachable);
-            }
-            TypedExprKind::Binary { lhs, rhs, .. } => {
-                self.collect_pure_fns_in_expr(lhs, reachable);
-                self.collect_pure_fns_in_expr(rhs, reachable);
-            }
-            TypedExprKind::Bool(_)
-            | TypedExprKind::Int(_)
-            | TypedExprKind::Var(_)
-            | TypedExprKind::Bind(_) => {}
-        }
     }
 
     fn register_pure_fn(&self, pure_fn: &TypedPureFnDef) -> Result<(), VerificationResult> {
@@ -956,7 +867,11 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         lemma: &TypedLemmaDef,
         stack: &mut Vec<String>,
+        verified: &mut BTreeSet<String>,
     ) -> Result<(), VerificationResult> {
+        if verified.contains(&lemma.name) {
+            return Ok(());
+        }
         if stack.iter().any(|name| name == &lemma.name) {
             return Err(self.unsupported_result(
                 self.tcx.def_span(self.def_id),
@@ -1017,7 +932,7 @@ impl<'tcx> Verifier<'tcx> {
                             format!("unknown lemma `{lemma_name}`"),
                         )
                     })?;
-                    self.verify_lemma(callee, stack)?;
+                    self.verify_lemma(callee, stack, verified)?;
                     let env = self.lemma_env_from_contract_args(args, &current, &spec, callee)?;
                     let req = self.contract_expr_to_bool(&env.current, &env.spec, &callee.req)?;
                     self.require_constraint(
@@ -1045,6 +960,9 @@ impl<'tcx> Verifier<'tcx> {
             format!("lemma `{}` postcondition failed", lemma.name),
         );
         stack.pop();
+        if result.is_ok() {
+            verified.insert(lemma.name.clone());
+        }
         result
     }
 
