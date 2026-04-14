@@ -129,10 +129,7 @@ pub struct Verifier<'tcx> {
     lemma_call_contracts: LemmaCallContracts,
     pure_fns: HashMap<String, TypedPureFnDef>,
     lemmas: HashMap<String, TypedLemmaDef>,
-    ordered_pure_fns: Vec<String>,
-    ordered_lemmas: Vec<String>,
     prepass_error: Option<VerificationResult>,
-    preloaded: bool,
     next_sym: Cell<usize>,
     type_encodings: RefCell<BTreeMap<SpecTy, Rc<TypeEncoding>>>,
 }
@@ -189,7 +186,7 @@ impl<'tcx> Verifier<'tcx> {
         } else if let Some(error) = prepass_error.clone() {
             contracts.insert(def_id, FunctionContractEntry::Invalid(error));
         }
-        let verifier = Self {
+        let mut verifier = Self {
             tcx,
             def_id,
             body,
@@ -199,15 +196,23 @@ impl<'tcx> Verifier<'tcx> {
             assertion_contracts,
             assumption_contracts,
             lemma_call_contracts,
-            pure_fns: ghosts.typed_pure_fns.clone(),
-            lemmas: ghosts.typed_lemmas.clone(),
-            ordered_pure_fns: ghosts.ordered_pure_fns.clone(),
-            ordered_lemmas: ghosts.ordered_lemmas.clone(),
+            pure_fns: HashMap::new(),
+            lemmas: HashMap::new(),
             prepass_error,
-            preloaded,
             next_sym,
             type_encodings: RefCell::new(BTreeMap::new()),
         };
+        if !preloaded {
+            reset_solver();
+            if let Err(error) = verifier.prepare(&ghosts.typed_pure_fns, &ghosts.typed_lemmas) {
+                verifier.prepass_error = Some(VerificationResult {
+                    function: "prepass".to_owned(),
+                    ..error
+                });
+            }
+        } else {
+            verifier.load_all_ghosts(&ghosts.typed_pure_fns, &ghosts.typed_lemmas);
+        }
         let function_spec_vars = verifier.instantiate_spec_vars(&spec_vars);
         Self {
             function_spec_vars,
@@ -219,12 +224,6 @@ impl<'tcx> Verifier<'tcx> {
         if let Some(result) = self.prepass_error.clone() {
             return result;
         }
-        if !self.preloaded {
-            reset_solver();
-            if let Err(err) = self.prepare() {
-                return err;
-            }
-        }
         let initial_state = match self.initial_state() {
             Ok(state) => state,
             Err(err) => return err,
@@ -232,9 +231,30 @@ impl<'tcx> Verifier<'tcx> {
         self.verify_from_initial_state(initial_state)
     }
 
-    pub fn prepare(&self) -> Result<(), VerificationResult> {
-        self.register_pure_fns()?;
-        self.verify_lemmas()
+    fn prepare(
+        &mut self,
+        pure_fn_defs: &[TypedPureFnDef],
+        lemma_defs: &[TypedLemmaDef],
+    ) -> Result<(), VerificationResult> {
+        self.register_pure_fns(pure_fn_defs)?;
+        self.verify_lemmas(lemma_defs)
+    }
+
+    fn load_all_ghosts(&mut self, pure_fn_defs: &[TypedPureFnDef], lemma_defs: &[TypedLemmaDef]) {
+        for pure_fn in pure_fn_defs {
+            let inserted = self
+                .pure_fns
+                .insert(pure_fn.name.clone(), pure_fn.clone())
+                .is_none();
+            assert!(inserted, "duplicate pure function `{}`", pure_fn.name);
+        }
+        for lemma in lemma_defs {
+            let inserted = self
+                .lemmas
+                .insert(lemma.name.clone(), lemma.clone())
+                .is_none();
+            assert!(inserted, "duplicate lemma `{}`", lemma.name);
+        }
     }
 
     fn verify_from_initial_state(&self, initial_state: State) -> VerificationResult {
@@ -792,22 +812,30 @@ impl<'tcx> Verifier<'tcx> {
         Ok(state)
     }
 
-    fn verify_lemmas(&self) -> Result<(), VerificationResult> {
+    fn verify_lemmas(&mut self, lemma_defs: &[TypedLemmaDef]) -> Result<(), VerificationResult> {
         let mut stack = Vec::new();
-        let mut verified = BTreeSet::new();
-        for lemma_name in &self.ordered_lemmas {
-            if let Some(lemma) = self.lemmas.get(lemma_name) {
-                self.verify_lemma(lemma, &mut stack, &mut verified)?;
-            }
+        for lemma in lemma_defs {
+            let inserted = self
+                .lemmas
+                .insert(lemma.name.clone(), lemma.clone())
+                .is_none();
+            assert!(inserted, "duplicate lemma `{}`", lemma.name);
+            self.verify_lemma(lemma, &mut stack)?;
         }
         Ok(())
     }
 
-    fn register_pure_fns(&self) -> Result<(), VerificationResult> {
-        for pure_fn_name in &self.ordered_pure_fns {
-            if let Some(pure_fn) = self.pure_fns.get(pure_fn_name) {
-                self.register_pure_fn(pure_fn)?;
-            }
+    fn register_pure_fns(
+        &mut self,
+        pure_fn_defs: &[TypedPureFnDef],
+    ) -> Result<(), VerificationResult> {
+        for pure_fn in pure_fn_defs {
+            self.register_pure_fn(pure_fn)?;
+            let inserted = self
+                .pure_fns
+                .insert(pure_fn.name.clone(), pure_fn.clone())
+                .is_none();
+            assert!(inserted, "duplicate pure function `{}`", pure_fn.name);
         }
         Ok(())
     }
@@ -867,11 +895,7 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         lemma: &TypedLemmaDef,
         stack: &mut Vec<String>,
-        verified: &mut BTreeSet<String>,
     ) -> Result<(), VerificationResult> {
-        if verified.contains(&lemma.name) {
-            return Ok(());
-        }
         if stack.iter().any(|name| name == &lemma.name) {
             return Err(self.unsupported_result(
                 self.tcx.def_span(self.def_id),
@@ -932,7 +956,7 @@ impl<'tcx> Verifier<'tcx> {
                             format!("unknown lemma `{lemma_name}`"),
                         )
                     })?;
-                    self.verify_lemma(callee, stack, verified)?;
+                    self.verify_lemma(callee, stack)?;
                     let env = self.lemma_env_from_contract_args(args, &current, &spec, callee)?;
                     let req = self.contract_expr_to_bool(&env.current, &env.spec, &callee.req)?;
                     self.require_constraint(
@@ -960,9 +984,6 @@ impl<'tcx> Verifier<'tcx> {
             format!("lemma `{}` postcondition failed", lemma.name),
         );
         stack.pop();
-        if result.is_ok() {
-            verified.insert(lemma.name.clone());
-        }
         result
     }
 

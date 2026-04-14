@@ -181,10 +181,8 @@ pub struct DirectivePrepass {
 pub struct GlobalGhostPrepass {
     pub pure_fns: HashMap<String, PureFnDef>,
     pub lemmas: HashMap<String, LemmaDef>,
-    pub typed_pure_fns: HashMap<String, TypedPureFnDef>,
-    pub typed_lemmas: HashMap<String, TypedLemmaDef>,
-    pub ordered_pure_fns: Vec<String>,
-    pub ordered_lemmas: Vec<String>,
+    pub typed_pure_fns: Vec<TypedPureFnDef>,
+    pub typed_lemmas: Vec<TypedLemmaDef>,
 }
 
 impl LoopContracts {
@@ -369,16 +367,14 @@ pub fn compute_global_ghost_prepass<'tcx>(
         lemma_order.push(lemma.name);
     }
 
-    let typed_pure_fns = type_pure_fns(&pure_fns, anchor_span)?;
-    let typed_lemmas = type_lemmas(&lemmas, &pure_fns, anchor_span)?;
+    let typed_pure_fn_map = type_pure_fns(&pure_fns, anchor_span)?;
+    let typed_lemma_map = type_lemmas(&lemmas, &pure_fns, anchor_span)?;
 
     Ok(GlobalGhostPrepass {
-        ordered_pure_fns: order_pure_fns(&typed_pure_fns, &pure_fn_order),
-        ordered_lemmas: order_lemmas(&typed_lemmas, &lemma_order),
         pure_fns,
         lemmas,
-        typed_pure_fns,
-        typed_lemmas,
+        typed_pure_fns: order_pure_fns(&typed_pure_fn_map, &pure_fn_order),
+        typed_lemmas: order_lemmas(&typed_lemma_map, &lemma_order),
     })
 }
 
@@ -2958,7 +2954,7 @@ fn type_lemmas(
 fn order_pure_fns(
     pure_fns: &HashMap<String, TypedPureFnDef>,
     declaration_order: &[String],
-) -> Vec<String> {
+) -> Vec<TypedPureFnDef> {
     let mut ordered = Vec::new();
     let mut visiting = HashSet::new();
     let mut visited = HashSet::new();
@@ -2973,7 +2969,7 @@ fn visit_pure_fn(
     pure_fns: &HashMap<String, TypedPureFnDef>,
     visiting: &mut HashSet<String>,
     visited: &mut HashSet<String>,
-    ordered: &mut Vec<String>,
+    ordered: &mut Vec<TypedPureFnDef>,
 ) {
     if visited.contains(name) || !visiting.insert(name.to_owned()) {
         return;
@@ -2983,7 +2979,7 @@ fn visit_pure_fn(
     }
     visiting.remove(name);
     if visited.insert(name.to_owned()) {
-        ordered.push(name.to_owned());
+        ordered.push(pure_fns.get(name).expect("typed pure fn").clone());
     }
 }
 
@@ -2992,7 +2988,7 @@ fn visit_pure_fn_expr(
     pure_fns: &HashMap<String, TypedPureFnDef>,
     visiting: &mut HashSet<String>,
     visited: &mut HashSet<String>,
-    ordered: &mut Vec<String>,
+    ordered: &mut Vec<TypedPureFnDef>,
 ) {
     match &expr.kind {
         TypedExprKind::PureCall { func, args } => {
@@ -3027,7 +3023,7 @@ fn visit_pure_fn_expr(
 fn order_lemmas(
     lemmas: &HashMap<String, TypedLemmaDef>,
     declaration_order: &[String],
-) -> Vec<String> {
+) -> Vec<TypedLemmaDef> {
     let mut ordered = Vec::new();
     let mut visiting = HashSet::new();
     let mut visited = HashSet::new();
@@ -3042,7 +3038,7 @@ fn visit_lemma(
     lemmas: &HashMap<String, TypedLemmaDef>,
     visiting: &mut HashSet<String>,
     visited: &mut HashSet<String>,
-    ordered: &mut Vec<String>,
+    ordered: &mut Vec<TypedLemmaDef>,
 ) {
     if visited.contains(name) || !visiting.insert(name.to_owned()) {
         return;
@@ -3056,7 +3052,7 @@ fn visit_lemma(
     }
     visiting.remove(name);
     if visited.insert(name.to_owned()) {
-        ordered.push(name.to_owned());
+        ordered.push(lemmas.get(name).expect("typed lemma").clone());
     }
 }
 

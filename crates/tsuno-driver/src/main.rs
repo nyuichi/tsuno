@@ -80,24 +80,22 @@ impl Callbacks for VerifyCallbacks {
         let Some((anchor_def_id, anchor_span)) = items.first().copied() else {
             return Compilation::Continue;
         };
-        let anchor_body = tcx
-            .mir_drops_elaborated_and_const_checked(anchor_def_id)
-            .steal();
         let anchor_verifier = Verifier::new(
             tcx,
             anchor_def_id,
             anchor_span,
-            anchor_body,
+            tcx.mir_drops_elaborated_and_const_checked(anchor_def_id)
+                .steal(),
             contracts.clone(),
             &ghosts,
             false,
         );
-        if let Err(mut error) = anchor_verifier.prepare() {
-            error.function = "prepass".to_owned();
-            self.results.push(error);
+        let anchor_result = anchor_verifier.verify();
+        let stop_after_anchor = anchor_result.function == "prepass";
+        self.results.push(anchor_result);
+        if stop_after_anchor {
             return Compilation::Continue;
         }
-        self.results.push(anchor_verifier.verify());
         for (local_def_id, span) in items.into_iter().skip(1) {
             let body = tcx
                 .mir_drops_elaborated_and_const_checked(local_def_id)
