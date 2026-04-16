@@ -9,15 +9,14 @@
 // | `u8`, `u16`, `u32`, `u64`, `usize` | same as Rust        | `Int`             | width bounds |
 // | `&T`                               | `Ref<T>`            | datatype wrapper  | `inv<T>(deref(x))` |
 // | `&mut T`                           | `Mut<T>`            | datatype wrapper  | `inv<T>(cur(x))` |
-// | `Vec<T>`                           | `Seq<T>`            | `Seq<T>`          | each element satisfies `inv<T>` |
 // | `(T0, .., Tn)`                     | `Tuple([T0, .., Tn])` | datatype        | conjunction of field invariants |
 // | `struct S { f0: T0, .., fn: Tn }`  | `S`                 | datatype          | conjunction of field invariants |
 //
 // Notes:
 // - `Mut<T>` additionally requires `cur(x) == fin(x)` when the mutable reference is closed.
-// - Structs with `Drop`, generic structs other than `Vec<T>`, and recursive structs are unsupported.
+// - Structs with `Drop`, generic structs, and recursive structs are unsupported.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::rc::Rc;
 use std::str::FromStr;
@@ -38,7 +37,7 @@ use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
     FunctionContract, LemmaCallContract, LoopContract, LoopContracts, ProgramPrepass,
     ResolvedExprEnv, SpecVarBinding, TypedGhostStmt, TypedLemmaDef, TypedPureFnDef,
-    spec_ty_for_rust_ty, vec_element_ty,
+    spec_ty_for_rust_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{BinaryOp, BuiltinFn, SpecTy, TypedExpr, TypedExprKind, UnaryOp};
@@ -51,7 +50,7 @@ thread_local! {
         init_z3();
         let solver = Solver::new();
         let mut params = z3::Params::new();
-        params.set_u32("timeout", 5_000);
+        params.set_u32("timeout", 1_000);
         solver.set_params(&params);
         solver
     };
@@ -85,12 +84,6 @@ enum AssertionKind {
     Existential,
 }
 
-#[derive(Debug)]
-struct SeqPredicateEncoding {
-    invariant: FuncDecl,
-    resolve: FuncDecl,
-}
-
 pub struct Verifier<'tcx> {
     tcx: TyCtxt<'tcx>,
     def_id: Option<LocalDefId>,
@@ -103,7 +96,6 @@ pub struct Verifier<'tcx> {
     lemmas: HashMap<String, TypedLemmaDef>,
     next_sym: Cell<usize>,
     value_encoder: ValueEncoder,
-    seq_predicates: RefCell<BTreeMap<SpecTy, Rc<SeqPredicateEncoding>>>,
 }
 
 pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<VerificationResult> {
@@ -154,7 +146,6 @@ impl<'tcx> Verifier<'tcx> {
             lemmas: HashMap::new(),
             next_sym: Cell::new(0),
             value_encoder: ValueEncoder::new(),
-            seq_predicates: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -2622,9 +2613,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn fresh_for_rust_ty(&self, ty: Ty<'tcx>, hint: &str) -> Result<SymValue, VerificationResult> {
-        if let TyKind::Adt(adt_def, args) = ty.kind()
-            && vec_element_ty(self.tcx, ty).is_none()
-        {
+        if let TyKind::Adt(adt_def, args) = ty.kind() {
             if !adt_def.is_struct() {
                 return Err(
                     self.unsupported_result(self.report_span(), format!("unsupported type {ty:?}"))
@@ -3036,14 +3025,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(Some(bool_and(formulas)))
             }
-            SpecTy::Seq(item) => {
-                let formula = if self.seq_uses_predicate(item)? {
-                    self.seq_invariant_formula(item, value, span)?
-                } else {
-                    self.list_type_invariant(item, value, span)?
-                };
-                Ok(Some(formula))
-            }
+            SpecTy::Seq(item) => Ok(Some(self.list_type_invariant(item, value, span)?)),
             SpecTy::Tuple(items) => {
                 let mut formulas = vec![self.inductive_tag_formula(ty, value, span)?];
                 for (index, item) in items.iter().enumerate() {
@@ -3103,13 +3085,7 @@ impl<'tcx> Verifier<'tcx> {
                     self.eq_for_spec_ty(inner, &cur, &fin, span)?,
                 ]))
             }
-            SpecTy::Seq(item) => {
-                if self.seq_uses_predicate(item)? {
-                    self.seq_resolve_formula(item, value, span)
-                } else {
-                    self.list_resolve_formula(item, value, span)
-                }
-            }
+            SpecTy::Seq(item) => self.list_resolve_formula(item, value, span),
             SpecTy::Tuple(items) => {
                 let mut formulas = Vec::with_capacity(items.len() + 1);
                 formulas.push(self.inductive_tag_formula(ty, value, span)?);
@@ -3151,84 +3127,6 @@ impl<'tcx> Verifier<'tcx> {
             .as_int()
             .expect("tag result")
             .eq(&encoding.tag))
-    }
-
-    fn seq_uses_predicate(&self, item: &SpecTy) -> Result<bool, VerificationResult> {
-        Ok(matches!(
-            self.type_encoding(item)?.kind,
-            TypeEncodingKind::Inductive(_)
-        ))
-    }
-
-    fn seq_predicates(
-        &self,
-        item: &SpecTy,
-    ) -> Result<Rc<SeqPredicateEncoding>, VerificationResult> {
-        if let Some(predicates) = self.seq_predicates.borrow().get(item).cloned() {
-            return Ok(predicates);
-        }
-        let predicates = self.build_seq_predicates(item)?;
-        self.seq_predicates
-            .borrow_mut()
-            .insert(item.clone(), predicates.clone());
-        Ok(predicates)
-    }
-
-    fn build_seq_predicates(
-        &self,
-        item: &SpecTy,
-    ) -> Result<Rc<SeqPredicateEncoding>, VerificationResult> {
-        let elem_encoding = self.type_encoding(item)?;
-        let seq_ty = SpecTy::Seq(Box::new(item.clone()));
-        let seq_sort = Sort::seq(&elem_encoding.sort);
-        let invariant = FuncDecl::new(
-            format!("inv_{}", self.sort_name(&seq_ty)),
-            &[&seq_sort],
-            &Sort::bool(),
-        );
-        let resolve = FuncDecl::new(
-            format!("resolve_{}", self.sort_name(&seq_ty)),
-            &[&seq_sort],
-            &Sort::bool(),
-        );
-        Ok(Rc::new(SeqPredicateEncoding { invariant, resolve }))
-    }
-
-    fn seq_invariant_formula(
-        &self,
-        item: &SpecTy,
-        value: &SymValue,
-        span: Span,
-    ) -> Result<Bool, VerificationResult> {
-        let SymValue::Seq(seq) = value else {
-            return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
-        };
-        let predicates = self.seq_predicates(item)?;
-        Ok(predicates
-            .invariant
-            .apply(&[seq])
-            .as_bool()
-            .expect("seq invariant application"))
-    }
-
-    fn seq_resolve_formula(
-        &self,
-        item: &SpecTy,
-        value: &SymValue,
-        span: Span,
-    ) -> Result<Bool, VerificationResult> {
-        if !spec_ty_contains_mut_ref(item) {
-            return self.seq_invariant_formula(item, value, span);
-        }
-        let SymValue::Seq(seq) = value else {
-            return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
-        };
-        let predicates = self.seq_predicates(item)?;
-        Ok(predicates
-            .resolve
-            .apply(&[seq])
-            .as_bool()
-            .expect("seq resolve application"))
     }
 
     fn list_resolve_formula(

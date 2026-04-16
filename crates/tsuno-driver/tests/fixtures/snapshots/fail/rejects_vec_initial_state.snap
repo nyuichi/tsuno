@@ -5,10 +5,8 @@ expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
-FAIL supports_vec_of_mut_refs
-  mutable reference close failed
-  src/main.rs:1:50: 1:51
-PASS main
-  all assertions discharged
+UNSUPPORTED rejects_vec_initial_state
+  generic structs are unsupported: std::vec::Vec<i32, std::alloc::Global>
+  src/main.rs:1:1: 1:43
 
 stderr:

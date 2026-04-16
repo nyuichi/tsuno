@@ -15,7 +15,6 @@ use rustc_hir::{HirId, Pat, PatKind};
 use rustc_middle::mir::{BasicBlock, Body, Local, PlaceElem, StatementKind, TerminatorKind};
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::def_id::LocalDefId;
-use rustc_span::symbol::sym;
 use rustc_span::{DUMMY_SP, Span, Symbol};
 
 #[derive(Debug, Clone, Default)]
@@ -654,17 +653,6 @@ fn is_fully_inferred_spec_ty(ty: &SpecTy) -> bool {
     }
 }
 
-fn is_vec_adt<'tcx>(tcx: TyCtxt<'tcx>, adt_def: ty::AdtDef<'tcx>) -> bool {
-    tcx.is_diagnostic_item(sym::Vec, adt_def.did())
-}
-
-pub(crate) fn vec_element_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
-    match ty.kind() {
-        TyKind::Adt(adt_def, args) if is_vec_adt(tcx, *adt_def) => Some(args.type_at(0)),
-        _ => None,
-    }
-}
-
 fn inferred_spec_var_ty(inferred: &mut SpecTypeInference, name: &str) -> Result<SpecTy, String> {
     let ty = inferred
         .resolved_ty(name)
@@ -782,22 +770,21 @@ pub fn spec_ty_for_rust_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<Spec
             Ok(SpecTy::Tuple(items))
         }
         TyKind::Adt(adt_def, args) => {
-            if let Some(elem_ty) = vec_element_ty(tcx, ty) {
-                let inner = spec_ty_for_rust_ty(tcx, elem_ty)?;
-                Ok(SpecTy::Seq(Box::new(inner)))
-            } else if adt_def.is_struct() {
-                let mut fields = Vec::new();
-                let name = tcx.def_path_str(adt_def.did());
-                for field in adt_def.non_enum_variant().fields.iter() {
-                    fields.push(StructFieldTy {
-                        name: field.name.to_string(),
-                        ty: spec_ty_for_rust_ty(tcx, field.ty(tcx, args))?,
-                    });
-                }
-                Ok(SpecTy::Struct(StructTy { name, fields }))
-            } else {
-                Err(format!("unsupported type {ty:?}"))
+            if !adt_def.is_struct() {
+                return Err(format!("unsupported type {ty:?}"));
             }
+            if !args.is_empty() {
+                return Err(format!("generic structs are unsupported: {ty:?}"));
+            }
+            let mut fields = Vec::new();
+            let name = tcx.def_path_str(adt_def.did());
+            for field in adt_def.non_enum_variant().fields.iter() {
+                fields.push(StructFieldTy {
+                    name: field.name.to_string(),
+                    ty: spec_ty_for_rust_ty(tcx, field.ty(tcx, args))?,
+                });
+            }
+            Ok(SpecTy::Struct(StructTy { name, fields }))
         }
         other => Err(format!("unsupported type {other:?}")),
     }
