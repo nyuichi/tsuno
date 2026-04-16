@@ -46,10 +46,6 @@ pub enum TypedExprKind {
         func: String,
         args: Vec<TypedExpr>,
     },
-    BuiltinCall {
-        func: BuiltinFn,
-        args: Vec<TypedExpr>,
-    },
     Field {
         base: Box<TypedExpr>,
         name: String,
@@ -142,36 +138,10 @@ pub enum SpecTy {
     U32,
     U64,
     Usize,
-    Seq(Box<SpecTy>),
     Tuple(Vec<SpecTy>),
     Struct(StructTy),
     Ref(Box<SpecTy>),
     Mut(Box<SpecTy>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[allow(clippy::enum_variant_names)]
-pub enum BuiltinFn {
-    SeqConcat,
-    SeqExtract,
-    SeqLen,
-    SeqNth,
-    SeqRev,
-    SeqUnit,
-}
-
-impl BuiltinFn {
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "seq_concat" => Some(Self::SeqConcat),
-            "seq_extract" => Some(Self::SeqExtract),
-            "seq_len" => Some(Self::SeqLen),
-            "seq_nth" => Some(Self::SeqNth),
-            "seq_rev" => Some(Self::SeqRev),
-            "seq_unit" => Some(Self::SeqUnit),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -964,12 +934,6 @@ impl<'a> PureFnParser<'a> {
             "u32" => Ok(SpecTy::U32),
             "u64" => Ok(SpecTy::U64),
             "usize" => Ok(SpecTy::Usize),
-            "Seq" => {
-                self.expect_char('<')?;
-                let inner = self.parse_spec_ty()?;
-                self.expect_char('>')?;
-                Ok(SpecTy::Seq(Box::new(inner)))
-            }
             _ => Err(ParseError::new(format!(
                 "unsupported pure function type `{ident}`"
             ))),
@@ -1442,8 +1406,8 @@ mod tests {
     fn parses_pure_function_block() {
         let defs = parse_pure_fn_block(
             r#"
-fn is_rev(x: Seq<i32>, y: Seq<i32>) -> bool {
-    seq_rev(x) == y
+fn add1(x: i32) -> i32 {
+    x + 1i32
 }
 "#,
         )
@@ -1451,27 +1415,38 @@ fn is_rev(x: Seq<i32>, y: Seq<i32>) -> bool {
         assert_eq!(
             defs,
             vec![PureFnDef {
-                name: "is_rev".to_owned(),
-                params: vec![
-                    PureFnParam {
-                        name: "x".to_owned(),
-                        ty: SpecTy::Seq(Box::new(SpecTy::I32)),
-                    },
-                    PureFnParam {
-                        name: "y".to_owned(),
-                        ty: SpecTy::Seq(Box::new(SpecTy::I32)),
-                    },
-                ],
-                result_ty: SpecTy::Bool,
+                name: "add1".to_owned(),
+                params: vec![PureFnParam {
+                    name: "x".to_owned(),
+                    ty: SpecTy::I32,
+                }],
+                result_ty: SpecTy::I32,
                 body: Expr::Binary {
-                    op: BinaryOp::Eq,
-                    lhs: Box::new(Expr::Call {
-                        func: "seq_rev".to_owned(),
-                        args: vec![Expr::Var("x".to_owned())],
-                    }),
-                    rhs: Box::new(Expr::Var("y".to_owned())),
+                    op: BinaryOp::Add,
+                    lhs: Box::new(Expr::Var("x".to_owned())),
+                    rhs: Box::new(Expr::Int(IntLiteral {
+                        digits: "1".to_owned(),
+                        suffix: Some(IntSuffix::I32),
+                    })),
                 },
             }]
+        );
+    }
+
+    #[test]
+    fn rejects_seq_types_in_pure_function_block() {
+        let err = parse_pure_fn_block(
+            r#"
+fn is_rev(x: Seq<i32>) -> bool {
+    true
+}
+"#,
+        )
+        .expect_err("Seq types should be rejected");
+        assert!(
+            err.message.contains("unsupported pure function type `Seq`"),
+            "unexpected error: {}",
+            err.message
         );
     }
 
@@ -1479,15 +1454,15 @@ fn is_rev(x: Seq<i32>, y: Seq<i32>) -> bool {
     fn parses_lemma_block() {
         let block = parse_ghost_block(
             r#"
-fn is_rev(x: Seq<i32>, y: Seq<i32>) -> bool {
-    seq_rev(x) == y
+fn add1(x: i32) -> i32 {
+    x + 1i32
 }
 
-fn rev_done(orig: Seq<i32>, cur: Seq<i32>)
+fn add1_done(x: i32)
   req true
-  ens is_rev(orig, cur)
+  ens add1(x) == x + 1i32
 {
-    assert is_rev(orig, cur);
+    assert add1(x) == x + 1i32;
 }
 "#,
         )
@@ -1496,47 +1471,57 @@ fn rev_done(orig: Seq<i32>, cur: Seq<i32>)
             block,
             GhostBlock {
                 pure_fns: vec![PureFnDef {
-                    name: "is_rev".to_owned(),
-                    params: vec![
-                        PureFnParam {
-                            name: "x".to_owned(),
-                            ty: SpecTy::Seq(Box::new(SpecTy::I32)),
-                        },
-                        PureFnParam {
-                            name: "y".to_owned(),
-                            ty: SpecTy::Seq(Box::new(SpecTy::I32)),
-                        },
-                    ],
-                    result_ty: SpecTy::Bool,
+                    name: "add1".to_owned(),
+                    params: vec![PureFnParam {
+                        name: "x".to_owned(),
+                        ty: SpecTy::I32,
+                    }],
+                    result_ty: SpecTy::I32,
                     body: Expr::Binary {
-                        op: BinaryOp::Eq,
-                        lhs: Box::new(Expr::Call {
-                            func: "seq_rev".to_owned(),
-                            args: vec![Expr::Var("x".to_owned())],
-                        }),
-                        rhs: Box::new(Expr::Var("y".to_owned())),
+                        op: BinaryOp::Add,
+                        lhs: Box::new(Expr::Var("x".to_owned())),
+                        rhs: Box::new(Expr::Int(IntLiteral {
+                            digits: "1".to_owned(),
+                            suffix: Some(IntSuffix::I32),
+                        })),
                     },
                 }],
                 lemmas: vec![LemmaDef {
-                    name: "rev_done".to_owned(),
-                    params: vec![
-                        PureFnParam {
-                            name: "orig".to_owned(),
-                            ty: SpecTy::Seq(Box::new(SpecTy::I32)),
-                        },
-                        PureFnParam {
-                            name: "cur".to_owned(),
-                            ty: SpecTy::Seq(Box::new(SpecTy::I32)),
-                        },
-                    ],
+                    name: "add1_done".to_owned(),
+                    params: vec![PureFnParam {
+                        name: "x".to_owned(),
+                        ty: SpecTy::I32,
+                    }],
                     req: Expr::Bool(true),
-                    ens: Expr::Call {
-                        func: "is_rev".to_owned(),
-                        args: vec![Expr::Var("orig".to_owned()), Expr::Var("cur".to_owned())],
+                    ens: Expr::Binary {
+                        op: BinaryOp::Eq,
+                        lhs: Box::new(Expr::Call {
+                            func: "add1".to_owned(),
+                            args: vec![Expr::Var("x".to_owned())],
+                        }),
+                        rhs: Box::new(Expr::Binary {
+                            op: BinaryOp::Add,
+                            lhs: Box::new(Expr::Var("x".to_owned())),
+                            rhs: Box::new(Expr::Int(IntLiteral {
+                                digits: "1".to_owned(),
+                                suffix: Some(IntSuffix::I32),
+                            })),
+                        }),
                     },
-                    body: vec![GhostStmt::Assert(Expr::Call {
-                        func: "is_rev".to_owned(),
-                        args: vec![Expr::Var("orig".to_owned()), Expr::Var("cur".to_owned())],
+                    body: vec![GhostStmt::Assert(Expr::Binary {
+                        op: BinaryOp::Eq,
+                        lhs: Box::new(Expr::Call {
+                            func: "add1".to_owned(),
+                            args: vec![Expr::Var("x".to_owned())],
+                        }),
+                        rhs: Box::new(Expr::Binary {
+                            op: BinaryOp::Add,
+                            lhs: Box::new(Expr::Var("x".to_owned())),
+                            rhs: Box::new(Expr::Int(IntLiteral {
+                                digits: "1".to_owned(),
+                                suffix: Some(IntSuffix::I32),
+                            })),
+                        }),
                     })],
                 }],
             }

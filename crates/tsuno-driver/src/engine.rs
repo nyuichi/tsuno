@@ -30,8 +30,8 @@ use rustc_middle::mir::{
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::source_map::Spanned;
 use rustc_span::{DUMMY_SP, Span};
-use z3::ast::{Ast, Bool, Dynamic, Int, Seq};
-use z3::{FuncDecl, Pattern, SatResult, Solver, Sort, SortKind};
+use z3::ast::{Ast, Bool, Dynamic, Int};
+use z3::{FuncDecl, SatResult, Solver, SortKind};
 
 use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
@@ -40,7 +40,7 @@ use crate::prepass::{
     spec_ty_for_rust_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
-use crate::spec::{BinaryOp, BuiltinFn, SpecTy, TypedExpr, TypedExprKind, UnaryOp};
+use crate::spec::{BinaryOp, SpecTy, TypedExpr, TypedExprKind, UnaryOp};
 use crate::value_encoding::{
     InductiveEncoding, InductiveValue, SymValue, TypeEncoding, TypeEncodingKind, ValueEncoder,
 };
@@ -1625,7 +1625,6 @@ impl<'tcx> Verifier<'tcx> {
                 let fin = self.mut_fin(value, inner, span)?;
                 self.construct_datatype(spec_ty, &[fresh, fin])
             }
-            SpecTy::Seq(_) => self.fresh_for_spec_ty(spec_ty, "dangle"),
             SpecTy::Ref(_)
             | SpecTy::Bool
             | SpecTy::IntLiteral
@@ -1703,13 +1702,6 @@ impl<'tcx> Verifier<'tcx> {
                     values.push(self.spec_expr_to_value(state, arg, resolved)?);
                 }
                 self.eval_pure_call(func, &expr.ty, values, self.control_span(state.ctrl))
-            }
-            TypedExprKind::BuiltinCall { func, args } => {
-                let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.spec_expr_to_value(state, arg, resolved)?);
-                }
-                self.eval_builtin_call(*func, args, values, self.control_span(state.ctrl))
             }
             TypedExprKind::Field { base, index, .. } => {
                 let value = self.spec_expr_to_value(state, base, resolved)?;
@@ -1806,13 +1798,6 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 self.eval_pure_call(func, &expr.ty, values, self.report_span())
             }
-            TypedExprKind::BuiltinCall { func, args } => {
-                let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.contract_expr_to_value(current, spec, arg)?);
-                }
-                self.eval_builtin_call(*func, args, values, self.report_span())
-            }
             TypedExprKind::Field { base, index, .. } => {
                 let value = self.contract_expr_to_value(current, spec, base)?;
                 self.project_field(value, &base.ty, *index, self.report_span())
@@ -1849,71 +1834,6 @@ impl<'tcx> Verifier<'tcx> {
                 let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
                 self.lower_binary_value(*op, &lhs.ty, &lhs_value, &rhs_value, self.report_span())
             }
-        }
-    }
-
-    fn eval_builtin_call(
-        &self,
-        func: BuiltinFn,
-        args: &[TypedExpr],
-        values: Vec<SymValue>,
-        span: Span,
-    ) -> Result<SymValue, VerificationResult> {
-        match func {
-            BuiltinFn::SeqLen => {
-                let SymValue::Seq(seq) = &values[0] else {
-                    return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
-                };
-                Ok(self.value_wrap_int(&seq.length()))
-            }
-            BuiltinFn::SeqExtract => {
-                let SymValue::Seq(seq) = &values[0] else {
-                    return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
-                };
-                let SpecTy::Seq(inner) = &args[0].ty else {
-                    unreachable!("typed seq_extract base");
-                };
-                let start = self.value_int_data(&values[1]);
-                let len = self.value_int_data(&values[2]);
-                Ok(SymValue::Seq(self.seq_extract(seq, inner, &start, &len)))
-            }
-            BuiltinFn::SeqConcat => {
-                let (SymValue::Seq(lhs), SymValue::Seq(rhs)) = (&values[0], &values[1]) else {
-                    return Err(self.unsupported_result(
-                        span,
-                        "expected sequence values for concatenation".to_owned(),
-                    ));
-                };
-                Ok(SymValue::Seq(Seq::concat(&[lhs, rhs])))
-            }
-            BuiltinFn::SeqNth => {
-                let SymValue::Seq(seq) = &values[0] else {
-                    return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
-                };
-                let SpecTy::Seq(inner) = &args[0].ty else {
-                    unreachable!("typed seq_nth base");
-                };
-                let index = self.value_int_data(&values[1]);
-                let dyn_value = seq.nth(index);
-                let encoding = self.type_encoding(inner)?;
-                let elem = self.decode_value(&encoding, dyn_value, span)?;
-                Ok(elem)
-            }
-            BuiltinFn::SeqRev => {
-                let SymValue::Seq(seq) = &values[0] else {
-                    return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
-                };
-                let SpecTy::Seq(inner) = &args[0].ty else {
-                    unreachable!("typed seq_rev base");
-                };
-                Ok(SymValue::Seq(self.seq_rev(seq, inner)))
-            }
-            BuiltinFn::SeqUnit => Ok(SymValue::Seq(match &values[0] {
-                SymValue::Bool(value) => Seq::unit(value),
-                SymValue::Int(value) => Seq::unit(value),
-                SymValue::Seq(value) => Seq::unit(value),
-                SymValue::Inductive(value) => Seq::unit(&value.ast),
-            })),
         }
     }
 
@@ -1956,117 +1876,6 @@ impl<'tcx> Verifier<'tcx> {
         let app = decl.apply(&args);
         let encoding = self.type_encoding(result_ty)?;
         self.decode_value(&encoding, app, span)
-    }
-
-    fn seq_extract(&self, seq: &Seq, inner: &SpecTy, start: &Int, len: &Int) -> Seq {
-        let elem = self
-            .type_encoding(inner)
-            .expect("sequence element encoding for seq_extract");
-        let seq_sort = Sort::seq(&elem.sort);
-        let decl = FuncDecl::new(
-            format!("seq_extract_{}", self.sort_name(inner)),
-            &[&seq_sort, &Sort::int(), &Sort::int()],
-            &seq_sort,
-        );
-        let input = Seq::fresh_const("seq_extract_input", &elem.sort);
-        let start_var = Int::fresh_const("seq_extract_start");
-        let len_var = Int::fresh_const("seq_extract_len");
-        let output = decl
-            .apply(&[&input, &start_var, &len_var])
-            .as_seq()
-            .expect("seq_extract result");
-        let idx = Int::fresh_const("seq_extract_idx");
-        let input_len = input.length();
-        let in_bounds = bool_and(vec![
-            start_var.ge(0),
-            len_var.ge(0),
-            start_var.le(input_len.clone()),
-            len_var.le(input_len.clone() - start_var.clone()),
-        ]);
-        GLOBAL_SOLVER.with(|solver| {
-            solver.assert(z3::ast::forall_const(
-                &[&input, &start_var, &len_var],
-                &[],
-                &in_bounds.clone().implies(output.length().eq(&len_var)),
-            ));
-            solver.assert(z3::ast::forall_const(
-                &[&input, &start_var, &len_var, &idx],
-                &[],
-                &bool_and(vec![in_bounds.clone(), idx.ge(0), idx.lt(len_var.clone())]).implies(
-                    output
-                        .nth(idx.clone())
-                        .eq(input.nth(start_var.clone() + idx.clone())),
-                ),
-            ));
-            let zero = Int::from_i64(0);
-            let prefix = decl
-                .apply(&[&input, &zero, &start_var])
-                .as_seq()
-                .expect("seq_extract prefix");
-            let suffix_start = start_var.clone() + len_var.clone();
-            let suffix_len = input_len.clone() - start_var.clone() - len_var.clone();
-            let suffix = decl
-                .apply(&[&input, &suffix_start, &suffix_len])
-                .as_seq()
-                .expect("seq_extract suffix");
-            solver.assert(z3::ast::forall_const(
-                &[&input, &start_var, &len_var],
-                &[],
-                &in_bounds.implies(input.eq(Seq::concat(&[&prefix, &output, &suffix]))),
-            ));
-        });
-        decl.apply(&[seq, start, len])
-            .as_seq()
-            .expect("seq_extract application")
-    }
-
-    fn seq_rev(&self, seq: &Seq, inner: &SpecTy) -> Seq {
-        let elem = self
-            .type_encoding(inner)
-            .expect("sequence element encoding for seq_rev");
-        let seq_sort = Sort::seq(&elem.sort);
-        let decl = FuncDecl::new(
-            format!("seq_rev_{}", self.sort_name(inner)),
-            &[&seq_sort],
-            &seq_sort,
-        );
-        let input = Seq::fresh_const("seq_rev_input", &elem.sort);
-        let output = decl.apply(&[&input]).as_seq().expect("seq_rev result");
-        let index = Int::fresh_const("seq_rev_idx");
-        let len = input.length();
-        GLOBAL_SOLVER.with(|solver| {
-            solver.assert(z3::ast::forall_const(
-                &[&input],
-                &[],
-                &output.length().eq(&len),
-            ));
-            solver.assert(z3::ast::forall_const(
-                &[&input, &index],
-                &[],
-                &bool_and(vec![
-                    index.ge(0),
-                    index.lt(len.clone()),
-                    output
-                        .nth(index.clone())
-                        .eq(input.nth(len.clone() - index.clone() - 1)),
-                ]),
-            ));
-            let left = Seq::fresh_const("seq_rev_left", &elem.sort);
-            let right = Seq::fresh_const("seq_rev_right", &elem.sort);
-            let left_rev = decl.apply(&[&left]).as_seq().expect("seq_rev left");
-            let right_rev = decl.apply(&[&right]).as_seq().expect("seq_rev right");
-            let both = Seq::concat(&[&left, &right]);
-            solver.assert(z3::ast::forall_const(
-                &[&left, &right],
-                &[],
-                &decl
-                    .apply(&[&both])
-                    .as_seq()
-                    .expect("seq_rev concat")
-                    .eq(Seq::concat(&[&right_rev, &left_rev])),
-            ));
-        });
-        decl.apply(&[seq]).as_seq().expect("seq_rev application")
     }
 
     fn function_postcondition_to_z3(
@@ -2197,9 +2006,7 @@ impl<'tcx> Verifier<'tcx> {
         match &expr.kind {
             TypedExprKind::Bind(_) => true,
             TypedExprKind::Bool(_) | TypedExprKind::Int(_) | TypedExprKind::Var(_) => false,
-            TypedExprKind::PureCall { args, .. } | TypedExprKind::BuiltinCall { args, .. } => {
-                args.iter().any(Self::expr_has_bind)
-            }
+            TypedExprKind::PureCall { args, .. } => args.iter().any(Self::expr_has_bind),
             TypedExprKind::Field { base, .. }
             | TypedExprKind::TupleField { base, .. }
             | TypedExprKind::Deref { base }
@@ -2422,15 +2229,6 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(self.value_bool_data(lhs).eq(self.value_bool_data(rhs)))
             }
             TypeEncodingKind::Int(_) => Ok(self.value_int_data(lhs).eq(self.value_int_data(rhs))),
-            TypeEncodingKind::Seq => {
-                let (SymValue::Seq(lhs), SymValue::Seq(rhs)) = (lhs, rhs) else {
-                    return Err(self.unsupported_result(
-                        span,
-                        "expected sequence values for equality".to_owned(),
-                    ));
-                };
-                Ok(lhs.eq(rhs))
-            }
             TypeEncodingKind::Inductive(inductive) => {
                 let (SymValue::Inductive(lhs), SymValue::Inductive(rhs)) = (lhs, rhs) else {
                     return Err(self.unsupported_result(
@@ -2523,44 +2321,6 @@ impl<'tcx> Verifier<'tcx> {
             .map_err(|err| self.unsupported_result(self.report_span(), err))
     }
 
-    fn sort_name(&self, ty: &SpecTy) -> String {
-        fn sanitize(raw: &str) -> String {
-            raw.chars()
-                .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-                .collect()
-        }
-        match ty {
-            SpecTy::Bool => "bool".to_owned(),
-            SpecTy::IntLiteral => "int_lit".to_owned(),
-            SpecTy::I8 => "i8".to_owned(),
-            SpecTy::I16 => "i16".to_owned(),
-            SpecTy::I32 => "i32".to_owned(),
-            SpecTy::I64 => "i64".to_owned(),
-            SpecTy::Isize => "isize".to_owned(),
-            SpecTy::U8 => "u8".to_owned(),
-            SpecTy::U16 => "u16".to_owned(),
-            SpecTy::U32 => "u32".to_owned(),
-            SpecTy::U64 => "u64".to_owned(),
-            SpecTy::Usize => "usize".to_owned(),
-            SpecTy::Seq(inner) => format!("seq_{}", self.sort_name(inner)),
-            SpecTy::Tuple(items) => format!(
-                "tuple_{}",
-                items
-                    .iter()
-                    .map(|item| self.sort_name(item))
-                    .collect::<Vec<_>>()
-                    .join("_")
-            ),
-            SpecTy::Struct(struct_ty) => format!("struct_{}", sanitize(&struct_ty.name)),
-            SpecTy::Ref(inner) => format!("ref_{}", self.sort_name(inner)),
-            SpecTy::Mut(inner) => format!("mut_{}", self.sort_name(inner)),
-        }
-    }
-
-    fn sort_for_spec_ty(&self, ty: &SpecTy) -> Result<Sort, VerificationResult> {
-        Ok(self.type_encoding(ty)?.sort.clone())
-    }
-
     fn construct_datatype(
         &self,
         ty: &SpecTy,
@@ -2590,9 +2350,6 @@ impl<'tcx> Verifier<'tcx> {
                 .as_int()
                 .map(SymValue::Int)
                 .ok_or_else(|| self.unsupported_result(span, "expected int Z3 value".to_owned())),
-            TypeEncodingKind::Seq => value.as_seq().map(SymValue::Seq).ok_or_else(|| {
-                self.unsupported_result(span, "expected sequence Z3 value".to_owned())
-            }),
             TypeEncodingKind::Inductive(inductive) => {
                 let mut fields = Vec::with_capacity(inductive.fields.len());
                 for (index, field_encoding) in inductive.fields.iter().enumerate() {
@@ -2613,18 +2370,11 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn fresh_for_rust_ty(&self, ty: Ty<'tcx>, hint: &str) -> Result<SymValue, VerificationResult> {
+        let spec_ty = spec_ty_for_rust_ty(self.tcx, ty)
+            .map_err(|err| self.unsupported_result(self.report_span(), err))?;
         if let TyKind::Adt(adt_def, args) = ty.kind() {
-            if !adt_def.is_struct() {
-                return Err(
-                    self.unsupported_result(self.report_span(), format!("unsupported type {ty:?}"))
-                );
-            }
-            if !args.is_empty() {
-                return Err(self.unsupported_result(
-                    self.report_span(),
-                    format!("generic structs are unsupported: {ty:?}"),
-                ));
-            }
+            debug_assert!(adt_def.is_struct());
+            debug_assert!(args.is_empty());
             if adt_def.has_dtor(self.tcx) {
                 return Err(self.unsupported_result(
                     self.report_span(),
@@ -2632,8 +2382,6 @@ impl<'tcx> Verifier<'tcx> {
                 ));
             }
         }
-        let spec_ty = spec_ty_for_rust_ty(self.tcx, ty)
-            .map_err(|err| self.unsupported_result(self.report_span(), err))?;
         self.fresh_for_spec_ty(&spec_ty, hint)
     }
 
@@ -2651,10 +2399,6 @@ impl<'tcx> Verifier<'tcx> {
             | SpecTy::U32
             | SpecTy::U64
             | SpecTy::Usize => Ok(self.value_wrap_int(&Int::new_const(self.fresh_name(hint)))),
-            SpecTy::Seq(inner) => Ok(SymValue::Seq(Seq::new_const(
-                self.fresh_name(hint),
-                &self.sort_for_spec_ty(inner)?,
-            ))),
             SpecTy::Tuple(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for (index, item) in items.iter().enumerate() {
@@ -3025,7 +2769,6 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(Some(bool_and(formulas)))
             }
-            SpecTy::Seq(item) => Ok(Some(self.list_type_invariant(item, value, span)?)),
             SpecTy::Tuple(items) => {
                 let mut formulas = vec![self.inductive_tag_formula(ty, value, span)?];
                 for (index, item) in items.iter().enumerate() {
@@ -3085,7 +2828,6 @@ impl<'tcx> Verifier<'tcx> {
                     self.eq_for_spec_ty(inner, &cur, &fin, span)?,
                 ]))
             }
-            SpecTy::Seq(item) => self.list_resolve_formula(item, value, span),
             SpecTy::Tuple(items) => {
                 let mut formulas = Vec::with_capacity(items.len() + 1);
                 formulas.push(self.inductive_tag_formula(ty, value, span)?);
@@ -3127,46 +2869,6 @@ impl<'tcx> Verifier<'tcx> {
             .as_int()
             .expect("tag result")
             .eq(&encoding.tag))
-    }
-
-    fn list_resolve_formula(
-        &self,
-        item: &SpecTy,
-        value: &SymValue,
-        span: Span,
-    ) -> Result<Bool, VerificationResult> {
-        let SymValue::Seq(seq) = value else {
-            return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
-        };
-        let index = Int::new_const(self.fresh_name("resolve_idx"));
-        let elem_encoding = self.type_encoding(item)?;
-        let nth = seq.nth(index.clone());
-        let elem = self.decode_value(&elem_encoding, nth.clone(), span)?;
-        let body = bool_and(vec![index.ge(0), index.lt(seq.length())])
-            .implies(self.resolve_formula_for_spec_ty(item, &elem, span)?);
-        let pattern = Pattern::new(&[&nth]);
-        Ok(z3::ast::forall_const(&[&index], &[&pattern], &body))
-    }
-
-    fn list_type_invariant(
-        &self,
-        item: &SpecTy,
-        value: &SymValue,
-        span: Span,
-    ) -> Result<Bool, VerificationResult> {
-        let SymValue::Seq(seq) = value else {
-            return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
-        };
-        let index = Int::new_const(self.fresh_name("list_inv_idx"));
-        let elem_encoding = self.type_encoding(item)?;
-        let nth = seq.nth(index.clone());
-        let elem = self.decode_value(&elem_encoding, nth.clone(), span)?;
-        let elem_inv = self
-            .spec_ty_formula(item, &elem, span)?
-            .unwrap_or_else(|| Bool::from_bool(true));
-        let body = bool_and(vec![index.ge(0), index.lt(seq.length())]).implies(elem_inv);
-        let pattern = Pattern::new(&[&nth]);
-        Ok(z3::ast::forall_const(&[&index], &[&pattern], &body))
     }
 
     fn require_type_invariant(
@@ -3436,7 +3138,7 @@ fn not_expr(expr: BoolExpr) -> BoolExpr {
 fn spec_ty_contains_mut_ref(ty: &SpecTy) -> bool {
     match ty {
         SpecTy::Mut(_) => true,
-        SpecTy::Seq(inner) | SpecTy::Ref(inner) => spec_ty_contains_mut_ref(inner),
+        SpecTy::Ref(inner) => spec_ty_contains_mut_ref(inner),
         SpecTy::Tuple(items) => items.iter().any(spec_ty_contains_mut_ref),
         SpecTy::Struct(struct_ty) => struct_ty
             .fields
@@ -3454,7 +3156,6 @@ fn sym_value_ast(value: &SymValue) -> &dyn Ast {
     match value {
         SymValue::Bool(value) => value,
         SymValue::Int(value) => value,
-        SymValue::Seq(value) => value,
         SymValue::Inductive(value) => &value.ast,
     }
 }

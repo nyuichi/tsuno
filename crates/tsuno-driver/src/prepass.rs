@@ -7,8 +7,8 @@ use crate::directive::{
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
-    BuiltinFn, Expr, LemmaDef, PureFnDef, SpecTy, StructFieldTy, StructTy, TypedExpr,
-    TypedExprKind, parse_ghost_block,
+    Expr, LemmaDef, PureFnDef, SpecTy, StructFieldTy, StructTy, TypedExpr, TypedExprKind,
+    parse_ghost_block,
 };
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{HirId, Pat, PatKind};
@@ -544,9 +544,6 @@ fn unify_spec_tys(lhs: &SpecTy, rhs: &SpecTy) -> Result<SpecTy, String> {
         (SpecTy::Mut(lhs), SpecTy::Mut(rhs)) => {
             Ok(SpecTy::Mut(Box::new(unify_spec_tys(lhs, rhs)?)))
         }
-        (SpecTy::Seq(lhs), SpecTy::Seq(rhs)) => {
-            Ok(SpecTy::Seq(Box::new(unify_spec_tys(lhs, rhs)?)))
-        }
         (SpecTy::Tuple(lhs), SpecTy::Tuple(rhs)) if lhs.len() == rhs.len() => {
             let mut items = Vec::with_capacity(lhs.len());
             for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
@@ -598,7 +595,6 @@ fn display_spec_ty(ty: &SpecTy) -> String {
         SpecTy::U32 => "u32".to_owned(),
         SpecTy::U64 => "u64".to_owned(),
         SpecTy::Usize => "usize".to_owned(),
-        SpecTy::Seq(inner) => format!("Seq<{}>", display_spec_ty(inner)),
         SpecTy::Ref(inner) => format!("Ref<{}>", display_spec_ty(inner)),
         SpecTy::Mut(inner) => format!("Mut<{}>", display_spec_ty(inner)),
         SpecTy::Tuple(items) => format!(
@@ -646,9 +642,7 @@ fn is_fully_inferred_spec_ty(ty: &SpecTy) -> bool {
             .fields
             .iter()
             .all(|field| is_fully_inferred_spec_ty(&field.ty)),
-        SpecTy::Seq(inner) | SpecTy::Ref(inner) | SpecTy::Mut(inner) => {
-            is_fully_inferred_spec_ty(inner)
-        }
+        SpecTy::Ref(inner) | SpecTy::Mut(inner) => is_fully_inferred_spec_ty(inner),
         _ => true,
     }
 }
@@ -790,141 +784,6 @@ pub fn spec_ty_for_rust_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<Spec
     }
 }
 
-fn infer_builtin_call_types(
-    func: BuiltinFn,
-    args: &[InferredExprTy],
-) -> Result<InferredExprTy, String> {
-    match func {
-        BuiltinFn::SeqLen => Ok(InferredExprTy::Known(SpecTy::Usize)),
-        BuiltinFn::SeqRev | BuiltinFn::SeqExtract => match args.first() {
-            Some(InferredExprTy::Known(SpecTy::Seq(inner))) => {
-                Ok(InferredExprTy::Known(SpecTy::Seq(inner.clone())))
-            }
-            _ => Ok(InferredExprTy::Unknown),
-        },
-        BuiltinFn::SeqConcat => match (args.first(), args.get(1)) {
-            (Some(InferredExprTy::Known(lhs)), Some(InferredExprTy::Known(rhs))) => {
-                Ok(InferredExprTy::Known(unify_spec_tys(lhs, rhs)?))
-            }
-            _ => Ok(InferredExprTy::Unknown),
-        },
-        BuiltinFn::SeqNth => match args.first() {
-            Some(InferredExprTy::Known(SpecTy::Seq(inner))) => {
-                Ok(InferredExprTy::Known(*inner.clone()))
-            }
-            _ => Ok(InferredExprTy::Unknown),
-        },
-        BuiltinFn::SeqUnit => match args.first() {
-            Some(InferredExprTy::Known(ty)) => {
-                Ok(InferredExprTy::Known(SpecTy::Seq(Box::new(ty.clone()))))
-            }
-            _ => Ok(InferredExprTy::Unknown),
-        },
-    }
-}
-
-fn type_builtin_call(func: BuiltinFn, args: Vec<TypedExpr>) -> Result<TypedExpr, String> {
-    match func {
-        BuiltinFn::SeqLen => {
-            if args.len() != 1 {
-                return Err("`seq_len` expects 1 argument".to_owned());
-            }
-            let Some(arg) = args.first() else {
-                unreachable!("checked arg count");
-            };
-            if !matches!(arg.ty, SpecTy::Seq(_)) {
-                return Err(format!(
-                    "`seq_len` requires `Seq<T>`, found `{}`",
-                    display_spec_ty(&arg.ty)
-                ));
-            }
-            Ok(TypedExpr {
-                ty: SpecTy::Usize,
-                kind: TypedExprKind::BuiltinCall { func, args },
-            })
-        }
-        BuiltinFn::SeqExtract => {
-            if args.len() != 3 {
-                return Err("`seq_extract` expects 3 arguments".to_owned());
-            }
-            let seq_ty = args[0].ty.clone();
-            if !matches!(seq_ty, SpecTy::Seq(_)) {
-                return Err(format!(
-                    "`seq_extract` requires `Seq<T>` as its first argument, found `{}`",
-                    display_spec_ty(&seq_ty)
-                ));
-            }
-            if !is_integer_spec_ty(&args[1].ty) || !is_integer_spec_ty(&args[2].ty) {
-                return Err("`seq_extract` start and length require integer arguments".to_owned());
-            }
-            Ok(TypedExpr {
-                ty: seq_ty,
-                kind: TypedExprKind::BuiltinCall { func, args },
-            })
-        }
-        BuiltinFn::SeqConcat => {
-            if args.len() != 2 {
-                return Err("`seq_concat` expects 2 arguments".to_owned());
-            }
-            let seq_ty = unify_spec_tys(&args[0].ty, &args[1].ty)?;
-            if !matches!(seq_ty, SpecTy::Seq(_)) {
-                return Err(format!(
-                    "`seq_concat` requires `Seq<T>` arguments, found `{}` and `{}`",
-                    display_spec_ty(&args[0].ty),
-                    display_spec_ty(&args[1].ty)
-                ));
-            }
-            Ok(TypedExpr {
-                ty: seq_ty,
-                kind: TypedExprKind::BuiltinCall { func, args },
-            })
-        }
-        BuiltinFn::SeqNth => {
-            if args.len() != 2 {
-                return Err("`seq_nth` expects 2 arguments".to_owned());
-            }
-            let SpecTy::Seq(inner) = &args[0].ty else {
-                return Err(format!(
-                    "`seq_nth` requires `Seq<T>` as its first argument, found `{}`",
-                    display_spec_ty(&args[0].ty)
-                ));
-            };
-            if !is_integer_spec_ty(&args[1].ty) {
-                return Err("`seq_nth` index requires an integer argument".to_owned());
-            }
-            Ok(TypedExpr {
-                ty: (**inner).clone(),
-                kind: TypedExprKind::BuiltinCall { func, args },
-            })
-        }
-        BuiltinFn::SeqRev => {
-            if args.len() != 1 {
-                return Err("`seq_rev` expects 1 argument".to_owned());
-            }
-            let seq_ty = args[0].ty.clone();
-            if !matches!(seq_ty, SpecTy::Seq(_)) {
-                return Err(format!(
-                    "`seq_rev` requires `Seq<T>`, found `{}`",
-                    display_spec_ty(&seq_ty)
-                ));
-            }
-            Ok(TypedExpr {
-                ty: seq_ty,
-                kind: TypedExprKind::BuiltinCall { func, args },
-            })
-        }
-        BuiltinFn::SeqUnit => {
-            if args.len() != 1 {
-                return Err("`seq_unit` expects 1 argument".to_owned());
-            }
-            Ok(TypedExpr {
-                ty: SpecTy::Seq(Box::new(args[0].ty.clone())),
-                kind: TypedExprKind::BuiltinCall { func, args },
-            })
-        }
-    }
-}
-
 fn type_pure_call(
     func: &str,
     args: &[Expr],
@@ -1005,45 +864,29 @@ fn infer_contract_expr_types(
             Ok(InferredExprTy::SpecVar(name.clone()))
         }
         Expr::Call { func, args } => {
-            if let Some(builtin) = BuiltinFn::from_name(func) {
-                let mut arg_tys = Vec::with_capacity(args.len());
-                for arg in args {
-                    arg_tys.push(infer_contract_expr_types(
-                        arg,
-                        pure_fns,
-                        spec_scope,
-                        params,
-                        allow_result,
-                        result_ty,
-                        inferred,
-                    )?);
-                }
-                infer_builtin_call_types(builtin, &arg_tys)
-            } else {
-                let Some(def) = pure_fns.get(func) else {
-                    return Err(format!("unknown pure function `{func}`"));
-                };
-                if def.params.len() != args.len() {
-                    return Err(format!(
-                        "pure function `{func}` expects {} arguments, found {}",
-                        def.params.len(),
-                        args.len()
-                    ));
-                }
-                for (arg, param) in args.iter().zip(&def.params) {
-                    let arg_ty = infer_contract_expr_types(
-                        arg,
-                        pure_fns,
-                        spec_scope,
-                        params,
-                        allow_result,
-                        result_ty,
-                        inferred,
-                    )?;
-                    constrain_expr_ty(inferred, &arg_ty, &param.ty)?;
-                }
-                Ok(InferredExprTy::Known(def.result_ty.clone()))
+            let Some(def) = pure_fns.get(func) else {
+                return Err(format!("unknown pure function `{func}`"));
+            };
+            if def.params.len() != args.len() {
+                return Err(format!(
+                    "pure function `{func}` expects {} arguments, found {}",
+                    def.params.len(),
+                    args.len()
+                ));
             }
+            for (arg, param) in args.iter().zip(&def.params) {
+                let arg_ty = infer_contract_expr_types(
+                    arg,
+                    pure_fns,
+                    spec_scope,
+                    params,
+                    allow_result,
+                    result_ty,
+                    inferred,
+                )?;
+                constrain_expr_ty(inferred, &arg_ty, &param.ty)?;
+            }
+            Ok(InferredExprTy::Known(def.result_ty.clone()))
         }
         Expr::Field { base, name } => {
             let base_ty = infer_contract_expr_types(
@@ -1190,33 +1033,22 @@ fn infer_body_expr_types(
             Ok(InferredExprTy::SpecVar(name.clone()))
         }
         Expr::Call { func, args } => {
-            if let Some(builtin) = BuiltinFn::from_name(func) {
-                let mut arg_tys = Vec::with_capacity(args.len());
-                for arg in args {
-                    arg_tys.push(infer_body_expr_types(
-                        arg, pure_fns, kind, spec_scope, local_tys, inferred,
-                    )?);
-                }
-                infer_builtin_call_types(builtin, &arg_tys)
-            } else {
-                let Some(def) = pure_fns.get(func) else {
-                    return Err(format!("unknown pure function `{func}`"));
-                };
-                if def.params.len() != args.len() {
-                    return Err(format!(
-                        "pure function `{func}` expects {} arguments, found {}",
-                        def.params.len(),
-                        args.len()
-                    ));
-                }
-                for (arg, param) in args.iter().zip(&def.params) {
-                    let arg_ty = infer_body_expr_types(
-                        arg, pure_fns, kind, spec_scope, local_tys, inferred,
-                    )?;
-                    constrain_expr_ty(inferred, &arg_ty, &param.ty)?;
-                }
-                Ok(InferredExprTy::Known(def.result_ty.clone()))
+            let Some(def) = pure_fns.get(func) else {
+                return Err(format!("unknown pure function `{func}`"));
+            };
+            if def.params.len() != args.len() {
+                return Err(format!(
+                    "pure function `{func}` expects {} arguments, found {}",
+                    def.params.len(),
+                    args.len()
+                ));
             }
+            for (arg, param) in args.iter().zip(&def.params) {
+                let arg_ty =
+                    infer_body_expr_types(arg, pure_fns, kind, spec_scope, local_tys, inferred)?;
+                constrain_expr_ty(inferred, &arg_ty, &param.ty)?;
+            }
+            Ok(InferredExprTy::Known(def.result_ty.clone()))
         }
         Expr::Field { base, name } => {
             let base_ty = infer_body_expr_types(
@@ -1412,35 +1244,17 @@ fn typed_contract_expr(
                 kind: TypedExprKind::Bind(name.clone()),
             })
         }
-        Expr::Call { func, args } => {
-            if let Some(builtin) = BuiltinFn::from_name(func) {
-                let mut typed_args = Vec::with_capacity(args.len());
-                for arg in args {
-                    typed_args.push(typed_contract_expr(
-                        arg,
-                        pure_fns,
-                        spec_scope,
-                        params,
-                        allow_result,
-                        result_ty,
-                        inferred,
-                    )?);
-                }
-                type_builtin_call(builtin, typed_args)
-            } else {
-                type_pure_call(func, args, pure_fns, &mut |arg| {
-                    typed_contract_expr(
-                        arg,
-                        pure_fns,
-                        spec_scope,
-                        params,
-                        allow_result,
-                        result_ty,
-                        inferred,
-                    )
-                })
-            }
-        }
+        Expr::Call { func, args } => type_pure_call(func, args, pure_fns, &mut |arg| {
+            typed_contract_expr(
+                arg,
+                pure_fns,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )
+        }),
         Expr::Field { base, name } => {
             let base = typed_contract_expr(
                 base,
@@ -1599,21 +1413,9 @@ fn typed_body_expr(
                 kind: TypedExprKind::Bind(name.clone()),
             })
         }
-        Expr::Call { func, args } => {
-            if let Some(builtin) = BuiltinFn::from_name(func) {
-                let mut typed_args = Vec::with_capacity(args.len());
-                for arg in args {
-                    typed_args.push(typed_body_expr(
-                        arg, pure_fns, kind, spec_scope, local_tys, inferred,
-                    )?);
-                }
-                type_builtin_call(builtin, typed_args)
-            } else {
-                type_pure_call(func, args, pure_fns, &mut |arg| {
-                    typed_body_expr(arg, pure_fns, kind, spec_scope, local_tys, inferred)
-                })
-            }
-        }
+        Expr::Call { func, args } => type_pure_call(func, args, pure_fns, &mut |arg| {
+            typed_body_expr(arg, pure_fns, kind, spec_scope, local_tys, inferred)
+        }),
         Expr::Field { base, name } => {
             let base = typed_body_expr(
                 expr_base(base),
@@ -2924,11 +2726,6 @@ fn visit_pure_fn_expr(
                 visit_pure_fn_expr(arg, pure_fns, visiting, visited, ordered);
             }
         }
-        TypedExprKind::BuiltinCall { args, .. } => {
-            for arg in args {
-                visit_pure_fn_expr(arg, pure_fns, visiting, visited, ordered);
-            }
-        }
         TypedExprKind::Field { base, .. }
         | TypedExprKind::TupleField { base, .. }
         | TypedExprKind::Deref { base }
@@ -3255,27 +3052,20 @@ fn validate_contract_expr_core(
             )
             .map_err(|err| err.message),
         Expr::Call { func, args } => {
-            if let Some(_builtin) = BuiltinFn::from_name(func) {
-                for arg in args {
-                    validate_contract_expr_core(arg, pure_fns, spec_scope, params, allow_result)?;
-                }
-                Ok(())
-            } else {
-                let Some(def) = pure_fns.get(func) else {
-                    return Err(format!("unknown pure function `{func}`"));
-                };
-                if def.params.len() != args.len() {
-                    return Err(format!(
-                        "pure function `{func}` expects {} arguments, found {}",
-                        def.params.len(),
-                        args.len()
-                    ));
-                }
-                for arg in args {
-                    validate_contract_expr_core(arg, pure_fns, spec_scope, params, allow_result)?;
-                }
-                Ok(())
+            let Some(def) = pure_fns.get(func) else {
+                return Err(format!("unknown pure function `{func}`"));
+            };
+            if def.params.len() != args.len() {
+                return Err(format!(
+                    "pure function `{func}` expects {} arguments, found {}",
+                    def.params.len(),
+                    args.len()
+                ));
             }
+            for arg in args {
+                validate_contract_expr_core(arg, pure_fns, spec_scope, params, allow_result)?;
+            }
+            Ok(())
         }
         Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Deref { base } => {
             validate_contract_expr_core(base, pure_fns, spec_scope, params, allow_result)
@@ -3353,35 +3143,28 @@ fn resolve_expr_env_into(
             Ok(())
         }
         Expr::Call { func, args } => {
-            if BuiltinFn::from_name(func).is_some() {
-                for arg in args {
-                    resolve_expr_env_into(arg, ctx, resolved)?;
-                }
-                Ok(())
-            } else {
-                let Some(def) = ctx.pure_fns.get(func) else {
-                    return Err(LoopPrepassError {
-                        span: ctx.span,
-                        display_span: None,
-                        message: format!("unknown pure function `{func}`"),
-                    });
-                };
-                if def.params.len() != args.len() {
-                    return Err(LoopPrepassError {
-                        span: ctx.span,
-                        display_span: None,
-                        message: format!(
-                            "pure function `{func}` expects {} arguments, found {}",
-                            def.params.len(),
-                            args.len()
-                        ),
-                    });
-                }
-                for arg in args {
-                    resolve_expr_env_into(arg, ctx, resolved)?;
-                }
-                Ok(())
+            let Some(def) = ctx.pure_fns.get(func) else {
+                return Err(LoopPrepassError {
+                    span: ctx.span,
+                    display_span: None,
+                    message: format!("unknown pure function `{func}`"),
+                });
+            };
+            if def.params.len() != args.len() {
+                return Err(LoopPrepassError {
+                    span: ctx.span,
+                    display_span: None,
+                    message: format!(
+                        "pure function `{func}` expects {} arguments, found {}",
+                        def.params.len(),
+                        args.len()
+                    ),
+                });
             }
+            for arg in args {
+                resolve_expr_env_into(arg, ctx, resolved)?;
+            }
+            Ok(())
         }
         Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Deref { base } => {
             resolve_expr_env_into(base, ctx, resolved)

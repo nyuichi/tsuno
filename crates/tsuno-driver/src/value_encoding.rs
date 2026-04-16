@@ -5,14 +5,13 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use crate::spec::{SpecTy, StructTy};
-use z3::ast::{Bool, Dynamic, Int, Seq};
+use z3::ast::{Bool, Dynamic, Int};
 use z3::{FuncDecl, Solver, Sort};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SymValue {
     Bool(Bool),
     Int(Int),
-    Seq(Seq),
     Inductive(InductiveValue),
 }
 
@@ -33,7 +32,6 @@ pub(crate) struct TypeEncoding {
 pub(crate) enum TypeEncodingKind {
     Bool(PrimitiveEncoding),
     Int(PrimitiveEncoding),
-    Seq,
     Inductive(Rc<InductiveEncoding>),
 }
 
@@ -140,13 +138,6 @@ impl ValueEncoder {
                     solver,
                 )),
             },
-            SpecTy::Seq(inner) => {
-                let elem = self.type_encoding(inner, solver)?;
-                TypeEncoding {
-                    sort: Sort::seq(&elem.sort),
-                    kind: TypeEncodingKind::Seq,
-                }
-            }
             SpecTy::Tuple(_) | SpecTy::Struct(_) | SpecTy::Ref(_) | SpecTy::Mut(_) => {
                 let inductive = self.build_inductive_encoding(ty, solver)?;
                 TypeEncoding {
@@ -262,7 +253,6 @@ impl ValueEncoder {
             SpecTy::U32 => "u32".to_owned(),
             SpecTy::U64 => "u64".to_owned(),
             SpecTy::Usize => "usize".to_owned(),
-            SpecTy::Seq(inner) => format!("seq_{}", self.sort_name(inner)),
             SpecTy::Tuple(items) => format!(
                 "tuple_{}",
                 items
