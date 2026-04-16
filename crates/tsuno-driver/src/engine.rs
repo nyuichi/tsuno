@@ -31,10 +31,8 @@ use rustc_middle::mir::{
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::source_map::Spanned;
 use rustc_span::{DUMMY_SP, Span};
-use z3::ast::{Ast, Bool, Datatype, Dynamic, Int, Seq};
-use z3::{
-    DatatypeAccessor, DatatypeBuilder, DatatypeSort, FuncDecl, SatResult, Solver, Sort, SortKind,
-};
+use z3::ast::{Ast, Bool, Dynamic, Int, Seq};
+use z3::{FuncDecl, Pattern, SatResult, Solver, Sort, SortKind};
 
 use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
@@ -44,57 +42,22 @@ use crate::prepass::{
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{BinaryOp, BuiltinFn, SpecTy, TypedExpr, TypedExprKind, UnaryOp};
+use crate::value_encoding::{
+    InductiveEncoding, InductiveValue, SymValue, TypeEncoding, TypeEncodingKind, ValueEncoder,
+};
 
 thread_local! {
     static GLOBAL_SOLVER: Solver = {
         init_z3();
         let solver = Solver::new();
         let mut params = z3::Params::new();
-        params.set_u32("timeout", 1_000);
+        params.set_u32("timeout", 5_000);
         solver.set_params(&params);
         solver
     };
 }
 
 static Z3_INIT: Once = Once::new();
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SymValue {
-    Bool(Bool),
-    Int(Int),
-    Seq(Seq),
-    Datatype(Datatype),
-}
-
-#[derive(Debug)]
-struct TypeEncoding {
-    sort: Sort,
-    kind: TypeEncodingKind,
-}
-
-#[derive(Debug)]
-enum TypeEncodingKind {
-    Bool,
-    Int,
-    Seq,
-    Datatype(Rc<DatatypeEncoding>),
-}
-
-#[derive(Debug)]
-struct DatatypeEncoding {
-    sort: DatatypeSort,
-    fields: Vec<Rc<TypeEncoding>>,
-}
-
-impl DatatypeEncoding {
-    fn constructor(&self) -> &z3::FuncDecl {
-        &self.sort.variants[0].constructor
-    }
-
-    fn accessor(&self, index: usize) -> &z3::FuncDecl {
-        &self.sort.variants[0].accessors[index]
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ControlPoint {
@@ -122,6 +85,12 @@ enum AssertionKind {
     Existential,
 }
 
+#[derive(Debug)]
+struct SeqPredicateEncoding {
+    invariant: FuncDecl,
+    resolve: FuncDecl,
+}
+
 pub struct Verifier<'tcx> {
     tcx: TyCtxt<'tcx>,
     def_id: Option<LocalDefId>,
@@ -133,7 +102,8 @@ pub struct Verifier<'tcx> {
     pure_fns: HashMap<String, TypedPureFnDef>,
     lemmas: HashMap<String, TypedLemmaDef>,
     next_sym: Cell<usize>,
-    type_encodings: RefCell<BTreeMap<SpecTy, Rc<TypeEncoding>>>,
+    value_encoder: ValueEncoder,
+    seq_predicates: RefCell<BTreeMap<SpecTy, Rc<SeqPredicateEncoding>>>,
 }
 
 pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<VerificationResult> {
@@ -183,7 +153,8 @@ impl<'tcx> Verifier<'tcx> {
             pure_fns: HashMap::new(),
             lemmas: HashMap::new(),
             next_sym: Cell::new(0),
-            type_encodings: RefCell::new(BTreeMap::new()),
+            value_encoder: ValueEncoder::new(),
+            seq_predicates: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -1950,7 +1921,7 @@ impl<'tcx> Verifier<'tcx> {
                 SymValue::Bool(value) => Seq::unit(value),
                 SymValue::Int(value) => Seq::unit(value),
                 SymValue::Seq(value) => Seq::unit(value),
-                SymValue::Datatype(value) => Seq::unit(value),
+                SymValue::Inductive(value) => Seq::unit(&value.ast),
             })),
         }
     }
@@ -2456,8 +2427,10 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Bool, VerificationResult> {
         match &encoding.kind {
-            TypeEncodingKind::Bool => Ok(self.value_bool_data(lhs).eq(self.value_bool_data(rhs))),
-            TypeEncodingKind::Int => Ok(self.value_int_data(lhs).eq(self.value_int_data(rhs))),
+            TypeEncodingKind::Bool(_) => {
+                Ok(self.value_bool_data(lhs).eq(self.value_bool_data(rhs)))
+            }
+            TypeEncodingKind::Int(_) => Ok(self.value_int_data(lhs).eq(self.value_int_data(rhs))),
             TypeEncodingKind::Seq => {
                 let (SymValue::Seq(lhs), SymValue::Seq(rhs)) = (lhs, rhs) else {
                     return Err(self.unsupported_result(
@@ -2467,14 +2440,32 @@ impl<'tcx> Verifier<'tcx> {
                 };
                 Ok(lhs.eq(rhs))
             }
-            TypeEncodingKind::Datatype(_) => {
-                let (SymValue::Datatype(lhs), SymValue::Datatype(rhs)) = (lhs, rhs) else {
+            TypeEncodingKind::Inductive(inductive) => {
+                let (SymValue::Inductive(lhs), SymValue::Inductive(rhs)) = (lhs, rhs) else {
                     return Err(self.unsupported_result(
                         span,
                         "expected datatype values for equality".to_owned(),
                     ));
                 };
-                Ok(lhs.eq(rhs))
+                if let (Some(lhs_fields), Some(rhs_fields)) = (&lhs.fields, &rhs.fields) {
+                    let mut equalities = Vec::with_capacity(inductive.fields.len());
+                    for ((field_encoding, lhs_field), rhs_field) in inductive
+                        .fields
+                        .iter()
+                        .zip(lhs_fields.iter())
+                        .zip(rhs_fields.iter())
+                    {
+                        equalities.push(self.eq_for_encoding(
+                            field_encoding,
+                            lhs_field,
+                            rhs_field,
+                            span,
+                        )?);
+                    }
+                    Ok(bool_and(equalities))
+                } else {
+                    Ok(lhs.ast.eq(&rhs.ast))
+                }
             }
         }
     }
@@ -2532,122 +2523,13 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn type_encoding(&self, ty: &SpecTy) -> Result<Rc<TypeEncoding>, VerificationResult> {
-        if let Some(encoding) = self.type_encodings.borrow().get(ty).cloned() {
-            return Ok(encoding);
-        }
-        let encoding = self.build_type_encoding(ty)?;
-        self.type_encodings
-            .borrow_mut()
-            .insert(ty.clone(), encoding.clone());
-        Ok(encoding)
+        with_solver(|solver| self.value_encoder.type_encoding(ty, solver))
+            .map_err(|err| self.unsupported_result(self.report_span(), err))
     }
 
-    fn datatype_encoding(&self, ty: &SpecTy) -> Result<Rc<DatatypeEncoding>, VerificationResult> {
-        let encoding = self.type_encoding(ty)?;
-        match &encoding.kind {
-            TypeEncodingKind::Datatype(encoding) => Ok(encoding.clone()),
-            _ => Err(self.unsupported_result(
-                self.report_span(),
-                format!("expected datatype-backed spec type, found {ty:?}"),
-            )),
-        }
-    }
-
-    fn build_type_encoding(&self, ty: &SpecTy) -> Result<Rc<TypeEncoding>, VerificationResult> {
-        let encoding = match ty {
-            SpecTy::Bool => TypeEncoding {
-                sort: Sort::bool(),
-                kind: TypeEncodingKind::Bool,
-            },
-            SpecTy::IntLiteral
-            | SpecTy::I8
-            | SpecTy::I16
-            | SpecTy::I32
-            | SpecTy::I64
-            | SpecTy::Isize
-            | SpecTy::U8
-            | SpecTy::U16
-            | SpecTy::U32
-            | SpecTy::U64
-            | SpecTy::Usize => TypeEncoding {
-                sort: Sort::int(),
-                kind: TypeEncodingKind::Int,
-            },
-            SpecTy::Seq(inner) => {
-                let elem = self.type_encoding(inner)?;
-                TypeEncoding {
-                    sort: Sort::seq(&elem.sort),
-                    kind: TypeEncodingKind::Seq,
-                }
-            }
-            SpecTy::Tuple(_) | SpecTy::Struct(_) | SpecTy::Ref(_) | SpecTy::Mut(_) => {
-                let datatype = self.build_datatype_encoding(ty)?;
-                TypeEncoding {
-                    sort: datatype.sort.sort.clone(),
-                    kind: TypeEncodingKind::Datatype(datatype),
-                }
-            }
-        };
-        Ok(Rc::new(encoding))
-    }
-
-    fn build_datatype_encoding(
-        &self,
-        ty: &SpecTy,
-    ) -> Result<Rc<DatatypeEncoding>, VerificationResult> {
-        let field_names = self.datatype_field_names(ty)?;
-        let field_encodings = self.datatype_field_encodings(ty)?;
-        let fields = field_names
-            .iter()
-            .zip(field_encodings.iter())
-            .map(|(name, encoding)| (name.as_str(), DatatypeAccessor::Sort(encoding.sort.clone())))
-            .collect::<Vec<_>>();
-        Ok(Rc::new(DatatypeEncoding {
-            sort: DatatypeBuilder::new(self.sort_name(ty))
-                .variant("mk", fields)
-                .finish(),
-            fields: field_encodings,
-        }))
-    }
-
-    fn datatype_field_names(&self, ty: &SpecTy) -> Result<Vec<String>, VerificationResult> {
-        match ty {
-            SpecTy::Ref(_) => Ok(vec!["deref".to_owned()]),
-            SpecTy::Mut(_) => Ok(vec!["cur".to_owned(), "fin".to_owned()]),
-            SpecTy::Tuple(items) => Ok((0..items.len()).map(|index| format!("_{index}")).collect()),
-            SpecTy::Struct(struct_ty) => Ok(struct_ty
-                .fields
-                .iter()
-                .map(|field| field.name.clone())
-                .collect()),
-            other => Err(self.unsupported_result(
-                self.report_span(),
-                format!("expected datatype-backed spec type, found {other:?}"),
-            )),
-        }
-    }
-
-    fn datatype_field_encodings(
-        &self,
-        ty: &SpecTy,
-    ) -> Result<Vec<Rc<TypeEncoding>>, VerificationResult> {
-        match ty {
-            SpecTy::Ref(inner) => Ok(vec![self.type_encoding(inner)?]),
-            SpecTy::Mut(inner) => {
-                let inner = self.type_encoding(inner)?;
-                Ok(vec![inner.clone(), inner])
-            }
-            SpecTy::Tuple(items) => items.iter().map(|item| self.type_encoding(item)).collect(),
-            SpecTy::Struct(struct_ty) => struct_ty
-                .fields
-                .iter()
-                .map(|field| self.type_encoding(&field.ty))
-                .collect(),
-            other => Err(self.unsupported_result(
-                self.report_span(),
-                format!("expected datatype-backed spec type, found {other:?}"),
-            )),
-        }
+    fn datatype_encoding(&self, ty: &SpecTy) -> Result<Rc<InductiveEncoding>, VerificationResult> {
+        with_solver(|solver| self.value_encoder.inductive_encoding(ty, solver))
+            .map_err(|err| self.unsupported_result(self.report_span(), err))
     }
 
     fn sort_name(&self, ty: &SpecTy) -> String {
@@ -2695,9 +2577,11 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<SymValue, VerificationResult> {
         let encoding = self.datatype_encoding(ty)?;
         let asts = fields.iter().map(sym_value_ast).collect::<Vec<_>>();
-        Ok(SymValue::Datatype(
-            encoding.constructor().apply(&asts).as_datatype().unwrap(),
-        ))
+        Ok(SymValue::Inductive(InductiveValue {
+            ty: ty.clone(),
+            ast: encoding.constructor.apply(&asts),
+            fields: Some(fields.to_vec()),
+        }))
     }
 
     fn decode_value(
@@ -2707,21 +2591,32 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
         match &encoding.kind {
-            TypeEncodingKind::Bool => value
+            TypeEncodingKind::Bool(_) => value
                 .as_bool()
                 .map(SymValue::Bool)
                 .ok_or_else(|| self.unsupported_result(span, "expected bool Z3 value".to_owned())),
-            TypeEncodingKind::Int => value
+            TypeEncodingKind::Int(_) => value
                 .as_int()
                 .map(SymValue::Int)
                 .ok_or_else(|| self.unsupported_result(span, "expected int Z3 value".to_owned())),
             TypeEncodingKind::Seq => value.as_seq().map(SymValue::Seq).ok_or_else(|| {
                 self.unsupported_result(span, "expected sequence Z3 value".to_owned())
             }),
-            TypeEncodingKind::Datatype(_) => {
-                value.as_datatype().map(SymValue::Datatype).ok_or_else(|| {
-                    self.unsupported_result(span, "expected datatype Z3 value".to_owned())
-                })
+            TypeEncodingKind::Inductive(inductive) => {
+                let mut fields = Vec::with_capacity(inductive.fields.len());
+                for (index, field_encoding) in inductive.fields.iter().enumerate() {
+                    let field_value = self.decode_value(
+                        field_encoding,
+                        inductive.accessors[index].apply(&[&value]),
+                        span,
+                    )?;
+                    fields.push(field_value);
+                }
+                Ok(SymValue::Inductive(InductiveValue {
+                    ty: inductive.ty.clone(),
+                    ast: value,
+                    fields: Some(fields),
+                }))
             }
         }
     }
@@ -2806,7 +2701,7 @@ impl<'tcx> Verifier<'tcx> {
         index: usize,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let SymValue::Datatype(value) = value else {
+        let SymValue::Inductive(value) = value else {
             return Err(self.unsupported_result(
                 span,
                 "field projection requires datatype-backed value".to_owned(),
@@ -2817,7 +2712,12 @@ impl<'tcx> Verifier<'tcx> {
             .fields
             .get(index)
             .ok_or_else(|| self.unsupported_result(span, "field index out of range".to_owned()))?;
-        self.decode_value(field, encoding.accessor(index).apply(&[&value]), span)
+        if let Some(fields) = &value.fields {
+            return fields.get(index).cloned().ok_or_else(|| {
+                self.unsupported_result(span, "field index out of range".to_owned())
+            });
+        }
+        self.decode_value(field, encoding.accessors[index].apply(&[&value.ast]), span)
     }
 
     fn ref_deref(
@@ -2826,13 +2726,16 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let SymValue::Datatype(value) = value else {
+        let SymValue::Inductive(value) = value else {
             return Err(self.unsupported_result(span, "expected shared reference value".to_owned()));
         };
         let encoding = self.datatype_encoding(&SpecTy::Ref(Box::new(inner_ty.clone())))?;
+        if let Some(fields) = &value.fields {
+            return Ok(fields[0].clone());
+        }
         self.decode_value(
             &encoding.fields[0],
-            encoding.accessor(0).apply(&[value]),
+            encoding.accessors[0].apply(&[&value.ast]),
             span,
         )
     }
@@ -2843,15 +2746,18 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let SymValue::Datatype(value) = value else {
+        let SymValue::Inductive(value) = value else {
             return Err(
                 self.unsupported_result(span, "expected mutable reference value".to_owned())
             );
         };
         let encoding = self.datatype_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
+        if let Some(fields) = &value.fields {
+            return Ok(fields[0].clone());
+        }
         self.decode_value(
             &encoding.fields[0],
-            encoding.accessor(0).apply(&[value]),
+            encoding.accessors[0].apply(&[&value.ast]),
             span,
         )
     }
@@ -2862,15 +2768,18 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let SymValue::Datatype(value) = value else {
+        let SymValue::Inductive(value) = value else {
             return Err(
                 self.unsupported_result(span, "expected mutable reference value".to_owned())
             );
         };
         let encoding = self.datatype_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
+        if let Some(fields) = &value.fields {
+            return Ok(fields[1].clone());
+        }
         self.decode_value(
             &encoding.fields[1],
-            encoding.accessor(1).apply(&[value]),
+            encoding.accessors[1].apply(&[&value.ast]),
             span,
         )
     }
@@ -3112,16 +3021,31 @@ impl<'tcx> Verifier<'tcx> {
             | SpecTy::U64
             | SpecTy::Usize => self.int_range_formula_for_spec_ty(ty, value, span),
             SpecTy::Ref(inner) => {
+                let mut formulas = vec![self.inductive_tag_formula(ty, value, span)?];
                 let deref_value = self.ref_deref(value, inner, span)?;
-                self.spec_ty_formula(inner, &deref_value, span)
+                if let Some(formula) = self.spec_ty_formula(inner, &deref_value, span)? {
+                    formulas.push(formula);
+                }
+                Ok(Some(bool_and(formulas)))
             }
             SpecTy::Mut(inner) => {
+                let mut formulas = vec![self.inductive_tag_formula(ty, value, span)?];
                 let current = self.mut_cur(value, inner, span)?;
-                self.spec_ty_formula(inner, &current, span)
+                if let Some(formula) = self.spec_ty_formula(inner, &current, span)? {
+                    formulas.push(formula);
+                }
+                Ok(Some(bool_and(formulas)))
             }
-            SpecTy::Seq(item) => Ok(Some(self.list_type_invariant(item, value, span)?)),
+            SpecTy::Seq(item) => {
+                let formula = if self.seq_uses_predicate(item)? {
+                    self.seq_invariant_formula(item, value, span)?
+                } else {
+                    self.list_type_invariant(item, value, span)?
+                };
+                Ok(Some(formula))
+            }
             SpecTy::Tuple(items) => {
-                let mut formulas = Vec::new();
+                let mut formulas = vec![self.inductive_tag_formula(ty, value, span)?];
                 for (index, item) in items.iter().enumerate() {
                     let field = self.project_field(value.clone(), ty, index, span)?;
                     if let Some(formula) = self.spec_ty_formula(item, &field, span)? {
@@ -3135,7 +3059,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
             }
             SpecTy::Struct(struct_ty) => {
-                let mut formulas = Vec::new();
+                let mut formulas = vec![self.inductive_tag_formula(ty, value, span)?];
                 for (index, field_ty) in struct_ty.fields.iter().enumerate() {
                     let field = self.project_field(value.clone(), ty, index, span)?;
                     if let Some(formula) = self.spec_ty_formula(&field_ty.ty, &field, span)? {
@@ -3170,15 +3094,25 @@ impl<'tcx> Verifier<'tcx> {
             | SpecTy::U32
             | SpecTy::U64
             | SpecTy::Usize => Ok(Bool::from_bool(true)),
-            SpecTy::Ref(_) => Ok(Bool::from_bool(true)),
+            SpecTy::Ref(_) => self.inductive_tag_formula(ty, value, span),
             SpecTy::Mut(inner) => {
                 let cur = self.mut_cur(value, inner, span)?;
                 let fin = self.mut_fin(value, inner, span)?;
-                self.eq_for_spec_ty(inner, &cur, &fin, span)
+                Ok(bool_and(vec![
+                    self.inductive_tag_formula(ty, value, span)?,
+                    self.eq_for_spec_ty(inner, &cur, &fin, span)?,
+                ]))
             }
-            SpecTy::Seq(item) => self.list_resolve_formula(item, value, span),
+            SpecTy::Seq(item) => {
+                if self.seq_uses_predicate(item)? {
+                    self.seq_resolve_formula(item, value, span)
+                } else {
+                    self.list_resolve_formula(item, value, span)
+                }
+            }
             SpecTy::Tuple(items) => {
-                let mut formulas = Vec::with_capacity(items.len());
+                let mut formulas = Vec::with_capacity(items.len() + 1);
+                formulas.push(self.inductive_tag_formula(ty, value, span)?);
                 for (index, item) in items.iter().enumerate() {
                     let field = self.project_field(value.clone(), ty, index, span)?;
                     formulas.push(self.resolve_formula_for_spec_ty(item, &field, span)?);
@@ -3186,7 +3120,8 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(bool_and(formulas))
             }
             SpecTy::Struct(struct_ty) => {
-                let mut formulas = Vec::with_capacity(struct_ty.fields.len());
+                let mut formulas = Vec::with_capacity(struct_ty.fields.len() + 1);
+                formulas.push(self.inductive_tag_formula(ty, value, span)?);
                 for (index, field_ty) in struct_ty.fields.iter().enumerate() {
                     let field = self.project_field(value.clone(), ty, index, span)?;
                     formulas.push(self.resolve_formula_for_spec_ty(&field_ty.ty, &field, span)?);
@@ -3194,6 +3129,106 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(bool_and(formulas))
             }
         }
+    }
+
+    fn inductive_tag_formula(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        let SymValue::Inductive(value) = value else {
+            return Err(self.unsupported_result(span, "expected datatype-backed value".to_owned()));
+        };
+        if value.fields.is_some() {
+            return Ok(Bool::from_bool(&value.ty == ty));
+        }
+        let encoding = self.datatype_encoding(ty)?;
+        Ok(self
+            .value_encoder
+            .tag_function()
+            .apply(&[&value.ast])
+            .as_int()
+            .expect("tag result")
+            .eq(&encoding.tag))
+    }
+
+    fn seq_uses_predicate(&self, item: &SpecTy) -> Result<bool, VerificationResult> {
+        Ok(matches!(
+            self.type_encoding(item)?.kind,
+            TypeEncodingKind::Inductive(_)
+        ))
+    }
+
+    fn seq_predicates(
+        &self,
+        item: &SpecTy,
+    ) -> Result<Rc<SeqPredicateEncoding>, VerificationResult> {
+        if let Some(predicates) = self.seq_predicates.borrow().get(item).cloned() {
+            return Ok(predicates);
+        }
+        let predicates = self.build_seq_predicates(item)?;
+        self.seq_predicates
+            .borrow_mut()
+            .insert(item.clone(), predicates.clone());
+        Ok(predicates)
+    }
+
+    fn build_seq_predicates(
+        &self,
+        item: &SpecTy,
+    ) -> Result<Rc<SeqPredicateEncoding>, VerificationResult> {
+        let elem_encoding = self.type_encoding(item)?;
+        let seq_ty = SpecTy::Seq(Box::new(item.clone()));
+        let seq_sort = Sort::seq(&elem_encoding.sort);
+        let invariant = FuncDecl::new(
+            format!("inv_{}", self.sort_name(&seq_ty)),
+            &[&seq_sort],
+            &Sort::bool(),
+        );
+        let resolve = FuncDecl::new(
+            format!("resolve_{}", self.sort_name(&seq_ty)),
+            &[&seq_sort],
+            &Sort::bool(),
+        );
+        Ok(Rc::new(SeqPredicateEncoding { invariant, resolve }))
+    }
+
+    fn seq_invariant_formula(
+        &self,
+        item: &SpecTy,
+        value: &SymValue,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        let SymValue::Seq(seq) = value else {
+            return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
+        };
+        let predicates = self.seq_predicates(item)?;
+        Ok(predicates
+            .invariant
+            .apply(&[seq])
+            .as_bool()
+            .expect("seq invariant application"))
+    }
+
+    fn seq_resolve_formula(
+        &self,
+        item: &SpecTy,
+        value: &SymValue,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        if !spec_ty_contains_mut_ref(item) {
+            return self.seq_invariant_formula(item, value, span);
+        }
+        let SymValue::Seq(seq) = value else {
+            return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
+        };
+        let predicates = self.seq_predicates(item)?;
+        Ok(predicates
+            .resolve
+            .apply(&[seq])
+            .as_bool()
+            .expect("seq resolve application"))
     }
 
     fn list_resolve_formula(
@@ -3207,10 +3242,12 @@ impl<'tcx> Verifier<'tcx> {
         };
         let index = Int::new_const(self.fresh_name("resolve_idx"));
         let elem_encoding = self.type_encoding(item)?;
-        let elem = self.decode_value(&elem_encoding, seq.nth(index.clone()), span)?;
+        let nth = seq.nth(index.clone());
+        let elem = self.decode_value(&elem_encoding, nth.clone(), span)?;
         let body = bool_and(vec![index.ge(0), index.lt(seq.length())])
             .implies(self.resolve_formula_for_spec_ty(item, &elem, span)?);
-        Ok(z3::ast::forall_const(&[&index], &[], &body))
+        let pattern = Pattern::new(&[&nth]);
+        Ok(z3::ast::forall_const(&[&index], &[&pattern], &body))
     }
 
     fn list_type_invariant(
@@ -3224,12 +3261,14 @@ impl<'tcx> Verifier<'tcx> {
         };
         let index = Int::new_const(self.fresh_name("list_inv_idx"));
         let elem_encoding = self.type_encoding(item)?;
-        let elem = self.decode_value(&elem_encoding, seq.nth(index.clone()), span)?;
+        let nth = seq.nth(index.clone());
+        let elem = self.decode_value(&elem_encoding, nth.clone(), span)?;
         let elem_inv = self
             .spec_ty_formula(item, &elem, span)?
             .unwrap_or_else(|| Bool::from_bool(true));
         let body = bool_and(vec![index.ge(0), index.lt(seq.length())]).implies(elem_inv);
-        Ok(z3::ast::forall_const(&[&index], &[], &body))
+        let pattern = Pattern::new(&[&nth]);
+        Ok(z3::ast::forall_const(&[&index], &[&pattern], &body))
     }
 
     fn require_type_invariant(
@@ -3518,6 +3557,6 @@ fn sym_value_ast(value: &SymValue) -> &dyn Ast {
         SymValue::Bool(value) => value,
         SymValue::Int(value) => value,
         SymValue::Seq(value) => value,
-        SymValue::Datatype(value) => value,
+        SymValue::Inductive(value) => &value.ast,
     }
 }
