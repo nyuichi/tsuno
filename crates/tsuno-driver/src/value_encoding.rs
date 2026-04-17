@@ -32,33 +32,39 @@ The backend asserts the following primitive retract axioms:
   forall v: value. (intbox)((int)(v)) = v
     pattern: ((int)(v))
 
-Composite values use one constructor family per spec type. For a spec type whose
-sanitized name is `<name>`, the backend creates:
+Composite values follow the same shape as VeriFast's constructor symbols:
+
+  each composite type gets a fresh subtype id s
+  each constructor family gets a fresh constructor tag k
+
+For a spec type whose sanitized name is `<name>`, the backend creates:
 
   mk_<name>              : value^n -> value
-  proj_<name>_<field_i>  : value -> value
-  ctortag_<name>         : value -> Int
+  ctortag<s>             : value -> Int
+  ctorinv_<name>_<i>     : value -> value
   TAG_<name>             : Int literal unique to the constructor family
 
 and asserts the following axioms:
 
-  forall x0 .. xn-1. ctortag_<name>(mk_<name>(x0, .., xn-1)) = TAG_<name>
+  forall x0 .. xn-1. ctortag<s>(mk_<name>(x0, .., xn-1)) = TAG_<name>
     pattern: mk_<name>(x0, .., xn-1)
 
-  forall x0 .. xn-1. proj_<name>_<field_i>(mk_<name>(x0, .., xn-1)) = xi
+  forall x0 .. xn-1. ctorinv_<name>_<i>(mk_<name>(x0, .., xn-1)) = xi
     pattern: mk_<name>(x0, .., xn-1)
 
 The engine builds type formulas over these symbols:
 
   Bool(v)     := true
   Int_T(v)    := bounds_T((int)(v))
-  Ref_T(v)    := ctortag_ref_T(v) = TAG_ref_T /\ T(proj_ref_T_deref(v))
-  Mut_T(v)    := ctortag_mut_T(v) = TAG_mut_T /\
-                 T(proj_mut_T_cur(v)) /\ T(proj_mut_T_fin(v))
+  Ref_T(v)    := ctortag<s>(v) = TAG_ref_T /\ T(ctorinv_ref_T_0(v))
+  Mut_T(v)    := ctortag<s>(v) = TAG_mut_T /\
+                 T(ctorinv_mut_T_0(v)) /\ T(ctorinv_mut_T_1(v))
   Tuple/Struct values are analogous: tag equality plus recursive field formulas.
 
 This keeps every surface spec value in the single `value` universe while still
-using Z3's native Bool/Int theories for primitive payloads.
+using Z3's native Bool/Int theories for primitive payloads. The engine does not
+pattern-match constructor applications on the Rust side; projections, tags, and
+payload access always go through these solver symbols.
 */
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +118,7 @@ pub(crate) struct ValueEncoder {
     bool_encoding: Rc<PrimitiveEncoding>,
     int_encoding: Rc<PrimitiveEncoding>,
     primitive_axioms_asserted: Cell<bool>,
+    next_subtype_id: Cell<u32>,
     next_ctor_tag: Cell<u32>,
     type_encodings: RefCell<BTreeMap<SpecTy, Rc<TypeEncoding>>>,
 }
@@ -134,6 +141,7 @@ impl ValueEncoder {
             bool_encoding,
             int_encoding,
             primitive_axioms_asserted: Cell::new(false),
+            next_subtype_id: Cell::new(0),
             next_ctor_tag: Cell::new(0),
             type_encodings: RefCell::new(BTreeMap::new()),
         }
@@ -221,8 +229,10 @@ impl ValueEncoder {
         let field_labels = self.composite_field_names(ty)?;
         let field_encodings = self.composite_field_encodings(ty, solver)?;
         let sort_name = self.sort_name(ty);
+        let subtype_id = self.next_subtype_id.get();
+        self.next_subtype_id.set(subtype_id + 1);
         let constructor_name = format!("mk_{sort_name}");
-        let tag_function_name = format!("ctortag_{sort_name}");
+        let tag_function_name = format!("ctortag{subtype_id}");
         let tag = Int::from_u64(u64::from(self.next_ctor_tag.get()));
         self.next_ctor_tag.set(self.next_ctor_tag.get() + 1);
 
@@ -236,7 +246,7 @@ impl ValueEncoder {
             .zip(field_encodings.iter())
             .map(|(label, field)| {
                 FuncDecl::new(
-                    format!("proj_{sort_name}_{label}"),
+                    format!("ctorinv_{sort_name}_{label}"),
                     &[&self.value_sort],
                     &field.sort,
                 )
@@ -660,5 +670,26 @@ mod tests {
         solver.assert(tuple_tag.eq(&tuple_encoding.tag).not());
         assert_eq!(solver.check(), SatResult::Unsat);
         solver.pop(1);
+    }
+
+    #[test]
+    fn composite_symbols_follow_verifast_style_naming() {
+        let solver = Solver::new();
+        let encoder = ValueEncoder::new(64);
+        let tuple_encoding = encoder
+            .composite_encoding(&SpecTy::Tuple(vec![SpecTy::Bool, SpecTy::I32]), &solver)
+            .expect("tuple encoding");
+
+        let tag_name = tuple_encoding.tag_function.name();
+        assert!(tag_name.starts_with("ctortag"));
+        assert!(
+            tag_name["ctortag".len()..]
+                .chars()
+                .all(|ch| ch.is_ascii_digit())
+        );
+
+        for inverse in &tuple_encoding.accessors {
+            assert!(inverse.name().starts_with("ctorinv"));
+        }
     }
 }

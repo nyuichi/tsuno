@@ -55,14 +55,6 @@ thread_local! {
         solver.set_params(&params);
         solver
     };
-    static PLAIN_SOLVER: Solver = {
-        init_z3();
-        let solver = Solver::new();
-        let mut params = z3::Params::new();
-        params.set_u32("timeout", 1_000);
-        solver.set_params(&params);
-        solver
-    };
 }
 
 static Z3_INIT: Once = Once::new();
@@ -83,7 +75,7 @@ pub struct State {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BoolExpr {
     Const(bool),
-    Value(SymValue),
+    Formula(Bool),
     Not(Box<BoolExpr>),
 }
 
@@ -457,12 +449,12 @@ impl<'tcx> Verifier<'tcx> {
                     let branch = match discr.ty(self.body(), self.tcx).kind() {
                         TyKind::Bool => {
                             if value == 0 {
-                                not_expr(BoolExpr::Value(discr_value.clone()))
+                                not_expr(BoolExpr::Formula(self.value_is_true(&discr_value)))
                             } else {
-                                BoolExpr::Value(discr_value.clone())
+                                BoolExpr::Formula(self.value_is_true(&discr_value))
                             }
                         }
-                        _ => BoolExpr::Value(self.value_wrap_bool(&self.eq_for_spec_ty(
+                        _ => BoolExpr::Formula(self.eq_for_spec_ty(
                             &self.spec_ty_for_place_ty(
                                 discr.ty(&self.body().local_decls, self.tcx),
                                 term.source_info.span,
@@ -470,7 +462,7 @@ impl<'tcx> Verifier<'tcx> {
                             &discr_value,
                             &self.value_int(value as i64),
                             term.source_info.span,
-                        )?)),
+                        )?),
                     };
                     let branch = self.bool_expr_to_z3(&branch)?;
                     seen_conditions.push(branch.clone());
@@ -501,7 +493,7 @@ impl<'tcx> Verifier<'tcx> {
                 ..
             } => {
                 let cond_value = self.eval_operand(&mut state, cond, term.source_info.span)?;
-                let mut formula = BoolExpr::Value(cond_value);
+                let mut formula = BoolExpr::Formula(self.value_is_true(&cond_value));
                 if !*expected {
                     formula = not_expr(formula);
                 }
@@ -1656,9 +1648,81 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<BoolExpr, VerificationResult> {
         match &expr.kind {
             TypedExprKind::Bool(value) => Ok(BoolExpr::Const(*value)),
-            _ => Ok(BoolExpr::Value(
-                self.spec_expr_to_value(state, expr, resolved)?,
-            )),
+            TypedExprKind::Unary {
+                op: UnaryOp::Not,
+                arg,
+            } => Ok(not_expr(self.spec_expr_to_bool(state, arg, resolved)?)),
+            TypedExprKind::Binary { op, lhs, rhs } => {
+                let formula = match op {
+                    BinaryOp::And => {
+                        let lhs =
+                            self.bool_expr_to_z3(&self.spec_expr_to_bool(state, lhs, resolved)?)?;
+                        let rhs =
+                            self.bool_expr_to_z3(&self.spec_expr_to_bool(state, rhs, resolved)?)?;
+                        Bool::and(&[&lhs, &rhs])
+                    }
+                    BinaryOp::Or => {
+                        let lhs =
+                            self.bool_expr_to_z3(&self.spec_expr_to_bool(state, lhs, resolved)?)?;
+                        let rhs =
+                            self.bool_expr_to_z3(&self.spec_expr_to_bool(state, rhs, resolved)?)?;
+                        Bool::or(&[&lhs, &rhs])
+                    }
+                    BinaryOp::Eq => {
+                        let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
+                        let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
+                        self.eq_for_spec_ty(
+                            &lhs.ty,
+                            &lhs_value,
+                            &rhs_value,
+                            self.control_span(state.ctrl),
+                        )?
+                    }
+                    BinaryOp::Ne => {
+                        let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
+                        let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
+                        self.eq_for_spec_ty(
+                            &lhs.ty,
+                            &lhs_value,
+                            &rhs_value,
+                            self.control_span(state.ctrl),
+                        )?
+                        .not()
+                    }
+                    BinaryOp::Lt => {
+                        let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
+                        let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
+                        self.value_int_data(&lhs_value)
+                            .lt(self.value_int_data(&rhs_value))
+                    }
+                    BinaryOp::Le => {
+                        let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
+                        let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
+                        self.value_int_data(&lhs_value)
+                            .le(self.value_int_data(&rhs_value))
+                    }
+                    BinaryOp::Gt => {
+                        let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
+                        let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
+                        self.value_int_data(&lhs_value)
+                            .gt(self.value_int_data(&rhs_value))
+                    }
+                    BinaryOp::Ge => {
+                        let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
+                        let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
+                        self.value_int_data(&lhs_value)
+                            .ge(self.value_int_data(&rhs_value))
+                    }
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
+                        let value = self.spec_expr_to_value(state, expr, resolved)?;
+                        self.value_is_true(&value)
+                    }
+                };
+                Ok(BoolExpr::Formula(formula))
+            }
+            _ => Ok(BoolExpr::Formula(self.value_is_true(
+                &self.spec_expr_to_value(state, expr, resolved)?,
+            ))),
         }
     }
 
@@ -1763,9 +1827,71 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<BoolExpr, VerificationResult> {
         match &expr.kind {
             TypedExprKind::Bool(value) => Ok(BoolExpr::Const(*value)),
-            _ => Ok(BoolExpr::Value(
-                self.contract_expr_to_value(current, spec, expr)?,
-            )),
+            TypedExprKind::Unary {
+                op: UnaryOp::Not,
+                arg,
+            } => Ok(not_expr(self.contract_expr_to_bool(current, spec, arg)?)),
+            TypedExprKind::Binary { op, lhs, rhs } => {
+                let formula = match op {
+                    BinaryOp::And => {
+                        let lhs =
+                            self.bool_expr_to_z3(&self.contract_expr_to_bool(current, spec, lhs)?)?;
+                        let rhs =
+                            self.bool_expr_to_z3(&self.contract_expr_to_bool(current, spec, rhs)?)?;
+                        Bool::and(&[&lhs, &rhs])
+                    }
+                    BinaryOp::Or => {
+                        let lhs =
+                            self.bool_expr_to_z3(&self.contract_expr_to_bool(current, spec, lhs)?)?;
+                        let rhs =
+                            self.bool_expr_to_z3(&self.contract_expr_to_bool(current, spec, rhs)?)?;
+                        Bool::or(&[&lhs, &rhs])
+                    }
+                    BinaryOp::Eq => {
+                        let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
+                        let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
+                        self.eq_for_spec_ty(&lhs.ty, &lhs_value, &rhs_value, self.report_span())?
+                    }
+                    BinaryOp::Ne => {
+                        let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
+                        let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
+                        self.eq_for_spec_ty(&lhs.ty, &lhs_value, &rhs_value, self.report_span())?
+                            .not()
+                    }
+                    BinaryOp::Lt => {
+                        let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
+                        let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
+                        self.value_int_data(&lhs_value)
+                            .lt(self.value_int_data(&rhs_value))
+                    }
+                    BinaryOp::Le => {
+                        let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
+                        let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
+                        self.value_int_data(&lhs_value)
+                            .le(self.value_int_data(&rhs_value))
+                    }
+                    BinaryOp::Gt => {
+                        let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
+                        let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
+                        self.value_int_data(&lhs_value)
+                            .gt(self.value_int_data(&rhs_value))
+                    }
+                    BinaryOp::Ge => {
+                        let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
+                        let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
+                        self.value_int_data(&lhs_value)
+                            .ge(self.value_int_data(&rhs_value))
+                    }
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
+                        let value = self.contract_expr_to_value(current, spec, expr)?;
+                        self.value_is_true(&value)
+                    }
+                };
+                Ok(BoolExpr::Formula(formula))
+            }
+            _ => Ok(BoolExpr::Formula(self.value_is_true(
+                &self.contract_expr_to_value(current, spec, expr)?,
+            ))),
         }
     }
 
@@ -1933,23 +2059,12 @@ impl<'tcx> Verifier<'tcx> {
                     self.add_path_condition(state, constraint);
                     Ok(())
                 }
-                SatResult::Unknown => {
-                    if self.ast_uses_encoded_symbols(&state.pc)
-                        || self.ast_uses_encoded_symbols(&constraint)
-                    {
-                        Err(VerificationResult {
-                            function: self.report_function(),
-                            status: VerificationStatus::Fail,
-                            span: diagnostic_span,
-                            message,
-                        })
-                    } else {
-                        Err(self.unknown_result(
-                            span,
-                            "solver returned unknown while checking assertion".to_owned(),
-                        ))
-                    }
-                }
+                SatResult::Unknown => Err(VerificationResult {
+                    function: self.report_function(),
+                    status: VerificationStatus::Fail,
+                    span: diagnostic_span,
+                    message,
+                }),
             },
             AssertionKind::Existential => {
                 match self.check_sat(&[state.pc.clone(), constraint.clone()]) {
@@ -1963,10 +2078,11 @@ impl<'tcx> Verifier<'tcx> {
                         span: diagnostic_span,
                         message,
                     }),
-                    SatResult::Unknown => Err(self.unknown_result(
-                        span,
-                        "solver returned unknown while checking assertion".to_owned(),
-                    )),
+                    SatResult::Unknown => {
+                        let _ = span;
+                        self.add_path_condition(state, constraint);
+                        Ok(())
+                    }
                 }
             }
         }
@@ -2038,19 +2154,21 @@ impl<'tcx> Verifier<'tcx> {
 
     fn check_sat(&self, assumptions: &[Bool]) -> SatResult {
         let assumptions = assumptions.iter().map(Bool::simplify).collect::<Vec<_>>();
-        if assumptions
-            .iter()
-            .all(|assumption| !self.ast_uses_encoded_symbols(assumption))
-        {
-            return with_plain_solver(|solver| solver.check_assumptions(&assumptions));
-        }
-        with_solver(|solver| solver.check_assumptions(&assumptions))
+        with_solver(|solver| {
+            solver.push();
+            for assumption in &assumptions {
+                solver.assert(assumption);
+            }
+            let result = solver.check();
+            solver.pop(1);
+            result
+        })
     }
 
     fn bool_expr_to_z3(&self, expr: &BoolExpr) -> Result<Bool, VerificationResult> {
         match expr {
             BoolExpr::Const(value) => Ok(Bool::from_bool(*value)),
-            BoolExpr::Value(value) => Ok(self.value_is_true(value)),
+            BoolExpr::Formula(formula) => Ok(formula.clone()),
             BoolExpr::Not(arg) => Ok(self.bool_expr_to_z3(arg)?.not()),
         }
     }
@@ -2259,15 +2377,6 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn value_int_data(&self, value: &SymValue) -> Int {
-        if value.ast.decl().name() == "(intbox)" {
-            return value
-                .ast
-                .children()
-                .into_iter()
-                .next()
-                .and_then(|child| child.as_int())
-                .expect("intbox payload");
-        }
         self.int_primitive_encoding()
             .unboxed
             .apply(&[&value.ast])
@@ -2276,15 +2385,6 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn value_bool_data(&self, value: &SymValue) -> Bool {
-        if value.ast.decl().name() == "(boolbox)" {
-            return value
-                .ast
-                .children()
-                .into_iter()
-                .next()
-                .and_then(|child| child.as_bool())
-                .expect("boolbox payload");
-        }
         self.bool_primitive_encoding()
             .unboxed
             .apply(&[&value.ast])
@@ -2328,42 +2428,14 @@ impl<'tcx> Verifier<'tcx> {
         encoding: &TypeEncoding,
         lhs: &SymValue,
         rhs: &SymValue,
-        span: Span,
+        _span: Span,
     ) -> Result<Bool, VerificationResult> {
         match &encoding.kind {
             TypeEncodingKind::Bool(_) => {
                 Ok(self.value_bool_data(lhs).eq(self.value_bool_data(rhs)))
             }
             TypeEncodingKind::Int(_) => Ok(self.value_int_data(lhs).eq(self.value_int_data(rhs))),
-            TypeEncodingKind::Composite(composite) => {
-                let lhs_fields = self.composite_children(composite, lhs);
-                let rhs_fields = self.composite_children(composite, rhs);
-                match (lhs_fields, rhs_fields) {
-                    (Some(lhs_fields), Some(rhs_fields)) => {
-                        let mut formulas = Vec::with_capacity(composite.fields.len());
-                        for (index, field_encoding) in composite.fields.iter().enumerate() {
-                            let lhs_field =
-                                self.decode_value(field_encoding, lhs_fields[index].clone(), span)?;
-                            let rhs_field =
-                                self.decode_value(field_encoding, rhs_fields[index].clone(), span)?;
-                            formulas.push(self.eq_for_encoding(
-                                field_encoding,
-                                &lhs_field,
-                                &rhs_field,
-                                span,
-                            )?);
-                        }
-                        Ok(bool_and(formulas))
-                    }
-                    _ if self.known_value_constructor_name(&lhs.ast)
-                        && self.known_value_constructor_name(&rhs.ast)
-                        && lhs.ast.decl().name() != rhs.ast.decl().name() =>
-                    {
-                        Ok(Bool::from_bool(false))
-                    }
-                    _ => Ok(lhs.ast.eq(&rhs.ast)),
-                }
-            }
+            TypeEncodingKind::Composite(_) => Ok(lhs.ast.eq(&rhs.ast)),
         }
     }
 
@@ -2869,9 +2941,6 @@ impl<'tcx> Verifier<'tcx> {
             .fields
             .get(index)
             .ok_or_else(|| self.unsupported_result(span, "field index out of range".to_owned()))?;
-        if let Some(children) = self.composite_children(encoding, value) {
-            return self.decode_value(field_encoding, children[index].clone(), span);
-        }
         self.decode_value(
             field_encoding,
             encoding.accessors[index].apply(&[&value.ast]),
@@ -2885,59 +2954,12 @@ impl<'tcx> Verifier<'tcx> {
         value: &SymValue,
         _span: Span,
     ) -> Result<Bool, VerificationResult> {
-        if let Some(name) = self.known_value_decl_name(&value.ast) {
-            if name == encoding.constructor_name {
-                return Ok(Bool::from_bool(true));
-            }
-            if self.known_value_constructor_name(&value.ast) {
-                return Ok(Bool::from_bool(false));
-            }
-        }
         Ok(encoding
             .tag_function
             .apply(&[&value.ast])
             .as_int()
             .expect("tag result")
             .eq(&encoding.tag))
-    }
-
-    fn composite_children(
-        &self,
-        encoding: &CompositeEncoding,
-        value: &SymValue,
-    ) -> Option<Vec<Dynamic>> {
-        let name = self.known_value_decl_name(&value.ast)?;
-        if name == encoding.constructor_name {
-            Some(value.ast.children())
-        } else {
-            None
-        }
-    }
-
-    fn known_value_decl_name(&self, value: &Dynamic) -> Option<String> {
-        Some(value.decl().name())
-    }
-
-    fn known_value_constructor_name(&self, value: &Dynamic) -> bool {
-        let name = value.decl().name();
-        name == "(boolbox)" || name == "(intbox)" || name.starts_with("mk_")
-    }
-
-    fn ast_uses_encoded_symbols(&self, ast: &dyn Ast) -> bool {
-        let name = ast.decl().name();
-        if name == "(boolbox)"
-            || name == "(bool)"
-            || name == "(intbox)"
-            || name == "(int)"
-            || name.starts_with("mk_")
-            || name.starts_with("proj_")
-            || name.starts_with("ctortag_")
-        {
-            return true;
-        }
-        ast.children()
-            .iter()
-            .any(|child| self.ast_uses_encoded_symbols(child))
     }
 
     fn require_type_invariant(
@@ -2988,15 +3010,6 @@ impl<'tcx> Verifier<'tcx> {
         VerificationResult {
             function: self.report_function(),
             status: VerificationStatus::Unsupported,
-            span: span_text(self.tcx, span),
-            message,
-        }
-    }
-
-    fn unknown_result(&self, span: Span, message: String) -> VerificationResult {
-        VerificationResult {
-            function: self.report_function(),
-            status: VerificationStatus::Unknown,
             span: span_text(self.tcx, span),
             message,
         }
@@ -3172,17 +3185,10 @@ fn reset_solver() {
     with_solver(|solver| {
         solver.reset();
     });
-    with_plain_solver(|solver| {
-        solver.reset();
-    });
 }
 
 fn with_solver<T>(f: impl FnOnce(&Solver) -> T) -> T {
     GLOBAL_SOLVER.with(|solver| f(solver))
-}
-
-fn with_plain_solver<T>(f: impl FnOnce(&Solver) -> T) -> T {
-    PLAIN_SOLVER.with(|solver| f(solver))
 }
 
 fn bool_and(exprs: Vec<Bool>) -> Bool {
