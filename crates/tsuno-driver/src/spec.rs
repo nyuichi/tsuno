@@ -46,6 +46,12 @@ pub enum TypedExprKind {
         func: String,
         args: Vec<TypedExpr>,
     },
+    CtorCall {
+        enum_name: String,
+        ctor_name: String,
+        ctor_index: usize,
+        args: Vec<TypedExpr>,
+    },
     Field {
         base: Box<TypedExpr>,
         name: String,
@@ -140,6 +146,7 @@ pub enum SpecTy {
     Usize,
     Tuple(Vec<SpecTy>),
     Struct(StructTy),
+    Named(String),
     Ref(Box<SpecTy>),
     Mut(Box<SpecTy>),
 }
@@ -176,8 +183,30 @@ pub struct LemmaDef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GhostBlock {
+    pub enums: Vec<EnumDef>,
     pub pure_fns: Vec<PureFnDef>,
     pub lemmas: Vec<LemmaDef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EnumDef {
+    pub name: String,
+    pub ctors: Vec<EnumCtorDef>,
+}
+
+impl EnumDef {
+    pub fn ctor(&self, name: &str) -> Option<(usize, &EnumCtorDef)> {
+        self.ctors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| ctor.name == name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EnumCtorDef {
+    pub name: String,
+    pub fields: Vec<SpecTy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -381,6 +410,7 @@ enum Token {
     RParen,
     Comma,
     Dot,
+    ColonColon,
     Question,
     Plus,
     Minus,
@@ -467,6 +497,14 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
             '.' => {
                 chars.next();
                 tokens.push(Token::Dot);
+            }
+            ':' => {
+                chars.next();
+                if chars.next() == Some(':') {
+                    tokens.push(Token::ColonColon);
+                } else {
+                    return Err(ParseError::new("unexpected `:` in spec expression"));
+                }
             }
             '?' => {
                 chars.next();
@@ -760,7 +798,25 @@ impl Parser {
                 Ok(Expr::Bind(ident))
             }
             Some(Token::Ident(ident)) => {
-                if !ident.starts_with("__") && self.eat(&Token::LParen) {
+                if self.eat(&Token::ColonColon) {
+                    let Some(Token::Ident(ctor)) = self.next().cloned() else {
+                        return Err(ParseError::new("expected constructor name after `::`"));
+                    };
+                    let func = format!("{ident}::{ctor}");
+                    let mut args = Vec::new();
+                    if self.eat(&Token::LParen) {
+                        if !self.eat(&Token::RParen) {
+                            loop {
+                                args.push(self.parse_expr()?);
+                                if self.eat(&Token::RParen) {
+                                    break;
+                                }
+                                self.expect(&Token::Comma)?;
+                            }
+                        }
+                    }
+                    Ok(Expr::Call { func, args })
+                } else if !ident.starts_with("__") && self.eat(&Token::LParen) {
                     let mut args = Vec::new();
                     if !self.eat(&Token::RParen) {
                         loop {
@@ -821,6 +877,7 @@ pub fn parse_ghost_block(text: &str) -> Result<GhostBlock, ParseError> {
     let mut block = GhostBlock::default();
     while parser.skip_ws() {
         match parser.parse_item()? {
+            GhostItem::Enum(def) => block.enums.push(def),
             GhostItem::PureFn(def) => block.pure_fns.push(def),
             GhostItem::Lemma(def) => block.lemmas.push(def),
         }
@@ -829,6 +886,7 @@ pub fn parse_ghost_block(text: &str) -> Result<GhostBlock, ParseError> {
 }
 
 enum GhostItem {
+    Enum(EnumDef),
     PureFn(PureFnDef),
     Lemma(LemmaDef),
 }
@@ -855,6 +913,10 @@ impl<'a> PureFnParser<'a> {
     }
 
     fn parse_item(&mut self) -> Result<GhostItem, ParseError> {
+        if self.starts_with_keyword("enum") {
+            self.expect_keyword("enum")?;
+            return Ok(GhostItem::Enum(self.parse_enum_def()?));
+        }
         self.expect_keyword("fn")?;
         let name = self.parse_ident()?;
         self.expect_char('(')?;
@@ -881,6 +943,45 @@ impl<'a> PureFnParser<'a> {
             return Ok(GhostItem::PureFn(self.parse_pure_fn_def(name, params)?));
         }
         Ok(GhostItem::Lemma(self.parse_lemma_def(name, params)?))
+    }
+
+    fn parse_enum_def(&mut self) -> Result<EnumDef, ParseError> {
+        let name = self.parse_ident()?;
+        self.expect_char('{')?;
+        let mut ctors = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.eat_char('}') {
+                break;
+            }
+            let ctor_name = self.parse_ident()?;
+            let mut fields = Vec::new();
+            self.skip_ws();
+            if self.eat_char('(') {
+                self.skip_ws();
+                if !self.eat_char(')') {
+                    loop {
+                        fields.push(self.parse_spec_ty()?);
+                        self.skip_ws();
+                        if self.eat_char(')') {
+                            break;
+                        }
+                        self.expect_char(',')?;
+                    }
+                }
+            }
+            ctors.push(EnumCtorDef {
+                name: ctor_name,
+                fields,
+            });
+            self.skip_ws();
+            if self.eat_char(',') {
+                continue;
+            }
+            self.expect_char('}')?;
+            break;
+        }
+        Ok(EnumDef { name, ctors })
     }
 
     fn parse_pure_fn_def(
@@ -922,6 +1023,12 @@ impl<'a> PureFnParser<'a> {
 
     fn parse_spec_ty(&mut self) -> Result<SpecTy, ParseError> {
         let ident = self.parse_ident()?;
+        self.skip_ws();
+        if self.peek_char() == Some('<') {
+            return Err(ParseError::new(format!(
+                "unsupported pure function type `{ident}`"
+            )));
+        }
         match ident.as_str() {
             "bool" => Ok(SpecTy::Bool),
             "i8" => Ok(SpecTy::I8),
@@ -934,9 +1041,7 @@ impl<'a> PureFnParser<'a> {
             "u32" => Ok(SpecTy::U32),
             "u64" => Ok(SpecTy::U64),
             "usize" => Ok(SpecTy::Usize),
-            _ => Err(ParseError::new(format!(
-                "unsupported pure function type `{ident}`"
-            ))),
+            _ => Ok(SpecTy::Named(ident)),
         }
     }
 
@@ -1187,7 +1292,7 @@ impl<'a> PureFnParser<'a> {
 
     fn expect_keyword(&mut self, keyword: &str) -> Result<(), ParseError> {
         self.skip_ws();
-        if self.text[self.cursor..].starts_with(keyword) {
+        if self.starts_with_keyword(keyword) {
             self.cursor += keyword.len();
             Ok(())
         } else {
@@ -1230,13 +1335,27 @@ impl<'a> PureFnParser<'a> {
     fn peek_char(&self) -> Option<char> {
         self.text[self.cursor..].chars().next()
     }
+
+    fn starts_with_keyword(&self, keyword: &str) -> bool {
+        let Some(rest) = self.text.get(self.cursor..) else {
+            return false;
+        };
+        let Some(suffix) = rest.strip_prefix(keyword) else {
+            return false;
+        };
+        suffix
+            .chars()
+            .next()
+            .is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BinaryOp, Expr, GhostBlock, GhostStmt, IntLiteral, IntSuffix, LemmaDef, PureFnDef,
-        PureFnParam, SpecTy, UnaryOp, parse_expr, parse_ghost_block, parse_pure_fn_block,
+        BinaryOp, EnumCtorDef, EnumDef, Expr, GhostBlock, GhostStmt, IntLiteral, IntSuffix,
+        LemmaDef, PureFnDef, PureFnParam, SpecTy, UnaryOp, parse_expr, parse_ghost_block,
+        parse_pure_fn_block,
     };
 
     #[test]
@@ -1387,6 +1506,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_enum_constructor_expression() {
+        let expr = parse_expr("assert", r#"IntList::Cons(1i32, IntList::Nil)"#).expect("expr");
+        assert_eq!(
+            expr,
+            Expr::Call {
+                func: "IntList::Cons".to_owned(),
+                args: vec![
+                    Expr::Int(IntLiteral {
+                        digits: "1".to_owned(),
+                        suffix: Some(IntSuffix::I32),
+                    }),
+                    Expr::Call {
+                        func: "IntList::Nil".to_owned(),
+                        args: vec![],
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
     fn parses_statement_expression_with_trailing_semicolon() {
         let expr = super::parse_statement_expr("assert", r#"{x} == 1i32;"#).expect("expr");
         assert_eq!(
@@ -1470,6 +1610,7 @@ fn add1_done(x: i32)
         assert_eq!(
             block,
             GhostBlock {
+                enums: vec![],
                 pure_fns: vec![PureFnDef {
                     name: "add1".to_owned(),
                     params: vec![PureFnParam {
@@ -1524,6 +1665,60 @@ fn add1_done(x: i32)
                         }),
                     })],
                 }],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_enum_definitions_in_ghost_block() {
+        let block = parse_ghost_block(
+            r#"
+enum IntList {
+    Nil,
+    Cons(i32, IntList),
+}
+
+fn singleton(x: i32) -> IntList {
+    IntList::Cons(x, IntList::Nil)
+}
+"#,
+        )
+        .expect("ghost block");
+        assert_eq!(
+            block,
+            GhostBlock {
+                enums: vec![EnumDef {
+                    name: "IntList".to_owned(),
+                    ctors: vec![
+                        EnumCtorDef {
+                            name: "Nil".to_owned(),
+                            fields: vec![],
+                        },
+                        EnumCtorDef {
+                            name: "Cons".to_owned(),
+                            fields: vec![SpecTy::I32, SpecTy::Named("IntList".to_owned())],
+                        },
+                    ],
+                }],
+                pure_fns: vec![PureFnDef {
+                    name: "singleton".to_owned(),
+                    params: vec![PureFnParam {
+                        name: "x".to_owned(),
+                        ty: SpecTy::I32,
+                    }],
+                    result_ty: SpecTy::Named("IntList".to_owned()),
+                    body: Expr::Call {
+                        func: "IntList::Cons".to_owned(),
+                        args: vec![
+                            Expr::Var("x".to_owned()),
+                            Expr::Call {
+                                func: "IntList::Nil".to_owned(),
+                                args: vec![],
+                            },
+                        ],
+                    },
+                }],
+                lemmas: vec![],
             }
         );
     }

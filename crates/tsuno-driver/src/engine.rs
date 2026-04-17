@@ -30,7 +30,7 @@ use rustc_middle::mir::{
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::source_map::Spanned;
 use rustc_span::{DUMMY_SP, Span};
-use z3::ast::{Ast, Bool, Int};
+use z3::ast::{Ast, Bool, Dynamic, Int};
 use z3::{FuncDecl, SatResult, Solver, SortKind};
 
 use crate::prepass::{
@@ -96,6 +96,9 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
         contracts,
     } = program;
     let mut verifier = Verifier::new(tcx, contracts);
+    for enum_def in ghosts.enums.values() {
+        verifier.value_encoder.register_enum_def(enum_def.clone());
+    }
     for pure_fn in &ghosts.typed_pure_fns {
         if let Err(error) = verifier.load_ghost_function(pure_fn) {
             return vec![VerificationResult {
@@ -754,8 +757,10 @@ impl<'tcx> Verifier<'tcx> {
         let mut current = HashMap::new();
         let mut vars = Vec::with_capacity(pure_fn.params.len());
         for param in &pure_fn.params {
-            let value = self
-                .fresh_for_spec_ty(&param.ty, &format!("pure_{}_{}", pure_fn.name, param.name))?;
+            let value = SymValue::new(Dynamic::new_const(
+                self.fresh_name(&format!("pure_{}_{}", pure_fn.name, param.name)),
+                self.value_encoder.value_sort(),
+            ));
             current.insert(param.name.clone(), value.clone());
             vars.push(value);
         }
@@ -1604,6 +1609,7 @@ impl<'tcx> Verifier<'tcx> {
             | SpecTy::U16
             | SpecTy::U32
             | SpecTy::U64
+            | SpecTy::Named(_)
             | SpecTy::Usize => Ok(value.clone()),
         }
     }
@@ -1737,6 +1743,15 @@ impl<'tcx> Verifier<'tcx> {
                     values.push(self.spec_expr_to_value(state, arg, resolved)?);
                 }
                 self.eval_pure_call(func, values, self.control_span(state.ctrl))
+            }
+            TypedExprKind::CtorCall {
+                ctor_index, args, ..
+            } => {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.spec_expr_to_value(state, arg, resolved)?);
+                }
+                self.construct_composite_ctor(&expr.ty, *ctor_index, &values)
             }
             TypedExprKind::Field { base, index, .. } => {
                 let value = self.spec_expr_to_value(state, base, resolved)?;
@@ -1890,6 +1905,15 @@ impl<'tcx> Verifier<'tcx> {
                     values.push(self.contract_expr_to_value(current, spec, arg)?);
                 }
                 self.eval_pure_call(func, values, self.report_span())
+            }
+            TypedExprKind::CtorCall {
+                ctor_index, args, ..
+            } => {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.contract_expr_to_value(current, spec, arg)?);
+                }
+                self.construct_composite_ctor(&expr.ty, *ctor_index, &values)
             }
             TypedExprKind::Field { base, index, .. } => {
                 let value = self.contract_expr_to_value(current, spec, base)?;
@@ -2122,6 +2146,7 @@ impl<'tcx> Verifier<'tcx> {
             TypedExprKind::Bind(_) => true,
             TypedExprKind::Bool(_) | TypedExprKind::Int(_) | TypedExprKind::Var(_) => false,
             TypedExprKind::PureCall { args, .. } => args.iter().any(Self::expr_has_bind),
+            TypedExprKind::CtorCall { args, .. } => args.iter().any(Self::expr_has_bind),
             TypedExprKind::Field { base, .. }
             | TypedExprKind::TupleField { base, .. }
             | TypedExprKind::Deref { base }
@@ -2348,6 +2373,19 @@ impl<'tcx> Verifier<'tcx> {
             .map_err(|err| self.unsupported_result(self.report_span(), err))
     }
 
+    fn construct_composite_ctor(
+        &self,
+        ty: &SpecTy,
+        ctor_index: usize,
+        fields: &[SymValue],
+    ) -> Result<SymValue, VerificationResult> {
+        with_solver(|solver| {
+            self.value_encoder
+                .construct_composite_ctor(ty, ctor_index, fields, solver)
+        })
+        .map_err(|err| self.unsupported_result(self.report_span(), err))
+    }
+
     fn fresh_for_rust_ty(&self, ty: Ty<'tcx>, hint: &str) -> Result<SymValue, VerificationResult> {
         let spec_ty = spec_ty_for_rust_ty(self.tcx, ty)
             .map_err(|err| self.unsupported_result(self.report_span(), err))?;
@@ -2365,6 +2403,12 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn fresh_for_spec_ty(&self, ty: &SpecTy, hint: &str) -> Result<SymValue, VerificationResult> {
+        if matches!(ty, SpecTy::Named(_)) {
+            return Ok(SymValue::new(Dynamic::new_const(
+                self.fresh_name(hint),
+                self.value_encoder.value_sort(),
+            )));
+        }
         let encoding = self.type_encoding(ty)?;
         self.fresh_for_encoding(&encoding, hint)
     }
@@ -2387,9 +2431,7 @@ impl<'tcx> Verifier<'tcx> {
                     .map_err(|err| self.unsupported_result(self.report_span(), err))?;
                 let mut fields = Vec::with_capacity(ctor.fields.len());
                 for (index, field) in ctor.fields.iter().enumerate() {
-                    fields.push(
-                        self.fresh_for_encoding(&field.encoding, &format!("{hint}_{index}"))?,
-                    );
+                    fields.push(self.fresh_for_spec_ty(&field.ty, &format!("{hint}_{index}"))?);
                 }
                 let args = fields.iter().map(SymValue::ast).collect::<Vec<_>>();
                 Ok(SymValue::new(ctor.symbol.apply(&args)))
@@ -2692,6 +2734,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(Some(bool_and(formulas)))
             }
+            SpecTy::Named(_) => self.named_invariant_formula(ty, value, span).map(Some),
         }
     }
 
@@ -2754,7 +2797,27 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(bool_and(formulas))
             }
+            SpecTy::Named(_) => self.named_invariant_formula(ty, value, span),
         }
+    }
+
+    fn named_invariant_formula(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        with_solver(|solver| {
+            let invariant = self
+                .value_encoder
+                .named_invariant(ty, solver)?
+                .ok_or_else(|| format!("missing named invariant for {ty:?}"))?;
+            Ok(invariant
+                .apply(&[value.ast()])
+                .as_bool()
+                .expect("named invariant predicate"))
+        })
+        .map_err(|err: String| self.unsupported_result(span, err))
     }
 
     fn decode_composite_field(
