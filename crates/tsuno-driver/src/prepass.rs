@@ -598,7 +598,28 @@ fn unify_spec_tys(lhs: &SpecTy, rhs: &SpecTy) -> Result<SpecTy, String> {
                 fields,
             }))
         }
-        (SpecTy::Named(lhs), SpecTy::Named(rhs)) if lhs == rhs => Ok(SpecTy::Named(lhs.clone())),
+        (
+            SpecTy::Named {
+                name: lhs_name,
+                args: lhs_args,
+            },
+            SpecTy::Named {
+                name: rhs_name,
+                args: rhs_args,
+            },
+        ) if lhs_name == rhs_name && lhs_args.len() == rhs_args.len() => {
+            let mut args = Vec::with_capacity(lhs_args.len());
+            for (lhs_arg, rhs_arg) in lhs_args.iter().zip(rhs_args) {
+                args.push(unify_spec_tys(lhs_arg, rhs_arg)?);
+            }
+            Ok(SpecTy::Named {
+                name: lhs_name.clone(),
+                args,
+            })
+        }
+        (SpecTy::TypeParam(lhs), SpecTy::TypeParam(rhs)) if lhs == rhs => {
+            Ok(SpecTy::TypeParam(lhs.clone()))
+        }
         _ => Err(format!(
             "type mismatch between `{}` and `{}`",
             display_spec_ty(lhs),
@@ -632,7 +653,21 @@ fn display_spec_ty(ty: &SpecTy) -> String {
                 .join(", ")
         ),
         SpecTy::Struct(struct_ty) => struct_ty.name.clone(),
-        SpecTy::Named(name) => name.clone(),
+        SpecTy::Named { name, args } => {
+            if args.is_empty() {
+                name.clone()
+            } else {
+                format!(
+                    "{}<{}>",
+                    name,
+                    args.iter()
+                        .map(display_spec_ty)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        }
+        SpecTy::TypeParam(name) => name.clone(),
     }
 }
 
@@ -669,7 +704,8 @@ fn is_fully_inferred_spec_ty(ty: &SpecTy) -> bool {
             .fields
             .iter()
             .all(|field| is_fully_inferred_spec_ty(&field.ty)),
-        SpecTy::Named(_) => true,
+        SpecTy::Named { args, .. } => args.iter().all(is_fully_inferred_spec_ty),
+        SpecTy::TypeParam(_) => true,
         SpecTy::Ref(inner) | SpecTy::Mut(inner) => is_fully_inferred_spec_ty(inner),
         _ => true,
     }
@@ -822,7 +858,11 @@ fn lookup_enum_ctor<'a>(
     Some((enum_def, ctor_index))
 }
 
-fn validate_named_spec_ty(ty: &SpecTy, enum_defs: &HashMap<String, EnumDef>) -> Result<(), String> {
+fn validate_named_spec_ty(
+    ty: &SpecTy,
+    enum_defs: &HashMap<String, EnumDef>,
+    type_params: &HashSet<String>,
+) -> Result<(), String> {
     match ty {
         SpecTy::Bool
         | SpecTy::IntLiteral
@@ -838,24 +878,213 @@ fn validate_named_spec_ty(ty: &SpecTy, enum_defs: &HashMap<String, EnumDef>) -> 
         | SpecTy::Usize => Ok(()),
         SpecTy::Tuple(items) => {
             for item in items {
-                validate_named_spec_ty(item, enum_defs)?;
+                validate_named_spec_ty(item, enum_defs, type_params)?;
             }
             Ok(())
         }
         SpecTy::Struct(struct_ty) => {
             for field in &struct_ty.fields {
-                validate_named_spec_ty(&field.ty, enum_defs)?;
+                validate_named_spec_ty(&field.ty, enum_defs, type_params)?;
             }
             Ok(())
         }
-        SpecTy::Named(name) => enum_defs
-            .contains_key(name)
+        SpecTy::Named { name, args } => {
+            let Some(enum_def) = enum_defs.get(name) else {
+                return Err(format!("unknown spec type `{name}`"));
+            };
+            if enum_def.type_params.len() != args.len() {
+                return Err(format!(
+                    "spec type `{name}` expects {} type arguments, found {}",
+                    enum_def.type_params.len(),
+                    args.len()
+                ));
+            }
+            for arg in args {
+                validate_named_spec_ty(arg, enum_defs, type_params)?;
+            }
+            Ok(())
+        }
+        SpecTy::TypeParam(name) => type_params
+            .contains(name)
             .then_some(())
-            .ok_or_else(|| format!("unknown spec type `{name}`")),
+            .ok_or_else(|| format!("unbound spec type parameter `{name}`")),
         SpecTy::Ref(_) | SpecTy::Mut(_) => {
             Err("Ref<T> and Mut<T> are not supported in spec enum definitions".to_owned())
         }
     }
+}
+
+fn enum_result_ty(enum_def: &EnumDef, type_args: Vec<SpecTy>) -> SpecTy {
+    SpecTy::Named {
+        name: enum_def.name.clone(),
+        args: type_args,
+    }
+}
+
+fn try_instantiate_spec_ty(ty: &SpecTy, bindings: &HashMap<String, SpecTy>) -> Option<SpecTy> {
+    match ty {
+        SpecTy::Bool => Some(SpecTy::Bool),
+        SpecTy::IntLiteral => Some(SpecTy::IntLiteral),
+        SpecTy::I8 => Some(SpecTy::I8),
+        SpecTy::I16 => Some(SpecTy::I16),
+        SpecTy::I32 => Some(SpecTy::I32),
+        SpecTy::I64 => Some(SpecTy::I64),
+        SpecTy::Isize => Some(SpecTy::Isize),
+        SpecTy::U8 => Some(SpecTy::U8),
+        SpecTy::U16 => Some(SpecTy::U16),
+        SpecTy::U32 => Some(SpecTy::U32),
+        SpecTy::U64 => Some(SpecTy::U64),
+        SpecTy::Usize => Some(SpecTy::Usize),
+        SpecTy::Tuple(items) => items
+            .iter()
+            .map(|item| try_instantiate_spec_ty(item, bindings))
+            .collect::<Option<Vec<_>>>()
+            .map(SpecTy::Tuple),
+        SpecTy::Struct(struct_ty) => struct_ty
+            .fields
+            .iter()
+            .map(|field| {
+                Some(StructFieldTy {
+                    name: field.name.clone(),
+                    ty: try_instantiate_spec_ty(&field.ty, bindings)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|fields| {
+                SpecTy::Struct(StructTy {
+                    name: struct_ty.name.clone(),
+                    fields,
+                })
+            }),
+        SpecTy::Named { name, args } => args
+            .iter()
+            .map(|arg| try_instantiate_spec_ty(arg, bindings))
+            .collect::<Option<Vec<_>>>()
+            .map(|args| SpecTy::Named {
+                name: name.clone(),
+                args,
+            }),
+        SpecTy::TypeParam(name) => bindings.get(name).cloned(),
+        SpecTy::Ref(inner) => Some(SpecTy::Ref(Box::new(try_instantiate_spec_ty(
+            inner, bindings,
+        )?))),
+        SpecTy::Mut(inner) => Some(SpecTy::Mut(Box::new(try_instantiate_spec_ty(
+            inner, bindings,
+        )?))),
+    }
+}
+
+fn infer_type_param_bindings(
+    pattern: &SpecTy,
+    actual: &SpecTy,
+    bindings: &mut HashMap<String, SpecTy>,
+) -> Result<(), String> {
+    match pattern {
+        SpecTy::TypeParam(name) => {
+            if let Some(bound) = bindings.get(name) {
+                let _ = unify_spec_tys(bound, actual)?;
+            } else {
+                bindings.insert(name.clone(), actual.clone());
+            }
+            Ok(())
+        }
+        SpecTy::Named { name, args } => match actual {
+            SpecTy::Named {
+                name: actual_name,
+                args: actual_args,
+            } if name == actual_name && args.len() == actual_args.len() => {
+                for (arg, actual_arg) in args.iter().zip(actual_args) {
+                    infer_type_param_bindings(arg, actual_arg, bindings)?;
+                }
+                Ok(())
+            }
+            _ => {
+                let _ = unify_spec_tys(pattern, actual)?;
+                Ok(())
+            }
+        },
+        SpecTy::Tuple(items) => match actual {
+            SpecTy::Tuple(actual_items) if items.len() == actual_items.len() => {
+                for (item, actual_item) in items.iter().zip(actual_items) {
+                    infer_type_param_bindings(item, actual_item, bindings)?;
+                }
+                Ok(())
+            }
+            _ => {
+                let _ = unify_spec_tys(pattern, actual)?;
+                Ok(())
+            }
+        },
+        SpecTy::Struct(struct_ty) => match actual {
+            SpecTy::Struct(actual_struct)
+                if struct_ty.name == actual_struct.name
+                    && struct_ty.fields.len() == actual_struct.fields.len() =>
+            {
+                for (field, actual_field) in struct_ty.fields.iter().zip(&actual_struct.fields) {
+                    if field.name != actual_field.name {
+                        return Err(format!(
+                            "type mismatch between `{}` and `{}`",
+                            display_spec_field_ty(field),
+                            display_spec_field_ty(actual_field)
+                        ));
+                    }
+                    infer_type_param_bindings(&field.ty, &actual_field.ty, bindings)?;
+                }
+                Ok(())
+            }
+            _ => {
+                let _ = unify_spec_tys(pattern, actual)?;
+                Ok(())
+            }
+        },
+        SpecTy::Ref(inner) => match actual {
+            SpecTy::Ref(actual_inner) => infer_type_param_bindings(inner, actual_inner, bindings),
+            _ => {
+                let _ = unify_spec_tys(pattern, actual)?;
+                Ok(())
+            }
+        },
+        SpecTy::Mut(inner) => match actual {
+            SpecTy::Mut(actual_inner) => infer_type_param_bindings(inner, actual_inner, bindings),
+            _ => {
+                let _ = unify_spec_tys(pattern, actual)?;
+                Ok(())
+            }
+        },
+        _ => {
+            let _ = unify_spec_tys(pattern, actual)?;
+            Ok(())
+        }
+    }
+}
+
+fn seed_enum_type_param_bindings(
+    enum_def: &EnumDef,
+    expected: &SpecTy,
+    bindings: &mut HashMap<String, SpecTy>,
+) -> Result<bool, String> {
+    let SpecTy::Named { name, args } = expected else {
+        return Ok(false);
+    };
+    if *name != enum_def.name {
+        return Ok(false);
+    }
+    if args.len() != enum_def.type_params.len() {
+        return Err(format!(
+            "constructor for `{}` expected {} type arguments, found {}",
+            enum_def.name,
+            enum_def.type_params.len(),
+            args.len()
+        ));
+    }
+    for (type_param, arg) in enum_def.type_params.iter().zip(args) {
+        if let Some(bound) = bindings.get(type_param) {
+            let _ = unify_spec_tys(bound, arg)?;
+        } else {
+            bindings.insert(type_param.clone(), arg.clone());
+        }
+    }
+    Ok(true)
 }
 
 fn validate_enum_defs(
@@ -863,6 +1092,7 @@ fn validate_enum_defs(
     span: Span,
 ) -> Result<(), LoopPrepassError> {
     for enum_def in enum_defs.values() {
+        let type_params: HashSet<_> = enum_def.type_params.iter().cloned().collect();
         let mut seen = HashSet::new();
         for ctor in &enum_def.ctors {
             if !seen.insert(ctor.name.clone()) {
@@ -876,7 +1106,7 @@ fn validate_enum_defs(
                 });
             }
             for field_ty in &ctor.fields {
-                validate_named_spec_ty(field_ty, enum_defs).map_err(|message| {
+                validate_named_spec_ty(field_ty, enum_defs, &type_params).map_err(|message| {
                     LoopPrepassError {
                         span,
                         display_span: None,
@@ -894,42 +1124,15 @@ fn validate_enum_defs(
 
 fn type_pure_call(
     func: &str,
+    type_args: &[SpecTy],
     args: &[Expr],
     pure_fns: &HashMap<String, PureFnDef>,
-    enum_defs: &HashMap<String, EnumDef>,
     type_arg: &mut impl FnMut(&Expr) -> Result<TypedExpr, String>,
 ) -> Result<TypedExpr, String> {
-    if let Some((enum_def, ctor_index)) = lookup_enum_ctor(enum_defs, func) {
-        let ctor = &enum_def.ctors[ctor_index];
-        if ctor.fields.len() != args.len() {
-            return Err(format!(
-                "constructor `{func}` expects {} arguments, found {}",
-                ctor.fields.len(),
-                args.len()
-            ));
-        }
-        let mut typed_args = Vec::with_capacity(args.len());
-        for (arg, field_ty) in args.iter().zip(&ctor.fields) {
-            let typed_arg = type_arg(arg)?;
-            let unified = unify_spec_tys(&typed_arg.ty, field_ty)?;
-            if unified != *field_ty {
-                return Err(format!(
-                    "constructor `{func}` expects `{}`, found `{}`",
-                    display_spec_ty(field_ty),
-                    display_spec_ty(&typed_arg.ty)
-                ));
-            }
-            typed_args.push(typed_arg);
-        }
-        return Ok(TypedExpr {
-            ty: SpecTy::Named(enum_def.name.clone()),
-            kind: TypedExprKind::CtorCall {
-                enum_name: enum_def.name.clone(),
-                ctor_name: ctor.name.clone(),
-                ctor_index,
-                args: typed_args,
-            },
-        });
+    if !type_args.is_empty() {
+        return Err(format!(
+            "type arguments are only supported on enum constructors, found `{func}`"
+        ));
     }
     let Some(def) = pure_fns.get(func) else {
         return Err(format!("unknown pure function `{func}`"));
@@ -964,6 +1167,147 @@ fn type_pure_call(
     })
 }
 
+fn explicit_enum_type_bindings(
+    func: &str,
+    enum_def: &EnumDef,
+    type_args: &[SpecTy],
+    enum_defs: &HashMap<String, EnumDef>,
+) -> Result<HashMap<String, SpecTy>, String> {
+    if type_args.is_empty() {
+        return Ok(HashMap::new());
+    }
+    if enum_def.type_params.len() != type_args.len() {
+        return Err(format!(
+            "constructor `{func}` expects {} type arguments, found {}",
+            enum_def.type_params.len(),
+            type_args.len()
+        ));
+    }
+    let scope = HashSet::new();
+    for type_arg in type_args {
+        validate_named_spec_ty(type_arg, enum_defs, &scope)?;
+    }
+    Ok(enum_def
+        .type_params
+        .iter()
+        .cloned()
+        .zip(type_args.iter().cloned())
+        .collect())
+}
+
+fn instantiate_enum_result_ty(
+    func: &str,
+    enum_def: &EnumDef,
+    bindings: &HashMap<String, SpecTy>,
+) -> Result<SpecTy, String> {
+    let mut type_args = Vec::with_capacity(enum_def.type_params.len());
+    for type_param in &enum_def.type_params {
+        let Some(arg) = bindings.get(type_param).cloned() else {
+            return Err(format!(
+                "could not infer type argument `{type_param}` for constructor `{func}`"
+            ));
+        };
+        type_args.push(arg);
+    }
+    Ok(enum_result_ty(enum_def, type_args))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn infer_ctor_call_result_ty(
+    func: &str,
+    enum_def: &EnumDef,
+    ctor_index: usize,
+    type_args: &[SpecTy],
+    args: &[Expr],
+    enum_defs: &HashMap<String, EnumDef>,
+    expected: Option<&SpecTy>,
+    infer_arg: &mut impl FnMut(&Expr, Option<&SpecTy>) -> Result<InferredExprTy, String>,
+) -> Result<SpecTy, String> {
+    let ctor = &enum_def.ctors[ctor_index];
+    if ctor.fields.len() != args.len() {
+        return Err(format!(
+            "constructor `{func}` expects {} arguments, found {}",
+            ctor.fields.len(),
+            args.len()
+        ));
+    }
+
+    let mut bindings = explicit_enum_type_bindings(func, enum_def, type_args, enum_defs)?;
+    if type_args.is_empty()
+        && let Some(expected) = expected
+    {
+        let _ = seed_enum_type_param_bindings(enum_def, expected, &mut bindings)?;
+    }
+
+    for (arg, field_ty) in args.iter().zip(&ctor.fields) {
+        let expected_field_ty = try_instantiate_spec_ty(field_ty, &bindings);
+        let arg_ty = infer_arg(arg, expected_field_ty.as_ref())?;
+        if let InferredExprTy::Known(actual_ty) = &arg_ty {
+            infer_type_param_bindings(field_ty, actual_ty, &mut bindings)?;
+        }
+    }
+
+    let result_ty = instantiate_enum_result_ty(func, enum_def, &bindings)?;
+    if let Some(expected) = expected {
+        let _ = unify_spec_tys(&result_ty, expected)?;
+    }
+    Ok(result_ty)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn type_ctor_call(
+    func: &str,
+    enum_def: &EnumDef,
+    ctor_index: usize,
+    type_args: &[SpecTy],
+    args: &[Expr],
+    enum_defs: &HashMap<String, EnumDef>,
+    expected: Option<&SpecTy>,
+    type_arg: &mut impl FnMut(&Expr, Option<&SpecTy>) -> Result<TypedExpr, String>,
+) -> Result<TypedExpr, String> {
+    let ctor = &enum_def.ctors[ctor_index];
+    if ctor.fields.len() != args.len() {
+        return Err(format!(
+            "constructor `{func}` expects {} arguments, found {}",
+            ctor.fields.len(),
+            args.len()
+        ));
+    }
+
+    let mut bindings = explicit_enum_type_bindings(func, enum_def, type_args, enum_defs)?;
+    if type_args.is_empty()
+        && let Some(expected) = expected
+    {
+        let _ = seed_enum_type_param_bindings(enum_def, expected, &mut bindings)?;
+    }
+
+    let mut typed_args = Vec::with_capacity(args.len());
+    for (arg, field_ty) in args.iter().zip(&ctor.fields) {
+        let expected_field_ty = try_instantiate_spec_ty(field_ty, &bindings);
+        let typed_arg = type_arg(arg, expected_field_ty.as_ref())?;
+        if let Some(expected_field_ty) = &expected_field_ty {
+            let _ = unify_spec_tys(&typed_arg.ty, expected_field_ty)?;
+        }
+        infer_type_param_bindings(field_ty, &typed_arg.ty, &mut bindings)?;
+        typed_args.push(typed_arg);
+    }
+
+    let result_ty = instantiate_enum_result_ty(func, enum_def, &bindings)?;
+    if let Some(expected) = expected {
+        let _ = unify_spec_tys(&result_ty, expected)?;
+    }
+    Ok(TypedExpr {
+        ty: result_ty,
+        kind: TypedExprKind::CtorCall {
+            enum_name: enum_def.name.clone(),
+            ctor_name: ctor.name.clone(),
+            ctor_index,
+            args: typed_args,
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn infer_contract_expr_types(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
@@ -974,12 +1318,40 @@ fn infer_contract_expr_types(
     result_ty: &SpecTy,
     inferred: &mut SpecTypeInference,
 ) -> Result<InferredExprTy, String> {
+    infer_contract_expr_types_with_expected(
+        expr,
+        pure_fns,
+        enum_defs,
+        spec_scope,
+        params,
+        allow_result,
+        result_ty,
+        inferred,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn infer_contract_expr_types_with_expected(
+    expr: &Expr,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    inferred: &mut SpecTypeInference,
+    expected: Option<&SpecTy>,
+) -> Result<InferredExprTy, String> {
     match expr {
         Expr::Bool(_) => Ok(InferredExprTy::Known(SpecTy::Bool)),
         Expr::Int(lit) => Ok(InferredExprTy::Known(lit.spec_ty())),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
                 inferred.ensure_var(name);
+                if let Some(expected) = expected {
+                    inferred.constrain(name, expected)?;
+                }
                 return Ok(InferredExprTy::SpecVar(name.clone()));
             }
             if let Some(ty) = params.get(name) {
@@ -1003,33 +1375,45 @@ fn infer_contract_expr_types(
                 )
                 .map_err(|err| err.message)?;
             inferred.ensure_var(name);
+            if let Some(expected) = expected {
+                inferred.constrain(name, expected)?;
+            }
             Ok(InferredExprTy::SpecVar(name.clone()))
         }
-        Expr::Call { func, args } => {
+        Expr::Call {
+            func,
+            type_args,
+            args,
+        } => {
             if let Some((enum_def, ctor_index)) = lookup_enum_ctor(enum_defs, func) {
-                let ctor = &enum_def.ctors[ctor_index];
-                if ctor.fields.len() != args.len() {
+                Ok(InferredExprTy::Known(infer_ctor_call_result_ty(
+                    func,
+                    enum_def,
+                    ctor_index,
+                    type_args,
+                    args,
+                    enum_defs,
+                    expected,
+                    &mut |arg, expected| {
+                        infer_contract_expr_types_with_expected(
+                            arg,
+                            pure_fns,
+                            enum_defs,
+                            spec_scope,
+                            params,
+                            allow_result,
+                            result_ty,
+                            inferred,
+                            expected,
+                        )
+                    },
+                )?))
+            } else {
+                if !type_args.is_empty() {
                     return Err(format!(
-                        "constructor `{func}` expects {} arguments, found {}",
-                        ctor.fields.len(),
-                        args.len()
+                        "type arguments are only supported on enum constructors, found `{func}`"
                     ));
                 }
-                for (arg, field_ty) in args.iter().zip(&ctor.fields) {
-                    let arg_ty = infer_contract_expr_types(
-                        arg,
-                        pure_fns,
-                        enum_defs,
-                        spec_scope,
-                        params,
-                        allow_result,
-                        result_ty,
-                        inferred,
-                    )?;
-                    constrain_expr_ty(inferred, &arg_ty, field_ty)?;
-                }
-                Ok(InferredExprTy::Known(SpecTy::Named(enum_def.name.clone())))
-            } else {
                 let Some(def) = pure_fns.get(func) else {
                     return Err(format!("unknown pure function `{func}`"));
                 };
@@ -1041,7 +1425,7 @@ fn infer_contract_expr_types(
                     ));
                 }
                 for (arg, param) in args.iter().zip(&def.params) {
-                    let arg_ty = infer_contract_expr_types(
+                    let arg_ty = infer_contract_expr_types_with_expected(
                         arg,
                         pure_fns,
                         enum_defs,
@@ -1050,6 +1434,7 @@ fn infer_contract_expr_types(
                         allow_result,
                         result_ty,
                         inferred,
+                        Some(&param.ty),
                     )?;
                     constrain_expr_ty(inferred, &arg_ty, &param.ty)?;
                 }
@@ -1186,12 +1571,31 @@ fn infer_body_expr_types(
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
 ) -> Result<InferredExprTy, String> {
+    infer_body_expr_types_with_expected(
+        expr, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn infer_body_expr_types_with_expected(
+    expr: &Expr,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    kind: DirectiveKind,
+    spec_scope: &mut SpecScope,
+    local_tys: &HashMap<String, SpecTy>,
+    inferred: &mut SpecTypeInference,
+    expected: Option<&SpecTy>,
+) -> Result<InferredExprTy, String> {
     match expr {
         Expr::Bool(_) => Ok(InferredExprTy::Known(SpecTy::Bool)),
         Expr::Int(lit) => Ok(InferredExprTy::Known(lit.spec_ty())),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
                 inferred.ensure_var(name);
+                if let Some(expected) = expected {
+                    inferred.constrain(name, expected)?;
+                }
                 return Ok(InferredExprTy::SpecVar(name.clone()));
             }
             local_tys
@@ -1205,26 +1609,38 @@ fn infer_body_expr_types(
                 .bind(name, Span::default(), None, kind.keyword())
                 .map_err(|err| err.message)?;
             inferred.ensure_var(name);
+            if let Some(expected) = expected {
+                inferred.constrain(name, expected)?;
+            }
             Ok(InferredExprTy::SpecVar(name.clone()))
         }
-        Expr::Call { func, args } => {
+        Expr::Call {
+            func,
+            type_args,
+            args,
+        } => {
             if let Some((enum_def, ctor_index)) = lookup_enum_ctor(enum_defs, func) {
-                let ctor = &enum_def.ctors[ctor_index];
-                if ctor.fields.len() != args.len() {
+                Ok(InferredExprTy::Known(infer_ctor_call_result_ty(
+                    func,
+                    enum_def,
+                    ctor_index,
+                    type_args,
+                    args,
+                    enum_defs,
+                    expected,
+                    &mut |arg, expected| {
+                        infer_body_expr_types_with_expected(
+                            arg, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred,
+                            expected,
+                        )
+                    },
+                )?))
+            } else {
+                if !type_args.is_empty() {
                     return Err(format!(
-                        "constructor `{func}` expects {} arguments, found {}",
-                        ctor.fields.len(),
-                        args.len()
+                        "type arguments are only supported on enum constructors, found `{func}`"
                     ));
                 }
-                for (arg, field_ty) in args.iter().zip(&ctor.fields) {
-                    let arg_ty = infer_body_expr_types(
-                        arg, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred,
-                    )?;
-                    constrain_expr_ty(inferred, &arg_ty, field_ty)?;
-                }
-                Ok(InferredExprTy::Known(SpecTy::Named(enum_def.name.clone())))
-            } else {
                 let Some(def) = pure_fns.get(func) else {
                     return Err(format!("unknown pure function `{func}`"));
                 };
@@ -1236,8 +1652,15 @@ fn infer_body_expr_types(
                     ));
                 }
                 for (arg, param) in args.iter().zip(&def.params) {
-                    let arg_ty = infer_body_expr_types(
-                        arg, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred,
+                    let arg_ty = infer_body_expr_types_with_expected(
+                        arg,
+                        pure_fns,
+                        enum_defs,
+                        kind,
+                        spec_scope,
+                        local_tys,
+                        inferred,
+                        Some(&param.ty),
                     )?;
                     constrain_expr_ty(inferred, &arg_ty, &param.ty)?;
                 }
@@ -1386,6 +1809,7 @@ fn local_spec_tys<'tcx>(
     Ok(types)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn typed_contract_expr(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
@@ -1395,6 +1819,31 @@ fn typed_contract_expr(
     allow_result: bool,
     result_ty: &SpecTy,
     inferred: &mut SpecTypeInference,
+) -> Result<TypedExpr, String> {
+    typed_contract_expr_with_expected(
+        expr,
+        pure_fns,
+        enum_defs,
+        spec_scope,
+        params,
+        allow_result,
+        result_ty,
+        inferred,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_contract_expr_with_expected(
+    expr: &Expr,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    inferred: &mut SpecTypeInference,
+    expected: Option<&SpecTy>,
 ) -> Result<TypedExpr, String> {
     match expr {
         Expr::Bool(value) => Ok(TypedExpr {
@@ -1445,20 +1894,52 @@ fn typed_contract_expr(
                 kind: TypedExprKind::Bind(name.clone()),
             })
         }
-        Expr::Call { func, args } => type_pure_call(func, args, pure_fns, enum_defs, &mut |arg| {
-            typed_contract_expr(
-                arg,
-                pure_fns,
-                enum_defs,
-                spec_scope,
-                params,
-                allow_result,
-                result_ty,
-                inferred,
-            )
-        }),
+        Expr::Call {
+            func,
+            type_args,
+            args,
+        } => {
+            if let Some((enum_def, ctor_index)) = lookup_enum_ctor(enum_defs, func) {
+                type_ctor_call(
+                    func,
+                    enum_def,
+                    ctor_index,
+                    type_args,
+                    args,
+                    enum_defs,
+                    expected,
+                    &mut |arg, expected| {
+                        typed_contract_expr_with_expected(
+                            arg,
+                            pure_fns,
+                            enum_defs,
+                            spec_scope,
+                            params,
+                            allow_result,
+                            result_ty,
+                            inferred,
+                            expected,
+                        )
+                    },
+                )
+            } else {
+                type_pure_call(func, type_args, args, pure_fns, &mut |arg| {
+                    typed_contract_expr_with_expected(
+                        arg,
+                        pure_fns,
+                        enum_defs,
+                        spec_scope,
+                        params,
+                        allow_result,
+                        result_ty,
+                        inferred,
+                        None,
+                    )
+                })
+            }
+        }
         Expr::Field { base, name } => {
-            let base = typed_contract_expr(
+            let base = typed_contract_expr_with_expected(
                 base,
                 pure_fns,
                 enum_defs,
@@ -1467,11 +1948,12 @@ fn typed_contract_expr(
                 allow_result,
                 result_ty,
                 inferred,
+                None,
             )?;
             type_named_field_expr(base, name)
         }
         Expr::TupleField { base, index } => {
-            let base = typed_contract_expr(
+            let base = typed_contract_expr_with_expected(
                 base,
                 pure_fns,
                 enum_defs,
@@ -1480,11 +1962,12 @@ fn typed_contract_expr(
                 allow_result,
                 result_ty,
                 inferred,
+                None,
             )?;
             type_tuple_field_expr(base, *index)
         }
         Expr::Deref { base } => {
-            let base = typed_contract_expr(
+            let base = typed_contract_expr_with_expected(
                 base,
                 pure_fns,
                 enum_defs,
@@ -1493,6 +1976,7 @@ fn typed_contract_expr(
                 allow_result,
                 result_ty,
                 inferred,
+                None,
             )?;
             match &base.ty {
                 SpecTy::Ref(inner) | SpecTy::Mut(inner) => Ok(TypedExpr {
@@ -1508,7 +1992,7 @@ fn typed_contract_expr(
             }
         }
         Expr::Unary { op, arg } => {
-            let arg = typed_contract_expr(
+            let arg = typed_contract_expr_with_expected(
                 arg,
                 pure_fns,
                 enum_defs,
@@ -1517,6 +2001,7 @@ fn typed_contract_expr(
                 allow_result,
                 result_ty,
                 inferred,
+                None,
             )?;
             match op {
                 crate::spec::UnaryOp::Not => {
@@ -1552,7 +2037,7 @@ fn typed_contract_expr(
             }
         }
         Expr::Binary { op, lhs, rhs } => {
-            let lhs = typed_contract_expr(
+            let lhs = typed_contract_expr_with_expected(
                 lhs,
                 pure_fns,
                 enum_defs,
@@ -1561,8 +2046,9 @@ fn typed_contract_expr(
                 allow_result,
                 result_ty,
                 inferred,
+                None,
             )?;
-            let rhs = typed_contract_expr(
+            let rhs = typed_contract_expr_with_expected(
                 rhs,
                 pure_fns,
                 enum_defs,
@@ -1571,6 +2057,7 @@ fn typed_contract_expr(
                 allow_result,
                 result_ty,
                 inferred,
+                None,
             )?;
             type_binary_expr(*op, lhs, rhs)
         }
@@ -1585,6 +2072,22 @@ fn typed_body_expr(
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
+) -> Result<TypedExpr, String> {
+    typed_body_expr_with_expected(
+        expr, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_body_expr_with_expected(
+    expr: &Expr,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    kind: DirectiveKind,
+    spec_scope: &mut SpecScope,
+    local_tys: &HashMap<String, SpecTy>,
+    inferred: &mut SpecTypeInference,
+    expected: Option<&SpecTy>,
 ) -> Result<TypedExpr, String> {
     match expr {
         Expr::Bool(value) => Ok(TypedExpr {
@@ -1622,13 +2125,37 @@ fn typed_body_expr(
                 kind: TypedExprKind::Bind(name.clone()),
             })
         }
-        Expr::Call { func, args } => type_pure_call(func, args, pure_fns, enum_defs, &mut |arg| {
-            typed_body_expr(
-                arg, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred,
-            )
-        }),
+        Expr::Call {
+            func,
+            type_args,
+            args,
+        } => {
+            if let Some((enum_def, ctor_index)) = lookup_enum_ctor(enum_defs, func) {
+                type_ctor_call(
+                    func,
+                    enum_def,
+                    ctor_index,
+                    type_args,
+                    args,
+                    enum_defs,
+                    expected,
+                    &mut |arg, expected| {
+                        typed_body_expr_with_expected(
+                            arg, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred,
+                            expected,
+                        )
+                    },
+                )
+            } else {
+                type_pure_call(func, type_args, args, pure_fns, &mut |arg| {
+                    typed_body_expr_with_expected(
+                        arg, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, None,
+                    )
+                })
+            }
+        }
         Expr::Field { base, name } => {
-            let base = typed_body_expr(
+            let base = typed_body_expr_with_expected(
                 expr_base(base),
                 pure_fns,
                 enum_defs,
@@ -1636,11 +2163,12 @@ fn typed_body_expr(
                 spec_scope,
                 local_tys,
                 inferred,
+                None,
             )?;
             type_named_field_expr(base, name)
         }
         Expr::TupleField { base, index } => {
-            let base = typed_body_expr(
+            let base = typed_body_expr_with_expected(
                 expr_base(base),
                 pure_fns,
                 enum_defs,
@@ -1648,12 +2176,13 @@ fn typed_body_expr(
                 spec_scope,
                 local_tys,
                 inferred,
+                None,
             )?;
             type_tuple_field_expr(base, *index)
         }
         Expr::Deref { base } => {
-            let base = typed_body_expr(
-                base, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred,
+            let base = typed_body_expr_with_expected(
+                base, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, None,
             )?;
             match &base.ty {
                 SpecTy::Ref(inner) | SpecTy::Mut(inner) => Ok(TypedExpr {
@@ -1669,8 +2198,8 @@ fn typed_body_expr(
             }
         }
         Expr::Unary { op, arg } => {
-            let arg = typed_body_expr(
-                arg, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred,
+            let arg = typed_body_expr_with_expected(
+                arg, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, None,
             )?;
             match op {
                 crate::spec::UnaryOp::Not => {
@@ -1706,11 +2235,11 @@ fn typed_body_expr(
             }
         }
         Expr::Binary { op, lhs, rhs } => {
-            let lhs = typed_body_expr(
-                lhs, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred,
+            let lhs = typed_body_expr_with_expected(
+                lhs, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, None,
             )?;
-            let rhs = typed_body_expr(
-                rhs, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred,
+            let rhs = typed_body_expr_with_expected(
+                rhs, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, None,
             )?;
             type_binary_expr(*op, lhs, rhs)
         }
@@ -2494,6 +3023,7 @@ fn infer_lemma_call(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn typed_lemma_call(
     expr: &Expr,
     span_text: &str,
@@ -3043,7 +3573,18 @@ fn visit_lemma(
 
 fn lemma_call_parts(expr: &Expr) -> Result<(&str, &[Expr]), String> {
     match expr {
-        Expr::Call { func, args } => Ok((func, args)),
+        Expr::Call {
+            func,
+            type_args,
+            args,
+        } => {
+            if !type_args.is_empty() {
+                return Err(format!(
+                    "lemma call does not support type arguments, found `{func}`"
+                ));
+            }
+            Ok((func, args))
+        }
         _ => Err("lemma call must be of the form `name(args...)`".to_owned()),
     }
 }
@@ -3267,6 +3808,7 @@ fn collect_ghost_items_in_source(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_function_contract_expr_prepass(
     span: Span,
     span_text: &str,
@@ -3315,7 +3857,11 @@ fn validate_contract_expr_core(
                 if allow_result { "ens" } else { "req" },
             )
             .map_err(|err| err.message),
-        Expr::Call { func, args } => {
+        Expr::Call {
+            func,
+            type_args,
+            args,
+        } => {
             if let Some((enum_def, ctor_index)) = lookup_enum_ctor(enum_defs, func) {
                 let ctor = &enum_def.ctors[ctor_index];
                 if ctor.fields.len() != args.len() {
@@ -3325,7 +3871,23 @@ fn validate_contract_expr_core(
                         args.len()
                     ));
                 }
+                if enum_def.type_params.len() != type_args.len() && !type_args.is_empty() {
+                    return Err(format!(
+                        "constructor `{func}` expects {} type arguments, found {}",
+                        enum_def.type_params.len(),
+                        type_args.len()
+                    ));
+                }
+                let scope = HashSet::new();
+                for type_arg in type_args {
+                    validate_named_spec_ty(type_arg, enum_defs, &scope)?;
+                }
             } else {
+                if !type_args.is_empty() {
+                    return Err(format!(
+                        "type arguments are only supported on enum constructors, found `{func}`"
+                    ));
+                }
                 let Some(def) = pure_fns.get(func) else {
                     return Err(format!("unknown pure function `{func}`"));
                 };
@@ -3433,7 +3995,11 @@ fn resolve_expr_env_into(
             resolved.spec_vars.insert(name.clone());
             Ok(())
         }
-        Expr::Call { func, args } => {
+        Expr::Call {
+            func,
+            type_args,
+            args,
+        } => {
             if let Some((enum_def, ctor_index)) = lookup_enum_ctor(ctx.enum_defs, func) {
                 let ctor = &enum_def.ctors[ctor_index];
                 if ctor.fields.len() != args.len() {
@@ -3447,7 +4013,27 @@ fn resolve_expr_env_into(
                         ),
                     });
                 }
+                if enum_def.type_params.len() != type_args.len() && !type_args.is_empty() {
+                    return Err(LoopPrepassError {
+                        span: ctx.span,
+                        display_span: None,
+                        message: format!(
+                            "constructor `{func}` expects {} type arguments, found {}",
+                            enum_def.type_params.len(),
+                            type_args.len()
+                        ),
+                    });
+                }
             } else {
+                if !type_args.is_empty() {
+                    return Err(LoopPrepassError {
+                        span: ctx.span,
+                        display_span: None,
+                        message: format!(
+                            "type arguments are only supported on enum constructors, found `{func}`"
+                        ),
+                    });
+                }
                 let Some(def) = ctx.pure_fns.get(func) else {
                     return Err(LoopPrepassError {
                         span: ctx.span,
@@ -3752,7 +4338,9 @@ fn written_locals<'tcx>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{Expr, PureFnDef, PureFnParam, SpecTy, TypedExprKind};
+    use crate::spec::{
+        EnumCtorDef, EnumDef, Expr, IntLiteral, PureFnDef, PureFnParam, SpecTy, TypedExprKind,
+    };
 
     #[test]
     fn preserves_user_pure_call_for_engine_encoding() {
@@ -3771,9 +4359,9 @@ mod tests {
 
         let typed = type_pure_call(
             "id",
+            &[],
             &[Expr::Var("arg".to_owned())],
             &pure_fns,
-            &HashMap::new(),
             &mut |expr| {
                 assert_eq!(expr, &Expr::Var("arg".to_owned()));
                 Ok(TypedExpr {
@@ -3797,5 +4385,77 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn types_generic_constructor_call_with_explicit_type_args() {
+        let enum_defs = HashMap::from([(
+            "List".to_owned(),
+            EnumDef {
+                name: "List".to_owned(),
+                type_params: vec!["T".to_owned()],
+                ctors: vec![
+                    EnumCtorDef {
+                        name: "Nil".to_owned(),
+                        fields: vec![],
+                    },
+                    EnumCtorDef {
+                        name: "Cons".to_owned(),
+                        fields: vec![
+                            SpecTy::TypeParam("T".to_owned()),
+                            SpecTy::Named {
+                                name: "List".to_owned(),
+                                args: vec![SpecTy::TypeParam("T".to_owned())],
+                            },
+                        ],
+                    },
+                ],
+            },
+        )]);
+
+        let expr = Expr::Call {
+            func: "List::Cons".to_owned(),
+            type_args: vec![SpecTy::I32],
+            args: vec![
+                Expr::Int(IntLiteral {
+                    digits: "0".to_owned(),
+                    suffix: None,
+                }),
+                Expr::Call {
+                    func: "List::Nil".to_owned(),
+                    type_args: vec![SpecTy::I32],
+                    args: vec![],
+                },
+            ],
+        };
+
+        let typed = typed_contract_expr(
+            &expr,
+            &HashMap::new(),
+            &enum_defs,
+            &mut SpecScope::default(),
+            &HashMap::new(),
+            false,
+            &SpecTy::Bool,
+            &mut SpecTypeInference::default(),
+        )
+        .expect("typed constructor call");
+
+        assert_eq!(
+            typed.ty,
+            SpecTy::Named {
+                name: "List".to_owned(),
+                args: vec![SpecTy::I32],
+            }
+        );
+        assert!(matches!(
+            typed.kind,
+            TypedExprKind::CtorCall {
+                enum_name,
+                ctor_name,
+                ctor_index: 1,
+                ..
+            } if enum_name == "List" && ctor_name == "Cons"
+        ));
     }
 }

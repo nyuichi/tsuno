@@ -6,6 +6,7 @@ pub enum Expr {
     Bind(String),
     Call {
         func: String,
+        type_args: Vec<SpecTy>,
         args: Vec<Expr>,
     },
     Field {
@@ -146,7 +147,8 @@ pub enum SpecTy {
     Usize,
     Tuple(Vec<SpecTy>),
     Struct(StructTy),
-    Named(String),
+    Named { name: String, args: Vec<SpecTy> },
+    TypeParam(String),
     Ref(Box<SpecTy>),
     Mut(Box<SpecTy>),
 }
@@ -191,6 +193,7 @@ pub struct GhostBlock {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EnumDef {
     pub name: String,
+    pub type_params: Vec<String>,
     pub ctors: Vec<EnumCtorDef>,
 }
 
@@ -787,6 +790,85 @@ impl Parser {
         Ok(expr)
     }
 
+    fn parse_call_args(&mut self) -> Result<Vec<Expr>, ParseError> {
+        let mut args = Vec::new();
+        self.expect(&Token::LParen)?;
+        if self.eat(&Token::RParen) {
+            return Ok(args);
+        }
+        loop {
+            args.push(self.parse_expr()?);
+            if self.eat(&Token::RParen) {
+                return Ok(args);
+            }
+            self.expect(&Token::Comma)?;
+        }
+    }
+
+    fn parse_token_spec_ty(&mut self) -> Result<SpecTy, ParseError> {
+        let Some(Token::Ident(ident)) = self.next().cloned() else {
+            return Err(ParseError::new("expected a type argument"));
+        };
+        let args = if self.eat(&Token::Lt) {
+            let mut args = Vec::new();
+            if !self.eat(&Token::Gt) {
+                loop {
+                    args.push(self.parse_token_spec_ty()?);
+                    if self.eat(&Token::Gt) {
+                        break;
+                    }
+                    self.expect(&Token::Comma)?;
+                }
+            }
+            args
+        } else {
+            Vec::new()
+        };
+        match ident.as_str() {
+            "bool" if args.is_empty() => Ok(SpecTy::Bool),
+            "i8" if args.is_empty() => Ok(SpecTy::I8),
+            "i16" if args.is_empty() => Ok(SpecTy::I16),
+            "i32" if args.is_empty() => Ok(SpecTy::I32),
+            "i64" if args.is_empty() => Ok(SpecTy::I64),
+            "isize" if args.is_empty() => Ok(SpecTy::Isize),
+            "u8" if args.is_empty() => Ok(SpecTy::U8),
+            "u16" if args.is_empty() => Ok(SpecTy::U16),
+            "u32" if args.is_empty() => Ok(SpecTy::U32),
+            "u64" if args.is_empty() => Ok(SpecTy::U64),
+            "usize" if args.is_empty() => Ok(SpecTy::Usize),
+            _ => Ok(SpecTy::Named { name: ident, args }),
+        }
+    }
+
+    fn try_parse_call_type_args(&mut self) -> Result<Option<Vec<SpecTy>>, ParseError> {
+        let saved = self.cursor;
+        let saw_turbofish = self.eat(&Token::ColonColon);
+        if !self.eat(&Token::Lt) {
+            self.cursor = saved;
+            return Ok(None);
+        }
+        let mut args = Vec::new();
+        if !self.eat(&Token::Gt) {
+            loop {
+                args.push(self.parse_token_spec_ty()?);
+                if self.eat(&Token::Gt) {
+                    break;
+                }
+                self.expect(&Token::Comma)?;
+            }
+        }
+        match self.tokens.get(self.cursor) {
+            Some(Token::LParen) | Some(Token::ColonColon) => Ok(Some(args)),
+            _ if saw_turbofish => Err(ParseError::new(
+                "expected `(` or `::` after type arguments in spec expression",
+            )),
+            _ => {
+                self.cursor = saved;
+                Ok(None)
+            }
+        }
+    }
+
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         match self.next().cloned() {
             Some(Token::Bool(value)) => Ok(Expr::Bool(value)),
@@ -798,36 +880,30 @@ impl Parser {
                 Ok(Expr::Bind(ident))
             }
             Some(Token::Ident(ident)) => {
+                let type_args = self.try_parse_call_type_args()?.unwrap_or_default();
                 if self.eat(&Token::ColonColon) {
                     let Some(Token::Ident(ctor)) = self.next().cloned() else {
                         return Err(ParseError::new("expected constructor name after `::`"));
                     };
                     let func = format!("{ident}::{ctor}");
-                    let mut args = Vec::new();
-                    if self.eat(&Token::LParen) {
-                        if !self.eat(&Token::RParen) {
-                            loop {
-                                args.push(self.parse_expr()?);
-                                if self.eat(&Token::RParen) {
-                                    break;
-                                }
-                                self.expect(&Token::Comma)?;
-                            }
-                        }
-                    }
-                    Ok(Expr::Call { func, args })
-                } else if !ident.starts_with("__") && self.eat(&Token::LParen) {
-                    let mut args = Vec::new();
-                    if !self.eat(&Token::RParen) {
-                        loop {
-                            args.push(self.parse_expr()?);
-                            if self.eat(&Token::RParen) {
-                                break;
-                            }
-                            self.expect(&Token::Comma)?;
-                        }
-                    }
-                    Ok(Expr::Call { func: ident, args })
+                    let args = if self.tokens.get(self.cursor) == Some(&Token::LParen) {
+                        self.parse_call_args()?
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(Expr::Call {
+                        func,
+                        type_args,
+                        args,
+                    })
+                } else if !ident.starts_with("__")
+                    && self.tokens.get(self.cursor) == Some(&Token::LParen)
+                {
+                    Ok(Expr::Call {
+                        func: ident,
+                        type_args,
+                        args: self.parse_call_args()?,
+                    })
                 } else {
                     Ok(Expr::Var(ident))
                 }
@@ -926,7 +1002,7 @@ impl<'a> PureFnParser<'a> {
             loop {
                 let param_name = self.parse_ident()?;
                 self.expect_char(':')?;
-                let ty = self.parse_spec_ty()?;
+                let ty = self.parse_spec_ty_with_params(&[])?;
                 params.push(PureFnParam {
                     name: param_name,
                     ty,
@@ -947,6 +1023,7 @@ impl<'a> PureFnParser<'a> {
 
     fn parse_enum_def(&mut self) -> Result<EnumDef, ParseError> {
         let name = self.parse_ident()?;
+        let type_params = self.parse_type_params()?;
         self.expect_char('{')?;
         let mut ctors = Vec::new();
         loop {
@@ -961,7 +1038,7 @@ impl<'a> PureFnParser<'a> {
                 self.skip_ws();
                 if !self.eat_char(')') {
                     loop {
-                        fields.push(self.parse_spec_ty()?);
+                        fields.push(self.parse_spec_ty_with_params(&type_params)?);
                         self.skip_ws();
                         if self.eat_char(')') {
                             break;
@@ -981,7 +1058,11 @@ impl<'a> PureFnParser<'a> {
             self.expect_char('}')?;
             break;
         }
-        Ok(EnumDef { name, ctors })
+        Ok(EnumDef {
+            name,
+            type_params,
+            ctors,
+        })
     }
 
     fn parse_pure_fn_def(
@@ -990,7 +1071,7 @@ impl<'a> PureFnParser<'a> {
         params: Vec<PureFnParam>,
     ) -> Result<PureFnDef, ParseError> {
         self.expect_arrow()?;
-        let result_ty = self.parse_spec_ty()?;
+        let result_ty = self.parse_spec_ty_with_params(&[])?;
         self.expect_char('{')?;
         let body = self.parse_braced_body()?;
         Ok(PureFnDef {
@@ -1021,27 +1102,58 @@ impl<'a> PureFnParser<'a> {
         })
     }
 
-    fn parse_spec_ty(&mut self) -> Result<SpecTy, ParseError> {
+    fn parse_type_params(&mut self) -> Result<Vec<String>, ParseError> {
+        self.skip_ws();
+        if !self.eat_char('<') {
+            return Ok(Vec::new());
+        }
+        let mut type_params = Vec::new();
+        loop {
+            type_params.push(self.parse_ident()?);
+            self.skip_ws();
+            if self.eat_char('>') {
+                return Ok(type_params);
+            }
+            self.expect_char(',')?;
+        }
+    }
+
+    fn parse_spec_ty_with_params(&mut self, type_params: &[String]) -> Result<SpecTy, ParseError> {
         let ident = self.parse_ident()?;
         self.skip_ws();
-        if self.peek_char() == Some('<') {
-            return Err(ParseError::new(format!(
-                "unsupported pure function type `{ident}`"
-            )));
-        }
+        let args = if self.eat_char('<') {
+            let mut args = Vec::new();
+            self.skip_ws();
+            if !self.eat_char('>') {
+                loop {
+                    args.push(self.parse_spec_ty_with_params(type_params)?);
+                    self.skip_ws();
+                    if self.eat_char('>') {
+                        break;
+                    }
+                    self.expect_char(',')?;
+                }
+            }
+            args
+        } else {
+            Vec::new()
+        };
         match ident.as_str() {
-            "bool" => Ok(SpecTy::Bool),
-            "i8" => Ok(SpecTy::I8),
-            "i16" => Ok(SpecTy::I16),
-            "i32" => Ok(SpecTy::I32),
-            "i64" => Ok(SpecTy::I64),
-            "isize" => Ok(SpecTy::Isize),
-            "u8" => Ok(SpecTy::U8),
-            "u16" => Ok(SpecTy::U16),
-            "u32" => Ok(SpecTy::U32),
-            "u64" => Ok(SpecTy::U64),
-            "usize" => Ok(SpecTy::Usize),
-            _ => Ok(SpecTy::Named(ident)),
+            "bool" if args.is_empty() => Ok(SpecTy::Bool),
+            "i8" if args.is_empty() => Ok(SpecTy::I8),
+            "i16" if args.is_empty() => Ok(SpecTy::I16),
+            "i32" if args.is_empty() => Ok(SpecTy::I32),
+            "i64" if args.is_empty() => Ok(SpecTy::I64),
+            "isize" if args.is_empty() => Ok(SpecTy::Isize),
+            "u8" if args.is_empty() => Ok(SpecTy::U8),
+            "u16" if args.is_empty() => Ok(SpecTy::U16),
+            "u32" if args.is_empty() => Ok(SpecTy::U32),
+            "u64" if args.is_empty() => Ok(SpecTy::U64),
+            "usize" if args.is_empty() => Ok(SpecTy::Usize),
+            _ if args.is_empty() && type_params.iter().any(|param| param == &ident) => {
+                Ok(SpecTy::TypeParam(ident))
+            }
+            _ => Ok(SpecTy::Named { name: ident, args }),
         }
     }
 
@@ -1498,6 +1610,7 @@ mod tests {
                 op: BinaryOp::Eq,
                 lhs: Box::new(Expr::Call {
                     func: "seq_rev".to_owned(),
+                    type_args: vec![],
                     args: vec![Expr::Var("xs".to_owned())],
                 }),
                 rhs: Box::new(Expr::Var("ys".to_owned())),
@@ -1512,6 +1625,7 @@ mod tests {
             expr,
             Expr::Call {
                 func: "IntList::Cons".to_owned(),
+                type_args: vec![],
                 args: vec![
                     Expr::Int(IntLiteral {
                         digits: "1".to_owned(),
@@ -1519,11 +1633,18 @@ mod tests {
                     }),
                     Expr::Call {
                         func: "IntList::Nil".to_owned(),
+                        type_args: vec![],
                         args: vec![],
                     },
                 ],
             }
         );
+    }
+
+    #[test]
+    fn parses_generic_enum_constructor_expression() {
+        let expr = parse_expr("assert", r#"List::<i32>::Cons(1i32, List::<i32>::Nil)"#);
+        assert!(expr.is_ok(), "{expr:?}");
     }
 
     #[test]
@@ -1574,19 +1695,21 @@ fn add1(x: i32) -> i32 {
     }
 
     #[test]
-    fn rejects_seq_types_in_pure_function_block() {
-        let err = parse_pure_fn_block(
+    fn parses_generic_named_types_in_pure_function_block() {
+        let defs = parse_pure_fn_block(
             r#"
 fn is_rev(x: Seq<i32>) -> bool {
     true
 }
 "#,
         )
-        .expect_err("Seq types should be rejected");
-        assert!(
-            err.message.contains("unsupported pure function type `Seq`"),
-            "unexpected error: {}",
-            err.message
+        .expect("generic named type should parse");
+        assert_eq!(
+            defs[0].params[0].ty,
+            SpecTy::Named {
+                name: "Seq".to_owned(),
+                args: vec![SpecTy::I32],
+            }
         );
     }
 
@@ -1638,6 +1761,7 @@ fn add1_done(x: i32)
                         op: BinaryOp::Eq,
                         lhs: Box::new(Expr::Call {
                             func: "add1".to_owned(),
+                            type_args: vec![],
                             args: vec![Expr::Var("x".to_owned())],
                         }),
                         rhs: Box::new(Expr::Binary {
@@ -1653,6 +1777,7 @@ fn add1_done(x: i32)
                         op: BinaryOp::Eq,
                         lhs: Box::new(Expr::Call {
                             func: "add1".to_owned(),
+                            type_args: vec![],
                             args: vec![Expr::Var("x".to_owned())],
                         }),
                         rhs: Box::new(Expr::Binary {
@@ -1689,6 +1814,7 @@ fn singleton(x: i32) -> IntList {
             GhostBlock {
                 enums: vec![EnumDef {
                     name: "IntList".to_owned(),
+                    type_params: vec![],
                     ctors: vec![
                         EnumCtorDef {
                             name: "Nil".to_owned(),
@@ -1696,7 +1822,13 @@ fn singleton(x: i32) -> IntList {
                         },
                         EnumCtorDef {
                             name: "Cons".to_owned(),
-                            fields: vec![SpecTy::I32, SpecTy::Named("IntList".to_owned())],
+                            fields: vec![
+                                SpecTy::I32,
+                                SpecTy::Named {
+                                    name: "IntList".to_owned(),
+                                    args: vec![],
+                                },
+                            ],
                         },
                     ],
                 }],
@@ -1706,13 +1838,18 @@ fn singleton(x: i32) -> IntList {
                         name: "x".to_owned(),
                         ty: SpecTy::I32,
                     }],
-                    result_ty: SpecTy::Named("IntList".to_owned()),
+                    result_ty: SpecTy::Named {
+                        name: "IntList".to_owned(),
+                        args: vec![],
+                    },
                     body: Expr::Call {
                         func: "IntList::Cons".to_owned(),
+                        type_args: vec![],
                         args: vec![
                             Expr::Var("x".to_owned()),
                             Expr::Call {
                                 func: "IntList::Nil".to_owned(),
+                                type_args: vec![],
                                 args: vec![],
                             },
                         ],
@@ -1721,5 +1858,22 @@ fn singleton(x: i32) -> IntList {
                 lemmas: vec![],
             }
         );
+    }
+
+    #[test]
+    fn parses_generic_enum_definitions_in_ghost_block() {
+        let block = parse_ghost_block(
+            r#"
+enum List<T> {
+    Nil,
+    Cons(T, List<T>),
+}
+
+fn singleton(x: i32) -> List<i32> {
+    List::Cons(x, List::Nil)
+}
+"#,
+        );
+        assert!(block.is_ok(), "{block:?}");
     }
 }

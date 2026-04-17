@@ -1609,8 +1609,12 @@ impl<'tcx> Verifier<'tcx> {
             | SpecTy::U16
             | SpecTy::U32
             | SpecTy::U64
-            | SpecTy::Named(_)
+            | SpecTy::Named { .. }
             | SpecTy::Usize => Ok(value.clone()),
+            SpecTy::TypeParam(name) => Err(self.unsupported_result(
+                span,
+                format!("unresolved spec type parameter `{name}` reached verifier"),
+            )),
         }
     }
 
@@ -2403,7 +2407,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn fresh_for_spec_ty(&self, ty: &SpecTy, hint: &str) -> Result<SymValue, VerificationResult> {
-        if matches!(ty, SpecTy::Named(_)) {
+        if matches!(ty, SpecTy::Named { .. }) {
             return Ok(SymValue::new(Dynamic::new_const(
                 self.fresh_name(hint),
                 self.value_encoder.value_sort(),
@@ -2734,7 +2738,11 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(Some(bool_and(formulas)))
             }
-            SpecTy::Named(_) => self.named_invariant_formula(ty, value, span).map(Some),
+            SpecTy::Named { .. } => self.named_invariant_formula(ty, value, span).map(Some),
+            SpecTy::TypeParam(name) => Err(self.unsupported_result(
+                span,
+                format!("unresolved spec type parameter `{name}` reached verifier"),
+            )),
         }
     }
 
@@ -2797,7 +2805,11 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(bool_and(formulas))
             }
-            SpecTy::Named(_) => self.named_invariant_formula(ty, value, span),
+            SpecTy::Named { .. } => self.named_invariant_formula(ty, value, span),
+            SpecTy::TypeParam(name) => Err(self.unsupported_result(
+                span,
+                format!("unresolved spec type parameter `{name}` reached verifier"),
+            )),
         }
     }
 
