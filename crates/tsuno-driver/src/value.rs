@@ -37,10 +37,18 @@ The backend asserts the following primitive axioms:
 
   (bool)((intbox)(0)) = false
 
-Composite values are arranged like VeriFast constructor families. Each
-composite spec type gets a fresh subtype id `s` and, currently, one constructor
-layout. The representation is future-proofed so the subtype owns a constructor
-list; adding multi-constructor datatypes later only extends that list.
+Composite values are arranged like VeriFast constructor families.
+
+For structural composites such as tuples, structs, Ref<T>, and Mut<T>, each
+concrete spec type gets a fresh subtype id `s` and, today, one constructor
+layout.
+
+For named spec enums, the constructor family is nominal and shared across all
+instantiations of the same enum declaration. This matches VeriFast's erased
+encoding of inductive datatype constructors: for `enum List<T> { Nil, Cons(T,
+List<T>) }`, both `List<i32>` and `List<bool>` reuse the same constructor/tag
+symbols. Type arguments are enforced only through per-instantiation invariant
+predicates.
 
 For a constructor family whose sanitized name is `<name>`, the backend creates:
 
@@ -56,6 +64,20 @@ and asserts:
 
   forall x0 .. xn-1. ctorinv_<name>_<i>(mk_<name>(x0, .., xn-1)) = xi
     pattern: mk_<name>(x0, .., xn-1)
+
+Single-constructor structural composites additionally get the eta-style axiom:
+
+  forall v: value. mk_<name>(ctorinv_<name>_0(v), .., ctorinv_<name>_n(v)) = v
+
+Named spec enums also get a per-instantiation invariant predicate:
+
+  inv_<name<args>> : value -> Bool
+
+For `List<i32>`, this invariant says exactly that a value is either a `Nil`
+constructor, or a `Cons` constructor whose head satisfies the `i32` range
+invariant and whose tail satisfies `inv_List<i32>`. For `List<bool>`, the same
+constructor family is reused, but the invariant changes to require boolean
+heads and recursive `inv_List<bool>` tails.
 */
 
 #[derive(Debug, Clone, PartialEq, Eq)]
