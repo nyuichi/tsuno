@@ -2,15 +2,15 @@
 
 // Supported Rust types are reflected into the spec language and encoded in Z3 as follows:
 //
-// | Rust type                          | spec type           | Z3 representation | invariant |
-// | ---------------------------------- | ------------------- | ----------------- | --------- |
-// | `bool`                             | `bool`              | `Bool`            | `true` |
-// | `i8`, `i16`, `i32`, `i64`, `isize` | same as Rust        | `Int`             | width bounds |
-// | `u8`, `u16`, `u32`, `u64`, `usize` | same as Rust        | `Int`             | width bounds |
-// | `&T`                               | `Ref<T>`            | datatype wrapper  | `inv<T>(deref(x))` |
-// | `&mut T`                           | `Mut<T>`            | datatype wrapper  | `inv<T>(cur(x))` |
-// | `(T0, .., Tn)`                     | `Tuple([T0, .., Tn])` | datatype        | conjunction of field invariants |
-// | `struct S { f0: T0, .., fn: Tn }`  | `S`                 | datatype          | conjunction of field invariants |
+// | Rust type                          | spec type           | Z3 representation           | invariant |
+// | ---------------------------------- | ------------------- | --------------------------- | --------- |
+// | `bool`                             | `bool`              | boxed value                 | `true` |
+// | `i8`, `i16`, `i32`, `i64`, `isize` | same as Rust        | boxed value                 | width bounds |
+// | `u8`, `u16`, `u32`, `u64`, `usize` | same as Rust        | boxed value                 | width bounds |
+// | `&T`                               | `Ref<T>`            | constructor over values     | `inv<T>(deref(x))` |
+// | `&mut T`                           | `Mut<T>`            | constructor over values     | `inv<T>(cur(x))` |
+// | `(T0, .., Tn)`                     | `Tuple([T0, .., Tn])` | constructor over values   | conjunction of field invariants |
+// | `struct S { f0: T0, .., fn: Tn }`  | `S`                 | constructor over values     | conjunction of field invariants |
 //
 // Notes:
 // - `Mut<T>` additionally requires `cur(x) == fin(x)` when the mutable reference is closed.
@@ -42,7 +42,8 @@ use crate::prepass::{
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{BinaryOp, SpecTy, TypedExpr, TypedExprKind, UnaryOp};
 use crate::value_encoding::{
-    InductiveEncoding, InductiveValue, SymValue, TypeEncoding, TypeEncodingKind, ValueEncoder,
+    InductiveEncoding, InductiveValue, PrimitiveValue, SymValue, TypeEncoding, TypeEncodingKind,
+    ValueEncoder,
 };
 
 thread_local! {
@@ -1991,7 +1992,15 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn check_sat(&self, assumptions: &[Bool]) -> SatResult {
-        with_solver(|solver| solver.check_assumptions(assumptions))
+        with_solver(|solver| {
+            solver.push();
+            for assumption in assumptions {
+                solver.assert(assumption);
+            }
+            let result = solver.check();
+            solver.pop(1);
+            result
+        })
     }
 
     fn bool_expr_to_z3(&self, expr: &BoolExpr) -> Result<Bool, VerificationResult> {
@@ -2163,7 +2172,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn value_int(&self, value: i64) -> SymValue {
-        SymValue::Int(Int::from_i64(value))
+        self.value_wrap_int(&Int::from_i64(value))
     }
 
     fn value_decimal_int(&self, digits: &str, span: Span) -> Result<SymValue, VerificationResult> {
@@ -2178,30 +2187,48 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn value_wrap_bool(&self, value: &Bool) -> SymValue {
-        SymValue::Bool(value.clone())
+        let encoding = self
+            .type_encoding(&SpecTy::Bool)
+            .expect("bool encoding should be available");
+        let TypeEncodingKind::Bool(encoding) = &encoding.kind else {
+            unreachable!("bool encoding kind");
+        };
+        SymValue::Bool(PrimitiveValue {
+            ast: encoding.boxed.apply(&[value]),
+            data: value.clone(),
+        })
     }
 
     fn value_wrap_int(&self, value: &Int) -> SymValue {
-        SymValue::Int(value.clone())
+        let encoding = self
+            .type_encoding(&SpecTy::IntLiteral)
+            .expect("int encoding should be available");
+        let TypeEncodingKind::Int(encoding) = &encoding.kind else {
+            unreachable!("int encoding kind");
+        };
+        SymValue::Int(PrimitiveValue {
+            ast: encoding.boxed.apply(&[value]),
+            data: value.clone(),
+        })
     }
 
     fn value_is_true(&self, value: &SymValue) -> Bool {
         match value {
-            SymValue::Bool(value) => value.clone(),
+            SymValue::Bool(value) => value.data.clone(),
             _ => unreachable!("typed bool expression lowered to non-bool value"),
         }
     }
 
     fn value_int_data(&self, value: &SymValue) -> Int {
         match value {
-            SymValue::Int(value) => value.clone(),
+            SymValue::Int(value) => value.data.clone(),
             _ => unreachable!("typed int expression lowered to non-int value"),
         }
     }
 
     fn value_bool_data(&self, value: &SymValue) -> Bool {
         match value {
-            SymValue::Bool(value) => value.clone(),
+            SymValue::Bool(value) => value.data.clone(),
             _ => unreachable!("typed bool expression lowered to non-bool value"),
         }
     }
@@ -2225,37 +2252,13 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Bool, VerificationResult> {
         match &encoding.kind {
-            TypeEncodingKind::Bool(_) => {
-                Ok(self.value_bool_data(lhs).eq(self.value_bool_data(rhs)))
-            }
-            TypeEncodingKind::Int(_) => Ok(self.value_int_data(lhs).eq(self.value_int_data(rhs))),
-            TypeEncodingKind::Inductive(inductive) => {
-                let (SymValue::Inductive(lhs), SymValue::Inductive(rhs)) = (lhs, rhs) else {
-                    return Err(self.unsupported_result(
-                        span,
-                        "expected datatype values for equality".to_owned(),
-                    ));
-                };
-                if let (Some(lhs_fields), Some(rhs_fields)) = (&lhs.fields, &rhs.fields) {
-                    let mut equalities = Vec::with_capacity(inductive.fields.len());
-                    for ((field_encoding, lhs_field), rhs_field) in inductive
-                        .fields
-                        .iter()
-                        .zip(lhs_fields.iter())
-                        .zip(rhs_fields.iter())
-                    {
-                        equalities.push(self.eq_for_encoding(
-                            field_encoding,
-                            lhs_field,
-                            rhs_field,
-                            span,
-                        )?);
-                    }
-                    Ok(bool_and(equalities))
-                } else {
-                    Ok(lhs.ast.eq(&rhs.ast))
-                }
-            }
+            TypeEncodingKind::Bool(primitive) => Ok(self
+                .decode_bool_payload(primitive, sym_value_dynamic(lhs), span)?
+                .eq(self.decode_bool_payload(primitive, sym_value_dynamic(rhs), span)?)),
+            TypeEncodingKind::Int(primitive) => Ok(self
+                .decode_int_payload(primitive, sym_value_dynamic(lhs), span)?
+                .eq(self.decode_int_payload(primitive, sym_value_dynamic(rhs), span)?)),
+            TypeEncodingKind::Inductive(_) => Ok(sym_value_dynamic(lhs).eq(sym_value_dynamic(rhs))),
         }
     }
 
@@ -2329,9 +2332,7 @@ impl<'tcx> Verifier<'tcx> {
         let encoding = self.datatype_encoding(ty)?;
         let asts = fields.iter().map(sym_value_ast).collect::<Vec<_>>();
         Ok(SymValue::Inductive(InductiveValue {
-            ty: ty.clone(),
             ast: encoding.constructor.apply(&asts),
-            fields: Some(fields.to_vec()),
         }))
     }
 
@@ -2342,31 +2343,62 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
         match &encoding.kind {
-            TypeEncodingKind::Bool(_) => value
-                .as_bool()
-                .map(SymValue::Bool)
-                .ok_or_else(|| self.unsupported_result(span, "expected bool Z3 value".to_owned())),
-            TypeEncodingKind::Int(_) => value
-                .as_int()
-                .map(SymValue::Int)
-                .ok_or_else(|| self.unsupported_result(span, "expected int Z3 value".to_owned())),
-            TypeEncodingKind::Inductive(inductive) => {
-                let mut fields = Vec::with_capacity(inductive.fields.len());
-                for (index, field_encoding) in inductive.fields.iter().enumerate() {
-                    let field_value = self.decode_value(
-                        field_encoding,
-                        inductive.accessors[index].apply(&[&value]),
-                        span,
-                    )?;
-                    fields.push(field_value);
-                }
-                Ok(SymValue::Inductive(InductiveValue {
-                    ty: inductive.ty.clone(),
-                    ast: value,
-                    fields: Some(fields),
-                }))
+            TypeEncodingKind::Bool(encoding) => Ok(SymValue::Bool(PrimitiveValue {
+                ast: value.clone(),
+                data: self.decode_bool_payload(encoding, &value, span)?,
+            })),
+            TypeEncodingKind::Int(encoding) => Ok(SymValue::Int(PrimitiveValue {
+                ast: value.clone(),
+                data: self.decode_int_payload(encoding, &value, span)?,
+            })),
+            TypeEncodingKind::Inductive(_) => {
+                Ok(SymValue::Inductive(InductiveValue { ast: value }))
             }
         }
+    }
+
+    fn decode_bool_payload(
+        &self,
+        encoding: &crate::value_encoding::PrimitiveEncoding,
+        value: &Dynamic,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        if let Some(payload) = self.boxed_payload(value, &encoding.boxed_name) {
+            return payload.as_bool().ok_or_else(|| {
+                self.unsupported_result(span, "expected boxed bool payload".to_owned())
+            });
+        }
+        encoding
+            .unboxed
+            .apply(&[value])
+            .as_bool()
+            .ok_or_else(|| self.unsupported_result(span, "expected boxed bool value".to_owned()))
+    }
+
+    fn decode_int_payload(
+        &self,
+        encoding: &crate::value_encoding::PrimitiveEncoding,
+        value: &Dynamic,
+        span: Span,
+    ) -> Result<Int, VerificationResult> {
+        if let Some(payload) = self.boxed_payload(value, &encoding.boxed_name) {
+            return payload.as_int().ok_or_else(|| {
+                self.unsupported_result(span, "expected boxed int payload".to_owned())
+            });
+        }
+        encoding
+            .unboxed
+            .apply(&[value])
+            .as_int()
+            .ok_or_else(|| self.unsupported_result(span, "expected boxed int value".to_owned()))
+    }
+
+    fn boxed_payload(&self, value: &Dynamic, boxed_name: &str) -> Option<Dynamic> {
+        if value.decl().name() != boxed_name {
+            return None;
+        }
+        let children = value.children();
+        (children.len() == 1).then(|| children[0].clone())
     }
 
     fn fresh_for_rust_ty(&self, ty: Ty<'tcx>, hint: &str) -> Result<SymValue, VerificationResult> {
@@ -2386,43 +2418,34 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn fresh_for_spec_ty(&self, ty: &SpecTy, hint: &str) -> Result<SymValue, VerificationResult> {
-        match ty {
-            SpecTy::Bool => Ok(self.value_wrap_bool(&Bool::new_const(self.fresh_name(hint)))),
-            SpecTy::IntLiteral
-            | SpecTy::I8
-            | SpecTy::I16
-            | SpecTy::I32
-            | SpecTy::I64
-            | SpecTy::Isize
-            | SpecTy::U8
-            | SpecTy::U16
-            | SpecTy::U32
-            | SpecTy::U64
-            | SpecTy::Usize => Ok(self.value_wrap_int(&Int::new_const(self.fresh_name(hint)))),
-            SpecTy::Tuple(items) => {
-                let mut values = Vec::with_capacity(items.len());
-                for (index, item) in items.iter().enumerate() {
-                    values.push(self.fresh_for_spec_ty(item, &format!("{hint}_{index}"))?);
+        let encoding = self.type_encoding(ty)?;
+        self.fresh_for_encoding(&encoding, hint)
+    }
+
+    fn fresh_for_encoding(
+        &self,
+        encoding: &TypeEncoding,
+        hint: &str,
+    ) -> Result<SymValue, VerificationResult> {
+        match &encoding.kind {
+            TypeEncodingKind::Bool(_) => {
+                Ok(self.value_wrap_bool(&Bool::new_const(self.fresh_name(hint))))
+            }
+            TypeEncodingKind::Int(_) => {
+                Ok(self.value_wrap_int(&Int::new_const(self.fresh_name(hint))))
+            }
+            TypeEncodingKind::Inductive(inductive) => {
+                let mut fields = Vec::with_capacity(inductive.fields.len());
+                for (index, field_encoding) in inductive.fields.iter().enumerate() {
+                    fields.push(self.fresh_for_encoding(
+                        field_encoding,
+                        &format!("{hint}_{}", inductive.field_labels[index]),
+                    )?);
                 }
-                self.construct_datatype(ty, &values)
-            }
-            SpecTy::Struct(struct_ty) => {
-                let mut values = Vec::with_capacity(struct_ty.fields.len());
-                for field in &struct_ty.fields {
-                    values.push(
-                        self.fresh_for_spec_ty(&field.ty, &format!("{hint}_{}", field.name))?,
-                    );
-                }
-                self.construct_datatype(ty, &values)
-            }
-            SpecTy::Ref(inner) => {
-                let deref_value = self.fresh_for_spec_ty(inner, &format!("{hint}_deref"))?;
-                self.construct_datatype(ty, &[deref_value])
-            }
-            SpecTy::Mut(inner) => {
-                let cur = self.fresh_for_spec_ty(inner, &format!("{hint}_cur"))?;
-                let fin = self.fresh_for_spec_ty(inner, &format!("{hint}_fin"))?;
-                self.construct_datatype(ty, &[cur, fin])
+                let asts = fields.iter().map(sym_value_ast).collect::<Vec<_>>();
+                Ok(SymValue::Inductive(InductiveValue {
+                    ast: inductive.constructor.apply(&asts),
+                }))
             }
         }
     }
@@ -2434,21 +2457,29 @@ impl<'tcx> Verifier<'tcx> {
         index: usize,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
+        let encoding = self.datatype_encoding(parent_ty)?;
+        self.project_field_from_encoding(value, &encoding, index, span)
+    }
+
+    fn project_field_from_encoding(
+        &self,
+        value: SymValue,
+        encoding: &InductiveEncoding,
+        index: usize,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
         let SymValue::Inductive(value) = value else {
             return Err(self.unsupported_result(
                 span,
                 "field projection requires datatype-backed value".to_owned(),
             ));
         };
-        let encoding = self.datatype_encoding(parent_ty)?;
         let field = encoding
             .fields
             .get(index)
             .ok_or_else(|| self.unsupported_result(span, "field index out of range".to_owned()))?;
-        if let Some(fields) = &value.fields {
-            return fields.get(index).cloned().ok_or_else(|| {
-                self.unsupported_result(span, "field index out of range".to_owned())
-            });
+        if let Some(payload) = self.constructor_field(&value.ast, encoding, index) {
+            return self.decode_value(field, payload, span);
         }
         self.decode_value(field, encoding.accessors[index].apply(&[&value.ast]), span)
     }
@@ -2459,18 +2490,11 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let SymValue::Inductive(value) = value else {
+        if !matches!(value, SymValue::Inductive(_)) {
             return Err(self.unsupported_result(span, "expected shared reference value".to_owned()));
-        };
-        let encoding = self.datatype_encoding(&SpecTy::Ref(Box::new(inner_ty.clone())))?;
-        if let Some(fields) = &value.fields {
-            return Ok(fields[0].clone());
         }
-        self.decode_value(
-            &encoding.fields[0],
-            encoding.accessors[0].apply(&[&value.ast]),
-            span,
-        )
+        let encoding = self.datatype_encoding(&SpecTy::Ref(Box::new(inner_ty.clone())))?;
+        self.decode_inductive_field(&encoding, value, 0, span)
     }
 
     fn mut_cur(
@@ -2479,20 +2503,13 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let SymValue::Inductive(value) = value else {
+        if !matches!(value, SymValue::Inductive(_)) {
             return Err(
                 self.unsupported_result(span, "expected mutable reference value".to_owned())
             );
-        };
-        let encoding = self.datatype_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
-        if let Some(fields) = &value.fields {
-            return Ok(fields[0].clone());
         }
-        self.decode_value(
-            &encoding.fields[0],
-            encoding.accessors[0].apply(&[&value.ast]),
-            span,
-        )
+        let encoding = self.datatype_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
+        self.decode_inductive_field(&encoding, value, 0, span)
     }
 
     fn mut_fin(
@@ -2501,20 +2518,13 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let SymValue::Inductive(value) = value else {
+        if !matches!(value, SymValue::Inductive(_)) {
             return Err(
                 self.unsupported_result(span, "expected mutable reference value".to_owned())
             );
-        };
-        let encoding = self.datatype_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
-        if let Some(fields) = &value.fields {
-            return Ok(fields[1].clone());
         }
-        self.decode_value(
-            &encoding.fields[1],
-            encoding.accessors[1].apply(&[&value.ast]),
-            span,
-        )
+        let encoding = self.datatype_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
+        self.decode_inductive_field(&encoding, value, 1, span)
     }
 
     fn spec_ty_for_place_ty(&self, ty: Ty<'tcx>, span: Span) -> Result<SpecTy, VerificationResult> {
@@ -2741,62 +2751,94 @@ impl<'tcx> Verifier<'tcx> {
         value: &SymValue,
         span: Span,
     ) -> Result<Option<Bool>, VerificationResult> {
-        match ty {
-            SpecTy::Bool | SpecTy::IntLiteral => Ok(None),
-            SpecTy::I8
-            | SpecTy::I16
-            | SpecTy::I32
-            | SpecTy::I64
-            | SpecTy::Isize
-            | SpecTy::U8
-            | SpecTy::U16
-            | SpecTy::U32
-            | SpecTy::U64
-            | SpecTy::Usize => self.int_range_formula_for_spec_ty(ty, value, span),
-            SpecTy::Ref(inner) => {
-                let mut formulas = vec![self.inductive_tag_formula(ty, value, span)?];
-                let deref_value = self.ref_deref(value, inner, span)?;
-                if let Some(formula) = self.spec_ty_formula(inner, &deref_value, span)? {
+        let encoding = self.type_encoding(ty)?;
+        self.spec_ty_formula_for_encoding(ty, &encoding, value, span)
+    }
+
+    fn spec_ty_formula_for_encoding(
+        &self,
+        ty: &SpecTy,
+        encoding: &TypeEncoding,
+        value: &SymValue,
+        span: Span,
+    ) -> Result<Option<Bool>, VerificationResult> {
+        match (&encoding.kind, ty) {
+            (TypeEncodingKind::Bool(_), SpecTy::Bool) => Ok(None),
+            (TypeEncodingKind::Int(_), SpecTy::IntLiteral) => Ok(None),
+            (
+                TypeEncodingKind::Int(_),
+                SpecTy::I8
+                | SpecTy::I16
+                | SpecTy::I32
+                | SpecTy::I64
+                | SpecTy::Isize
+                | SpecTy::U8
+                | SpecTy::U16
+                | SpecTy::U32
+                | SpecTy::U64
+                | SpecTy::Usize,
+            ) => self.int_range_formula_for_spec_ty(ty, value, span),
+            (TypeEncodingKind::Inductive(inductive), SpecTy::Ref(inner)) => {
+                let mut formulas =
+                    vec![self.inductive_tag_formula_for_encoding(inductive, value, span)?];
+                let deref_value = self.decode_inductive_field(inductive, value, 0, span)?;
+                if let Some(formula) = self.spec_ty_formula_for_encoding(
+                    inner,
+                    &inductive.fields[0],
+                    &deref_value,
+                    span,
+                )? {
                     formulas.push(formula);
                 }
                 Ok(Some(bool_and(formulas)))
             }
-            SpecTy::Mut(inner) => {
-                let mut formulas = vec![self.inductive_tag_formula(ty, value, span)?];
-                let current = self.mut_cur(value, inner, span)?;
-                if let Some(formula) = self.spec_ty_formula(inner, &current, span)? {
+            (TypeEncodingKind::Inductive(inductive), SpecTy::Mut(inner)) => {
+                let mut formulas =
+                    vec![self.inductive_tag_formula_for_encoding(inductive, value, span)?];
+                let current = self.decode_inductive_field(inductive, value, 0, span)?;
+                if let Some(formula) =
+                    self.spec_ty_formula_for_encoding(inner, &inductive.fields[0], &current, span)?
+                {
                     formulas.push(formula);
                 }
                 Ok(Some(bool_and(formulas)))
             }
-            SpecTy::Tuple(items) => {
-                let mut formulas = vec![self.inductive_tag_formula(ty, value, span)?];
+            (TypeEncodingKind::Inductive(inductive), SpecTy::Tuple(items)) => {
+                let mut formulas =
+                    vec![self.inductive_tag_formula_for_encoding(inductive, value, span)?];
                 for (index, item) in items.iter().enumerate() {
-                    let field = self.project_field(value.clone(), ty, index, span)?;
-                    if let Some(formula) = self.spec_ty_formula(item, &field, span)? {
+                    let field = self.decode_inductive_field(inductive, value, index, span)?;
+                    if let Some(formula) = self.spec_ty_formula_for_encoding(
+                        item,
+                        &inductive.fields[index],
+                        &field,
+                        span,
+                    )? {
                         formulas.push(formula);
                     }
                 }
-                if formulas.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(bool_and(formulas)))
-                }
+                Ok(Some(bool_and(formulas)))
             }
-            SpecTy::Struct(struct_ty) => {
-                let mut formulas = vec![self.inductive_tag_formula(ty, value, span)?];
+            (TypeEncodingKind::Inductive(inductive), SpecTy::Struct(struct_ty)) => {
+                let mut formulas =
+                    vec![self.inductive_tag_formula_for_encoding(inductive, value, span)?];
                 for (index, field_ty) in struct_ty.fields.iter().enumerate() {
-                    let field = self.project_field(value.clone(), ty, index, span)?;
-                    if let Some(formula) = self.spec_ty_formula(&field_ty.ty, &field, span)? {
+                    let field = self.decode_inductive_field(inductive, value, index, span)?;
+                    if let Some(formula) = self.spec_ty_formula_for_encoding(
+                        &field_ty.ty,
+                        &inductive.fields[index],
+                        &field,
+                        span,
+                    )? {
                         formulas.push(formula);
                     }
                 }
-                if formulas.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(bool_and(formulas)))
-                }
+                Ok(Some(bool_and(formulas)))
             }
+            _ => Err(self.unsupported_result(
+                span,
+                format!("type/encoding mismatch for invariant: {ty:?}"),
+            )),
         }
     }
 
@@ -2806,62 +2848,129 @@ impl<'tcx> Verifier<'tcx> {
         value: &SymValue,
         span: Span,
     ) -> Result<Bool, VerificationResult> {
-        match ty {
-            SpecTy::Bool
-            | SpecTy::IntLiteral
-            | SpecTy::I8
-            | SpecTy::I16
-            | SpecTy::I32
-            | SpecTy::I64
-            | SpecTy::Isize
-            | SpecTy::U8
-            | SpecTy::U16
-            | SpecTy::U32
-            | SpecTy::U64
-            | SpecTy::Usize => Ok(Bool::from_bool(true)),
-            SpecTy::Ref(_) => self.inductive_tag_formula(ty, value, span),
-            SpecTy::Mut(inner) => {
-                let cur = self.mut_cur(value, inner, span)?;
-                let fin = self.mut_fin(value, inner, span)?;
+        let encoding = self.type_encoding(ty)?;
+        self.resolve_formula_for_encoding(ty, &encoding, value, span)
+    }
+
+    fn resolve_formula_for_encoding(
+        &self,
+        ty: &SpecTy,
+        encoding: &TypeEncoding,
+        value: &SymValue,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        match (&encoding.kind, ty) {
+            (
+                TypeEncodingKind::Bool(_) | TypeEncodingKind::Int(_),
+                SpecTy::Bool
+                | SpecTy::IntLiteral
+                | SpecTy::I8
+                | SpecTy::I16
+                | SpecTy::I32
+                | SpecTy::I64
+                | SpecTy::Isize
+                | SpecTy::U8
+                | SpecTy::U16
+                | SpecTy::U32
+                | SpecTy::U64
+                | SpecTy::Usize,
+            ) => Ok(Bool::from_bool(true)),
+            (TypeEncodingKind::Inductive(inductive), SpecTy::Ref(_)) => {
+                self.inductive_tag_formula_for_encoding(inductive, value, span)
+            }
+            (TypeEncodingKind::Inductive(inductive), SpecTy::Mut(inner)) => {
+                let cur = self.decode_inductive_field(inductive, value, 0, span)?;
+                let fin = self.decode_inductive_field(inductive, value, 1, span)?;
                 Ok(bool_and(vec![
-                    self.inductive_tag_formula(ty, value, span)?,
-                    self.eq_for_spec_ty(inner, &cur, &fin, span)?,
+                    self.inductive_tag_formula_for_encoding(inductive, value, span)?,
+                    self.eq_for_encoding(&inductive.fields[0], &cur, &fin, span)?,
+                    self.resolve_formula_for_encoding(inner, &inductive.fields[0], &cur, span)?,
+                    self.resolve_formula_for_encoding(inner, &inductive.fields[1], &fin, span)?,
                 ]))
             }
-            SpecTy::Tuple(items) => {
+            (TypeEncodingKind::Inductive(inductive), SpecTy::Tuple(items)) => {
                 let mut formulas = Vec::with_capacity(items.len() + 1);
-                formulas.push(self.inductive_tag_formula(ty, value, span)?);
+                formulas.push(self.inductive_tag_formula_for_encoding(inductive, value, span)?);
                 for (index, item) in items.iter().enumerate() {
-                    let field = self.project_field(value.clone(), ty, index, span)?;
-                    formulas.push(self.resolve_formula_for_spec_ty(item, &field, span)?);
+                    let field = self.decode_inductive_field(inductive, value, index, span)?;
+                    formulas.push(self.resolve_formula_for_encoding(
+                        item,
+                        &inductive.fields[index],
+                        &field,
+                        span,
+                    )?);
                 }
                 Ok(bool_and(formulas))
             }
-            SpecTy::Struct(struct_ty) => {
+            (TypeEncodingKind::Inductive(inductive), SpecTy::Struct(struct_ty)) => {
                 let mut formulas = Vec::with_capacity(struct_ty.fields.len() + 1);
-                formulas.push(self.inductive_tag_formula(ty, value, span)?);
+                formulas.push(self.inductive_tag_formula_for_encoding(inductive, value, span)?);
                 for (index, field_ty) in struct_ty.fields.iter().enumerate() {
-                    let field = self.project_field(value.clone(), ty, index, span)?;
-                    formulas.push(self.resolve_formula_for_spec_ty(&field_ty.ty, &field, span)?);
+                    let field = self.decode_inductive_field(inductive, value, index, span)?;
+                    formulas.push(self.resolve_formula_for_encoding(
+                        &field_ty.ty,
+                        &inductive.fields[index],
+                        &field,
+                        span,
+                    )?);
                 }
                 Ok(bool_and(formulas))
             }
+            _ => Err(self.unsupported_result(
+                span,
+                format!("type/encoding mismatch for resolution: {ty:?}"),
+            )),
         }
     }
 
-    fn inductive_tag_formula(
+    fn decode_inductive_field(
         &self,
-        ty: &SpecTy,
+        encoding: &InductiveEncoding,
+        value: &SymValue,
+        index: usize,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let SymValue::Inductive(value) = value else {
+            return Err(self.unsupported_result(span, "expected datatype-backed value".to_owned()));
+        };
+        let field_encoding = encoding
+            .fields
+            .get(index)
+            .ok_or_else(|| self.unsupported_result(span, "field index out of range".to_owned()))?;
+        if let Some(payload) = self.constructor_field(&value.ast, encoding, index) {
+            return self.decode_value(field_encoding, payload, span);
+        }
+        self.decode_value(
+            field_encoding,
+            encoding.accessors[index].apply(&[&value.ast]),
+            span,
+        )
+    }
+
+    fn constructor_field(
+        &self,
+        value: &Dynamic,
+        encoding: &InductiveEncoding,
+        index: usize,
+    ) -> Option<Dynamic> {
+        if value.decl().name() != encoding.constructor_name {
+            return None;
+        }
+        value.children().get(index).cloned()
+    }
+
+    fn inductive_tag_formula_for_encoding(
+        &self,
+        encoding: &InductiveEncoding,
         value: &SymValue,
         span: Span,
     ) -> Result<Bool, VerificationResult> {
         let SymValue::Inductive(value) = value else {
             return Err(self.unsupported_result(span, "expected datatype-backed value".to_owned()));
         };
-        if value.fields.is_some() {
-            return Ok(Bool::from_bool(&value.ty == ty));
+        if value.ast.decl().name() == encoding.constructor_name {
+            return Ok(Bool::from_bool(true));
         }
-        let encoding = self.datatype_encoding(ty)?;
         Ok(self
             .value_encoder
             .tag_function()
@@ -3094,6 +3203,8 @@ impl CallEnv {
 fn init_z3() {
     Z3_INIT.call_once(|| {
         z3::set_global_param("model", "true");
+        z3::set_global_param("smt.auto_config", "false");
+        z3::set_global_param("smt.mbqi", "false");
     });
 }
 
@@ -3152,10 +3263,14 @@ fn span_text(tcx: TyCtxt<'_>, span: Span) -> String {
     tcx.sess.source_map().span_to_diagnostic_string(span)
 }
 
-fn sym_value_ast(value: &SymValue) -> &dyn Ast {
+fn sym_value_dynamic(value: &SymValue) -> &Dynamic {
     match value {
-        SymValue::Bool(value) => value,
-        SymValue::Int(value) => value,
+        SymValue::Bool(value) => &value.ast,
+        SymValue::Int(value) => &value.ast,
         SymValue::Inductive(value) => &value.ast,
     }
+}
+
+fn sym_value_ast(value: &SymValue) -> &dyn Ast {
+    sym_value_dynamic(value)
 }
