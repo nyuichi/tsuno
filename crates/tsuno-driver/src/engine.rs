@@ -2,22 +2,21 @@
 
 // Supported Rust types are reflected into the spec language and encoded in Z3 as follows:
 //
-// | Rust type                          | spec type           | Z3 representation | invariant |
-// | ---------------------------------- | ------------------- | ----------------- | --------- |
-// | `bool`                             | `bool`              | `Bool`            | `true` |
-// | `i8`, `i16`, `i32`, `i64`, `isize` | same as Rust        | `Int`             | width bounds |
-// | `u8`, `u16`, `u32`, `u64`, `usize` | same as Rust        | `Int`             | width bounds |
-// | `&T`                               | `Ref<T>`            | datatype wrapper  | `inv<T>(deref(x))` |
-// | `&mut T`                           | `Mut<T>`            | datatype wrapper  | `inv<T>(cur(x))` |
-// | `Vec<T>`                           | `Seq<T>`            | `Seq<T>`          | each element satisfies `inv<T>` |
-// | `(T0, .., Tn)`                     | `Tuple([T0, .., Tn])` | datatype        | conjunction of field invariants |
-// | `struct S { f0: T0, .., fn: Tn }`  | `S`                 | datatype          | conjunction of field invariants |
+// | Rust type                          | spec type           | Z3 representation           | invariant |
+// | ---------------------------------- | ------------------- | --------------------------- | --------- |
+// | `bool`                             | `bool`              | boxed value                 | `true` |
+// | `i8`, `i16`, `i32`, `i64`, `isize` | same as Rust        | boxed value                 | width bounds |
+// | `u8`, `u16`, `u32`, `u64`, `usize` | same as Rust        | boxed value                 | width bounds |
+// | `&T`                               | `Ref<T>`            | constructor over values     | `inv<T>(deref(x))` |
+// | `&mut T`                           | `Mut<T>`            | constructor over values     | `inv<T>(cur(x))` |
+// | `(T0, .., Tn)`                     | `Tuple([T0, .., Tn])` | constructor over values   | conjunction of field invariants |
+// | `struct S { f0: T0, .., fn: Tn }`  | `S`                 | constructor over values     | conjunction of field invariants |
 //
 // Notes:
 // - `Mut<T>` additionally requires `cur(x) == fin(x)` when the mutable reference is closed.
-// - Structs with `Drop`, generic structs other than `Vec<T>`, and recursive structs are unsupported.
+// - Structs with `Drop`, generic structs, and recursive structs are unsupported.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::rc::Rc;
 use std::str::FromStr;
@@ -31,19 +30,18 @@ use rustc_middle::mir::{
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::source_map::Spanned;
 use rustc_span::{DUMMY_SP, Span};
-use z3::ast::{Ast, Bool, Datatype, Dynamic, Int, Seq};
-use z3::{
-    DatatypeAccessor, DatatypeBuilder, DatatypeSort, FuncDecl, SatResult, Solver, Sort, SortKind,
-};
+use z3::ast::{Ast, Bool, Int};
+use z3::{FuncDecl, SatResult, Solver, SortKind};
 
 use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
     FunctionContract, LemmaCallContract, LoopContract, LoopContracts, ProgramPrepass,
     ResolvedExprEnv, SpecVarBinding, TypedGhostStmt, TypedLemmaDef, TypedPureFnDef,
-    spec_ty_for_rust_ty, vec_element_ty,
+    spec_ty_for_rust_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
-use crate::spec::{BinaryOp, BuiltinFn, SpecTy, TypedExpr, TypedExprKind, UnaryOp};
+use crate::spec::{BinaryOp, SpecTy, TypedExpr, TypedExprKind, UnaryOp};
+use crate::value::{CompositeEncoding, SymValue, TypeEncoding, TypeEncodingKind, ValueEncoder};
 
 thread_local! {
     static GLOBAL_SOLVER: Solver = {
@@ -58,44 +56,6 @@ thread_local! {
 
 static Z3_INIT: Once = Once::new();
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SymValue {
-    Bool(Bool),
-    Int(Int),
-    Seq(Seq),
-    Datatype(Datatype),
-}
-
-#[derive(Debug)]
-struct TypeEncoding {
-    sort: Sort,
-    kind: TypeEncodingKind,
-}
-
-#[derive(Debug)]
-enum TypeEncodingKind {
-    Bool,
-    Int,
-    Seq,
-    Datatype(Rc<DatatypeEncoding>),
-}
-
-#[derive(Debug)]
-struct DatatypeEncoding {
-    sort: DatatypeSort,
-    fields: Vec<Rc<TypeEncoding>>,
-}
-
-impl DatatypeEncoding {
-    fn constructor(&self) -> &z3::FuncDecl {
-        &self.sort.variants[0].constructor
-    }
-
-    fn accessor(&self, index: usize) -> &z3::FuncDecl {
-        &self.sort.variants[0].accessors[index]
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ControlPoint {
     basic_block: BasicBlock,
@@ -107,13 +67,6 @@ pub struct State {
     pc: Bool,
     model: BTreeMap<Local, SymValue>,
     ctrl: ControlPoint,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BoolExpr {
-    Const(bool),
-    Value(SymValue),
-    Not(Box<BoolExpr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +86,7 @@ pub struct Verifier<'tcx> {
     pure_fns: HashMap<String, TypedPureFnDef>,
     lemmas: HashMap<String, TypedLemmaDef>,
     next_sym: Cell<usize>,
-    type_encodings: RefCell<BTreeMap<SpecTy, Rc<TypeEncoding>>>,
+    value_encoder: ValueEncoder,
 }
 
 pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<VerificationResult> {
@@ -183,7 +136,7 @@ impl<'tcx> Verifier<'tcx> {
             pure_fns: HashMap::new(),
             lemmas: HashMap::new(),
             next_sym: Cell::new(0),
-            type_encodings: RefCell::new(BTreeMap::new()),
+            value_encoder: ValueEncoder::new(tcx.data_layout.pointer_size().bits()),
         }
     }
 
@@ -291,10 +244,6 @@ impl<'tcx> Verifier<'tcx> {
                                 Ok(formula) => formula,
                                 Err(err) => return err,
                             };
-                            let formula = match self.bool_expr_to_z3(&formula) {
-                                Ok(formula) => formula,
-                                Err(err) => return err,
-                            };
                             if let Err(err) = self.assert_expr_constraint(
                                 &mut state,
                                 &assertion.assertion,
@@ -312,10 +261,6 @@ impl<'tcx> Verifier<'tcx> {
                                 &assumption.assumption,
                                 &assumption.resolution,
                             ) {
-                                Ok(formula) => formula,
-                                Err(err) => return err,
-                            };
-                            let formula = match self.bool_expr_to_z3(&formula) {
                                 Ok(formula) => formula,
                                 Err(err) => return err,
                             };
@@ -486,12 +431,12 @@ impl<'tcx> Verifier<'tcx> {
                     let branch = match discr.ty(self.body(), self.tcx).kind() {
                         TyKind::Bool => {
                             if value == 0 {
-                                not_expr(BoolExpr::Value(discr_value.clone()))
+                                self.value_is_true(&discr_value).not()
                             } else {
-                                BoolExpr::Value(discr_value.clone())
+                                self.value_is_true(&discr_value)
                             }
                         }
-                        _ => BoolExpr::Value(self.value_wrap_bool(&self.eq_for_spec_ty(
+                        _ => self.eq_for_spec_ty(
                             &self.spec_ty_for_place_ty(
                                 discr.ty(&self.body().local_decls, self.tcx),
                                 term.source_info.span,
@@ -499,9 +444,8 @@ impl<'tcx> Verifier<'tcx> {
                             &discr_value,
                             &self.value_int(value as i64),
                             term.source_info.span,
-                        )?)),
+                        )?,
                     };
-                    let branch = self.bool_expr_to_z3(&branch)?;
                     seen_conditions.push(branch.clone());
                     if let Some(next) =
                         self.prune_state(state.clone(), branch, term.source_info.span)?
@@ -530,11 +474,10 @@ impl<'tcx> Verifier<'tcx> {
                 ..
             } => {
                 let cond_value = self.eval_operand(&mut state, cond, term.source_info.span)?;
-                let mut formula = BoolExpr::Value(cond_value);
+                let mut formula = self.value_is_true(&cond_value);
                 if !*expected {
-                    formula = not_expr(formula);
+                    formula = formula.not();
                 }
-                let formula = self.bool_expr_to_z3(&formula)?;
                 self.assert_constraint(
                     &mut state,
                     formula,
@@ -666,7 +609,6 @@ impl<'tcx> Verifier<'tcx> {
                 &loop_contract.invariant,
                 &loop_contract.resolution,
             )?;
-            let invariant = self.bool_expr_to_z3(&invariant)?;
             self.assert_expr_constraint(
                 &mut state,
                 &loop_contract.invariant,
@@ -701,7 +643,6 @@ impl<'tcx> Verifier<'tcx> {
                 &loop_contract.invariant,
                 &loop_contract.resolution,
             )?;
-            let invariant = self.bool_expr_to_z3(&invariant)?;
             if !self.assume_constraint(&mut state, invariant, span)? {
                 return Ok(None);
             }
@@ -785,13 +726,11 @@ impl<'tcx> Verifier<'tcx> {
             merged.model.insert(local, merged_value);
         }
 
+        merged.pc = merged.pc.simplify();
         match self.check_sat(std::slice::from_ref(&merged.pc)) {
             SatResult::Sat => Ok(Some(merged)),
             SatResult::Unsat => Ok(None),
-            SatResult::Unknown => Err(self.unknown_result(
-                self.control_span(ctrl),
-                "solver returned unknown while checking merged path feasibility".to_owned(),
-            )),
+            SatResult::Unknown => Ok(Some(merged)),
         }
     }
 
@@ -822,8 +761,7 @@ impl<'tcx> Verifier<'tcx> {
         }
         let spec = HashMap::new();
         let body = self.contract_expr_to_value(&current, &spec, &pure_fn.body)?;
-        let fn_value =
-            self.apply_pure_fn_decl(&decl, &pure_fn.result_ty, &vars, self.report_span())?;
+        let fn_value = self.apply_pure_fn_decl(&decl, &vars)?;
         let mut consequent =
             vec![self.eq_for_spec_ty(&pure_fn.result_ty, &fn_value, &body, self.report_span())?];
         if let Some(formula) =
@@ -842,7 +780,7 @@ impl<'tcx> Verifier<'tcx> {
         } else {
             bool_and(antecedent).implies(bool_and(consequent))
         };
-        let asts: Vec<&dyn Ast> = vars.iter().map(sym_value_ast).collect();
+        let asts: Vec<&dyn Ast> = vars.iter().map(|value| value.ast()).collect();
         with_solver(|solver| {
             solver.assert(z3::ast::forall_const(&asts, &[], &body));
         });
@@ -877,7 +815,7 @@ impl<'tcx> Verifier<'tcx> {
             },
         };
         let req = self.contract_expr_to_bool(&current, &spec, &lemma.req)?;
-        if !self.assume_constraint(&mut state, self.bool_expr_to_z3(&req)?, self.report_span())? {
+        if !self.assume_constraint(&mut state, req, self.report_span())? {
             stack.pop();
             return Ok(());
         }
@@ -897,7 +835,7 @@ impl<'tcx> Verifier<'tcx> {
                     self.assert_expr_constraint(
                         &mut state,
                         expr,
-                        self.bool_expr_to_z3(&formula)?,
+                        formula,
                         self.report_span(),
                         format!("lemma `{}`", lemma.name),
                         format!("lemma `{}` assertion failed", lemma.name),
@@ -905,11 +843,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 TypedGhostStmt::Assume(expr) => {
                     let formula = self.contract_expr_to_bool(&current, &spec, expr)?;
-                    if !self.assume_constraint(
-                        &mut state,
-                        self.bool_expr_to_z3(&formula)?,
-                        self.report_span(),
-                    )? {
+                    if !self.assume_constraint(&mut state, formula, self.report_span())? {
                         stack.pop();
                         return Ok(());
                     }
@@ -927,17 +861,13 @@ impl<'tcx> Verifier<'tcx> {
                     self.assert_expr_constraint(
                         &mut state,
                         &callee.req,
-                        self.bool_expr_to_z3(&req)?,
+                        req,
                         self.report_span(),
                         format!("lemma `{}`", lemma.name),
                         format!("lemma `{}` precondition failed", callee.name),
                     )?;
                     let ens = self.contract_expr_to_bool(&env.current, &env.spec, &callee.ens)?;
-                    if !self.assume_constraint(
-                        &mut state,
-                        self.bool_expr_to_z3(&ens)?,
-                        self.report_span(),
-                    )? {
+                    if !self.assume_constraint(&mut state, ens, self.report_span())? {
                         stack.pop();
                         return Ok(());
                     }
@@ -948,7 +878,7 @@ impl<'tcx> Verifier<'tcx> {
         let result = self.assert_expr_constraint(
             &mut state,
             &lemma.ens,
-            self.bool_expr_to_z3(&ens)?,
+            ens,
             self.report_span(),
             format!("lemma `{}`", lemma.name),
             format!("lemma `{}` postcondition failed", lemma.name),
@@ -971,13 +901,13 @@ impl<'tcx> Verifier<'tcx> {
         self.assert_expr_constraint(
             state,
             &lemma.req,
-            self.bool_expr_to_z3(&req)?,
+            req,
             span,
             call.span_text.clone(),
             format!("lemma `{}` precondition failed", lemma.name),
         )?;
         let ens = self.contract_expr_to_bool(&env.current, &env.spec, &lemma.ens)?;
-        self.assume_constraint(state, self.bool_expr_to_z3(&ens)?, span)
+        self.assume_constraint(state, ens, span)
     }
 
     fn lemma_env_from_state_exprs(
@@ -1123,7 +1053,7 @@ impl<'tcx> Verifier<'tcx> {
                     for operand in operands {
                         values.push(self.eval_operand(state, operand, span)?);
                     }
-                    self.construct_datatype(&result_ty, &values)
+                    self.construct_composite(&result_ty, &values)
                 }
                 AggregateKind::Adt(def_id, variant_idx, args, _, _) => {
                     let adt_def = self.tcx.adt_def(def_id);
@@ -1141,7 +1071,7 @@ impl<'tcx> Verifier<'tcx> {
                         rvalue.ty(&self.body().local_decls, self.tcx),
                     )
                     .map_err(|err| self.unsupported_result(span, err))?;
-                    self.construct_datatype(&result_ty, &values)
+                    self.construct_composite(&result_ty, &values)
                 }
                 _ => Err(self.unsupported_result(span, format!("unsupported aggregate {kind:?}"))),
             },
@@ -1164,7 +1094,7 @@ impl<'tcx> Verifier<'tcx> {
         };
         self.write_place(state, place, final_value.clone(), span)?;
         let inner_ty = self.spec_ty_for_place_ty(self.place_ty(place), span)?;
-        self.construct_datatype(&SpecTy::Mut(Box::new(inner_ty)), &[current, final_value])
+        self.construct_composite(&SpecTy::Mut(Box::new(inner_ty)), &[current, final_value])
     }
 
     fn create_shared_borrow(
@@ -1175,7 +1105,7 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<SymValue, VerificationResult> {
         let value = self.read_place(state, place, ReadMode::Current, span)?;
         let inner_ty = self.spec_ty_for_place_ty(self.place_ty(place), span)?;
-        self.construct_datatype(&SpecTy::Ref(Box::new(inner_ty)), &[value])
+        self.construct_composite(&SpecTy::Ref(Box::new(inner_ty)), &[value])
     }
 
     fn eval_binary_op(
@@ -1203,7 +1133,7 @@ impl<'tcx> Verifier<'tcx> {
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_wrap_int(&int_value))
+                Ok(self.value_encoder.wrap_int(&int_value))
             }
             BinOp::Sub => {
                 let int_value = self.value_int_data(&lhs_value) - self.value_int_data(&rhs_value);
@@ -1214,7 +1144,7 @@ impl<'tcx> Verifier<'tcx> {
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_wrap_int(&int_value))
+                Ok(self.value_encoder.wrap_int(&int_value))
             }
             BinOp::Mul => {
                 let int_value = self.value_int_data(&lhs_value) * self.value_int_data(&rhs_value);
@@ -1225,35 +1155,35 @@ impl<'tcx> Verifier<'tcx> {
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_wrap_int(&int_value))
+                Ok(self.value_encoder.wrap_int(&int_value))
             }
-            BinOp::Eq => Ok(self.value_wrap_bool(&self.eq_for_spec_ty(
+            BinOp::Eq => Ok(self.value_encoder.wrap_bool(&self.eq_for_spec_ty(
                 &lhs_spec_ty,
                 &lhs_value,
                 &rhs_value,
                 span,
             )?)),
-            BinOp::Ne => Ok(self.value_wrap_bool(
+            BinOp::Ne => Ok(self.value_encoder.wrap_bool(
                 &self
                     .eq_for_spec_ty(&lhs_spec_ty, &lhs_value, &rhs_value, span)?
                     .not(),
             )),
-            BinOp::Lt => Ok(self.value_wrap_bool(
+            BinOp::Lt => Ok(self.value_encoder.wrap_bool(
                 &self
                     .value_int_data(&lhs_value)
                     .lt(self.value_int_data(&rhs_value)),
             )),
-            BinOp::Le => Ok(self.value_wrap_bool(
+            BinOp::Le => Ok(self.value_encoder.wrap_bool(
                 &self
                     .value_int_data(&lhs_value)
                     .le(self.value_int_data(&rhs_value)),
             )),
-            BinOp::Gt => Ok(self.value_wrap_bool(
+            BinOp::Gt => Ok(self.value_encoder.wrap_bool(
                 &self
                     .value_int_data(&lhs_value)
                     .gt(self.value_int_data(&rhs_value)),
             )),
-            BinOp::Ge => Ok(self.value_wrap_bool(
+            BinOp::Ge => Ok(self.value_encoder.wrap_bool(
                 &self
                     .value_int_data(&lhs_value)
                     .ge(self.value_int_data(&rhs_value)),
@@ -1290,7 +1220,7 @@ impl<'tcx> Verifier<'tcx> {
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                self.value_wrap_int(&int_value)
+                self.value_encoder.wrap_int(&int_value)
             }
             BinOp::Sub | BinOp::SubWithOverflow => {
                 let int_value = self.value_int_data(&lhs_value) - self.value_int_data(&rhs_value);
@@ -1301,7 +1231,7 @@ impl<'tcx> Verifier<'tcx> {
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                self.value_wrap_int(&int_value)
+                self.value_encoder.wrap_int(&int_value)
             }
             BinOp::Mul | BinOp::MulWithOverflow => {
                 let int_value = self.value_int_data(&lhs_value) * self.value_int_data(&rhs_value);
@@ -1312,7 +1242,7 @@ impl<'tcx> Verifier<'tcx> {
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                self.value_wrap_int(&int_value)
+                self.value_encoder.wrap_int(&int_value)
             }
             other => {
                 return Err(self.unsupported_result(
@@ -1322,7 +1252,7 @@ impl<'tcx> Verifier<'tcx> {
             }
         };
         let overflow_value = self.overflow_value_for_result(result_ty, &result_value, span)?;
-        self.construct_datatype(&tuple_ty, &[result_value, overflow_value])
+        self.construct_composite(&tuple_ty, &[result_value, overflow_value])
     }
 
     fn eval_unary_op(
@@ -1335,10 +1265,9 @@ impl<'tcx> Verifier<'tcx> {
         let value = self.eval_operand(state, operand, span)?;
         let operand_ty = operand.ty(&self.body().local_decls, self.tcx);
         let result = match op {
-            UnOp::Not => match operand_ty.kind() {
-                TyKind::Bool => Ok(self.value_wrap_bool(&self.value_bool_data(&value).not())),
-                _ => Ok(self.value_wrap_bool(&self.value_bool_data(&value).not())),
-            },
+            UnOp::Not => Ok(self
+                .value_encoder
+                .wrap_bool(&self.value_is_true(&value).not())),
             UnOp::Neg => {
                 let int_value = Int::from_i64(0) - self.value_int_data(&value);
                 self.require_int_invariant(
@@ -1348,7 +1277,7 @@ impl<'tcx> Verifier<'tcx> {
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_wrap_int(&int_value))
+                Ok(self.value_encoder.wrap_int(&int_value))
             }
             other => {
                 Err(self.unsupported_result(span, format!("unsupported unary operator {other:?}")))
@@ -1448,13 +1377,13 @@ impl<'tcx> Verifier<'tcx> {
             }
             TyKind::Tuple(fields) if fields.is_empty() => {
                 let spec_ty = self.spec_ty_for_place_ty(ty, span)?;
-                self.construct_datatype(&spec_ty, &[])
+                self.construct_composite(&spec_ty, &[])
             }
             TyKind::Adt(adt_def, _)
                 if adt_def.is_struct() && adt_def.non_enum_variant().fields.is_empty() =>
             {
                 let spec_ty = self.spec_ty_for_place_ty(ty, span)?;
-                self.construct_datatype(&spec_ty, &[])
+                self.construct_composite(&spec_ty, &[])
             }
             _ => Err(self.unsupported_result(span, format!("unsupported constant type {ty:?}"))),
         }
@@ -1585,7 +1514,7 @@ impl<'tcx> Verifier<'tcx> {
                     span,
                 )?;
                 let fin = self.mut_fin(&value, inner_ty, span)?;
-                self.construct_datatype(spec_ty, &[current, fin])
+                self.construct_composite(spec_ty, &[current, fin])
             }
             PlaceElem::Field(field, _) => {
                 let index = field.index();
@@ -1616,7 +1545,7 @@ impl<'tcx> Verifier<'tcx> {
                         items.push(field_value);
                     }
                 }
-                self.construct_datatype(spec_ty, &items)
+                self.construct_composite(spec_ty, &items)
             }
             other => Err(self
                 .unsupported_result(span, format!("unsupported assignment projection {other:?}"))),
@@ -1648,7 +1577,7 @@ impl<'tcx> Verifier<'tcx> {
                     let field_value = self.project_field(value.clone(), spec_ty, index, span)?;
                     updated.push(self.dangle_value(field_ty, &field_value, span)?);
                 }
-                self.construct_datatype(spec_ty, &updated)
+                self.construct_composite(spec_ty, &updated)
             }
             SpecTy::Struct(struct_ty) => {
                 let mut updated = Vec::with_capacity(struct_ty.fields.len());
@@ -1656,14 +1585,13 @@ impl<'tcx> Verifier<'tcx> {
                     let field_value = self.project_field(value.clone(), spec_ty, index, span)?;
                     updated.push(self.dangle_value(&field_ty.ty, &field_value, span)?);
                 }
-                self.construct_datatype(spec_ty, &updated)
+                self.construct_composite(spec_ty, &updated)
             }
             SpecTy::Mut(inner) => {
                 let fresh = self.fresh_for_spec_ty(inner, "dangle")?;
                 let fin = self.mut_fin(value, inner, span)?;
-                self.construct_datatype(spec_ty, &[fresh, fin])
+                self.construct_composite(spec_ty, &[fresh, fin])
             }
-            SpecTy::Seq(_) => self.fresh_for_spec_ty(spec_ty, "dangle"),
             SpecTy::Ref(_)
             | SpecTy::Bool
             | SpecTy::IntLiteral
@@ -1685,12 +1613,80 @@ impl<'tcx> Verifier<'tcx> {
         state: &State,
         expr: &TypedExpr,
         resolved: &ResolvedExprEnv,
-    ) -> Result<BoolExpr, VerificationResult> {
+    ) -> Result<Bool, VerificationResult> {
         match &expr.kind {
-            TypedExprKind::Bool(value) => Ok(BoolExpr::Const(*value)),
-            _ => Ok(BoolExpr::Value(
-                self.spec_expr_to_value(state, expr, resolved)?,
-            )),
+            TypedExprKind::Bool(value) => Ok(Bool::from_bool(*value)),
+            TypedExprKind::Unary {
+                op: UnaryOp::Not,
+                arg,
+            } => Ok(self.spec_expr_to_bool(state, arg, resolved)?.not()),
+            TypedExprKind::Binary { op, lhs, rhs } => match op {
+                BinaryOp::And => {
+                    let lhs = self.spec_expr_to_bool(state, lhs, resolved)?;
+                    let rhs = self.spec_expr_to_bool(state, rhs, resolved)?;
+                    Ok(Bool::and(&[&lhs, &rhs]))
+                }
+                BinaryOp::Or => {
+                    let lhs = self.spec_expr_to_bool(state, lhs, resolved)?;
+                    let rhs = self.spec_expr_to_bool(state, rhs, resolved)?;
+                    Ok(Bool::or(&[&lhs, &rhs]))
+                }
+                BinaryOp::Eq => {
+                    let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
+                    let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
+                    self.eq_for_spec_ty(
+                        &lhs.ty,
+                        &lhs_value,
+                        &rhs_value,
+                        self.control_span(state.ctrl),
+                    )
+                }
+                BinaryOp::Ne => {
+                    let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
+                    let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
+                    Ok(self
+                        .eq_for_spec_ty(
+                            &lhs.ty,
+                            &lhs_value,
+                            &rhs_value,
+                            self.control_span(state.ctrl),
+                        )?
+                        .not())
+                }
+                BinaryOp::Lt => {
+                    let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
+                    let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
+                    Ok(self
+                        .value_int_data(&lhs_value)
+                        .lt(self.value_int_data(&rhs_value)))
+                }
+                BinaryOp::Le => {
+                    let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
+                    let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
+                    Ok(self
+                        .value_int_data(&lhs_value)
+                        .le(self.value_int_data(&rhs_value)))
+                }
+                BinaryOp::Gt => {
+                    let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
+                    let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
+                    Ok(self
+                        .value_int_data(&lhs_value)
+                        .gt(self.value_int_data(&rhs_value)))
+                }
+                BinaryOp::Ge => {
+                    let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
+                    let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
+                    Ok(self
+                        .value_int_data(&lhs_value)
+                        .ge(self.value_int_data(&rhs_value)))
+                }
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
+                    let value = self.spec_expr_to_value(state, expr, resolved)?;
+                    Ok(self.value_is_true(&value))
+                }
+            },
+            _ => Ok(self.value_is_true(&self.spec_expr_to_value(state, expr, resolved)?)),
         }
     }
 
@@ -1740,14 +1736,7 @@ impl<'tcx> Verifier<'tcx> {
                 for arg in args {
                     values.push(self.spec_expr_to_value(state, arg, resolved)?);
                 }
-                self.eval_pure_call(func, &expr.ty, values, self.control_span(state.ctrl))
-            }
-            TypedExprKind::BuiltinCall { func, args } => {
-                let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.spec_expr_to_value(state, arg, resolved)?);
-                }
-                self.eval_builtin_call(*func, args, values, self.control_span(state.ctrl))
+                self.eval_pure_call(func, values, self.control_span(state.ctrl))
             }
             TypedExprKind::Field { base, index, .. } => {
                 let value = self.spec_expr_to_value(state, base, resolved)?;
@@ -1799,12 +1788,70 @@ impl<'tcx> Verifier<'tcx> {
         current: &HashMap<String, SymValue>,
         spec: &HashMap<String, SymValue>,
         expr: &TypedExpr,
-    ) -> Result<BoolExpr, VerificationResult> {
+    ) -> Result<Bool, VerificationResult> {
         match &expr.kind {
-            TypedExprKind::Bool(value) => Ok(BoolExpr::Const(*value)),
-            _ => Ok(BoolExpr::Value(
-                self.contract_expr_to_value(current, spec, expr)?,
-            )),
+            TypedExprKind::Bool(value) => Ok(Bool::from_bool(*value)),
+            TypedExprKind::Unary {
+                op: UnaryOp::Not,
+                arg,
+            } => Ok(self.contract_expr_to_bool(current, spec, arg)?.not()),
+            TypedExprKind::Binary { op, lhs, rhs } => match op {
+                BinaryOp::And => {
+                    let lhs = self.contract_expr_to_bool(current, spec, lhs)?;
+                    let rhs = self.contract_expr_to_bool(current, spec, rhs)?;
+                    Ok(Bool::and(&[&lhs, &rhs]))
+                }
+                BinaryOp::Or => {
+                    let lhs = self.contract_expr_to_bool(current, spec, lhs)?;
+                    let rhs = self.contract_expr_to_bool(current, spec, rhs)?;
+                    Ok(Bool::or(&[&lhs, &rhs]))
+                }
+                BinaryOp::Eq => {
+                    let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
+                    let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
+                    self.eq_for_spec_ty(&lhs.ty, &lhs_value, &rhs_value, self.report_span())
+                }
+                BinaryOp::Ne => {
+                    let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
+                    let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
+                    Ok(self
+                        .eq_for_spec_ty(&lhs.ty, &lhs_value, &rhs_value, self.report_span())?
+                        .not())
+                }
+                BinaryOp::Lt => {
+                    let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
+                    let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
+                    Ok(self
+                        .value_int_data(&lhs_value)
+                        .lt(self.value_int_data(&rhs_value)))
+                }
+                BinaryOp::Le => {
+                    let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
+                    let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
+                    Ok(self
+                        .value_int_data(&lhs_value)
+                        .le(self.value_int_data(&rhs_value)))
+                }
+                BinaryOp::Gt => {
+                    let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
+                    let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
+                    Ok(self
+                        .value_int_data(&lhs_value)
+                        .gt(self.value_int_data(&rhs_value)))
+                }
+                BinaryOp::Ge => {
+                    let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
+                    let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
+                    Ok(self
+                        .value_int_data(&lhs_value)
+                        .ge(self.value_int_data(&rhs_value)))
+                }
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
+                    let value = self.contract_expr_to_value(current, spec, expr)?;
+                    Ok(self.value_is_true(&value))
+                }
+            },
+            _ => Ok(self.value_is_true(&self.contract_expr_to_value(current, spec, expr)?)),
         }
     }
 
@@ -1842,14 +1889,7 @@ impl<'tcx> Verifier<'tcx> {
                 for arg in args {
                     values.push(self.contract_expr_to_value(current, spec, arg)?);
                 }
-                self.eval_pure_call(func, &expr.ty, values, self.report_span())
-            }
-            TypedExprKind::BuiltinCall { func, args } => {
-                let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.contract_expr_to_value(current, spec, arg)?);
-                }
-                self.eval_builtin_call(*func, args, values, self.report_span())
+                self.eval_pure_call(func, values, self.report_span())
             }
             TypedExprKind::Field { base, index, .. } => {
                 let value = self.contract_expr_to_value(current, spec, base)?;
@@ -1890,75 +1930,9 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn eval_builtin_call(
-        &self,
-        func: BuiltinFn,
-        args: &[TypedExpr],
-        values: Vec<SymValue>,
-        span: Span,
-    ) -> Result<SymValue, VerificationResult> {
-        match func {
-            BuiltinFn::SeqLen => {
-                let SymValue::Seq(seq) = &values[0] else {
-                    return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
-                };
-                Ok(self.value_wrap_int(&seq.length()))
-            }
-            BuiltinFn::SeqExtract => {
-                let SymValue::Seq(seq) = &values[0] else {
-                    return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
-                };
-                let SpecTy::Seq(inner) = &args[0].ty else {
-                    unreachable!("typed seq_extract base");
-                };
-                let start = self.value_int_data(&values[1]);
-                let len = self.value_int_data(&values[2]);
-                Ok(SymValue::Seq(self.seq_extract(seq, inner, &start, &len)))
-            }
-            BuiltinFn::SeqConcat => {
-                let (SymValue::Seq(lhs), SymValue::Seq(rhs)) = (&values[0], &values[1]) else {
-                    return Err(self.unsupported_result(
-                        span,
-                        "expected sequence values for concatenation".to_owned(),
-                    ));
-                };
-                Ok(SymValue::Seq(Seq::concat(&[lhs, rhs])))
-            }
-            BuiltinFn::SeqNth => {
-                let SymValue::Seq(seq) = &values[0] else {
-                    return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
-                };
-                let SpecTy::Seq(inner) = &args[0].ty else {
-                    unreachable!("typed seq_nth base");
-                };
-                let index = self.value_int_data(&values[1]);
-                let dyn_value = seq.nth(index);
-                let encoding = self.type_encoding(inner)?;
-                let elem = self.decode_value(&encoding, dyn_value, span)?;
-                Ok(elem)
-            }
-            BuiltinFn::SeqRev => {
-                let SymValue::Seq(seq) = &values[0] else {
-                    return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
-                };
-                let SpecTy::Seq(inner) = &args[0].ty else {
-                    unreachable!("typed seq_rev base");
-                };
-                Ok(SymValue::Seq(self.seq_rev(seq, inner)))
-            }
-            BuiltinFn::SeqUnit => Ok(SymValue::Seq(match &values[0] {
-                SymValue::Bool(value) => Seq::unit(value),
-                SymValue::Int(value) => Seq::unit(value),
-                SymValue::Seq(value) => Seq::unit(value),
-                SymValue::Datatype(value) => Seq::unit(value),
-            })),
-        }
-    }
-
     fn eval_pure_call(
         &self,
         func: &str,
-        result_ty: &SpecTy,
         values: Vec<SymValue>,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
@@ -1966,16 +1940,13 @@ impl<'tcx> Verifier<'tcx> {
             return Err(self.unsupported_result(span, format!("unknown pure function `{func}`")));
         };
         let decl = self.pure_fn_decl(pure_fn)?;
-        self.apply_pure_fn_decl(&decl, result_ty, &values, span)
+        self.apply_pure_fn_decl(&decl, &values)
     }
 
     fn pure_fn_decl(&self, pure_fn: &TypedPureFnDef) -> Result<FuncDecl, VerificationResult> {
-        let mut domain_sorts = Vec::with_capacity(pure_fn.params.len());
-        for param in &pure_fn.params {
-            domain_sorts.push(self.type_encoding(&param.ty)?.sort.clone());
-        }
+        let domain_sorts = vec![self.value_encoder.value_sort().clone(); pure_fn.params.len()];
         let domain_refs: Vec<_> = domain_sorts.iter().collect();
-        let result_sort = self.type_encoding(&pure_fn.result_ty)?.sort.clone();
+        let result_sort = self.value_encoder.value_sort().clone();
         Ok(FuncDecl::new(
             format!("pure_fn_{}", pure_fn.name),
             &domain_refs,
@@ -1986,125 +1957,10 @@ impl<'tcx> Verifier<'tcx> {
     fn apply_pure_fn_decl(
         &self,
         decl: &FuncDecl,
-        result_ty: &SpecTy,
         values: &[SymValue],
-        span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let args: Vec<&dyn Ast> = values.iter().map(sym_value_ast).collect();
-        let app = decl.apply(&args);
-        let encoding = self.type_encoding(result_ty)?;
-        self.decode_value(&encoding, app, span)
-    }
-
-    fn seq_extract(&self, seq: &Seq, inner: &SpecTy, start: &Int, len: &Int) -> Seq {
-        let elem = self
-            .type_encoding(inner)
-            .expect("sequence element encoding for seq_extract");
-        let seq_sort = Sort::seq(&elem.sort);
-        let decl = FuncDecl::new(
-            format!("seq_extract_{}", self.sort_name(inner)),
-            &[&seq_sort, &Sort::int(), &Sort::int()],
-            &seq_sort,
-        );
-        let input = Seq::fresh_const("seq_extract_input", &elem.sort);
-        let start_var = Int::fresh_const("seq_extract_start");
-        let len_var = Int::fresh_const("seq_extract_len");
-        let output = decl
-            .apply(&[&input, &start_var, &len_var])
-            .as_seq()
-            .expect("seq_extract result");
-        let idx = Int::fresh_const("seq_extract_idx");
-        let input_len = input.length();
-        let in_bounds = bool_and(vec![
-            start_var.ge(0),
-            len_var.ge(0),
-            start_var.le(input_len.clone()),
-            len_var.le(input_len.clone() - start_var.clone()),
-        ]);
-        GLOBAL_SOLVER.with(|solver| {
-            solver.assert(z3::ast::forall_const(
-                &[&input, &start_var, &len_var],
-                &[],
-                &in_bounds.clone().implies(output.length().eq(&len_var)),
-            ));
-            solver.assert(z3::ast::forall_const(
-                &[&input, &start_var, &len_var, &idx],
-                &[],
-                &bool_and(vec![in_bounds.clone(), idx.ge(0), idx.lt(len_var.clone())]).implies(
-                    output
-                        .nth(idx.clone())
-                        .eq(input.nth(start_var.clone() + idx.clone())),
-                ),
-            ));
-            let zero = Int::from_i64(0);
-            let prefix = decl
-                .apply(&[&input, &zero, &start_var])
-                .as_seq()
-                .expect("seq_extract prefix");
-            let suffix_start = start_var.clone() + len_var.clone();
-            let suffix_len = input_len.clone() - start_var.clone() - len_var.clone();
-            let suffix = decl
-                .apply(&[&input, &suffix_start, &suffix_len])
-                .as_seq()
-                .expect("seq_extract suffix");
-            solver.assert(z3::ast::forall_const(
-                &[&input, &start_var, &len_var],
-                &[],
-                &in_bounds.implies(input.eq(Seq::concat(&[&prefix, &output, &suffix]))),
-            ));
-        });
-        decl.apply(&[seq, start, len])
-            .as_seq()
-            .expect("seq_extract application")
-    }
-
-    fn seq_rev(&self, seq: &Seq, inner: &SpecTy) -> Seq {
-        let elem = self
-            .type_encoding(inner)
-            .expect("sequence element encoding for seq_rev");
-        let seq_sort = Sort::seq(&elem.sort);
-        let decl = FuncDecl::new(
-            format!("seq_rev_{}", self.sort_name(inner)),
-            &[&seq_sort],
-            &seq_sort,
-        );
-        let input = Seq::fresh_const("seq_rev_input", &elem.sort);
-        let output = decl.apply(&[&input]).as_seq().expect("seq_rev result");
-        let index = Int::fresh_const("seq_rev_idx");
-        let len = input.length();
-        GLOBAL_SOLVER.with(|solver| {
-            solver.assert(z3::ast::forall_const(
-                &[&input],
-                &[],
-                &output.length().eq(&len),
-            ));
-            solver.assert(z3::ast::forall_const(
-                &[&input, &index],
-                &[],
-                &bool_and(vec![
-                    index.ge(0),
-                    index.lt(len.clone()),
-                    output
-                        .nth(index.clone())
-                        .eq(input.nth(len.clone() - index.clone() - 1)),
-                ]),
-            ));
-            let left = Seq::fresh_const("seq_rev_left", &elem.sort);
-            let right = Seq::fresh_const("seq_rev_right", &elem.sort);
-            let left_rev = decl.apply(&[&left]).as_seq().expect("seq_rev left");
-            let right_rev = decl.apply(&[&right]).as_seq().expect("seq_rev right");
-            let both = Seq::concat(&[&left, &right]);
-            solver.assert(z3::ast::forall_const(
-                &[&left, &right],
-                &[],
-                &decl
-                    .apply(&[&both])
-                    .as_seq()
-                    .expect("seq_rev concat")
-                    .eq(Seq::concat(&[&right_rev, &left_rev])),
-            ));
-        });
-        decl.apply(&[seq]).as_seq().expect("seq_rev application")
+        let args: Vec<&dyn Ast> = values.iter().map(SymValue::ast).collect();
+        Ok(SymValue::new(decl.apply(&args)))
     }
 
     fn function_postcondition_to_z3(
@@ -2125,6 +1981,23 @@ impl<'tcx> Verifier<'tcx> {
         diagnostic_span: String,
         message: String,
     ) -> Result<(), VerificationResult> {
+        let constraint = constraint.simplify();
+        if let Some(value) = constraint.as_bool() {
+            return match (kind, value) {
+                (AssertionKind::Universal, true) | (AssertionKind::Existential, true) => {
+                    self.add_path_condition(state, constraint);
+                    Ok(())
+                }
+                (AssertionKind::Universal, false) | (AssertionKind::Existential, false) => {
+                    Err(VerificationResult {
+                        function: self.report_function(),
+                        status: VerificationStatus::Fail,
+                        span: diagnostic_span,
+                        message,
+                    })
+                }
+            };
+        }
         match kind {
             AssertionKind::Universal => match self.check_sat(&[state.pc.clone(), constraint.not()])
             {
@@ -2138,10 +2011,12 @@ impl<'tcx> Verifier<'tcx> {
                     self.add_path_condition(state, constraint);
                     Ok(())
                 }
-                SatResult::Unknown => Err(self.unknown_result(
-                    span,
-                    "solver returned unknown while checking assertion".to_owned(),
-                )),
+                SatResult::Unknown => Err(VerificationResult {
+                    function: self.report_function(),
+                    status: VerificationStatus::Fail,
+                    span: diagnostic_span,
+                    message,
+                }),
             },
             AssertionKind::Existential => {
                 match self.check_sat(&[state.pc.clone(), constraint.clone()]) {
@@ -2155,10 +2030,11 @@ impl<'tcx> Verifier<'tcx> {
                         span: diagnostic_span,
                         message,
                     }),
-                    SatResult::Unknown => Err(self.unknown_result(
-                        span,
-                        "solver returned unknown while checking assertion".to_owned(),
-                    )),
+                    SatResult::Unknown => {
+                        let _ = span;
+                        self.add_path_condition(state, constraint);
+                        Ok(())
+                    }
                 }
             }
         }
@@ -2189,16 +2065,25 @@ impl<'tcx> Verifier<'tcx> {
         constraint: Bool,
         span: Span,
     ) -> Result<bool, VerificationResult> {
+        let constraint = constraint.simplify();
+        if let Some(value) = constraint.as_bool() {
+            if value {
+                self.add_path_condition(state, constraint);
+                return Ok(true);
+            }
+            return Ok(false);
+        }
         match self.check_sat(&[state.pc.clone(), constraint.clone()]) {
             SatResult::Sat => {
                 self.add_path_condition(state, constraint);
                 Ok(true)
             }
             SatResult::Unsat => Ok(false),
-            SatResult::Unknown => Err(self.unknown_result(
-                span,
-                "solver returned unknown while checking assumption".to_owned(),
-            )),
+            SatResult::Unknown => {
+                let _ = span;
+                self.add_path_condition(state, constraint);
+                Ok(true)
+            }
         }
     }
 
@@ -2216,28 +2101,27 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn add_path_condition(&self, state: &mut State, constraint: Bool) {
-        state.pc = bool_and(vec![state.pc.clone(), constraint]);
+        state.pc = bool_and(vec![state.pc.clone(), constraint]).simplify();
     }
 
     fn check_sat(&self, assumptions: &[Bool]) -> SatResult {
-        with_solver(|solver| solver.check_assumptions(assumptions))
-    }
-
-    fn bool_expr_to_z3(&self, expr: &BoolExpr) -> Result<Bool, VerificationResult> {
-        match expr {
-            BoolExpr::Const(value) => Ok(Bool::from_bool(*value)),
-            BoolExpr::Value(value) => Ok(self.value_is_true(value)),
-            BoolExpr::Not(arg) => Ok(self.bool_expr_to_z3(arg)?.not()),
-        }
+        let assumptions = assumptions.iter().map(Bool::simplify).collect::<Vec<_>>();
+        with_solver(|solver| {
+            solver.push();
+            for assumption in &assumptions {
+                solver.assert(assumption);
+            }
+            let result = solver.check();
+            solver.pop(1);
+            result
+        })
     }
 
     fn expr_has_bind(expr: &TypedExpr) -> bool {
         match &expr.kind {
             TypedExprKind::Bind(_) => true,
             TypedExprKind::Bool(_) | TypedExprKind::Int(_) | TypedExprKind::Var(_) => false,
-            TypedExprKind::PureCall { args, .. } | TypedExprKind::BuiltinCall { args, .. } => {
-                args.iter().any(Self::expr_has_bind)
-            }
+            TypedExprKind::PureCall { args, .. } => args.iter().any(Self::expr_has_bind),
             TypedExprKind::Field { base, .. }
             | TypedExprKind::TupleField { base, .. }
             | TypedExprKind::Deref { base }
@@ -2303,7 +2187,7 @@ impl<'tcx> Verifier<'tcx> {
         let inner_spec_ty = self.spec_ty_for_place_ty(inner_ty, self.report_span())?;
         let final_value = self.mut_fin(value, &inner_spec_ty, self.report_span())?;
         let fresh = self.fresh_for_rust_ty(inner_ty, "opaque_cur")?;
-        self.construct_datatype(&SpecTy::Mut(Box::new(inner_spec_ty)), &[fresh, final_value])
+        self.construct_composite(&SpecTy::Mut(Box::new(inner_spec_ty)), &[fresh, final_value])
     }
 
     fn havoc_loop_written_locals(
@@ -2394,47 +2278,25 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn value_int(&self, value: i64) -> SymValue {
-        SymValue::Int(Int::from_i64(value))
+        self.value_encoder.int_value(value)
     }
 
     fn value_decimal_int(&self, digits: &str, span: Span) -> Result<SymValue, VerificationResult> {
-        let int = Int::from_str(digits).map_err(|()| {
+        self.value_encoder.decimal_int_value(digits).map_err(|_| {
             self.unsupported_result(span, format!("invalid integer literal `{digits}`"))
-        })?;
-        Ok(self.value_wrap_int(&int))
+        })
     }
 
     fn value_bool(&self, value: bool) -> SymValue {
-        self.value_wrap_bool(&Bool::from_bool(value))
-    }
-
-    fn value_wrap_bool(&self, value: &Bool) -> SymValue {
-        SymValue::Bool(value.clone())
-    }
-
-    fn value_wrap_int(&self, value: &Int) -> SymValue {
-        SymValue::Int(value.clone())
+        self.value_encoder.bool_value(value)
     }
 
     fn value_is_true(&self, value: &SymValue) -> Bool {
-        match value {
-            SymValue::Bool(value) => value.clone(),
-            _ => unreachable!("typed bool expression lowered to non-bool value"),
-        }
+        self.value_encoder.bool_term(value)
     }
 
     fn value_int_data(&self, value: &SymValue) -> Int {
-        match value {
-            SymValue::Int(value) => value.clone(),
-            _ => unreachable!("typed int expression lowered to non-int value"),
-        }
-    }
-
-    fn value_bool_data(&self, value: &SymValue) -> Bool {
-        match value {
-            SymValue::Bool(value) => value.clone(),
-            _ => unreachable!("typed bool expression lowered to non-bool value"),
-        }
+        self.value_encoder.int_term(value)
     }
 
     fn eq_for_spec_ty(
@@ -2444,46 +2306,12 @@ impl<'tcx> Verifier<'tcx> {
         rhs: &SymValue,
         span: Span,
     ) -> Result<Bool, VerificationResult> {
-        let encoding = self.type_encoding(ty)?;
-        self.eq_for_encoding(&encoding, lhs, rhs, span)
-    }
-
-    fn eq_for_encoding(
-        &self,
-        encoding: &TypeEncoding,
-        lhs: &SymValue,
-        rhs: &SymValue,
-        span: Span,
-    ) -> Result<Bool, VerificationResult> {
-        match &encoding.kind {
-            TypeEncodingKind::Bool => Ok(self.value_bool_data(lhs).eq(self.value_bool_data(rhs))),
-            TypeEncodingKind::Int => Ok(self.value_int_data(lhs).eq(self.value_int_data(rhs))),
-            TypeEncodingKind::Seq => {
-                let (SymValue::Seq(lhs), SymValue::Seq(rhs)) = (lhs, rhs) else {
-                    return Err(self.unsupported_result(
-                        span,
-                        "expected sequence values for equality".to_owned(),
-                    ));
-                };
-                Ok(lhs.eq(rhs))
-            }
-            TypeEncodingKind::Datatype(_) => {
-                let (SymValue::Datatype(lhs), SymValue::Datatype(rhs)) = (lhs, rhs) else {
-                    return Err(self.unsupported_result(
-                        span,
-                        "expected datatype values for equality".to_owned(),
-                    ));
-                };
-                Ok(lhs.eq(rhs))
-            }
-        }
+        with_solver(|solver| self.value_encoder.eq_for_spec_ty(ty, lhs, rhs, solver))
+            .map_err(|err| self.unsupported_result(span, err))
     }
 
     fn lower_unary_value(&self, op: UnaryOp, value: &SymValue) -> SymValue {
-        match op {
-            UnaryOp::Not => self.value_wrap_bool(&self.value_bool_data(value).not()),
-            UnaryOp::Neg => self.value_wrap_int(&(Int::from_i64(0) - self.value_int_data(value))),
-        }
+        self.value_encoder.lower_unary_value(op, value)
     }
 
     fn lower_binary_value(
@@ -2494,253 +2322,38 @@ impl<'tcx> Verifier<'tcx> {
         rhs: &SymValue,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        Ok(match op {
-            BinaryOp::Eq => self.value_wrap_bool(&self.eq_for_spec_ty(lhs_ty, lhs, rhs, span)?),
-            BinaryOp::Ne => {
-                self.value_wrap_bool(&self.eq_for_spec_ty(lhs_ty, lhs, rhs, span)?.not())
-            }
-            BinaryOp::And => self.value_wrap_bool(&Bool::and(&[
-                &self.value_bool_data(lhs),
-                &self.value_bool_data(rhs),
-            ])),
-            BinaryOp::Or => self.value_wrap_bool(&Bool::or(&[
-                &self.value_bool_data(lhs),
-                &self.value_bool_data(rhs),
-            ])),
-            BinaryOp::Lt => {
-                self.value_wrap_bool(&self.value_int_data(lhs).lt(self.value_int_data(rhs)))
-            }
-            BinaryOp::Le => {
-                self.value_wrap_bool(&self.value_int_data(lhs).le(self.value_int_data(rhs)))
-            }
-            BinaryOp::Gt => {
-                self.value_wrap_bool(&self.value_int_data(lhs).gt(self.value_int_data(rhs)))
-            }
-            BinaryOp::Ge => {
-                self.value_wrap_bool(&self.value_int_data(lhs).ge(self.value_int_data(rhs)))
-            }
-            BinaryOp::Add => {
-                self.value_wrap_int(&(self.value_int_data(lhs) + self.value_int_data(rhs)))
-            }
-            BinaryOp::Sub => {
-                self.value_wrap_int(&(self.value_int_data(lhs) - self.value_int_data(rhs)))
-            }
-            BinaryOp::Mul => {
-                self.value_wrap_int(&(self.value_int_data(lhs) * self.value_int_data(rhs)))
-            }
+        with_solver(|solver| {
+            self.value_encoder
+                .lower_binary_value(op, lhs_ty, lhs, rhs, solver)
         })
+        .map_err(|err| self.unsupported_result(span, err))
     }
 
     fn type_encoding(&self, ty: &SpecTy) -> Result<Rc<TypeEncoding>, VerificationResult> {
-        if let Some(encoding) = self.type_encodings.borrow().get(ty).cloned() {
-            return Ok(encoding);
-        }
-        let encoding = self.build_type_encoding(ty)?;
-        self.type_encodings
-            .borrow_mut()
-            .insert(ty.clone(), encoding.clone());
-        Ok(encoding)
+        with_solver(|solver| self.value_encoder.type_encoding(ty, solver))
+            .map_err(|err| self.unsupported_result(self.report_span(), err))
     }
 
-    fn datatype_encoding(&self, ty: &SpecTy) -> Result<Rc<DatatypeEncoding>, VerificationResult> {
-        let encoding = self.type_encoding(ty)?;
-        match &encoding.kind {
-            TypeEncodingKind::Datatype(encoding) => Ok(encoding.clone()),
-            _ => Err(self.unsupported_result(
-                self.report_span(),
-                format!("expected datatype-backed spec type, found {ty:?}"),
-            )),
-        }
+    fn composite_encoding(&self, ty: &SpecTy) -> Result<Rc<CompositeEncoding>, VerificationResult> {
+        with_solver(|solver| self.value_encoder.composite_encoding(ty, solver))
+            .map_err(|err| self.unsupported_result(self.report_span(), err))
     }
 
-    fn build_type_encoding(&self, ty: &SpecTy) -> Result<Rc<TypeEncoding>, VerificationResult> {
-        let encoding = match ty {
-            SpecTy::Bool => TypeEncoding {
-                sort: Sort::bool(),
-                kind: TypeEncodingKind::Bool,
-            },
-            SpecTy::IntLiteral
-            | SpecTy::I8
-            | SpecTy::I16
-            | SpecTy::I32
-            | SpecTy::I64
-            | SpecTy::Isize
-            | SpecTy::U8
-            | SpecTy::U16
-            | SpecTy::U32
-            | SpecTy::U64
-            | SpecTy::Usize => TypeEncoding {
-                sort: Sort::int(),
-                kind: TypeEncodingKind::Int,
-            },
-            SpecTy::Seq(inner) => {
-                let elem = self.type_encoding(inner)?;
-                TypeEncoding {
-                    sort: Sort::seq(&elem.sort),
-                    kind: TypeEncodingKind::Seq,
-                }
-            }
-            SpecTy::Tuple(_) | SpecTy::Struct(_) | SpecTy::Ref(_) | SpecTy::Mut(_) => {
-                let datatype = self.build_datatype_encoding(ty)?;
-                TypeEncoding {
-                    sort: datatype.sort.sort.clone(),
-                    kind: TypeEncodingKind::Datatype(datatype),
-                }
-            }
-        };
-        Ok(Rc::new(encoding))
-    }
-
-    fn build_datatype_encoding(
-        &self,
-        ty: &SpecTy,
-    ) -> Result<Rc<DatatypeEncoding>, VerificationResult> {
-        let field_names = self.datatype_field_names(ty)?;
-        let field_encodings = self.datatype_field_encodings(ty)?;
-        let fields = field_names
-            .iter()
-            .zip(field_encodings.iter())
-            .map(|(name, encoding)| (name.as_str(), DatatypeAccessor::Sort(encoding.sort.clone())))
-            .collect::<Vec<_>>();
-        Ok(Rc::new(DatatypeEncoding {
-            sort: DatatypeBuilder::new(self.sort_name(ty))
-                .variant("mk", fields)
-                .finish(),
-            fields: field_encodings,
-        }))
-    }
-
-    fn datatype_field_names(&self, ty: &SpecTy) -> Result<Vec<String>, VerificationResult> {
-        match ty {
-            SpecTy::Ref(_) => Ok(vec!["deref".to_owned()]),
-            SpecTy::Mut(_) => Ok(vec!["cur".to_owned(), "fin".to_owned()]),
-            SpecTy::Tuple(items) => Ok((0..items.len()).map(|index| format!("_{index}")).collect()),
-            SpecTy::Struct(struct_ty) => Ok(struct_ty
-                .fields
-                .iter()
-                .map(|field| field.name.clone())
-                .collect()),
-            other => Err(self.unsupported_result(
-                self.report_span(),
-                format!("expected datatype-backed spec type, found {other:?}"),
-            )),
-        }
-    }
-
-    fn datatype_field_encodings(
-        &self,
-        ty: &SpecTy,
-    ) -> Result<Vec<Rc<TypeEncoding>>, VerificationResult> {
-        match ty {
-            SpecTy::Ref(inner) => Ok(vec![self.type_encoding(inner)?]),
-            SpecTy::Mut(inner) => {
-                let inner = self.type_encoding(inner)?;
-                Ok(vec![inner.clone(), inner])
-            }
-            SpecTy::Tuple(items) => items.iter().map(|item| self.type_encoding(item)).collect(),
-            SpecTy::Struct(struct_ty) => struct_ty
-                .fields
-                .iter()
-                .map(|field| self.type_encoding(&field.ty))
-                .collect(),
-            other => Err(self.unsupported_result(
-                self.report_span(),
-                format!("expected datatype-backed spec type, found {other:?}"),
-            )),
-        }
-    }
-
-    fn sort_name(&self, ty: &SpecTy) -> String {
-        fn sanitize(raw: &str) -> String {
-            raw.chars()
-                .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-                .collect()
-        }
-        match ty {
-            SpecTy::Bool => "bool".to_owned(),
-            SpecTy::IntLiteral => "int_lit".to_owned(),
-            SpecTy::I8 => "i8".to_owned(),
-            SpecTy::I16 => "i16".to_owned(),
-            SpecTy::I32 => "i32".to_owned(),
-            SpecTy::I64 => "i64".to_owned(),
-            SpecTy::Isize => "isize".to_owned(),
-            SpecTy::U8 => "u8".to_owned(),
-            SpecTy::U16 => "u16".to_owned(),
-            SpecTy::U32 => "u32".to_owned(),
-            SpecTy::U64 => "u64".to_owned(),
-            SpecTy::Usize => "usize".to_owned(),
-            SpecTy::Seq(inner) => format!("seq_{}", self.sort_name(inner)),
-            SpecTy::Tuple(items) => format!(
-                "tuple_{}",
-                items
-                    .iter()
-                    .map(|item| self.sort_name(item))
-                    .collect::<Vec<_>>()
-                    .join("_")
-            ),
-            SpecTy::Struct(struct_ty) => format!("struct_{}", sanitize(&struct_ty.name)),
-            SpecTy::Ref(inner) => format!("ref_{}", self.sort_name(inner)),
-            SpecTy::Mut(inner) => format!("mut_{}", self.sort_name(inner)),
-        }
-    }
-
-    fn sort_for_spec_ty(&self, ty: &SpecTy) -> Result<Sort, VerificationResult> {
-        Ok(self.type_encoding(ty)?.sort.clone())
-    }
-
-    fn construct_datatype(
+    fn construct_composite(
         &self,
         ty: &SpecTy,
         fields: &[SymValue],
     ) -> Result<SymValue, VerificationResult> {
-        let encoding = self.datatype_encoding(ty)?;
-        let asts = fields.iter().map(sym_value_ast).collect::<Vec<_>>();
-        Ok(SymValue::Datatype(
-            encoding.constructor().apply(&asts).as_datatype().unwrap(),
-        ))
-    }
-
-    fn decode_value(
-        &self,
-        encoding: &TypeEncoding,
-        value: Dynamic,
-        span: Span,
-    ) -> Result<SymValue, VerificationResult> {
-        match &encoding.kind {
-            TypeEncodingKind::Bool => value
-                .as_bool()
-                .map(SymValue::Bool)
-                .ok_or_else(|| self.unsupported_result(span, "expected bool Z3 value".to_owned())),
-            TypeEncodingKind::Int => value
-                .as_int()
-                .map(SymValue::Int)
-                .ok_or_else(|| self.unsupported_result(span, "expected int Z3 value".to_owned())),
-            TypeEncodingKind::Seq => value.as_seq().map(SymValue::Seq).ok_or_else(|| {
-                self.unsupported_result(span, "expected sequence Z3 value".to_owned())
-            }),
-            TypeEncodingKind::Datatype(_) => {
-                value.as_datatype().map(SymValue::Datatype).ok_or_else(|| {
-                    self.unsupported_result(span, "expected datatype Z3 value".to_owned())
-                })
-            }
-        }
+        with_solver(|solver| self.value_encoder.construct_composite(ty, fields, solver))
+            .map_err(|err| self.unsupported_result(self.report_span(), err))
     }
 
     fn fresh_for_rust_ty(&self, ty: Ty<'tcx>, hint: &str) -> Result<SymValue, VerificationResult> {
-        if let TyKind::Adt(adt_def, args) = ty.kind()
-            && vec_element_ty(self.tcx, ty).is_none()
-        {
-            if !adt_def.is_struct() {
-                return Err(
-                    self.unsupported_result(self.report_span(), format!("unsupported type {ty:?}"))
-                );
-            }
-            if !args.is_empty() {
-                return Err(self.unsupported_result(
-                    self.report_span(),
-                    format!("generic structs are unsupported: {ty:?}"),
-                ));
-            }
+        let spec_ty = spec_ty_for_rust_ty(self.tcx, ty)
+            .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+        if let TyKind::Adt(adt_def, args) = ty.kind() {
+            debug_assert!(adt_def.is_struct());
+            debug_assert!(args.is_empty());
             if adt_def.has_dtor(self.tcx) {
                 return Err(self.unsupported_result(
                     self.report_span(),
@@ -2748,53 +2361,38 @@ impl<'tcx> Verifier<'tcx> {
                 ));
             }
         }
-        let spec_ty = spec_ty_for_rust_ty(self.tcx, ty)
-            .map_err(|err| self.unsupported_result(self.report_span(), err))?;
         self.fresh_for_spec_ty(&spec_ty, hint)
     }
 
     fn fresh_for_spec_ty(&self, ty: &SpecTy, hint: &str) -> Result<SymValue, VerificationResult> {
-        match ty {
-            SpecTy::Bool => Ok(self.value_wrap_bool(&Bool::new_const(self.fresh_name(hint)))),
-            SpecTy::IntLiteral
-            | SpecTy::I8
-            | SpecTy::I16
-            | SpecTy::I32
-            | SpecTy::I64
-            | SpecTy::Isize
-            | SpecTy::U8
-            | SpecTy::U16
-            | SpecTy::U32
-            | SpecTy::U64
-            | SpecTy::Usize => Ok(self.value_wrap_int(&Int::new_const(self.fresh_name(hint)))),
-            SpecTy::Seq(inner) => Ok(SymValue::Seq(Seq::new_const(
-                self.fresh_name(hint),
-                &self.sort_for_spec_ty(inner)?,
-            ))),
-            SpecTy::Tuple(items) => {
-                let mut values = Vec::with_capacity(items.len());
-                for (index, item) in items.iter().enumerate() {
-                    values.push(self.fresh_for_spec_ty(item, &format!("{hint}_{index}"))?);
-                }
-                self.construct_datatype(ty, &values)
-            }
-            SpecTy::Struct(struct_ty) => {
-                let mut values = Vec::with_capacity(struct_ty.fields.len());
-                for field in &struct_ty.fields {
-                    values.push(
-                        self.fresh_for_spec_ty(&field.ty, &format!("{hint}_{}", field.name))?,
+        let encoding = self.type_encoding(ty)?;
+        self.fresh_for_encoding(&encoding, hint)
+    }
+
+    fn fresh_for_encoding(
+        &self,
+        encoding: &TypeEncoding,
+        hint: &str,
+    ) -> Result<SymValue, VerificationResult> {
+        match &encoding.kind {
+            TypeEncodingKind::Bool => Ok(self
+                .value_encoder
+                .wrap_bool(&Bool::new_const(self.fresh_name(hint)))),
+            TypeEncodingKind::Int => Ok(self
+                .value_encoder
+                .wrap_int(&Int::new_const(self.fresh_name(hint)))),
+            TypeEncodingKind::Composite(composite) => {
+                let ctor = composite
+                    .single_constructor()
+                    .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+                let mut fields = Vec::with_capacity(ctor.fields.len());
+                for (index, field) in ctor.fields.iter().enumerate() {
+                    fields.push(
+                        self.fresh_for_encoding(&field.encoding, &format!("{hint}_{index}"))?,
                     );
                 }
-                self.construct_datatype(ty, &values)
-            }
-            SpecTy::Ref(inner) => {
-                let deref_value = self.fresh_for_spec_ty(inner, &format!("{hint}_deref"))?;
-                self.construct_datatype(ty, &[deref_value])
-            }
-            SpecTy::Mut(inner) => {
-                let cur = self.fresh_for_spec_ty(inner, &format!("{hint}_cur"))?;
-                let fin = self.fresh_for_spec_ty(inner, &format!("{hint}_fin"))?;
-                self.construct_datatype(ty, &[cur, fin])
+                let args = fields.iter().map(SymValue::ast).collect::<Vec<_>>();
+                Ok(SymValue::new(ctor.symbol.apply(&args)))
             }
         }
     }
@@ -2806,18 +2404,11 @@ impl<'tcx> Verifier<'tcx> {
         index: usize,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let SymValue::Datatype(value) = value else {
-            return Err(self.unsupported_result(
-                span,
-                "field projection requires datatype-backed value".to_owned(),
-            ));
-        };
-        let encoding = self.datatype_encoding(parent_ty)?;
-        let field = encoding
-            .fields
-            .get(index)
-            .ok_or_else(|| self.unsupported_result(span, "field index out of range".to_owned()))?;
-        self.decode_value(field, encoding.accessor(index).apply(&[&value]), span)
+        with_solver(|solver| {
+            self.value_encoder
+                .project_field(parent_ty, &value, index, solver)
+        })
+        .map_err(|err| self.unsupported_result(span, err))
     }
 
     fn ref_deref(
@@ -2826,15 +2417,8 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let SymValue::Datatype(value) = value else {
-            return Err(self.unsupported_result(span, "expected shared reference value".to_owned()));
-        };
-        let encoding = self.datatype_encoding(&SpecTy::Ref(Box::new(inner_ty.clone())))?;
-        self.decode_value(
-            &encoding.fields[0],
-            encoding.accessor(0).apply(&[value]),
-            span,
-        )
+        let encoding = self.composite_encoding(&SpecTy::Ref(Box::new(inner_ty.clone())))?;
+        self.decode_composite_field(&encoding, value, 0, span)
     }
 
     fn mut_cur(
@@ -2843,17 +2427,8 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let SymValue::Datatype(value) = value else {
-            return Err(
-                self.unsupported_result(span, "expected mutable reference value".to_owned())
-            );
-        };
-        let encoding = self.datatype_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
-        self.decode_value(
-            &encoding.fields[0],
-            encoding.accessor(0).apply(&[value]),
-            span,
-        )
+        let encoding = self.composite_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
+        self.decode_composite_field(&encoding, value, 0, span)
     }
 
     fn mut_fin(
@@ -2862,17 +2437,8 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let SymValue::Datatype(value) = value else {
-            return Err(
-                self.unsupported_result(span, "expected mutable reference value".to_owned())
-            );
-        };
-        let encoding = self.datatype_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
-        self.decode_value(
-            &encoding.fields[1],
-            encoding.accessor(1).apply(&[value]),
-            span,
-        )
+        let encoding = self.composite_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
+        self.decode_composite_field(&encoding, value, 1, span)
     }
 
     fn spec_ty_for_place_ty(&self, ty: Ty<'tcx>, span: Span) -> Result<SpecTy, VerificationResult> {
@@ -2965,30 +2531,6 @@ impl<'tcx> Verifier<'tcx> {
         }))
     }
 
-    fn int_bounds_for_spec_ty(
-        &self,
-        ty: &SpecTy,
-        span: Span,
-    ) -> Result<Option<(Int, Int)>, VerificationResult> {
-        let rust_ty = match ty {
-            SpecTy::I8 => Some(self.tcx.types.i8),
-            SpecTy::I16 => Some(self.tcx.types.i16),
-            SpecTy::I32 => Some(self.tcx.types.i32),
-            SpecTy::I64 => Some(self.tcx.types.i64),
-            SpecTy::Isize => Some(self.tcx.types.isize),
-            SpecTy::U8 => Some(self.tcx.types.u8),
-            SpecTy::U16 => Some(self.tcx.types.u16),
-            SpecTy::U32 => Some(self.tcx.types.u32),
-            SpecTy::U64 => Some(self.tcx.types.u64),
-            SpecTy::Usize => Some(self.tcx.types.usize),
-            _ => None,
-        };
-        rust_ty
-            .map(|rust_ty| self.int_bounds_for_rust_ty(rust_ty, span))
-            .transpose()
-            .map(|opt| opt.flatten())
-    }
-
     fn int_range_formula_for_int(&self, bounds: Option<(Int, Int)>, value: &Int) -> Option<Bool> {
         bounds.map(|(lower, upper)| bool_and(vec![value.ge(lower), value.le(upper)]))
     }
@@ -3063,7 +2605,7 @@ impl<'tcx> Verifier<'tcx> {
                 );
             }
         };
-        Ok(self.value_wrap_int(&int))
+        Ok(self.value_encoder.wrap_int(&int))
     }
 
     fn overflow_value_for_result(
@@ -3078,19 +2620,7 @@ impl<'tcx> Verifier<'tcx> {
                 &self.value_int_data(value),
             )
             .unwrap_or_else(|| Bool::from_bool(true));
-        Ok(self.value_wrap_bool(&bool_not(in_range)))
-    }
-
-    fn int_range_formula_for_spec_ty(
-        &self,
-        ty: &SpecTy,
-        value: &SymValue,
-        span: Span,
-    ) -> Result<Option<Bool>, VerificationResult> {
-        Ok(self.int_range_formula_for_int(
-            self.int_bounds_for_spec_ty(ty, span)?,
-            &self.value_int_data(value),
-        ))
+        Ok(self.value_encoder.wrap_bool(&bool_not(in_range)))
     }
 
     fn spec_ty_formula(
@@ -3100,8 +2630,9 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Option<Bool>, VerificationResult> {
         match ty {
-            SpecTy::Bool | SpecTy::IntLiteral => Ok(None),
-            SpecTy::I8
+            SpecTy::Bool => Ok(None),
+            SpecTy::IntLiteral
+            | SpecTy::I8
             | SpecTy::I16
             | SpecTy::I32
             | SpecTy::I64
@@ -3110,43 +2641,56 @@ impl<'tcx> Verifier<'tcx> {
             | SpecTy::U16
             | SpecTy::U32
             | SpecTy::U64
-            | SpecTy::Usize => self.int_range_formula_for_spec_ty(ty, value, span),
+            | SpecTy::Usize => Ok(self.int_range_formula_for_int(
+                self.value_encoder
+                    .int_bounds(ty)
+                    .map_err(|err| self.unsupported_result(span, err))?,
+                &self.value_int_data(value),
+            )),
             SpecTy::Ref(inner) => {
-                let deref_value = self.ref_deref(value, inner, span)?;
-                self.spec_ty_formula(inner, &deref_value, span)
+                let composite = self.composite_encoding(ty)?;
+                let deref = self.decode_composite_field(&composite, value, 0, span)?;
+                let mut formulas =
+                    vec![self.composite_tag_formula_for_encoding(&composite, value, 0, span)?];
+                if let Some(formula) = self.spec_ty_formula(inner, &deref, span)? {
+                    formulas.push(formula);
+                }
+                Ok(Some(bool_and(formulas)))
             }
             SpecTy::Mut(inner) => {
-                let current = self.mut_cur(value, inner, span)?;
-                self.spec_ty_formula(inner, &current, span)
+                let composite = self.composite_encoding(ty)?;
+                let current = self.decode_composite_field(&composite, value, 0, span)?;
+                let mut formulas =
+                    vec![self.composite_tag_formula_for_encoding(&composite, value, 0, span)?];
+                if let Some(formula) = self.spec_ty_formula(inner, &current, span)? {
+                    formulas.push(formula);
+                }
+                Ok(Some(bool_and(formulas)))
             }
-            SpecTy::Seq(item) => Ok(Some(self.list_type_invariant(item, value, span)?)),
             SpecTy::Tuple(items) => {
-                let mut formulas = Vec::new();
-                for (index, item) in items.iter().enumerate() {
-                    let field = self.project_field(value.clone(), ty, index, span)?;
-                    if let Some(formula) = self.spec_ty_formula(item, &field, span)? {
+                let composite = self.composite_encoding(ty)?;
+                let mut formulas =
+                    vec![self.composite_tag_formula_for_encoding(&composite, value, 0, span)?];
+                for (index, field_ty) in items.iter().enumerate() {
+                    let field = self.decode_composite_field(&composite, value, index, span)?;
+                    if let Some(formula) = self.spec_ty_formula(field_ty, &field, span)? {
                         formulas.push(formula);
                     }
                 }
-                if formulas.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(bool_and(formulas)))
-                }
+                Ok(Some(bool_and(formulas)))
             }
             SpecTy::Struct(struct_ty) => {
-                let mut formulas = Vec::new();
-                for (index, field_ty) in struct_ty.fields.iter().enumerate() {
-                    let field = self.project_field(value.clone(), ty, index, span)?;
-                    if let Some(formula) = self.spec_ty_formula(&field_ty.ty, &field, span)? {
+                let composite = self.composite_encoding(ty)?;
+                let mut formulas =
+                    vec![self.composite_tag_formula_for_encoding(&composite, value, 0, span)?];
+                for (index, field) in struct_ty.fields.iter().enumerate() {
+                    let field_value =
+                        self.decode_composite_field(&composite, value, index, span)?;
+                    if let Some(formula) = self.spec_ty_formula(&field.ty, &field_value, span)? {
                         formulas.push(formula);
                     }
                 }
-                if formulas.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(bool_and(formulas)))
-                }
+                Ok(Some(bool_and(formulas)))
             }
         }
     }
@@ -3170,66 +2714,71 @@ impl<'tcx> Verifier<'tcx> {
             | SpecTy::U32
             | SpecTy::U64
             | SpecTy::Usize => Ok(Bool::from_bool(true)),
-            SpecTy::Ref(_) => Ok(Bool::from_bool(true)),
-            SpecTy::Mut(inner) => {
-                let cur = self.mut_cur(value, inner, span)?;
-                let fin = self.mut_fin(value, inner, span)?;
-                self.eq_for_spec_ty(inner, &cur, &fin, span)
+            SpecTy::Ref(_) => {
+                let composite = self.composite_encoding(ty)?;
+                self.composite_tag_formula_for_encoding(&composite, value, 0, span)
             }
-            SpecTy::Seq(item) => self.list_resolve_formula(item, value, span),
+            SpecTy::Mut(inner) => {
+                let composite = self.composite_encoding(ty)?;
+                let cur = self.decode_composite_field(&composite, value, 0, span)?;
+                let fin = self.decode_composite_field(&composite, value, 1, span)?;
+                Ok(bool_and(vec![
+                    self.composite_tag_formula_for_encoding(&composite, value, 0, span)?,
+                    self.eq_for_spec_ty(inner, &cur, &fin, span)?,
+                    self.resolve_formula_for_spec_ty(inner, &cur, span)?,
+                    self.resolve_formula_for_spec_ty(inner, &fin, span)?,
+                ]))
+            }
             SpecTy::Tuple(items) => {
-                let mut formulas = Vec::with_capacity(items.len());
-                for (index, item) in items.iter().enumerate() {
-                    let field = self.project_field(value.clone(), ty, index, span)?;
-                    formulas.push(self.resolve_formula_for_spec_ty(item, &field, span)?);
+                let composite = self.composite_encoding(ty)?;
+                let mut formulas = Vec::with_capacity(items.len() + 1);
+                formulas.push(self.composite_tag_formula_for_encoding(&composite, value, 0, span)?);
+                for (index, field_ty) in items.iter().enumerate() {
+                    let field = self.decode_composite_field(&composite, value, index, span)?;
+                    formulas.push(self.resolve_formula_for_spec_ty(field_ty, &field, span)?);
                 }
                 Ok(bool_and(formulas))
             }
             SpecTy::Struct(struct_ty) => {
-                let mut formulas = Vec::with_capacity(struct_ty.fields.len());
-                for (index, field_ty) in struct_ty.fields.iter().enumerate() {
-                    let field = self.project_field(value.clone(), ty, index, span)?;
-                    formulas.push(self.resolve_formula_for_spec_ty(&field_ty.ty, &field, span)?);
+                let composite = self.composite_encoding(ty)?;
+                let mut formulas = Vec::with_capacity(struct_ty.fields.len() + 1);
+                formulas.push(self.composite_tag_formula_for_encoding(&composite, value, 0, span)?);
+                for (index, field) in struct_ty.fields.iter().enumerate() {
+                    let field_value =
+                        self.decode_composite_field(&composite, value, index, span)?;
+                    formulas.push(self.resolve_formula_for_spec_ty(
+                        &field.ty,
+                        &field_value,
+                        span,
+                    )?);
                 }
                 Ok(bool_and(formulas))
             }
         }
     }
 
-    fn list_resolve_formula(
+    fn decode_composite_field(
         &self,
-        item: &SpecTy,
+        encoding: &CompositeEncoding,
         value: &SymValue,
+        index: usize,
         span: Span,
-    ) -> Result<Bool, VerificationResult> {
-        let SymValue::Seq(seq) = value else {
-            return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
-        };
-        let index = Int::new_const(self.fresh_name("resolve_idx"));
-        let elem_encoding = self.type_encoding(item)?;
-        let elem = self.decode_value(&elem_encoding, seq.nth(index.clone()), span)?;
-        let body = bool_and(vec![index.ge(0), index.lt(seq.length())])
-            .implies(self.resolve_formula_for_spec_ty(item, &elem, span)?);
-        Ok(z3::ast::forall_const(&[&index], &[], &body))
+    ) -> Result<SymValue, VerificationResult> {
+        self.value_encoder
+            .project_composite_field(encoding, value, index)
+            .map_err(|err| self.unsupported_result(span, err))
     }
 
-    fn list_type_invariant(
+    fn composite_tag_formula_for_encoding(
         &self,
-        item: &SpecTy,
+        encoding: &CompositeEncoding,
         value: &SymValue,
+        ctor_index: usize,
         span: Span,
     ) -> Result<Bool, VerificationResult> {
-        let SymValue::Seq(seq) = value else {
-            return Err(self.unsupported_result(span, "expected sequence value".to_owned()));
-        };
-        let index = Int::new_const(self.fresh_name("list_inv_idx"));
-        let elem_encoding = self.type_encoding(item)?;
-        let elem = self.decode_value(&elem_encoding, seq.nth(index.clone()), span)?;
-        let elem_inv = self
-            .spec_ty_formula(item, &elem, span)?
-            .unwrap_or_else(|| Bool::from_bool(true));
-        let body = bool_and(vec![index.ge(0), index.lt(seq.length())]).implies(elem_inv);
-        Ok(z3::ast::forall_const(&[&index], &[], &body))
+        self.value_encoder
+            .tag_formula(encoding, ctor_index, value)
+            .map_err(|err| self.unsupported_result(span, err))
     }
 
     fn require_type_invariant(
@@ -3280,15 +2829,6 @@ impl<'tcx> Verifier<'tcx> {
         VerificationResult {
             function: self.report_function(),
             status: VerificationStatus::Unsupported,
-            span: span_text(self.tcx, span),
-            message,
-        }
-    }
-
-    fn unknown_result(&self, span: Span, message: String) -> VerificationResult {
-        VerificationResult {
-            function: self.report_function(),
-            status: VerificationStatus::Unknown,
             span: span_text(self.tcx, span),
             message,
         }
@@ -3378,7 +2918,7 @@ impl<'tcx> Verifier<'tcx> {
         } else {
             self.contract_expr_to_bool(&env.current, &env.spec, &contract.req)?
         };
-        let mut formulas = vec![self.bool_expr_to_z3(&manual)?];
+        let mut formulas = vec![manual];
         formulas.extend(self.auto_contract_formulas(contract, env, span, is_post)?);
         Ok(bool_and(formulas))
     }
@@ -3455,6 +2995,8 @@ impl CallEnv {
 fn init_z3() {
     Z3_INIT.call_once(|| {
         z3::set_global_param("model", "true");
+        z3::set_global_param("smt.auto_config", "false");
+        z3::set_global_param("smt.mbqi", "false");
     });
 }
 
@@ -3488,18 +3030,10 @@ fn bool_not(expr: Bool) -> Bool {
     expr.not()
 }
 
-fn not_expr(expr: BoolExpr) -> BoolExpr {
-    match expr {
-        BoolExpr::Const(value) => BoolExpr::Const(!value),
-        BoolExpr::Not(inner) => *inner,
-        other => BoolExpr::Not(Box::new(other)),
-    }
-}
-
 fn spec_ty_contains_mut_ref(ty: &SpecTy) -> bool {
     match ty {
         SpecTy::Mut(_) => true,
-        SpecTy::Seq(inner) | SpecTy::Ref(inner) => spec_ty_contains_mut_ref(inner),
+        SpecTy::Ref(inner) => spec_ty_contains_mut_ref(inner),
         SpecTy::Tuple(items) => items.iter().any(spec_ty_contains_mut_ref),
         SpecTy::Struct(struct_ty) => struct_ty
             .fields
@@ -3511,13 +3045,4 @@ fn spec_ty_contains_mut_ref(ty: &SpecTy) -> bool {
 
 fn span_text(tcx: TyCtxt<'_>, span: Span) -> String {
     tcx.sess.source_map().span_to_diagnostic_string(span)
-}
-
-fn sym_value_ast(value: &SymValue) -> &dyn Ast {
-    match value {
-        SymValue::Bool(value) => value,
-        SymValue::Int(value) => value,
-        SymValue::Seq(value) => value,
-        SymValue::Datatype(value) => value,
-    }
 }

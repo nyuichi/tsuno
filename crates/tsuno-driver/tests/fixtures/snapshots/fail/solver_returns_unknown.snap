@@ -5,9 +5,9 @@ expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
-UNKNOWN solver_returns_unknown
-  solver returned unknown while checking assertion
-  src/main.rs:10:6: 10:6
+FAIL solver_returns_unknown
+  assertion failed
+  src/main.rs:9:1: 9:70
 PASS main
   all assertions discharged
 
