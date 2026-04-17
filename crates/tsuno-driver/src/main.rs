@@ -12,7 +12,7 @@ mod engine;
 mod prepass;
 mod report;
 mod spec;
-mod value_encoding;
+mod value;
 
 use std::env;
 
