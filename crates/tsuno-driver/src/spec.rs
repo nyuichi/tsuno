@@ -4,8 +4,14 @@ pub enum Expr {
     Int(IntLiteral),
     Var(String),
     Bind(String),
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+        default: Option<Box<Expr>>,
+    },
     Call {
         func: String,
+        type_args: Vec<SpecTy>,
         args: Vec<Expr>,
     },
     Field {
@@ -37,13 +43,45 @@ pub struct TypedExpr {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchArm {
+    pub pattern: MatchPattern,
+    pub body: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchPattern {
+    Constructor {
+        enum_name: String,
+        ctor_name: String,
+        bindings: Vec<MatchBinding>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchBinding {
+    Var(String),
+    Wildcard,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypedExprKind {
     Bool(bool),
     Int(IntLiteral),
     Var(String),
     Bind(String),
+    Match {
+        scrutinee: Box<TypedExpr>,
+        arms: Vec<TypedMatchArm>,
+        default: Option<Box<TypedExpr>>,
+    },
     PureCall {
         func: String,
+        args: Vec<TypedExpr>,
+    },
+    CtorCall {
+        enum_name: String,
+        ctor_name: String,
+        ctor_index: usize,
         args: Vec<TypedExpr>,
     },
     Field {
@@ -70,6 +108,21 @@ pub enum TypedExprKind {
         lhs: Box<TypedExpr>,
         rhs: Box<TypedExpr>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedMatchArm {
+    pub ctor_index: usize,
+    pub enum_name: String,
+    pub ctor_name: String,
+    pub bindings: Vec<TypedMatchBinding>,
+    pub body: TypedExpr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypedMatchBinding {
+    Var { name: String, ty: SpecTy },
+    Wildcard { ty: SpecTy },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -140,6 +193,8 @@ pub enum SpecTy {
     Usize,
     Tuple(Vec<SpecTy>),
     Struct(StructTy),
+    Named { name: String, args: Vec<SpecTy> },
+    TypeParam(String),
     Ref(Box<SpecTy>),
     Mut(Box<SpecTy>),
 }
@@ -162,7 +217,21 @@ pub struct PureFnDef {
 pub enum GhostStmt {
     Assert(Expr),
     Assume(Expr),
-    Call { name: String, args: Vec<Expr> },
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
+    Match {
+        scrutinee: Expr,
+        arms: Vec<GhostMatchArm>,
+        default: Option<Vec<GhostStmt>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhostMatchArm {
+    pub pattern: MatchPattern,
+    pub body: Vec<GhostStmt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,8 +245,31 @@ pub struct LemmaDef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GhostBlock {
+    pub enums: Vec<EnumDef>,
     pub pure_fns: Vec<PureFnDef>,
     pub lemmas: Vec<LemmaDef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EnumDef {
+    pub name: String,
+    pub type_params: Vec<String>,
+    pub ctors: Vec<EnumCtorDef>,
+}
+
+impl EnumDef {
+    pub fn ctor(&self, name: &str) -> Option<(usize, &EnumCtorDef)> {
+        self.ctors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| ctor.name == name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EnumCtorDef {
+    pub name: String,
+    pub fields: Vec<SpecTy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -275,6 +367,15 @@ pub fn parse_raw_expr(_kind: &str, text: &str) -> Result<Expr, ParseError> {
     let expr = parser.parse_expr()?;
     parser.expect_end()?;
     Ok(expr)
+}
+
+fn parse_raw_match_pattern(text: &str) -> Result<MatchPattern, ParseError> {
+    let mut parser = Parser::new(text)?;
+    let pattern = parser
+        .parse_match_arm_pattern()?
+        .ok_or_else(|| ParseError::new("expected match arm pattern"))?;
+    parser.expect_end()?;
+    Ok(pattern)
 }
 
 fn decode_legacy_string_literal(text: &str) -> Result<Option<String>, ParseError> {
@@ -379,8 +480,12 @@ enum Token {
     Bool(bool),
     LParen,
     RParen,
+    LBrace,
+    RBrace,
     Comma,
     Dot,
+    ColonColon,
+    FatArrow,
     Question,
     Plus,
     Minus,
@@ -460,6 +565,14 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
                 chars.next();
                 tokens.push(Token::RParen);
             }
+            '{' => {
+                chars.next();
+                tokens.push(Token::LBrace);
+            }
+            '}' => {
+                chars.next();
+                tokens.push(Token::RBrace);
+            }
             ',' => {
                 chars.next();
                 tokens.push(Token::Comma);
@@ -467,6 +580,14 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
             '.' => {
                 chars.next();
                 tokens.push(Token::Dot);
+            }
+            ':' => {
+                chars.next();
+                if chars.next() == Some(':') {
+                    tokens.push(Token::ColonColon);
+                } else {
+                    return Err(ParseError::new("unexpected `:` in spec expression"));
+                }
             }
             '?' => {
                 chars.next();
@@ -495,7 +616,10 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
             }
             '=' => {
                 chars.next();
-                if chars.next() == Some('=') {
+                if chars.peek() == Some(&'>') {
+                    chars.next();
+                    tokens.push(Token::FatArrow);
+                } else if chars.next() == Some('=') {
                     tokens.push(Token::EqEq);
                 } else {
                     return Err(ParseError::new("unexpected `=` in spec expression"));
@@ -749,6 +873,169 @@ impl Parser {
         Ok(expr)
     }
 
+    fn parse_call_args(&mut self) -> Result<Vec<Expr>, ParseError> {
+        let mut args = Vec::new();
+        self.expect(&Token::LParen)?;
+        if self.eat(&Token::RParen) {
+            return Ok(args);
+        }
+        loop {
+            args.push(self.parse_expr()?);
+            if self.eat(&Token::RParen) {
+                return Ok(args);
+            }
+            self.expect(&Token::Comma)?;
+        }
+    }
+
+    fn parse_match_bindings(&mut self) -> Result<Vec<MatchBinding>, ParseError> {
+        let mut bindings = Vec::new();
+        self.expect(&Token::LParen)?;
+        if self.eat(&Token::RParen) {
+            return Ok(bindings);
+        }
+        loop {
+            bindings.push(match self.next().cloned() {
+                Some(Token::Ident(name)) if name == "_" => MatchBinding::Wildcard,
+                Some(Token::Ident(name)) => MatchBinding::Var(name),
+                _ => {
+                    return Err(ParseError::new(
+                        "expected a variable name or `_` in match pattern",
+                    ));
+                }
+            });
+            if self.eat(&Token::RParen) {
+                return Ok(bindings);
+            }
+            self.expect(&Token::Comma)?;
+        }
+    }
+
+    fn parse_match_arm_pattern(&mut self) -> Result<Option<MatchPattern>, ParseError> {
+        let Some(Token::Ident(enum_name)) = self.next().cloned() else {
+            return Err(ParseError::new("expected constructor pattern or `_`"));
+        };
+        if enum_name == "_" {
+            return Ok(None);
+        }
+        self.expect(&Token::ColonColon)?;
+        let Some(Token::Ident(ctor_name)) = self.next().cloned() else {
+            return Err(ParseError::new(
+                "expected constructor name in match pattern",
+            ));
+        };
+        let bindings = if self.tokens.get(self.cursor) == Some(&Token::LParen) {
+            self.parse_match_bindings()?
+        } else {
+            Vec::new()
+        };
+        Ok(Some(MatchPattern::Constructor {
+            enum_name,
+            ctor_name,
+            bindings,
+        }))
+    }
+
+    fn parse_match_expr(&mut self) -> Result<Expr, ParseError> {
+        let scrutinee = self.parse_expr()?;
+        self.expect(&Token::LBrace)?;
+        let mut arms = Vec::new();
+        let mut default = None;
+        loop {
+            if self.eat(&Token::RBrace) {
+                break;
+            }
+            let pattern = self.parse_match_arm_pattern()?;
+            self.expect(&Token::FatArrow)?;
+            let body = self.parse_expr()?;
+            match pattern {
+                Some(pattern) => arms.push(MatchArm { pattern, body }),
+                None => {
+                    if default.is_some() {
+                        return Err(ParseError::new(
+                            "match expression cannot contain multiple `_` arms",
+                        ));
+                    }
+                    default = Some(Box::new(body));
+                }
+            }
+            if self.eat(&Token::Comma) {
+                continue;
+            }
+            self.expect(&Token::RBrace)?;
+            break;
+        }
+        Ok(Expr::Match {
+            scrutinee: Box::new(scrutinee),
+            arms,
+            default,
+        })
+    }
+
+    fn parse_token_spec_ty(&mut self) -> Result<SpecTy, ParseError> {
+        let Some(Token::Ident(ident)) = self.next().cloned() else {
+            return Err(ParseError::new("expected a type argument"));
+        };
+        let args = if self.eat(&Token::Lt) {
+            let mut args = Vec::new();
+            if !self.eat(&Token::Gt) {
+                loop {
+                    args.push(self.parse_token_spec_ty()?);
+                    if self.eat(&Token::Gt) {
+                        break;
+                    }
+                    self.expect(&Token::Comma)?;
+                }
+            }
+            args
+        } else {
+            Vec::new()
+        };
+        match ident.as_str() {
+            "bool" if args.is_empty() => Ok(SpecTy::Bool),
+            "i8" if args.is_empty() => Ok(SpecTy::I8),
+            "i16" if args.is_empty() => Ok(SpecTy::I16),
+            "i32" if args.is_empty() => Ok(SpecTy::I32),
+            "i64" if args.is_empty() => Ok(SpecTy::I64),
+            "isize" if args.is_empty() => Ok(SpecTy::Isize),
+            "u8" if args.is_empty() => Ok(SpecTy::U8),
+            "u16" if args.is_empty() => Ok(SpecTy::U16),
+            "u32" if args.is_empty() => Ok(SpecTy::U32),
+            "u64" if args.is_empty() => Ok(SpecTy::U64),
+            "usize" if args.is_empty() => Ok(SpecTy::Usize),
+            _ => Ok(SpecTy::Named { name: ident, args }),
+        }
+    }
+
+    fn try_parse_call_type_args(&mut self) -> Result<Option<Vec<SpecTy>>, ParseError> {
+        let saved = self.cursor;
+        let saw_turbofish = self.eat(&Token::ColonColon);
+        if !self.eat(&Token::Lt) {
+            self.cursor = saved;
+            return Ok(None);
+        }
+        let mut args = Vec::new();
+        if !self.eat(&Token::Gt) {
+            loop {
+                args.push(self.parse_token_spec_ty()?);
+                if self.eat(&Token::Gt) {
+                    break;
+                }
+                self.expect(&Token::Comma)?;
+            }
+        }
+        match self.tokens.get(self.cursor) {
+            Some(Token::LParen) | Some(Token::ColonColon) => Ok(Some(args)),
+            _ if saw_turbofish => Err(ParseError::new(
+                "expected `(` or `::` after type arguments in spec expression",
+            )),
+            _ => {
+                self.cursor = saved;
+                Ok(None)
+            }
+        }
+    }
+
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         match self.next().cloned() {
             Some(Token::Bool(value)) => Ok(Expr::Bool(value)),
@@ -759,19 +1046,32 @@ impl Parser {
                 };
                 Ok(Expr::Bind(ident))
             }
+            Some(Token::Ident(ident)) if ident == "match" => self.parse_match_expr(),
             Some(Token::Ident(ident)) => {
-                if !ident.starts_with("__") && self.eat(&Token::LParen) {
-                    let mut args = Vec::new();
-                    if !self.eat(&Token::RParen) {
-                        loop {
-                            args.push(self.parse_expr()?);
-                            if self.eat(&Token::RParen) {
-                                break;
-                            }
-                            self.expect(&Token::Comma)?;
-                        }
-                    }
-                    Ok(Expr::Call { func: ident, args })
+                let type_args = self.try_parse_call_type_args()?.unwrap_or_default();
+                if self.eat(&Token::ColonColon) {
+                    let Some(Token::Ident(ctor)) = self.next().cloned() else {
+                        return Err(ParseError::new("expected constructor name after `::`"));
+                    };
+                    let func = format!("{ident}::{ctor}");
+                    let args = if self.tokens.get(self.cursor) == Some(&Token::LParen) {
+                        self.parse_call_args()?
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(Expr::Call {
+                        func,
+                        type_args,
+                        args,
+                    })
+                } else if !ident.starts_with("__")
+                    && self.tokens.get(self.cursor) == Some(&Token::LParen)
+                {
+                    Ok(Expr::Call {
+                        func: ident,
+                        type_args,
+                        args: self.parse_call_args()?,
+                    })
                 } else {
                     Ok(Expr::Var(ident))
                 }
@@ -821,6 +1121,7 @@ pub fn parse_ghost_block(text: &str) -> Result<GhostBlock, ParseError> {
     let mut block = GhostBlock::default();
     while parser.skip_ws() {
         match parser.parse_item()? {
+            GhostItem::Enum(def) => block.enums.push(def),
             GhostItem::PureFn(def) => block.pure_fns.push(def),
             GhostItem::Lemma(def) => block.lemmas.push(def),
         }
@@ -829,6 +1130,7 @@ pub fn parse_ghost_block(text: &str) -> Result<GhostBlock, ParseError> {
 }
 
 enum GhostItem {
+    Enum(EnumDef),
     PureFn(PureFnDef),
     Lemma(LemmaDef),
 }
@@ -855,6 +1157,10 @@ impl<'a> PureFnParser<'a> {
     }
 
     fn parse_item(&mut self) -> Result<GhostItem, ParseError> {
+        if self.starts_with_keyword("enum") {
+            self.expect_keyword("enum")?;
+            return Ok(GhostItem::Enum(self.parse_enum_def()?));
+        }
         self.expect_keyword("fn")?;
         let name = self.parse_ident()?;
         self.expect_char('(')?;
@@ -864,7 +1170,7 @@ impl<'a> PureFnParser<'a> {
             loop {
                 let param_name = self.parse_ident()?;
                 self.expect_char(':')?;
-                let ty = self.parse_spec_ty()?;
+                let ty = self.parse_spec_ty_with_params(&[])?;
                 params.push(PureFnParam {
                     name: param_name,
                     ty,
@@ -883,13 +1189,57 @@ impl<'a> PureFnParser<'a> {
         Ok(GhostItem::Lemma(self.parse_lemma_def(name, params)?))
     }
 
+    fn parse_enum_def(&mut self) -> Result<EnumDef, ParseError> {
+        let name = self.parse_ident()?;
+        let type_params = self.parse_type_params()?;
+        self.expect_char('{')?;
+        let mut ctors = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.eat_char('}') {
+                break;
+            }
+            let ctor_name = self.parse_ident()?;
+            let mut fields = Vec::new();
+            self.skip_ws();
+            if self.eat_char('(') {
+                self.skip_ws();
+                if !self.eat_char(')') {
+                    loop {
+                        fields.push(self.parse_spec_ty_with_params(&type_params)?);
+                        self.skip_ws();
+                        if self.eat_char(')') {
+                            break;
+                        }
+                        self.expect_char(',')?;
+                    }
+                }
+            }
+            ctors.push(EnumCtorDef {
+                name: ctor_name,
+                fields,
+            });
+            self.skip_ws();
+            if self.eat_char(',') {
+                continue;
+            }
+            self.expect_char('}')?;
+            break;
+        }
+        Ok(EnumDef {
+            name,
+            type_params,
+            ctors,
+        })
+    }
+
     fn parse_pure_fn_def(
         &mut self,
         name: String,
         params: Vec<PureFnParam>,
     ) -> Result<PureFnDef, ParseError> {
         self.expect_arrow()?;
-        let result_ty = self.parse_spec_ty()?;
+        let result_ty = self.parse_spec_ty_with_params(&[])?;
         self.expect_char('{')?;
         let body = self.parse_braced_body()?;
         Ok(PureFnDef {
@@ -920,23 +1270,58 @@ impl<'a> PureFnParser<'a> {
         })
     }
 
-    fn parse_spec_ty(&mut self) -> Result<SpecTy, ParseError> {
+    fn parse_type_params(&mut self) -> Result<Vec<String>, ParseError> {
+        self.skip_ws();
+        if !self.eat_char('<') {
+            return Ok(Vec::new());
+        }
+        let mut type_params = Vec::new();
+        loop {
+            type_params.push(self.parse_ident()?);
+            self.skip_ws();
+            if self.eat_char('>') {
+                return Ok(type_params);
+            }
+            self.expect_char(',')?;
+        }
+    }
+
+    fn parse_spec_ty_with_params(&mut self, type_params: &[String]) -> Result<SpecTy, ParseError> {
         let ident = self.parse_ident()?;
+        self.skip_ws();
+        let args = if self.eat_char('<') {
+            let mut args = Vec::new();
+            self.skip_ws();
+            if !self.eat_char('>') {
+                loop {
+                    args.push(self.parse_spec_ty_with_params(type_params)?);
+                    self.skip_ws();
+                    if self.eat_char('>') {
+                        break;
+                    }
+                    self.expect_char(',')?;
+                }
+            }
+            args
+        } else {
+            Vec::new()
+        };
         match ident.as_str() {
-            "bool" => Ok(SpecTy::Bool),
-            "i8" => Ok(SpecTy::I8),
-            "i16" => Ok(SpecTy::I16),
-            "i32" => Ok(SpecTy::I32),
-            "i64" => Ok(SpecTy::I64),
-            "isize" => Ok(SpecTy::Isize),
-            "u8" => Ok(SpecTy::U8),
-            "u16" => Ok(SpecTy::U16),
-            "u32" => Ok(SpecTy::U32),
-            "u64" => Ok(SpecTy::U64),
-            "usize" => Ok(SpecTy::Usize),
-            _ => Err(ParseError::new(format!(
-                "unsupported pure function type `{ident}`"
-            ))),
+            "bool" if args.is_empty() => Ok(SpecTy::Bool),
+            "i8" if args.is_empty() => Ok(SpecTy::I8),
+            "i16" if args.is_empty() => Ok(SpecTy::I16),
+            "i32" if args.is_empty() => Ok(SpecTy::I32),
+            "i64" if args.is_empty() => Ok(SpecTy::I64),
+            "isize" if args.is_empty() => Ok(SpecTy::Isize),
+            "u8" if args.is_empty() => Ok(SpecTy::U8),
+            "u16" if args.is_empty() => Ok(SpecTy::U16),
+            "u32" if args.is_empty() => Ok(SpecTy::U32),
+            "u64" if args.is_empty() => Ok(SpecTy::U64),
+            "usize" if args.is_empty() => Ok(SpecTy::Usize),
+            _ if args.is_empty() && type_params.iter().any(|param| param == &ident) => {
+                Ok(SpecTy::TypeParam(ident))
+            }
+            _ => Ok(SpecTy::Named { name: ident, args }),
         }
     }
 
@@ -960,77 +1345,107 @@ impl<'a> PureFnParser<'a> {
         Err(ParseError::new("unclosed `{` in pure function block"))
     }
 
-    fn parse_lemma_body(&self, body: &str) -> Result<Vec<GhostStmt>, ParseError> {
-        let mut stmts = Vec::new();
-        let mut cursor = 0usize;
-        while cursor < body.len() {
-            while let Some(ch) = body[cursor..].chars().next() {
-                if ch.is_whitespace() {
-                    cursor += ch.len_utf8();
-                } else {
-                    break;
-                }
-                if cursor >= body.len() {
-                    return Ok(stmts);
-                }
-            }
-            if cursor >= body.len() {
-                break;
-            }
-            if body[cursor..].starts_with("assert") {
-                cursor += "assert".len();
-                let (expr_text, next) = self.parse_stmt_expr_text(body, cursor)?;
-                cursor = next;
-                stmts.push(GhostStmt::Assert(parse_source_expr(
-                    "lemma assert",
-                    expr_text,
-                )?));
-                continue;
-            }
-            if body[cursor..].starts_with("assume") {
-                cursor += "assume".len();
-                let (expr_text, next) = self.parse_stmt_expr_text(body, cursor)?;
-                cursor = next;
-                stmts.push(GhostStmt::Assume(parse_source_expr(
-                    "lemma assume",
-                    expr_text,
-                )?));
-                continue;
-            }
+    fn parse_lemma_body(&self, body: &'a str) -> Result<Vec<GhostStmt>, ParseError> {
+        let mut parser = Self::new(body);
+        parser.parse_lemma_stmts()
+    }
 
-            let name_start = cursor;
-            let mut chars = body[cursor..].chars();
-            let Some(first) = chars.next() else {
-                break;
-            };
-            if !(first.is_ascii_alphabetic() || first == '_') {
-                return Err(ParseError::new("expected lemma statement"));
-            }
-            cursor += first.len_utf8();
-            while let Some(ch) = body[cursor..].chars().next() {
-                if ch.is_ascii_alphanumeric() || ch == '_' {
-                    cursor += ch.len_utf8();
-                } else {
-                    break;
-                }
-            }
-            let name = body[name_start..cursor].to_owned();
-            while let Some(ch) = body[cursor..].chars().next() {
-                if ch.is_whitespace() {
-                    cursor += ch.len_utf8();
-                } else {
-                    break;
-                }
-            }
-            if !body[cursor..].starts_with('(') {
-                return Err(ParseError::new("expected `(` in lemma call"));
-            }
-            let (args_body, next) = self.parse_paren_body(body, cursor)?;
-            cursor = self.expect_stmt_terminator(body, next)?;
-            let args = self.parse_call_args(args_body)?;
-            stmts.push(GhostStmt::Call { name, args });
+    fn parse_lemma_stmts(&mut self) -> Result<Vec<GhostStmt>, ParseError> {
+        let mut stmts = Vec::new();
+        while self.skip_ws() {
+            stmts.push(self.parse_lemma_stmt()?);
         }
         Ok(stmts)
+    }
+
+    fn parse_lemma_stmt(&mut self) -> Result<GhostStmt, ParseError> {
+        if self.starts_with_keyword("assert") {
+            self.expect_keyword("assert")?;
+            let (expr_text, next) = self.parse_stmt_expr_text(self.text, self.cursor)?;
+            self.cursor = next;
+            return Ok(GhostStmt::Assert(parse_source_expr(
+                "lemma assert",
+                expr_text,
+            )?));
+        }
+        if self.starts_with_keyword("assume") {
+            self.expect_keyword("assume")?;
+            let (expr_text, next) = self.parse_stmt_expr_text(self.text, self.cursor)?;
+            self.cursor = next;
+            return Ok(GhostStmt::Assume(parse_source_expr(
+                "lemma assume",
+                expr_text,
+            )?));
+        }
+        if self.starts_with_keyword("match") {
+            self.expect_keyword("match")?;
+            return self.parse_lemma_match_stmt();
+        }
+
+        let name = self.parse_ident()?;
+        self.skip_ws();
+        if !self.text[self.cursor..].starts_with('(') {
+            return Err(ParseError::new("expected `(` in lemma call"));
+        }
+        let (args_body, next) = self.parse_paren_body(self.text, self.cursor)?;
+        self.cursor = self.expect_stmt_terminator(self.text, next)?;
+        Ok(GhostStmt::Call {
+            name,
+            args: self.parse_call_args(args_body)?,
+        })
+    }
+
+    fn parse_lemma_match_stmt(&mut self) -> Result<GhostStmt, ParseError> {
+        let (scrutinee_text, cursor) = self.parse_until_top_level_char('{')?;
+        self.cursor = cursor;
+        let scrutinee = parse_source_expr("lemma match scrutinee", scrutinee_text)?;
+        self.expect_char('{')?;
+        let mut arms = Vec::new();
+        let mut default = None;
+        let mut seen_default = false;
+        loop {
+            self.skip_ws();
+            if self.eat_char('}') {
+                break;
+            }
+            if seen_default {
+                return Err(ParseError::new("default match arm must be last"));
+            }
+            let (pattern_text, next) = self.parse_until_top_level_fat_arrow()?;
+            self.cursor = next;
+            self.expect_char('{')?;
+            let body_text = self.parse_braced_body()?;
+            let body = self.parse_lemma_body(body_text)?;
+            let pattern_text = pattern_text.trim();
+            if pattern_text == "_" {
+                if default.is_some() {
+                    return Err(ParseError::new("duplicate default match arm"));
+                }
+                default = Some(body);
+                seen_default = true;
+            } else {
+                arms.push(GhostMatchArm {
+                    pattern: parse_raw_match_pattern(pattern_text)?,
+                    body,
+                });
+            }
+            self.skip_ws();
+            if self.eat_char(',') {
+                continue;
+            }
+            if self.eat_char('}') {
+                break;
+            }
+            if matches!(self.peek_char(), Some(ch) if ch == '_' || ch.is_ascii_alphabetic()) {
+                continue;
+            }
+            return Err(ParseError::new("expected `,` or `}` after match arm"));
+        }
+        Ok(GhostStmt::Match {
+            scrutinee,
+            arms,
+            default,
+        })
     }
 
     fn parse_call_args(&self, text: &str) -> Result<Vec<Expr>, ParseError> {
@@ -1148,6 +1563,54 @@ impl<'a> PureFnParser<'a> {
         Err(ParseError::new("unclosed `(` in lemma call"))
     }
 
+    fn parse_until_top_level_char(&self, target: char) -> Result<(&'a str, usize), ParseError> {
+        let start = self.cursor;
+        let mut cursor = self.cursor;
+        let mut depth = 0usize;
+        while cursor < self.text.len() {
+            let ch = self.text[cursor..].chars().next().expect("char");
+            match ch {
+                '(' | '[' | '<' => depth += 1,
+                ')' | ']' | '>' => depth = depth.saturating_sub(1),
+                _ if ch == target && depth == 0 => {
+                    let text = self.text[start..cursor].trim_end();
+                    if text.is_empty() {
+                        return Err(ParseError::new("expected spec expression"));
+                    }
+                    return Ok((text, cursor));
+                }
+                _ => {}
+            }
+            cursor += ch.len_utf8();
+        }
+        Err(ParseError::new(format!(
+            "expected `{target}` in lemma match"
+        )))
+    }
+
+    fn parse_until_top_level_fat_arrow(&self) -> Result<(&'a str, usize), ParseError> {
+        let start = self.cursor;
+        let mut cursor = self.cursor;
+        let mut depth = 0usize;
+        while cursor < self.text.len() {
+            let ch = self.text[cursor..].chars().next().expect("char");
+            match ch {
+                '(' | '[' | '<' => depth += 1,
+                ')' | ']' | '>' => depth = depth.saturating_sub(1),
+                '=' if depth == 0 && self.text[cursor..].starts_with("=>") => {
+                    let text = self.text[start..cursor].trim_end();
+                    if text.is_empty() {
+                        return Err(ParseError::new("expected match arm pattern"));
+                    }
+                    return Ok((text, cursor + 2));
+                }
+                _ => {}
+            }
+            cursor += ch.len_utf8();
+        }
+        Err(ParseError::new("expected `=>` in lemma match arm"))
+    }
+
     fn expect_stmt_terminator(&self, text: &str, mut cursor: usize) -> Result<usize, ParseError> {
         while let Some(ch) = text[cursor..].chars().next() {
             if ch.is_whitespace() {
@@ -1187,7 +1650,7 @@ impl<'a> PureFnParser<'a> {
 
     fn expect_keyword(&mut self, keyword: &str) -> Result<(), ParseError> {
         self.skip_ws();
-        if self.text[self.cursor..].starts_with(keyword) {
+        if self.starts_with_keyword(keyword) {
             self.cursor += keyword.len();
             Ok(())
         } else {
@@ -1230,13 +1693,27 @@ impl<'a> PureFnParser<'a> {
     fn peek_char(&self) -> Option<char> {
         self.text[self.cursor..].chars().next()
     }
+
+    fn starts_with_keyword(&self, keyword: &str) -> bool {
+        let Some(rest) = self.text.get(self.cursor..) else {
+            return false;
+        };
+        let Some(suffix) = rest.strip_prefix(keyword) else {
+            return false;
+        };
+        suffix
+            .chars()
+            .next()
+            .is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BinaryOp, Expr, GhostBlock, GhostStmt, IntLiteral, IntSuffix, LemmaDef, PureFnDef,
-        PureFnParam, SpecTy, UnaryOp, parse_expr, parse_ghost_block, parse_pure_fn_block,
+        BinaryOp, EnumCtorDef, EnumDef, Expr, GhostBlock, GhostStmt, IntLiteral, IntSuffix,
+        LemmaDef, MatchArm, MatchBinding, MatchPattern, PureFnDef, PureFnParam, SpecTy, UnaryOp,
+        parse_expr, parse_ghost_block, parse_pure_fn_block, parse_raw_expr,
     };
 
     #[test]
@@ -1379,9 +1856,83 @@ mod tests {
                 op: BinaryOp::Eq,
                 lhs: Box::new(Expr::Call {
                     func: "seq_rev".to_owned(),
+                    type_args: vec![],
                     args: vec![Expr::Var("xs".to_owned())],
                 }),
                 rhs: Box::new(Expr::Var("ys".to_owned())),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_enum_constructor_expression() {
+        let expr = parse_expr("assert", r#"IntList::Cons(1i32, IntList::Nil)"#).expect("expr");
+        assert_eq!(
+            expr,
+            Expr::Call {
+                func: "IntList::Cons".to_owned(),
+                type_args: vec![],
+                args: vec![
+                    Expr::Int(IntLiteral {
+                        digits: "1".to_owned(),
+                        suffix: Some(IntSuffix::I32),
+                    }),
+                    Expr::Call {
+                        func: "IntList::Nil".to_owned(),
+                        type_args: vec![],
+                        args: vec![],
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_generic_enum_constructor_expression() {
+        let expr = parse_expr("assert", r#"List::<i32>::Cons(1i32, List::<i32>::Nil)"#);
+        assert!(expr.is_ok(), "{expr:?}");
+    }
+
+    #[test]
+    fn parses_match_expression() {
+        let expr = parse_raw_expr(
+            "pure function body",
+            r#"match xs { List::Nil => 0i32, List::Cons(_, xs0) => len(xs0) }"#,
+        )
+        .expect("match expr");
+        assert_eq!(
+            expr,
+            Expr::Match {
+                scrutinee: Box::new(Expr::Var("xs".to_owned())),
+                arms: vec![
+                    MatchArm {
+                        pattern: MatchPattern::Constructor {
+                            enum_name: "List".to_owned(),
+                            ctor_name: "Nil".to_owned(),
+                            bindings: vec![],
+                        },
+                        body: Expr::Int(IntLiteral {
+                            digits: "0".to_owned(),
+                            suffix: Some(IntSuffix::I32),
+                        }),
+                    },
+                    MatchArm {
+                        pattern: MatchPattern::Constructor {
+                            enum_name: "List".to_owned(),
+                            ctor_name: "Cons".to_owned(),
+                            bindings: vec![
+                                MatchBinding::Wildcard,
+                                MatchBinding::Var("xs0".to_owned()),
+                            ],
+                        },
+                        body: Expr::Call {
+                            func: "len".to_owned(),
+                            type_args: vec![],
+                            args: vec![Expr::Var("xs0".to_owned())],
+                        },
+                    },
+                ],
+                default: None,
             }
         );
     }
@@ -1434,19 +1985,21 @@ fn add1(x: i32) -> i32 {
     }
 
     #[test]
-    fn rejects_seq_types_in_pure_function_block() {
-        let err = parse_pure_fn_block(
+    fn parses_generic_named_types_in_pure_function_block() {
+        let defs = parse_pure_fn_block(
             r#"
 fn is_rev(x: Seq<i32>) -> bool {
     true
 }
 "#,
         )
-        .expect_err("Seq types should be rejected");
-        assert!(
-            err.message.contains("unsupported pure function type `Seq`"),
-            "unexpected error: {}",
-            err.message
+        .expect("generic named type should parse");
+        assert_eq!(
+            defs[0].params[0].ty,
+            SpecTy::Named {
+                name: "Seq".to_owned(),
+                args: vec![SpecTy::I32],
+            }
         );
     }
 
@@ -1470,6 +2023,7 @@ fn add1_done(x: i32)
         assert_eq!(
             block,
             GhostBlock {
+                enums: vec![],
                 pure_fns: vec![PureFnDef {
                     name: "add1".to_owned(),
                     params: vec![PureFnParam {
@@ -1497,6 +2051,7 @@ fn add1_done(x: i32)
                         op: BinaryOp::Eq,
                         lhs: Box::new(Expr::Call {
                             func: "add1".to_owned(),
+                            type_args: vec![],
                             args: vec![Expr::Var("x".to_owned())],
                         }),
                         rhs: Box::new(Expr::Binary {
@@ -1512,6 +2067,7 @@ fn add1_done(x: i32)
                         op: BinaryOp::Eq,
                         lhs: Box::new(Expr::Call {
                             func: "add1".to_owned(),
+                            type_args: vec![],
                             args: vec![Expr::Var("x".to_owned())],
                         }),
                         rhs: Box::new(Expr::Binary {
@@ -1526,5 +2082,135 @@ fn add1_done(x: i32)
                 }],
             }
         );
+    }
+
+    #[test]
+    fn parses_lemma_match_statement() {
+        let block = parse_ghost_block(
+            r#"
+enum List<T> {
+    Nil,
+    Cons(T, List<T>),
+}
+
+fn check(xs: List<i32>)
+  req true
+  ens true
+{
+    match xs {
+        List::Nil => {
+            assert true;
+        }
+        List::Cons(_, xs0) => {
+            check(xs0);
+        }
+    }
+}
+"#,
+        );
+        assert!(block.is_ok(), "{block:?}");
+    }
+
+    #[test]
+    fn parses_enum_definitions_in_ghost_block() {
+        let block = parse_ghost_block(
+            r#"
+enum IntList {
+    Nil,
+    Cons(i32, IntList),
+}
+
+fn singleton(x: i32) -> IntList {
+    IntList::Cons(x, IntList::Nil)
+}
+"#,
+        )
+        .expect("ghost block");
+        assert_eq!(
+            block,
+            GhostBlock {
+                enums: vec![EnumDef {
+                    name: "IntList".to_owned(),
+                    type_params: vec![],
+                    ctors: vec![
+                        EnumCtorDef {
+                            name: "Nil".to_owned(),
+                            fields: vec![],
+                        },
+                        EnumCtorDef {
+                            name: "Cons".to_owned(),
+                            fields: vec![
+                                SpecTy::I32,
+                                SpecTy::Named {
+                                    name: "IntList".to_owned(),
+                                    args: vec![],
+                                },
+                            ],
+                        },
+                    ],
+                }],
+                pure_fns: vec![PureFnDef {
+                    name: "singleton".to_owned(),
+                    params: vec![PureFnParam {
+                        name: "x".to_owned(),
+                        ty: SpecTy::I32,
+                    }],
+                    result_ty: SpecTy::Named {
+                        name: "IntList".to_owned(),
+                        args: vec![],
+                    },
+                    body: Expr::Call {
+                        func: "IntList::Cons".to_owned(),
+                        type_args: vec![],
+                        args: vec![
+                            Expr::Var("x".to_owned()),
+                            Expr::Call {
+                                func: "IntList::Nil".to_owned(),
+                                type_args: vec![],
+                                args: vec![],
+                            },
+                        ],
+                    },
+                }],
+                lemmas: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_generic_enum_definitions_in_ghost_block() {
+        let block = parse_ghost_block(
+            r#"
+enum List<T> {
+    Nil,
+    Cons(T, List<T>),
+}
+
+fn singleton(x: i32) -> List<i32> {
+    List::Cons(x, List::Nil)
+}
+"#,
+        );
+        assert!(block.is_ok(), "{block:?}");
+    }
+
+    #[test]
+    fn parses_recursive_pure_function_with_match_body() {
+        let block = parse_ghost_block(
+            r#"
+enum List<T> {
+    Nil,
+    Cons(T, List<T>),
+}
+
+fn len(xs: List<i32>) -> i32 {
+    match xs {
+        List::Nil => 0i32,
+        List::Cons(_, xs0) => 1i32 + len(xs0),
+    }
+}
+"#,
+        );
+        assert!(block.is_ok(), "{block:?}");
     }
 }

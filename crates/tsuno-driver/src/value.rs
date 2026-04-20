@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::str::FromStr;
 
-use crate::spec::{BinaryOp, SpecTy, StructTy, UnaryOp};
+use crate::spec::{BinaryOp, EnumDef, SpecTy, StructTy, UnaryOp};
 use z3::ast::{self, Ast, Bool, Dynamic, Int};
 use z3::{FuncDecl, Pattern, Solver, Sort, Symbol};
 
@@ -37,10 +37,18 @@ The backend asserts the following primitive axioms:
 
   (bool)((intbox)(0)) = false
 
-Composite values are arranged like VeriFast constructor families. Each
-composite spec type gets a fresh subtype id `s` and, currently, one constructor
-layout. The representation is future-proofed so the subtype owns a constructor
-list; adding multi-constructor datatypes later only extends that list.
+Composite values are arranged like VeriFast constructor families.
+
+For structural composites such as tuples, structs, Ref<T>, and Mut<T>, each
+concrete spec type gets a fresh subtype id `s` and, today, one constructor
+layout.
+
+For named spec enums, the constructor family is nominal and shared across all
+instantiations of the same enum declaration. This matches VeriFast's erased
+encoding of inductive datatype constructors: for `enum List<T> { Nil, Cons(T,
+List<T>) }`, both `List<i32>` and `List<bool>` reuse the same constructor/tag
+symbols. Type arguments are enforced only through per-instantiation invariant
+predicates.
 
 For a constructor family whose sanitized name is `<name>`, the backend creates:
 
@@ -56,6 +64,69 @@ and asserts:
 
   forall x0 .. xn-1. ctorinv_<name>_<i>(mk_<name>(x0, .., xn-1)) = xi
     pattern: mk_<name>(x0, .., xn-1)
+
+Single-constructor structural composites additionally get the eta-style axiom:
+
+  forall v: value. mk_<name>(ctorinv_<name>_0(v), .., ctorinv_<name>_n(v)) = v
+
+Named spec enums also get a per-instantiation invariant predicate:
+
+  inv_<name<args>> : value -> Bool
+
+For `List<i32>`, this invariant says exactly that a value is either a `Nil`
+constructor, or a `Cons` constructor whose head satisfies the `i32` range
+invariant and whose tail satisfies `inv_List<i32>`. For `List<bool>`, the same
+constructor family is reused, but the invariant changes to require boolean
+heads and recursive `inv_List<bool>` tails.
+
+Recursive pure functions are encoded in `engine.rs` on top of the enum
+constructor family described above. There is no separate fixpoint datatype here;
+the function still has type `value^n -> value`.
+
+Concrete example:
+
+  /*@
+  enum List<T> { Nil, Cons(T, List<T>) }
+
+  fn len(xs: List<i32>) -> i32 {
+      match xs {
+          List::Nil => 0i32,
+          List::Cons(_, xs0) => 1i32 + len(xs0),
+      }
+  }
+  */
+
+The engine creates a single uninterpreted symbol:
+
+  len : value -> value
+
+and then asserts one equation per constructor arm, schematically:
+
+  forall .
+    len(mk_List_Nil()) = (intbox)(0)
+
+  forall head tail.
+    i32_range((int)(head)) && inv_List<i32>(tail)
+      => len(mk_List_Cons(head, tail))
+           = (intbox)((int)(len(tail)) + 1)
+
+so recursion happens through the constructor argument `tail`, not by unfolding a
+separate recursive value encoding.
+
+When a proof or recursive lemma does
+
+  match xs {
+      List::Cons(x, xs0) => ...
+  }
+
+the branch uses the same constructor family:
+
+  x   = ctorinv_List_Cons_0(xs)
+  xs0 = ctorinv_List_Cons_1(xs)
+  xs  = mk_List_Cons(x, xs0)
+
+That last equality is what lets Z3 rewrite `len(xs)` using the constructor
+equation above.
 */
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +170,20 @@ pub(crate) struct PrimitiveEncoding {
 pub(crate) struct CompositeEncoding {
     pub(crate) tag_function: FuncDecl,
     pub(crate) constructors: Vec<Rc<ConstructorEncoding>>,
+    pub(crate) invariant: Option<Rc<FuncDecl>>,
+}
+
+#[derive(Debug)]
+struct EnumFamilyEncoding {
+    tag_function_name: String,
+    constructors: Vec<Rc<EnumFamilyCtorEncoding>>,
+}
+
+#[derive(Debug)]
+struct EnumFamilyCtorEncoding {
+    symbol_name: String,
+    inverse_names: Vec<String>,
+    tag_value: u32,
 }
 
 impl CompositeEncoding {
@@ -124,8 +209,11 @@ pub(crate) struct ConstructorEncoding {
 #[derive(Debug)]
 pub(crate) struct FieldEncoding {
     pub(crate) inverse: FuncDecl,
-    pub(crate) encoding: Rc<TypeEncoding>,
+    pub(crate) ty: SpecTy,
 }
+
+type CtorFields = Vec<(String, SpecTy)>;
+type CtorSpecs = Vec<(String, CtorFields)>;
 
 pub(crate) struct ValueEncoder {
     pointer_width_bits: u64,
@@ -135,6 +223,8 @@ pub(crate) struct ValueEncoder {
     primitive_axioms_asserted: Cell<bool>,
     next_subtype_id: Cell<u32>,
     next_ctor_tag: Cell<u32>,
+    enum_defs: RefCell<BTreeMap<String, EnumDef>>,
+    enum_family_encodings: RefCell<BTreeMap<String, Rc<EnumFamilyEncoding>>>,
     type_encodings: RefCell<BTreeMap<SpecTy, Rc<TypeEncoding>>>,
 }
 
@@ -158,8 +248,14 @@ impl ValueEncoder {
             primitive_axioms_asserted: Cell::new(false),
             next_subtype_id: Cell::new(0),
             next_ctor_tag: Cell::new(0),
+            enum_defs: RefCell::new(BTreeMap::new()),
+            enum_family_encodings: RefCell::new(BTreeMap::new()),
             type_encodings: RefCell::new(BTreeMap::new()),
         }
+    }
+
+    pub(crate) fn register_enum_def(&self, def: EnumDef) {
+        self.enum_defs.borrow_mut().insert(def.name.clone(), def);
     }
 
     pub(crate) fn value_sort(&self) -> &Sort {
@@ -175,10 +271,11 @@ impl ValueEncoder {
         if let Some(encoding) = self.type_encodings.borrow().get(ty).cloned() {
             return Ok(encoding);
         }
-        let encoding = self.build_type_encoding(ty, solver)?;
+        let encoding = self.build_type_encoding(ty)?;
         self.type_encodings
             .borrow_mut()
             .insert(ty.clone(), encoding.clone());
+        self.assert_type_axioms(ty, &encoding, solver)?;
         Ok(encoding)
     }
 
@@ -192,6 +289,15 @@ impl ValueEncoder {
             TypeEncodingKind::Composite(encoding) => Ok(encoding.clone()),
             _ => Err(format!("expected composite-backed spec type, found {ty:?}")),
         }
+    }
+
+    pub(crate) fn named_invariant(
+        &self,
+        ty: &SpecTy,
+        solver: &Solver,
+    ) -> Result<Option<Rc<FuncDecl>>, String> {
+        let composite = self.composite_encoding(ty, solver)?;
+        Ok(composite.invariant.clone())
     }
 
     pub(crate) fn wrap_bool(&self, value: &Bool) -> SymValue {
@@ -287,8 +393,21 @@ impl ValueEncoder {
         fields: &[SymValue],
         solver: &Solver,
     ) -> Result<SymValue, String> {
+        self.construct_composite_ctor(ty, 0, fields, solver)
+    }
+
+    pub(crate) fn construct_composite_ctor(
+        &self,
+        ty: &SpecTy,
+        ctor_index: usize,
+        fields: &[SymValue],
+        solver: &Solver,
+    ) -> Result<SymValue, String> {
         let composite = self.composite_encoding(ty, solver)?;
-        let ctor = composite.single_constructor()?;
+        let ctor = composite
+            .constructors
+            .get(ctor_index)
+            .ok_or_else(|| format!("constructor index {ctor_index} out of range"))?;
         if fields.len() != ctor.fields.len() {
             return Err(format!(
                 "constructor `{}` expects {} fields, found {}",
@@ -318,7 +437,20 @@ impl ValueEncoder {
         value: &SymValue,
         index: usize,
     ) -> Result<SymValue, String> {
-        let ctor = composite.single_constructor()?;
+        self.project_composite_ctor_field(composite, 0, value, index)
+    }
+
+    pub(crate) fn project_composite_ctor_field(
+        &self,
+        composite: &CompositeEncoding,
+        ctor_index: usize,
+        value: &SymValue,
+        index: usize,
+    ) -> Result<SymValue, String> {
+        let ctor = composite
+            .constructors
+            .get(ctor_index)
+            .ok_or_else(|| format!("constructor index {ctor_index} out of range"))?;
         let field = ctor
             .fields
             .get(index)
@@ -371,11 +503,7 @@ impl ValueEncoder {
         }))
     }
 
-    fn build_type_encoding(
-        &self,
-        ty: &SpecTy,
-        solver: &Solver,
-    ) -> Result<Rc<TypeEncoding>, String> {
+    fn build_type_encoding(&self, ty: &SpecTy) -> Result<Rc<TypeEncoding>, String> {
         let kind = match ty {
             SpecTy::Bool => TypeEncodingKind::Bool,
             SpecTy::IntLiteral
@@ -389,21 +517,27 @@ impl ValueEncoder {
             | SpecTy::U32
             | SpecTy::U64
             | SpecTy::Usize => TypeEncodingKind::Int,
-            SpecTy::Tuple(_) | SpecTy::Struct(_) | SpecTy::Ref(_) | SpecTy::Mut(_) => {
-                TypeEncodingKind::Composite(self.build_composite_encoding(ty, solver)?)
+            SpecTy::Tuple(_)
+            | SpecTy::Struct(_)
+            | SpecTy::Named { .. }
+            | SpecTy::Ref(_)
+            | SpecTy::Mut(_) => TypeEncodingKind::Composite(self.build_composite_encoding(ty)?),
+            SpecTy::TypeParam(name) => {
+                return Err(format!(
+                    "unresolved spec type parameter `{name}` reached value encoding"
+                ));
             }
         };
         Ok(Rc::new(TypeEncoding { kind }))
     }
 
-    fn build_composite_encoding(
-        &self,
-        ty: &SpecTy,
-        solver: &Solver,
-    ) -> Result<Rc<CompositeEncoding>, String> {
-        let field_labels = self.composite_field_names(ty)?;
-        let field_encodings = self.composite_field_encodings(ty, solver)?;
-        let sort_name = self.sort_name(ty);
+    fn build_composite_encoding(&self, ty: &SpecTy) -> Result<Rc<CompositeEncoding>, String> {
+        if let SpecTy::Named { name, args } = ty {
+            return self.build_named_composite_encoding(name, args);
+        }
+
+        let ctor_specs = self.composite_ctor_specs(ty)?;
+        let sort_name = self.type_name(ty);
         let subtype_id = self.next_subtype_id.get();
         self.next_subtype_id.set(subtype_id + 1);
 
@@ -412,40 +546,182 @@ impl ValueEncoder {
             &[&self.value_sort],
             &Sort::int(),
         );
-        let constructor_name = format!("mk_{sort_name}");
-        let constructor_tag = Int::from_u64(u64::from(self.next_ctor_tag.get()));
-        self.next_ctor_tag.set(self.next_ctor_tag.get() + 1);
-
-        let domain_sorts = field_encodings
-            .iter()
-            .map(|_| &self.value_sort)
-            .collect::<Vec<_>>();
-        let constructor_symbol =
-            FuncDecl::new(constructor_name.as_str(), &domain_sorts, &self.value_sort);
-        let fields = field_labels
+        let constructors = ctor_specs
             .into_iter()
-            .zip(field_encodings)
-            .map(|(label, encoding)| FieldEncoding {
-                inverse: FuncDecl::new(
-                    format!("ctorinv_{sort_name}_{label}"),
-                    &[&self.value_sort],
-                    &self.value_sort,
-                ),
-                encoding,
+            .map(|(ctor_name, fields)| {
+                let constructor_name = if ctor_name.is_empty() {
+                    format!("mk_{sort_name}")
+                } else {
+                    format!("mk_{sort_name}_{ctor_name}")
+                };
+                let constructor_tag = Int::from_u64(u64::from(self.next_ctor_tag.get()));
+                self.next_ctor_tag.set(self.next_ctor_tag.get() + 1);
+                let domain_sorts = fields.iter().map(|_| &self.value_sort).collect::<Vec<_>>();
+                let constructor_symbol =
+                    FuncDecl::new(constructor_name.as_str(), &domain_sorts, &self.value_sort);
+                let fields = fields
+                    .into_iter()
+                    .map(|(label, field_ty)| FieldEncoding {
+                        inverse: FuncDecl::new(
+                            if ctor_name.is_empty() {
+                                format!("ctorinv_{sort_name}_{label}")
+                            } else {
+                                format!("ctorinv_{sort_name}_{ctor_name}_{label}")
+                            },
+                            &[&self.value_sort],
+                            &self.value_sort,
+                        ),
+                        ty: field_ty,
+                    })
+                    .collect::<Vec<_>>();
+                Rc::new(ConstructorEncoding {
+                    name: constructor_name,
+                    symbol: constructor_symbol,
+                    fields,
+                    tag: constructor_tag,
+                })
             })
             .collect::<Vec<_>>();
-        let constructor = Rc::new(ConstructorEncoding {
-            name: constructor_name,
-            symbol: constructor_symbol,
-            fields,
-            tag: constructor_tag,
-        });
         let composite = Rc::new(CompositeEncoding {
             tag_function,
-            constructors: vec![constructor],
+            constructors,
+            invariant: matches!(ty, SpecTy::Named { .. }).then(|| {
+                Rc::new(FuncDecl::new(
+                    format!("inv_{sort_name}"),
+                    &[&self.value_sort],
+                    &Sort::bool(),
+                ))
+            }),
         });
-        self.assert_composite_axioms(&composite, solver);
         Ok(composite)
+    }
+
+    fn build_named_composite_encoding(
+        &self,
+        name: &str,
+        type_args: &[SpecTy],
+    ) -> Result<Rc<CompositeEncoding>, String> {
+        let family = self.enum_family_encoding(name)?;
+        let ctor_specs = self.named_ctor_specs(name, type_args)?;
+        if family.constructors.len() != ctor_specs.len() {
+            return Err(format!(
+                "enum family `{name}` constructor shape mismatch: expected {}, found {}",
+                family.constructors.len(),
+                ctor_specs.len()
+            ));
+        }
+
+        let constructors = family
+            .constructors
+            .iter()
+            .zip(ctor_specs)
+            .map(|(family_ctor, (_ctor_name, fields))| {
+                let field_count = fields.len();
+                let domain_sorts = (0..field_count)
+                    .map(|_| &self.value_sort)
+                    .collect::<Vec<_>>();
+                Rc::new(ConstructorEncoding {
+                    name: family_ctor.symbol_name.clone(),
+                    symbol: FuncDecl::new(
+                        family_ctor.symbol_name.as_str(),
+                        &domain_sorts,
+                        &self.value_sort,
+                    ),
+                    fields: fields
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (_label, ty))| FieldEncoding {
+                            inverse: FuncDecl::new(
+                                family_ctor.inverse_names[index].as_str(),
+                                &[&self.value_sort],
+                                &self.value_sort,
+                            ),
+                            ty,
+                        })
+                        .collect(),
+                    tag: Int::from_u64(u64::from(family_ctor.tag_value)),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let invariant_name = format!("inv_{}", self.instantiated_named_type_name(name, type_args));
+        Ok(Rc::new(CompositeEncoding {
+            tag_function: FuncDecl::new(
+                family.tag_function_name.as_str(),
+                &[&self.value_sort],
+                &Sort::int(),
+            ),
+            constructors,
+            invariant: Some(Rc::new(FuncDecl::new(
+                invariant_name,
+                &[&self.value_sort],
+                &Sort::bool(),
+            ))),
+        }))
+    }
+
+    fn enum_family_encoding(&self, name: &str) -> Result<Rc<EnumFamilyEncoding>, String> {
+        if let Some(encoding) = self.enum_family_encodings.borrow().get(name).cloned() {
+            return Ok(encoding);
+        }
+
+        let enum_def = self
+            .enum_defs
+            .borrow()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("unknown spec enum `{name}`"))?;
+        let family_sort_name = self.enum_family_name(&enum_def.name);
+        let subtype_id = self.next_subtype_id.get();
+        self.next_subtype_id.set(subtype_id + 1);
+        let tag_function_name = format!("ctortag{subtype_id}");
+        let constructors = enum_def
+            .ctors
+            .iter()
+            .map(|ctor| {
+                let symbol_name = format!("mk_{family_sort_name}_{}", ctor.name);
+                let tag_value = self.next_ctor_tag.get();
+                self.next_ctor_tag.set(tag_value + 1);
+                let inverse_names = ctor
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| format!("ctorinv_{family_sort_name}_{}_{}", ctor.name, index))
+                    .collect();
+                Rc::new(EnumFamilyCtorEncoding {
+                    symbol_name,
+                    inverse_names,
+                    tag_value,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let encoding = Rc::new(EnumFamilyEncoding {
+            tag_function_name,
+            constructors,
+        });
+        self.enum_family_encodings
+            .borrow_mut()
+            .insert(name.to_owned(), encoding.clone());
+        Ok(encoding)
+    }
+
+    fn assert_type_axioms(
+        &self,
+        ty: &SpecTy,
+        encoding: &TypeEncoding,
+        solver: &Solver,
+    ) -> Result<(), String> {
+        match &encoding.kind {
+            TypeEncodingKind::Bool | TypeEncodingKind::Int => Ok(()),
+            TypeEncodingKind::Composite(composite) => {
+                self.assert_composite_axioms(composite, solver);
+                if matches!(ty, SpecTy::Named { .. }) {
+                    self.assert_named_invariant_axioms(ty, composite, solver)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn ensure_primitive_axioms(&self, solver: &Solver) {
@@ -530,6 +806,94 @@ impl ValueEncoder {
                 self.assert_patterned_forall(solver, &arg_refs, &constructor_app, &body);
             }
         }
+
+        if let Ok(ctor) = composite.single_constructor()
+            && !ctor.fields.is_empty()
+        {
+            let value = Dynamic::new_const(format!("{}_eta_value", ctor.name), &self.value_sort);
+            let projected_args = ctor
+                .fields
+                .iter()
+                .map(|field| field.inverse.apply(&[&value]))
+                .collect::<Vec<_>>();
+            let arg_refs = projected_args
+                .iter()
+                .map(|arg| arg as &dyn Ast)
+                .collect::<Vec<_>>();
+            let reconstructed = ctor.symbol.apply(&arg_refs);
+            let body = reconstructed.eq(&value);
+            let pattern = Pattern::new(&[&reconstructed]);
+            solver.assert(ast::forall_const(&[&value], &[&pattern], &body));
+        }
+    }
+
+    fn assert_named_invariant_axioms(
+        &self,
+        ty: &SpecTy,
+        composite: &CompositeEncoding,
+        solver: &Solver,
+    ) -> Result<(), String> {
+        let Some(invariant) = &composite.invariant else {
+            return Ok(());
+        };
+
+        for ctor in &composite.constructors {
+            let args = ctor
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    Dynamic::new_const(format!("{}_inv_arg_{index}", ctor.name), &self.value_sort)
+                })
+                .collect::<Vec<_>>();
+            let arg_refs = args.iter().map(|arg| arg as &dyn Ast).collect::<Vec<_>>();
+            let constructor_app = ctor.symbol.apply(&arg_refs);
+            let inv_app = invariant
+                .apply(&[&constructor_app])
+                .as_bool()
+                .expect("named invariant predicate");
+            let mut antecedent = Vec::new();
+            for (index, field) in ctor.fields.iter().enumerate() {
+                let value = SymValue::new(args[index].clone());
+                if let Some(formula) = self.field_invariant_formula(&field.ty, &value, solver)? {
+                    antecedent.push(formula);
+                }
+            }
+            let body = bool_implies(bool_conjoin(antecedent), inv_app);
+            self.assert_patterned_forall(solver, &arg_refs, &constructor_app, &body);
+        }
+
+        let value = Dynamic::new_const(
+            format!("{}_inv_value", self.type_name(ty)),
+            &self.value_sort,
+        );
+        let inv_app = invariant
+            .apply(&[&value])
+            .as_bool()
+            .expect("named invariant predicate");
+        let value_sym = SymValue::new(value.clone());
+        let mut branches = Vec::new();
+        for (ctor_index, ctor) in composite.constructors.iter().enumerate() {
+            let mut formulas = vec![self.tag_formula(composite, ctor_index, &value_sym)?];
+            for (field_index, field) in ctor.fields.iter().enumerate() {
+                let field_value = self.project_composite_ctor_field(
+                    composite,
+                    ctor_index,
+                    &value_sym,
+                    field_index,
+                )?;
+                if let Some(formula) =
+                    self.field_invariant_formula(&field.ty, &field_value, solver)?
+                {
+                    formulas.push(formula);
+                }
+            }
+            branches.push(bool_conjoin(formulas));
+        }
+        let pattern = Pattern::new(&[&inv_app]);
+        let body = bool_implies(inv_app.clone(), bool_disjoin(branches));
+        solver.assert(ast::forall_const(&[&value], &[&pattern], &body));
+        Ok(())
     }
 
     fn assert_patterned_forall(
@@ -547,46 +911,184 @@ impl ValueEncoder {
         solver.assert(ast::forall_const(bounds, &[&pattern], body));
     }
 
-    fn composite_field_names(&self, ty: &SpecTy) -> Result<Vec<String>, String> {
-        match ty {
-            SpecTy::Ref(_) => Ok(vec!["deref".to_owned()]),
-            SpecTy::Mut(_) => Ok(vec!["cur".to_owned(), "fin".to_owned()]),
-            SpecTy::Tuple(items) => Ok((0..items.len()).map(|index| format!("_{index}")).collect()),
-            SpecTy::Struct(StructTy { fields, .. }) => {
-                Ok(fields.iter().map(|field| field.name.clone()).collect())
-            }
-            other => Err(format!(
-                "expected composite-backed spec type, found {other:?}"
-            )),
-        }
-    }
-
-    fn composite_field_encodings(
+    fn field_invariant_formula(
         &self,
         ty: &SpecTy,
+        value: &SymValue,
         solver: &Solver,
-    ) -> Result<Vec<Rc<TypeEncoding>>, String> {
+    ) -> Result<Option<Bool>, String> {
         match ty {
-            SpecTy::Ref(inner) => Ok(vec![self.type_encoding(inner, solver)?]),
-            SpecTy::Mut(inner) => {
-                let inner = self.type_encoding(inner, solver)?;
-                Ok(vec![inner.clone(), inner])
+            SpecTy::Bool => Ok(None),
+            SpecTy::IntLiteral
+            | SpecTy::I8
+            | SpecTy::I16
+            | SpecTy::I32
+            | SpecTy::I64
+            | SpecTy::Isize
+            | SpecTy::U8
+            | SpecTy::U16
+            | SpecTy::U32
+            | SpecTy::U64
+            | SpecTy::Usize => Ok(self.int_bounds(ty)?.map(|(lower, upper)| {
+                bool_conjoin(vec![
+                    self.int_term(value).ge(lower),
+                    self.int_term(value).le(upper),
+                ])
+            })),
+            SpecTy::Named { name, args } => {
+                let invariant = self
+                    .named_invariant(
+                        &SpecTy::Named {
+                            name: name.clone(),
+                            args: args.clone(),
+                        },
+                        solver,
+                    )?
+                    .ok_or_else(|| format!("missing invariant predicate for `{name}`"))?;
+                Ok(Some(
+                    invariant
+                        .apply(&[value.ast()])
+                        .as_bool()
+                        .expect("named invariant predicate"),
+                ))
             }
-            SpecTy::Tuple(items) => items
-                .iter()
-                .map(|item| self.type_encoding(item, solver))
-                .collect(),
-            SpecTy::Struct(StructTy { fields, .. }) => fields
-                .iter()
-                .map(|field| self.type_encoding(&field.ty, solver))
-                .collect(),
+            other => Err(format!(
+                "unsupported spec enum field type in invariant encoding: {other:?}"
+            )),
+        }
+    }
+
+    fn composite_ctor_specs(&self, ty: &SpecTy) -> Result<CtorSpecs, String> {
+        match ty {
+            SpecTy::Ref(inner) => Ok(vec![(
+                String::new(),
+                vec![("deref".to_owned(), (**inner).clone())],
+            )]),
+            SpecTy::Mut(inner) => Ok(vec![(
+                String::new(),
+                vec![
+                    ("cur".to_owned(), (**inner).clone()),
+                    ("fin".to_owned(), (**inner).clone()),
+                ],
+            )]),
+            SpecTy::Tuple(items) => Ok(vec![(
+                String::new(),
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| (format!("_{index}"), item.clone()))
+                    .collect(),
+            )]),
+            SpecTy::Struct(StructTy { fields, .. }) => Ok(vec![(
+                String::new(),
+                fields
+                    .iter()
+                    .map(|field| (field.name.clone(), field.ty.clone()))
+                    .collect(),
+            )]),
+            SpecTy::Named { name, args } => self.named_ctor_specs(name, args),
             other => Err(format!(
                 "expected composite-backed spec type, found {other:?}"
             )),
         }
     }
 
-    fn sort_name(&self, ty: &SpecTy) -> String {
+    fn named_ctor_specs(&self, name: &str, type_args: &[SpecTy]) -> Result<CtorSpecs, String> {
+        let enum_def = self
+            .enum_defs
+            .borrow()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("unknown spec enum `{name}`"))?;
+        if enum_def.type_params.len() != type_args.len() {
+            return Err(format!(
+                "spec enum `{name}` expects {} type arguments, found {}",
+                enum_def.type_params.len(),
+                type_args.len()
+            ));
+        }
+        let bindings = enum_def
+            .type_params
+            .iter()
+            .cloned()
+            .zip(type_args.iter().cloned())
+            .collect::<BTreeMap<_, _>>();
+        enum_def
+            .ctors
+            .into_iter()
+            .map(|ctor| {
+                Ok((
+                    ctor.name,
+                    ctor.fields
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, field_ty)| {
+                            Ok((
+                                index.to_string(),
+                                self.instantiate_named_field_ty(&field_ty, &bindings)?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, String>>()?,
+                ))
+            })
+            .collect()
+    }
+
+    fn instantiate_named_field_ty(
+        &self,
+        ty: &SpecTy,
+        bindings: &BTreeMap<String, SpecTy>,
+    ) -> Result<SpecTy, String> {
+        match ty {
+            SpecTy::Bool => Ok(SpecTy::Bool),
+            SpecTy::IntLiteral => Ok(SpecTy::IntLiteral),
+            SpecTy::I8 => Ok(SpecTy::I8),
+            SpecTy::I16 => Ok(SpecTy::I16),
+            SpecTy::I32 => Ok(SpecTy::I32),
+            SpecTy::I64 => Ok(SpecTy::I64),
+            SpecTy::Isize => Ok(SpecTy::Isize),
+            SpecTy::U8 => Ok(SpecTy::U8),
+            SpecTy::U16 => Ok(SpecTy::U16),
+            SpecTy::U32 => Ok(SpecTy::U32),
+            SpecTy::U64 => Ok(SpecTy::U64),
+            SpecTy::Usize => Ok(SpecTy::Usize),
+            SpecTy::Tuple(items) => Ok(SpecTy::Tuple(
+                items
+                    .iter()
+                    .map(|item| self.instantiate_named_field_ty(item, bindings))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
+            SpecTy::Struct(struct_ty) => Ok(SpecTy::Struct(StructTy {
+                name: struct_ty.name.clone(),
+                fields: struct_ty
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        Ok(crate::spec::StructFieldTy {
+                            name: field.name.clone(),
+                            ty: self.instantiate_named_field_ty(&field.ty, bindings)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            })),
+            SpecTy::Named { name, args } => Ok(SpecTy::Named {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|arg| self.instantiate_named_field_ty(arg, bindings))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
+            SpecTy::TypeParam(name) => bindings
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("unbound spec type parameter `{name}` in enum encoding")),
+            SpecTy::Ref(_) | SpecTy::Mut(_) => Err(format!(
+                "unsupported spec enum field type in value encoding: {ty:?}"
+            )),
+        }
+    }
+
+    fn type_name(&self, ty: &SpecTy) -> String {
         fn sanitize(raw: &str) -> String {
             raw.chars()
                 .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
@@ -610,14 +1112,41 @@ impl ValueEncoder {
                 "tuple_{}",
                 items
                     .iter()
-                    .map(|item| self.sort_name(item))
+                    .map(|item| self.type_name(item))
                     .collect::<Vec<_>>()
                     .join("_")
             ),
             SpecTy::Struct(struct_ty) => format!("struct_{}", sanitize(&struct_ty.name)),
-            SpecTy::Ref(inner) => format!("ref_{}", self.sort_name(inner)),
-            SpecTy::Mut(inner) => format!("mut_{}", self.sort_name(inner)),
+            SpecTy::Named { name, args } => self.instantiated_named_type_name(name, args),
+            SpecTy::Ref(inner) => format!("ref_{}", self.type_name(inner)),
+            SpecTy::Mut(inner) => format!("mut_{}", self.type_name(inner)),
+            SpecTy::TypeParam(name) => format!("typeparam_{}", sanitize(name)),
         }
+    }
+
+    fn enum_family_name(&self, name: &str) -> String {
+        format!("enum_{}", self.sanitize_name(name))
+    }
+
+    fn instantiated_named_type_name(&self, name: &str, args: &[SpecTy]) -> String {
+        let base = self.enum_family_name(name);
+        if args.is_empty() {
+            return base;
+        }
+        format!(
+            "{}_{}",
+            base,
+            args.iter()
+                .map(|arg| self.type_name(arg))
+                .collect::<Vec<_>>()
+                .join("_")
+        )
+    }
+
+    fn sanitize_name(&self, raw: &str) -> String {
+        raw.chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+            .collect()
     }
 
     fn pointer_sized_int_bounds(&self, signed: bool) -> Result<(Int, Int), String> {
@@ -637,6 +1166,28 @@ impl ValueEncoder {
             Ok((Int::from_u64(0), upper))
         }
     }
+}
+
+fn bool_conjoin(forms: Vec<Bool>) -> Bool {
+    if forms.is_empty() {
+        Bool::from_bool(true)
+    } else {
+        let refs = forms.iter().collect::<Vec<_>>();
+        Bool::and(&refs)
+    }
+}
+
+fn bool_disjoin(forms: Vec<Bool>) -> Bool {
+    if forms.is_empty() {
+        Bool::from_bool(false)
+    } else {
+        let refs = forms.iter().collect::<Vec<_>>();
+        Bool::or(&refs)
+    }
+}
+
+fn bool_implies(lhs: Bool, rhs: Bool) -> Bool {
+    lhs.implies(rhs)
 }
 
 #[cfg(test)]
@@ -892,6 +1443,41 @@ mod tests {
             .expect("tuple tag");
         solver.push();
         solver.assert(tuple_tag.eq(&tuple_ctor.tag).not());
+        assert_eq!(solver.check(), SatResult::Unsat);
+        solver.pop(1);
+    }
+
+    #[test]
+    fn single_constructor_composites_support_eta_reconstruction_from_opaque_values() {
+        z3::set_global_param("smt.auto_config", "false");
+        z3::set_global_param("smt.mbqi", "false");
+
+        let solver = Solver::new();
+        let mut params = z3::Params::new();
+        params.set_u32("timeout", 1_000);
+        solver.set_params(&params);
+
+        let encoder = ValueEncoder::new(64);
+        let _ = encoder
+            .type_encoding(&SpecTy::Bool, &solver)
+            .expect("bool encoding");
+        let _ = encoder
+            .type_encoding(&SpecTy::I32, &solver)
+            .expect("int encoding");
+        let tuple_encoding = encoder
+            .composite_encoding(&SpecTy::Tuple(vec![SpecTy::Bool, SpecTy::I32]), &solver)
+            .expect("tuple encoding");
+        let tuple_ctor = tuple_encoding
+            .single_constructor()
+            .expect("single constructor");
+        let opaque_tuple = Dynamic::new_const("opaque_tuple", encoder.value_sort());
+        let reconstructed = tuple_ctor.symbol.apply(&[
+            &tuple_ctor.fields[0].inverse.apply(&[&opaque_tuple]),
+            &tuple_ctor.fields[1].inverse.apply(&[&opaque_tuple]),
+        ]);
+
+        solver.push();
+        solver.assert(reconstructed.eq(&opaque_tuple).not());
         assert_eq!(solver.check(), SatResult::Unsat);
         solver.pop(1);
     }

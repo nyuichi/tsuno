@@ -30,17 +30,17 @@ use rustc_middle::mir::{
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::source_map::Spanned;
 use rustc_span::{DUMMY_SP, Span};
-use z3::ast::{Ast, Bool, Int};
+use z3::ast::{Ast, Bool, Dynamic, Int};
 use z3::{FuncDecl, SatResult, Solver, SortKind};
 
 use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
     FunctionContract, LemmaCallContract, LoopContract, LoopContracts, ProgramPrepass,
-    ResolvedExprEnv, SpecVarBinding, TypedGhostStmt, TypedLemmaDef, TypedPureFnDef,
-    spec_ty_for_rust_ty,
+    ResolvedExprEnv, SpecVarBinding, TypedGhostMatchArm, TypedGhostStmt, TypedLemmaDef,
+    TypedPureFnDef, spec_ty_for_rust_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
-use crate::spec::{BinaryOp, SpecTy, TypedExpr, TypedExprKind, UnaryOp};
+use crate::spec::{BinaryOp, SpecTy, TypedExpr, TypedExprKind, TypedMatchBinding, UnaryOp};
 use crate::value::{CompositeEncoding, SymValue, TypeEncoding, TypeEncodingKind, ValueEncoder};
 
 thread_local! {
@@ -96,6 +96,9 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
         contracts,
     } = program;
     let mut verifier = Verifier::new(tcx, contracts);
+    for enum_def in ghosts.enums.values() {
+        verifier.value_encoder.register_enum_def(enum_def.clone());
+    }
     for pure_fn in &ghosts.typed_pure_fns {
         if let Err(error) = verifier.load_ghost_function(pure_fn) {
             return vec![VerificationResult {
@@ -167,12 +170,12 @@ impl<'tcx> Verifier<'tcx> {
         &mut self,
         pure_fn: &TypedPureFnDef,
     ) -> Result<(), VerificationResult> {
-        self.register_pure_fn(pure_fn)?;
         let inserted = self
             .pure_fns
             .insert(pure_fn.name.clone(), pure_fn.clone())
             .is_none();
         assert!(inserted, "duplicate pure function `{}`", pure_fn.name);
+        self.register_pure_fn(pure_fn)?;
         Ok(())
     }
 
@@ -182,8 +185,7 @@ impl<'tcx> Verifier<'tcx> {
             .insert(lemma.name.clone(), lemma.clone())
             .is_none();
         assert!(inserted, "duplicate lemma `{}`", lemma.name);
-        let mut stack = Vec::new();
-        self.verify_lemma(lemma, &mut stack)
+        self.verify_lemma(lemma)
     }
 
     pub fn verify_function(
@@ -750,12 +752,24 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn register_pure_fn(&self, pure_fn: &TypedPureFnDef) -> Result<(), VerificationResult> {
+        if Self::typed_expr_calls_pure_fn(&pure_fn.body, &pure_fn.name) {
+            return self.register_recursive_pure_fn(pure_fn);
+        }
+        self.register_nonrecursive_pure_fn(pure_fn)
+    }
+
+    fn register_nonrecursive_pure_fn(
+        &self,
+        pure_fn: &TypedPureFnDef,
+    ) -> Result<(), VerificationResult> {
         let decl = self.pure_fn_decl(pure_fn)?;
         let mut current = HashMap::new();
         let mut vars = Vec::with_capacity(pure_fn.params.len());
         for param in &pure_fn.params {
-            let value = self
-                .fresh_for_spec_ty(&param.ty, &format!("pure_{}_{}", pure_fn.name, param.name))?;
+            let value = SymValue::new(Dynamic::new_const(
+                self.fresh_name(&format!("pure_{}_{}", pure_fn.name, param.name)),
+                self.value_encoder.value_sort(),
+            ));
             current.insert(param.name.clone(), value.clone());
             vars.push(value);
         }
@@ -787,18 +801,144 @@ impl<'tcx> Verifier<'tcx> {
         Ok(())
     }
 
-    fn verify_lemma(
+    fn register_recursive_pure_fn(
         &self,
-        lemma: &TypedLemmaDef,
-        stack: &mut Vec<String>,
+        pure_fn: &TypedPureFnDef,
     ) -> Result<(), VerificationResult> {
-        if stack.iter().any(|name| name == &lemma.name) {
+        let TypedExprKind::Match {
+            scrutinee,
+            arms,
+            default,
+        } = &pure_fn.body.kind
+        else {
             return Err(self.unsupported_result(
                 self.report_span(),
-                format!("recursive lemma `{}` is not supported", lemma.name),
+                format!(
+                    "recursive pure function `{}` must use a top-level match",
+                    pure_fn.name
+                ),
             ));
+        };
+        let TypedExprKind::Var(scrutinee_name) = &scrutinee.kind else {
+            return Err(self.unsupported_result(
+                self.report_span(),
+                format!(
+                    "recursive pure function `{}` must match on a parameter",
+                    pure_fn.name
+                ),
+            ));
+        };
+        let Some(recursive_param_index) = pure_fn
+            .params
+            .iter()
+            .position(|param| param.name == *scrutinee_name)
+        else {
+            return Err(self.unsupported_result(
+                self.report_span(),
+                format!(
+                    "recursive pure function `{}` must match on a parameter",
+                    pure_fn.name
+                ),
+            ));
+        };
+        let recursive_param = &pure_fn.params[recursive_param_index];
+        let composite = self.composite_encoding(&recursive_param.ty)?;
+        let decl = self.pure_fn_decl(pure_fn)?;
+        for ctor_index in 0..composite.constructors.len() {
+            let arm = arms.iter().find(|arm| arm.ctor_index == ctor_index);
+            let branch_body = if let Some(arm) = arm {
+                &arm.body
+            } else if let Some(default) = default {
+                default.as_ref()
+            } else {
+                unreachable!("typed recursive pure match must be exhaustive")
+            };
+            let mut current = HashMap::new();
+            let mut fn_args = Vec::with_capacity(pure_fn.params.len());
+            let mut quantified = Vec::new();
+            let mut antecedent = Vec::new();
+            let mut ctor_fields = Vec::new();
+            for (param_index, param) in pure_fn.params.iter().enumerate() {
+                if param_index == recursive_param_index {
+                    let ctor = composite
+                        .constructors
+                        .get(ctor_index)
+                        .expect("constructor index from composite encoding");
+                    ctor_fields.clear();
+                    for (field_index, field) in ctor.fields.iter().enumerate() {
+                        let value = SymValue::new(Dynamic::new_const(
+                            self.fresh_name(&format!(
+                                "pure_{}_{}_{}_{}",
+                                pure_fn.name, param.name, ctor_index, field_index
+                            )),
+                            self.value_encoder.value_sort(),
+                        ));
+                        if let Some(formula) =
+                            self.spec_ty_formula(&field.ty, &value, self.report_span())?
+                        {
+                            antecedent.push(formula);
+                        }
+                        quantified.push(value.clone());
+                        ctor_fields.push(value);
+                    }
+                    let recursive_value =
+                        self.construct_composite_ctor(&param.ty, ctor_index, &ctor_fields)?;
+                    current.insert(param.name.clone(), recursive_value.clone());
+                    fn_args.push(recursive_value);
+                    if let Some(arm) = arm {
+                        for (binding, field_value) in arm.bindings.iter().zip(ctor_fields.iter()) {
+                            if let TypedMatchBinding::Var { name, .. } = binding {
+                                current.insert(name.clone(), field_value.clone());
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let value = SymValue::new(Dynamic::new_const(
+                    self.fresh_name(&format!("pure_{}_{}", pure_fn.name, param.name)),
+                    self.value_encoder.value_sort(),
+                ));
+                if let Some(formula) =
+                    self.spec_ty_formula(&param.ty, &value, self.report_span())?
+                {
+                    antecedent.push(formula);
+                }
+                current.insert(param.name.clone(), value.clone());
+                fn_args.push(value.clone());
+                quantified.push(value);
+            }
+            let spec = HashMap::new();
+            let body = self.contract_expr_to_value(&current, &spec, branch_body)?;
+            let fn_value = self.apply_pure_fn_decl(&decl, &fn_args)?;
+            let mut consequent = vec![self.eq_for_spec_ty(
+                &pure_fn.result_ty,
+                &fn_value,
+                &body,
+                self.report_span(),
+            )?];
+            if let Some(formula) =
+                self.spec_ty_formula(&pure_fn.result_ty, &fn_value, self.report_span())?
+            {
+                consequent.push(formula);
+            }
+            let clause = if antecedent.is_empty() {
+                bool_and(consequent)
+            } else {
+                bool_and(antecedent).implies(bool_and(consequent))
+            };
+            let asts: Vec<&dyn Ast> = quantified.iter().map(SymValue::ast).collect();
+            with_solver(|solver| {
+                if asts.is_empty() {
+                    solver.assert(&clause);
+                } else {
+                    solver.assert(z3::ast::forall_const(&asts, &[], &clause));
+                }
+            });
         }
-        stack.push(lemma.name.clone());
+        Ok(())
+    }
+
+    fn verify_lemma(&self, lemma: &TypedLemmaDef) -> Result<(), VerificationResult> {
         let mut current = HashMap::new();
         for param in &lemma.params {
             let value =
@@ -816,7 +956,6 @@ impl<'tcx> Verifier<'tcx> {
         };
         let req = self.contract_expr_to_bool(&current, &spec, &lemma.req)?;
         if !self.assume_constraint(&mut state, req, self.report_span())? {
-            stack.pop();
             return Ok(());
         }
         for param in &lemma.params {
@@ -824,67 +963,181 @@ impl<'tcx> Verifier<'tcx> {
             if let Some(formula) = self.spec_ty_formula(&param.ty, value, self.report_span())?
                 && !self.assume_constraint(&mut state, formula, self.report_span())?
             {
-                stack.pop();
                 return Ok(());
             }
         }
-        for stmt in &lemma.body {
-            match stmt {
-                TypedGhostStmt::Assert(expr) => {
-                    let formula = self.contract_expr_to_bool(&current, &spec, expr)?;
-                    self.assert_expr_constraint(
-                        &mut state,
-                        expr,
-                        formula,
-                        self.report_span(),
-                        format!("lemma `{}`", lemma.name),
-                        format!("lemma `{}` assertion failed", lemma.name),
-                    )?;
+        let final_states = self.execute_lemma_stmts(lemma, &current, &spec, state, &lemma.body)?;
+        for mut final_state in final_states {
+            let ens = self.contract_expr_to_bool(&current, &spec, &lemma.ens)?;
+            self.assert_expr_constraint(
+                &mut final_state,
+                &lemma.ens,
+                ens,
+                self.report_span(),
+                format!("lemma `{}`", lemma.name),
+                format!("lemma `{}` postcondition failed", lemma.name),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn execute_lemma_stmts(
+        &self,
+        lemma: &TypedLemmaDef,
+        current: &HashMap<String, SymValue>,
+        spec: &HashMap<String, SymValue>,
+        mut state: State,
+        stmts: &[TypedGhostStmt],
+    ) -> Result<Vec<State>, VerificationResult> {
+        let Some((stmt, rest)) = stmts.split_first() else {
+            return Ok(vec![state]);
+        };
+        match stmt {
+            TypedGhostStmt::Assert(expr) => {
+                let formula = self.contract_expr_to_bool(current, spec, expr)?;
+                self.assert_expr_constraint(
+                    &mut state,
+                    expr,
+                    formula,
+                    self.report_span(),
+                    format!("lemma `{}`", lemma.name),
+                    format!("lemma `{}` assertion failed", lemma.name),
+                )?;
+                self.execute_lemma_stmts(lemma, current, spec, state, rest)
+            }
+            TypedGhostStmt::Assume(expr) => {
+                let formula = self.contract_expr_to_bool(current, spec, expr)?;
+                if !self.assume_constraint(&mut state, formula, self.report_span())? {
+                    return Ok(Vec::new());
                 }
-                TypedGhostStmt::Assume(expr) => {
-                    let formula = self.contract_expr_to_bool(&current, &spec, expr)?;
-                    if !self.assume_constraint(&mut state, formula, self.report_span())? {
-                        stack.pop();
-                        return Ok(());
-                    }
-                }
-                TypedGhostStmt::Call { lemma_name, args } => {
-                    let callee = self.lemmas.get(lemma_name).ok_or_else(|| {
-                        self.unsupported_result(
-                            self.report_span(),
-                            format!("unknown lemma `{lemma_name}`"),
-                        )
-                    })?;
-                    self.verify_lemma(callee, stack)?;
-                    let env = self.lemma_env_from_contract_args(args, &current, &spec, callee)?;
-                    let req = self.contract_expr_to_bool(&env.current, &env.spec, &callee.req)?;
-                    self.assert_expr_constraint(
-                        &mut state,
-                        &callee.req,
-                        req,
+                self.execute_lemma_stmts(lemma, current, spec, state, rest)
+            }
+            TypedGhostStmt::Call { lemma_name, args } => {
+                let callee = self.lemmas.get(lemma_name).ok_or_else(|| {
+                    self.unsupported_result(
                         self.report_span(),
-                        format!("lemma `{}`", lemma.name),
-                        format!("lemma `{}` precondition failed", callee.name),
-                    )?;
-                    let ens = self.contract_expr_to_bool(&env.current, &env.spec, &callee.ens)?;
-                    if !self.assume_constraint(&mut state, ens, self.report_span())? {
-                        stack.pop();
-                        return Ok(());
-                    }
+                        format!("unknown lemma `{lemma_name}`"),
+                    )
+                })?;
+                let env = self.lemma_env_from_contract_args(args, current, spec, callee)?;
+                let req = self.contract_expr_to_bool(&env.current, &env.spec, &callee.req)?;
+                self.assert_expr_constraint(
+                    &mut state,
+                    &callee.req,
+                    req,
+                    self.report_span(),
+                    format!("lemma `{}`", lemma.name),
+                    format!("lemma `{}` precondition failed", callee.name),
+                )?;
+                let ens = self.contract_expr_to_bool(&env.current, &env.spec, &callee.ens)?;
+                if !self.assume_constraint(&mut state, ens, self.report_span())? {
+                    return Ok(Vec::new());
+                }
+                self.execute_lemma_stmts(lemma, current, spec, state, rest)
+            }
+            TypedGhostStmt::Match {
+                scrutinee,
+                arms,
+                default,
+            } => self.execute_lemma_match(
+                lemma,
+                current,
+                spec,
+                state,
+                scrutinee,
+                arms,
+                default.as_deref(),
+                rest,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_lemma_match(
+        &self,
+        lemma: &TypedLemmaDef,
+        current: &HashMap<String, SymValue>,
+        spec: &HashMap<String, SymValue>,
+        state: State,
+        scrutinee: &TypedExpr,
+        arms: &[TypedGhostMatchArm],
+        default: Option<&[TypedGhostStmt]>,
+        rest: &[TypedGhostStmt],
+    ) -> Result<Vec<State>, VerificationResult> {
+        let scrutinee_value = self.contract_expr_to_value(current, spec, scrutinee)?;
+        let composite = self.composite_encoding(&scrutinee.ty)?;
+        let mut guard_formulas = Vec::with_capacity(arms.len());
+        let mut final_states = Vec::new();
+        for arm in arms {
+            let mut branch_state = state.clone();
+            let guard = self.composite_tag_formula_for_encoding(
+                &composite,
+                &scrutinee_value,
+                arm.ctor_index,
+                self.report_span(),
+            )?;
+            guard_formulas.push(guard.clone());
+            if !self.assume_constraint(&mut branch_state, guard, self.report_span())? {
+                continue;
+            }
+            let mut branch_current = current.clone();
+            let mut field_values = Vec::with_capacity(arm.bindings.len());
+            for (field_index, binding) in arm.bindings.iter().enumerate() {
+                let field_value = self
+                    .value_encoder
+                    .project_composite_ctor_field(
+                        &composite,
+                        arm.ctor_index,
+                        &scrutinee_value,
+                        field_index,
+                    )
+                    .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+                if let TypedMatchBinding::Var { name, .. } = binding {
+                    branch_current.insert(name.clone(), field_value.clone());
+                }
+                field_values.push(field_value);
+            }
+            let ctor_value =
+                self.construct_composite_ctor(&scrutinee.ty, arm.ctor_index, &field_values)?;
+            let branch_eq = self.eq_for_spec_ty(
+                &scrutinee.ty,
+                &scrutinee_value,
+                &ctor_value,
+                self.report_span(),
+            )?;
+            if !self.assume_constraint(&mut branch_state, branch_eq, self.report_span())? {
+                continue;
+            }
+            let branch_end_states =
+                self.execute_lemma_stmts(lemma, &branch_current, spec, branch_state, &arm.body)?;
+            for branch_end_state in branch_end_states {
+                final_states.extend(self.execute_lemma_stmts(
+                    lemma,
+                    current,
+                    spec,
+                    branch_end_state,
+                    rest,
+                )?);
+            }
+        }
+        if let Some(default) = default {
+            let mut default_state = state;
+            let default_guard = bool_and(guard_formulas.into_iter().map(bool_not).collect());
+            if self.assume_constraint(&mut default_state, default_guard, self.report_span())? {
+                let default_end_states =
+                    self.execute_lemma_stmts(lemma, current, spec, default_state, default)?;
+                for default_end_state in default_end_states {
+                    final_states.extend(self.execute_lemma_stmts(
+                        lemma,
+                        current,
+                        spec,
+                        default_end_state,
+                        rest,
+                    )?);
                 }
             }
         }
-        let ens = self.contract_expr_to_bool(&current, &spec, &lemma.ens)?;
-        let result = self.assert_expr_constraint(
-            &mut state,
-            &lemma.ens,
-            ens,
-            self.report_span(),
-            format!("lemma `{}`", lemma.name),
-            format!("lemma `{}` postcondition failed", lemma.name),
-        );
-        stack.pop();
-        result
+        Ok(final_states)
     }
 
     fn execute_lemma_call(
@@ -1604,7 +1857,12 @@ impl<'tcx> Verifier<'tcx> {
             | SpecTy::U16
             | SpecTy::U32
             | SpecTy::U64
+            | SpecTy::Named { .. }
             | SpecTy::Usize => Ok(value.clone()),
+            SpecTy::TypeParam(name) => Err(self.unsupported_result(
+                span,
+                format!("unresolved spec type parameter `{name}` reached verifier"),
+            )),
         }
     }
 
@@ -1686,6 +1944,9 @@ impl<'tcx> Verifier<'tcx> {
                     Ok(self.value_is_true(&value))
                 }
             },
+            TypedExprKind::Match { .. } => {
+                Ok(self.value_is_true(&self.spec_expr_to_value(state, expr, resolved)?))
+            }
             _ => Ok(self.value_is_true(&self.spec_expr_to_value(state, expr, resolved)?)),
         }
     }
@@ -1731,12 +1992,25 @@ impl<'tcx> Verifier<'tcx> {
                     )
                 })
             }
+            TypedExprKind::Match { .. } => Err(self.unsupported_result(
+                self.control_span(state.ctrl),
+                "match expressions are only supported in pure function bodies".to_owned(),
+            )),
             TypedExprKind::PureCall { func, args } => {
                 let mut values = Vec::with_capacity(args.len());
                 for arg in args {
                     values.push(self.spec_expr_to_value(state, arg, resolved)?);
                 }
                 self.eval_pure_call(func, values, self.control_span(state.ctrl))
+            }
+            TypedExprKind::CtorCall {
+                ctor_index, args, ..
+            } => {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.spec_expr_to_value(state, arg, resolved)?);
+                }
+                self.construct_composite_ctor(&expr.ty, *ctor_index, &values)
             }
             TypedExprKind::Field { base, index, .. } => {
                 let value = self.spec_expr_to_value(state, base, resolved)?;
@@ -1851,6 +2125,9 @@ impl<'tcx> Verifier<'tcx> {
                     Ok(self.value_is_true(&value))
                 }
             },
+            TypedExprKind::Match { .. } => {
+                Ok(self.value_is_true(&self.contract_expr_to_value(current, spec, expr)?))
+            }
             _ => Ok(self.value_is_true(&self.contract_expr_to_value(current, spec, expr)?)),
         }
     }
@@ -1884,12 +2161,26 @@ impl<'tcx> Verifier<'tcx> {
                     format!("missing spec binding `{name}`"),
                 )
             }),
+            TypedExprKind::Match {
+                scrutinee,
+                arms,
+                default,
+            } => self.contract_match_to_value(current, spec, scrutinee, arms, default.as_deref()),
             TypedExprKind::PureCall { func, args } => {
                 let mut values = Vec::with_capacity(args.len());
                 for arg in args {
                     values.push(self.contract_expr_to_value(current, spec, arg)?);
                 }
                 self.eval_pure_call(func, values, self.report_span())
+            }
+            TypedExprKind::CtorCall {
+                ctor_index, args, ..
+            } => {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.contract_expr_to_value(current, spec, arg)?);
+                }
+                self.construct_composite_ctor(&expr.ty, *ctor_index, &values)
             }
             TypedExprKind::Field { base, index, .. } => {
                 let value = self.contract_expr_to_value(current, spec, base)?;
@@ -1927,6 +2218,101 @@ impl<'tcx> Verifier<'tcx> {
                 let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
                 self.lower_binary_value(*op, &lhs.ty, &lhs_value, &rhs_value, self.report_span())
             }
+        }
+    }
+
+    fn contract_match_to_value(
+        &self,
+        current: &HashMap<String, SymValue>,
+        spec: &HashMap<String, SymValue>,
+        scrutinee: &TypedExpr,
+        arms: &[crate::spec::TypedMatchArm],
+        default: Option<&TypedExpr>,
+    ) -> Result<SymValue, VerificationResult> {
+        let scrutinee_value = self.contract_expr_to_value(current, spec, scrutinee)?;
+        let composite = self.composite_encoding(&scrutinee.ty)?;
+        let mut branches = Vec::with_capacity(arms.len());
+        for arm in arms {
+            let mut arm_current = current.clone();
+            for (field_index, binding) in arm.bindings.iter().enumerate() {
+                if let TypedMatchBinding::Var { name, .. } = binding {
+                    let field_value = self
+                        .value_encoder
+                        .project_composite_ctor_field(
+                            &composite,
+                            arm.ctor_index,
+                            &scrutinee_value,
+                            field_index,
+                        )
+                        .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+                    arm_current.insert(name.clone(), field_value);
+                }
+            }
+            let body = self.contract_expr_to_value(&arm_current, spec, &arm.body)?;
+            let guard = self.composite_tag_formula_for_encoding(
+                &composite,
+                &scrutinee_value,
+                arm.ctor_index,
+                self.report_span(),
+            )?;
+            branches.push((guard, body));
+        }
+        let mut result = if let Some(default) = default {
+            self.contract_expr_to_value(current, spec, default)?
+        } else {
+            branches
+                .last()
+                .map(|(_, value)| value.clone())
+                .ok_or_else(|| {
+                    self.unsupported_result(
+                        self.report_span(),
+                        "match expression must contain at least one arm".to_owned(),
+                    )
+                })?
+        };
+        for (guard, value) in branches.into_iter().rev() {
+            result = SymValue::new(guard.ite(value.dynamic(), result.dynamic()));
+        }
+        Ok(result)
+    }
+
+    fn typed_expr_calls_pure_fn(expr: &TypedExpr, name: &str) -> bool {
+        match &expr.kind {
+            TypedExprKind::PureCall { func, args } => {
+                func == name
+                    || args
+                        .iter()
+                        .any(|arg| Self::typed_expr_calls_pure_fn(arg, name))
+            }
+            TypedExprKind::Match {
+                scrutinee,
+                arms,
+                default,
+            } => {
+                Self::typed_expr_calls_pure_fn(scrutinee, name)
+                    || arms
+                        .iter()
+                        .any(|arm| Self::typed_expr_calls_pure_fn(&arm.body, name))
+                    || default
+                        .as_deref()
+                        .is_some_and(|body| Self::typed_expr_calls_pure_fn(body, name))
+            }
+            TypedExprKind::CtorCall { args, .. } => args
+                .iter()
+                .any(|arg| Self::typed_expr_calls_pure_fn(arg, name)),
+            TypedExprKind::Field { base, .. }
+            | TypedExprKind::TupleField { base, .. }
+            | TypedExprKind::Deref { base }
+            | TypedExprKind::Fin { base }
+            | TypedExprKind::Unary { arg: base, .. } => Self::typed_expr_calls_pure_fn(base, name),
+            TypedExprKind::Binary { lhs, rhs, .. } => {
+                Self::typed_expr_calls_pure_fn(lhs, name)
+                    || Self::typed_expr_calls_pure_fn(rhs, name)
+            }
+            TypedExprKind::Bool(_)
+            | TypedExprKind::Int(_)
+            | TypedExprKind::Var(_)
+            | TypedExprKind::Bind(_) => false,
         }
     }
 
@@ -2121,7 +2507,17 @@ impl<'tcx> Verifier<'tcx> {
         match &expr.kind {
             TypedExprKind::Bind(_) => true,
             TypedExprKind::Bool(_) | TypedExprKind::Int(_) | TypedExprKind::Var(_) => false,
+            TypedExprKind::Match {
+                scrutinee,
+                arms,
+                default,
+            } => {
+                Self::expr_has_bind(scrutinee)
+                    || arms.iter().any(|arm| Self::expr_has_bind(&arm.body))
+                    || default.as_deref().is_some_and(Self::expr_has_bind)
+            }
             TypedExprKind::PureCall { args, .. } => args.iter().any(Self::expr_has_bind),
+            TypedExprKind::CtorCall { args, .. } => args.iter().any(Self::expr_has_bind),
             TypedExprKind::Field { base, .. }
             | TypedExprKind::TupleField { base, .. }
             | TypedExprKind::Deref { base }
@@ -2348,6 +2744,19 @@ impl<'tcx> Verifier<'tcx> {
             .map_err(|err| self.unsupported_result(self.report_span(), err))
     }
 
+    fn construct_composite_ctor(
+        &self,
+        ty: &SpecTy,
+        ctor_index: usize,
+        fields: &[SymValue],
+    ) -> Result<SymValue, VerificationResult> {
+        with_solver(|solver| {
+            self.value_encoder
+                .construct_composite_ctor(ty, ctor_index, fields, solver)
+        })
+        .map_err(|err| self.unsupported_result(self.report_span(), err))
+    }
+
     fn fresh_for_rust_ty(&self, ty: Ty<'tcx>, hint: &str) -> Result<SymValue, VerificationResult> {
         let spec_ty = spec_ty_for_rust_ty(self.tcx, ty)
             .map_err(|err| self.unsupported_result(self.report_span(), err))?;
@@ -2365,6 +2774,12 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn fresh_for_spec_ty(&self, ty: &SpecTy, hint: &str) -> Result<SymValue, VerificationResult> {
+        if matches!(ty, SpecTy::Named { .. }) {
+            return Ok(SymValue::new(Dynamic::new_const(
+                self.fresh_name(hint),
+                self.value_encoder.value_sort(),
+            )));
+        }
         let encoding = self.type_encoding(ty)?;
         self.fresh_for_encoding(&encoding, hint)
     }
@@ -2387,9 +2802,7 @@ impl<'tcx> Verifier<'tcx> {
                     .map_err(|err| self.unsupported_result(self.report_span(), err))?;
                 let mut fields = Vec::with_capacity(ctor.fields.len());
                 for (index, field) in ctor.fields.iter().enumerate() {
-                    fields.push(
-                        self.fresh_for_encoding(&field.encoding, &format!("{hint}_{index}"))?,
-                    );
+                    fields.push(self.fresh_for_spec_ty(&field.ty, &format!("{hint}_{index}"))?);
                 }
                 let args = fields.iter().map(SymValue::ast).collect::<Vec<_>>();
                 Ok(SymValue::new(ctor.symbol.apply(&args)))
@@ -2692,6 +3105,11 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(Some(bool_and(formulas)))
             }
+            SpecTy::Named { .. } => self.named_invariant_formula(ty, value, span).map(Some),
+            SpecTy::TypeParam(name) => Err(self.unsupported_result(
+                span,
+                format!("unresolved spec type parameter `{name}` reached verifier"),
+            )),
         }
     }
 
@@ -2754,7 +3172,31 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(bool_and(formulas))
             }
+            SpecTy::Named { .. } => self.named_invariant_formula(ty, value, span),
+            SpecTy::TypeParam(name) => Err(self.unsupported_result(
+                span,
+                format!("unresolved spec type parameter `{name}` reached verifier"),
+            )),
         }
+    }
+
+    fn named_invariant_formula(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        with_solver(|solver| {
+            let invariant = self
+                .value_encoder
+                .named_invariant(ty, solver)?
+                .ok_or_else(|| format!("missing named invariant for {ty:?}"))?;
+            Ok(invariant
+                .apply(&[value.ast()])
+                .as_bool()
+                .expect("named invariant predicate"))
+        })
+        .map_err(|err: String| self.unsupported_result(span, err))
     }
 
     fn decode_composite_field(
