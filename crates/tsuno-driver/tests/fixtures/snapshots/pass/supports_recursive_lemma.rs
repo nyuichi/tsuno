@@ -1,9 +1,4 @@
 /*@
-enum List<T> {
-    Nil,
-    Cons(T, List<T>),
-}
-
 fn len(xs: List<i32>) -> i32 {
     match xs {
         List::Nil => 0i32,

@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::str::FromStr;
 
@@ -226,6 +226,7 @@ pub(crate) struct ValueEncoder {
     enum_defs: RefCell<BTreeMap<String, EnumDef>>,
     enum_family_encodings: RefCell<BTreeMap<String, Rc<EnumFamilyEncoding>>>,
     type_encodings: RefCell<BTreeMap<SpecTy, Rc<TypeEncoding>>>,
+    asserted_type_axioms: RefCell<BTreeSet<SpecTy>>,
 }
 
 impl ValueEncoder {
@@ -251,7 +252,13 @@ impl ValueEncoder {
             enum_defs: RefCell::new(BTreeMap::new()),
             enum_family_encodings: RefCell::new(BTreeMap::new()),
             type_encodings: RefCell::new(BTreeMap::new()),
+            asserted_type_axioms: RefCell::new(BTreeSet::new()),
         }
+    }
+
+    pub(crate) fn reset_solver_state(&self) {
+        self.primitive_axioms_asserted.set(false);
+        self.asserted_type_axioms.borrow_mut().clear();
     }
 
     pub(crate) fn register_enum_def(&self, def: EnumDef) {
@@ -269,12 +276,17 @@ impl ValueEncoder {
     ) -> Result<Rc<TypeEncoding>, String> {
         self.ensure_primitive_axioms(solver);
         if let Some(encoding) = self.type_encodings.borrow().get(ty).cloned() {
+            if !self.asserted_type_axioms.borrow().contains(ty) {
+                self.asserted_type_axioms.borrow_mut().insert(ty.clone());
+                self.assert_type_axioms(ty, &encoding, solver)?;
+            }
             return Ok(encoding);
         }
         let encoding = self.build_type_encoding(ty)?;
         self.type_encodings
             .borrow_mut()
             .insert(ty.clone(), encoding.clone());
+        self.asserted_type_axioms.borrow_mut().insert(ty.clone());
         self.assert_type_axioms(ty, &encoding, solver)?;
         Ok(encoding)
     }
@@ -323,6 +335,9 @@ impl ValueEncoder {
     }
 
     pub(crate) fn bool_term(&self, value: &SymValue) -> Bool {
+        if let Some(payload) = self.boxed_payload(value, &self.bool_encoding.boxed) {
+            return payload.as_bool().expect("boxed bool payload");
+        }
         self.bool_encoding
             .unboxed
             .apply(&[value.ast()])
@@ -331,11 +346,26 @@ impl ValueEncoder {
     }
 
     pub(crate) fn int_term(&self, value: &SymValue) -> Int {
+        if let Some(payload) = self.boxed_payload(value, &self.int_encoding.boxed) {
+            return payload.as_int().expect("boxed int payload");
+        }
         self.int_encoding
             .unboxed
             .apply(&[value.ast()])
             .as_int()
             .expect("boxed int payload")
+    }
+
+    fn boxed_payload(&self, value: &SymValue, boxed: &FuncDecl) -> Option<Dynamic> {
+        let ast = value.dynamic();
+        if ast.decl().name() != boxed.name() {
+            return None;
+        }
+        let children = ast.children();
+        match children.as_slice() {
+            [payload] => Some(payload.clone()),
+            _ => None,
+        }
     }
 
     pub(crate) fn eq_for_spec_ty(
@@ -455,6 +485,12 @@ impl ValueEncoder {
             .fields
             .get(index)
             .ok_or_else(|| format!("field index {index} out of range"))?;
+        if value.dynamic().decl().name() == ctor.symbol.name() {
+            let children = value.dynamic().children();
+            if let Some(payload) = children.get(index) {
+                return Ok(SymValue::new(payload.clone()));
+            }
+        }
         Ok(SymValue::new(field.inverse.apply(&[value.ast()])))
     }
 
@@ -468,6 +504,17 @@ impl ValueEncoder {
             .constructors
             .get(ctor_index)
             .ok_or_else(|| format!("constructor index {ctor_index} out of range"))?;
+        let decl_name = value.dynamic().decl().name();
+        if decl_name == ctor.symbol.name() {
+            return Ok(Bool::from_bool(true));
+        }
+        if composite
+            .constructors
+            .iter()
+            .any(|other| decl_name == other.symbol.name())
+        {
+            return Ok(Bool::from_bool(false));
+        }
         Ok(composite
             .tag_function
             .apply(&[value.ast()])
@@ -715,8 +762,8 @@ impl ValueEncoder {
         match &encoding.kind {
             TypeEncodingKind::Bool | TypeEncodingKind::Int => Ok(()),
             TypeEncodingKind::Composite(composite) => {
-                self.assert_composite_axioms(composite, solver);
                 if matches!(ty, SpecTy::Named { .. }) {
+                    self.assert_composite_axioms(composite, solver);
                     self.assert_named_invariant_axioms(ty, composite, solver)?;
                 }
                 Ok(())
@@ -725,60 +772,11 @@ impl ValueEncoder {
     }
 
     fn ensure_primitive_axioms(&self, solver: &Solver) {
+        let _ = solver;
         if self.primitive_axioms_asserted.get() {
             return;
         }
-        self.assert_bool_retract_axioms(solver);
-        self.assert_int_retract_axioms(solver);
-        self.assert_bool_of_zero_int_axiom(solver);
         self.primitive_axioms_asserted.set(true);
-    }
-
-    fn assert_bool_retract_axioms(&self, solver: &Solver) {
-        let payload = Bool::new_const("value_bool_payload");
-        let boxed = self.bool_encoding.boxed.apply(&[&payload]);
-        let unboxed = self
-            .bool_encoding
-            .unboxed
-            .apply(&[&boxed])
-            .as_bool()
-            .expect("bool payload");
-        self.assert_patterned_forall(solver, &[&payload], &boxed, &unboxed.eq(&payload));
-
-        let value = Dynamic::new_const("value_bool_value", &self.value_sort);
-        let bool_view = self.bool_encoding.unboxed.apply(&[&value]);
-        let bool_pattern = Pattern::new(&[&bool_view]);
-        let body = self.bool_encoding.boxed.apply(&[&bool_view]).eq(&value);
-        solver.assert(ast::forall_const(&[&value], &[&bool_pattern], &body));
-    }
-
-    fn assert_int_retract_axioms(&self, solver: &Solver) {
-        let payload = Int::new_const("value_int_payload");
-        let boxed = self.int_encoding.boxed.apply(&[&payload]);
-        let unboxed = self
-            .int_encoding
-            .unboxed
-            .apply(&[&boxed])
-            .as_int()
-            .expect("int payload");
-        self.assert_patterned_forall(solver, &[&payload], &boxed, &unboxed.eq(&payload));
-
-        let value = Dynamic::new_const("value_int_value", &self.value_sort);
-        let int_view = self.int_encoding.unboxed.apply(&[&value]);
-        let int_pattern = Pattern::new(&[&int_view]);
-        let body = self.int_encoding.boxed.apply(&[&int_view]).eq(&value);
-        solver.assert(ast::forall_const(&[&value], &[&int_pattern], &body));
-    }
-
-    fn assert_bool_of_zero_int_axiom(&self, solver: &Solver) {
-        let zero = self.int_encoding.boxed.apply(&[&Int::from_i64(0)]);
-        let zero_as_bool = self
-            .bool_encoding
-            .unboxed
-            .apply(&[&zero])
-            .as_bool()
-            .expect("boxed bool payload");
-        solver.assert(zero_as_bool.eq(Bool::from_bool(false)));
     }
 
     fn assert_composite_axioms(&self, composite: &CompositeEncoding, solver: &Solver) {
@@ -1273,15 +1271,8 @@ mod tests {
     }
 
     #[test]
-    fn primitive_axioms_support_retracts() {
-        z3::set_global_param("smt.auto_config", "false");
-        z3::set_global_param("smt.mbqi", "false");
-
+    fn primitive_terms_unwrap_boxed_values_syntactically() {
         let solver = Solver::new();
-        let mut params = z3::Params::new();
-        params.set_u32("timeout", 1_000);
-        solver.set_params(&params);
-
         let encoder = ValueEncoder::new(64);
         let _ = encoder
             .type_encoding(&SpecTy::Bool, &solver)
@@ -1289,73 +1280,15 @@ mod tests {
         let _ = encoder
             .type_encoding(&SpecTy::I32, &solver)
             .expect("int encoding");
-        let bool_payload = Bool::new_const("bool_payload");
-        let boxed_bool = encoder.bool_encoding.boxed.apply(&[&bool_payload]);
-        let unboxed_bool = encoder
-            .bool_encoding
-            .unboxed
-            .apply(&[&boxed_bool])
-            .as_bool()
-            .expect("unboxed bool");
+        let boxed_bool = encoder.bool_value(true);
+        assert_eq!(encoder.bool_term(&boxed_bool).to_string(), "true");
 
-        solver.push();
-        solver.assert(unboxed_bool.eq(&bool_payload).not());
-        assert_eq!(solver.check(), SatResult::Unsat);
-        solver.pop(1);
-
-        let int_payload = Int::new_const("int_payload");
-        let boxed_int = encoder.int_encoding.boxed.apply(&[&int_payload]);
-        let unboxed_int = encoder
-            .int_encoding
-            .unboxed
-            .apply(&[&boxed_int])
-            .as_int()
-            .expect("unboxed int");
-
-        solver.push();
-        solver.assert(unboxed_int.eq(&int_payload).not());
-        assert_eq!(solver.check(), SatResult::Unsat);
-        solver.pop(1);
-
-        let opaque_value = Dynamic::new_const("opaque_value", encoder.value_sort());
-        let reboxed_int = encoder
-            .int_encoding
-            .boxed
-            .apply(&[&encoder.int_encoding.unboxed.apply(&[&opaque_value])]);
-        solver.push();
-        solver.assert(reboxed_int.eq(&opaque_value).not());
-        assert_eq!(solver.check(), SatResult::Unsat);
-        solver.pop(1);
+        let boxed_int = encoder.int_value(42);
+        assert_eq!(encoder.int_term(&boxed_int).to_string(), "42");
     }
 
     #[test]
-    fn primitive_axioms_support_bool_reboxing_from_unboxed_values() {
-        z3::set_global_param("smt.auto_config", "false");
-        z3::set_global_param("smt.mbqi", "false");
-
-        let solver = Solver::new();
-        let mut params = z3::Params::new();
-        params.set_u32("timeout", 1_000);
-        solver.set_params(&params);
-
-        let encoder = ValueEncoder::new(64);
-        let _ = encoder
-            .type_encoding(&SpecTy::Bool, &solver)
-            .expect("bool encoding");
-
-        let opaque_value = Dynamic::new_const("opaque_bool_value", encoder.value_sort());
-        let reboxed_bool = encoder
-            .bool_encoding
-            .boxed
-            .apply(&[&encoder.bool_encoding.unboxed.apply(&[&opaque_value])]);
-        solver.push();
-        solver.assert(reboxed_bool.eq(&opaque_value).not());
-        assert_eq!(solver.check(), SatResult::Unsat);
-        solver.pop(1);
-    }
-
-    #[test]
-    fn primitive_axioms_map_zero_int_to_false_bool() {
+    fn primitive_encodings_keep_solver_consistent() {
         z3::set_global_param("smt.auto_config", "false");
         z3::set_global_param("smt.mbqi", "false");
 
@@ -1372,29 +1305,12 @@ mod tests {
             .type_encoding(&SpecTy::I32, &solver)
             .expect("int encoding");
 
-        let zero_as_value = encoder.int_encoding.boxed.apply(&[&Int::from_i64(0)]);
-        let zero_as_bool = encoder
-            .bool_encoding
-            .unboxed
-            .apply(&[&zero_as_value])
-            .as_bool()
-            .expect("bool payload");
-        solver.push();
-        solver.assert(zero_as_bool.eq(Bool::from_bool(false)).not());
-        assert_eq!(solver.check(), SatResult::Unsat);
-        solver.pop(1);
+        assert_eq!(solver.check(), SatResult::Sat);
     }
 
     #[test]
-    fn composite_axioms_support_projection_and_tag_reasoning() {
-        z3::set_global_param("smt.auto_config", "false");
-        z3::set_global_param("smt.mbqi", "false");
-
+    fn known_structural_composites_project_and_tag_syntactically() {
         let solver = Solver::new();
-        let mut params = z3::Params::new();
-        params.set_u32("timeout", 1_000);
-        solver.set_params(&params);
-
         let encoder = ValueEncoder::new(64);
         let _ = encoder
             .type_encoding(&SpecTy::Bool, &solver)
@@ -1415,48 +1331,34 @@ mod tests {
             &encoder.int_encoding.boxed.apply(&[&count]),
         ]);
 
-        let projected_flag = tuple_ctor.fields[0].inverse.apply(&[&tuple]);
-        let projected_count = tuple_ctor.fields[1].inverse.apply(&[&tuple]);
-
-        solver.push();
-        solver.assert(
-            projected_flag
-                .eq(encoder.bool_encoding.boxed.apply(&[&flag]))
-                .not(),
+        assert_eq!(
+            encoder
+                .project_composite_field(&tuple_encoding, &SymValue::new(tuple.clone()), 0)
+                .expect("flag field")
+                .dynamic(),
+            &encoder.bool_encoding.boxed.apply(&[&flag])
         );
-        assert_eq!(solver.check(), SatResult::Unsat);
-        solver.pop(1);
-
-        solver.push();
-        solver.assert(
-            projected_count
-                .eq(encoder.int_encoding.boxed.apply(&[&count]))
-                .not(),
+        assert_eq!(
+            encoder
+                .project_composite_field(&tuple_encoding, &SymValue::new(tuple.clone()), 1)
+                .expect("count field")
+                .dynamic(),
+            &encoder.int_encoding.boxed.apply(&[&count])
         );
-        assert_eq!(solver.check(), SatResult::Unsat);
-        solver.pop(1);
 
-        let tuple_tag = tuple_encoding
-            .tag_function
-            .apply(&[&tuple])
-            .as_int()
-            .expect("tuple tag");
-        solver.push();
-        solver.assert(tuple_tag.eq(&tuple_ctor.tag).not());
-        assert_eq!(solver.check(), SatResult::Unsat);
-        solver.pop(1);
+        assert_eq!(
+            encoder
+                .tag_formula(&tuple_encoding, 0, &SymValue::new(tuple))
+                .expect("tuple tag")
+                .simplify()
+                .as_bool(),
+            Some(true)
+        );
     }
 
     #[test]
-    fn single_constructor_composites_support_eta_reconstruction_from_opaque_values() {
-        z3::set_global_param("smt.auto_config", "false");
-        z3::set_global_param("smt.mbqi", "false");
-
+    fn opaque_structural_composites_do_not_gain_eta_axioms() {
         let solver = Solver::new();
-        let mut params = z3::Params::new();
-        params.set_u32("timeout", 1_000);
-        solver.set_params(&params);
-
         let encoder = ValueEncoder::new(64);
         let _ = encoder
             .type_encoding(&SpecTy::Bool, &solver)
@@ -1478,7 +1380,7 @@ mod tests {
 
         solver.push();
         solver.assert(reconstructed.eq(&opaque_tuple).not());
-        assert_eq!(solver.check(), SatResult::Unsat);
+        assert_eq!(solver.check(), SatResult::Sat);
         solver.pop(1);
     }
 

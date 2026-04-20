@@ -131,12 +131,47 @@ fn prelude_definitions_are_available_by_default() {
 }
 
 #[test]
+fn named_lemma_parameter_is_admissible() {
+    let output = run_fixture_file(pass_fixture_file("named_lemma_parameter_is_admissible"));
+    assert!(
+        output.status.success(),
+        "unexpected stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn redefining_prelude_definition_is_rejected() {
     let output = run_prepass_fixture("rejects_duplicate_prelude_definition");
     assert!(!output.status.success(), "fixture unexpectedly passed");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("duplicate pure function name"),
+        "unexpected stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn complex_lemma_assumption_is_admitted_during_prepass() {
+    let output = run_prepass_fixture("allows_complex_lemma_assumption");
+    assert!(
+        output.status.success(),
+        "unexpected stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn rejects_unknown_existential_lemma_assertion_during_prepass() {
+    let output = run_prepass_fixture("rejects_unknown_existential_lemma_assertion");
+    assert!(!output.status.success(), "fixture unexpectedly passed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("FAIL prepass"),
+        "unexpected stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("solver returned unknown") || stdout.contains("solver timed out"),
         "unexpected stdout:\n{stdout}"
     );
 }
