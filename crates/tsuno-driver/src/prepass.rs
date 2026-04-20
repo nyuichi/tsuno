@@ -7,8 +7,9 @@ use crate::directive::{
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
-    EnumDef, Expr, LemmaDef, MatchBinding, MatchPattern, PureFnDef, SpecTy, StructFieldTy,
-    StructTy, TypedExpr, TypedExprKind, TypedMatchArm, TypedMatchBinding, parse_ghost_block,
+    EnumDef, Expr, GhostMatchArm, LemmaDef, MatchBinding, MatchPattern, PureFnDef, SpecTy,
+    StructFieldTy, StructTy, TypedExpr, TypedExprKind, TypedMatchArm, TypedMatchBinding,
+    parse_ghost_block,
 };
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{HirId, Pat, PatKind};
@@ -97,6 +98,18 @@ pub enum TypedGhostStmt {
         lemma_name: String,
         args: Vec<TypedExpr>,
     },
+    Match {
+        scrutinee: TypedExpr,
+        arms: Vec<TypedGhostMatchArm>,
+        default: Option<Vec<TypedGhostStmt>>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct TypedGhostMatchArm {
+    pub ctor_index: usize,
+    pub bindings: Vec<TypedMatchBinding>,
+    pub body: Vec<TypedGhostStmt>,
 }
 
 #[derive(Debug, Clone)]
@@ -373,14 +386,14 @@ pub fn compute_global_ghost_prepass<'tcx>(
     }
 
     let typed_pure_fns = type_pure_fns(&pure_fns, &pure_fn_order, &enums, anchor_span)?;
-    let typed_lemma_map = type_lemmas(&lemmas, &pure_fns, &enums, anchor_span)?;
+    let typed_lemmas = type_lemmas(&lemmas, &lemma_order, &pure_fns, &enums, anchor_span)?;
 
     Ok(GlobalGhostPrepass {
         enums,
         pure_fns,
         lemmas,
         typed_pure_fns,
-        typed_lemmas: order_lemmas(&typed_lemma_map, &lemma_order),
+        typed_lemmas,
     })
 }
 
@@ -3743,14 +3756,468 @@ fn type_pure_fns(
     Ok(typed)
 }
 
+fn lemma_body_callee<'a>(
+    name: &str,
+    available_lemmas: &'a HashMap<String, LemmaDef>,
+    all_lemmas: &HashMap<String, LemmaDef>,
+) -> Result<&'a LemmaDef, String> {
+    if let Some(lemma) = available_lemmas.get(name) {
+        return Ok(lemma);
+    }
+    if all_lemmas.contains_key(name) {
+        return Err("A lemma can call only preceding lemmas or itself.".to_owned());
+    }
+    Err(format!("unknown lemma `{name}`"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn infer_lemma_stmts(
+    stmts: &[crate::spec::GhostStmt],
+    available_lemmas: &HashMap<String, LemmaDef>,
+    all_lemmas: &HashMap<String, LemmaDef>,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    local_tys: &HashMap<String, SpecTy>,
+    result_ty: &SpecTy,
+    inferred: &mut SpecTypeInference,
+) -> Result<(), String> {
+    for stmt in stmts {
+        match stmt {
+            crate::spec::GhostStmt::Assert(expr) | crate::spec::GhostStmt::Assume(expr) => {
+                infer_contract_expr_types(
+                    expr, pure_fns, enum_defs, spec_scope, local_tys, false, result_ty, inferred,
+                )?;
+            }
+            crate::spec::GhostStmt::Call { name, args } => {
+                let callee = lemma_body_callee(name, available_lemmas, all_lemmas)?;
+                if callee.params.len() != args.len() {
+                    return Err(format!(
+                        "lemma `{name}` expects {} arguments, found {}",
+                        callee.params.len(),
+                        args.len()
+                    ));
+                }
+                for (arg, param) in args.iter().zip(&callee.params) {
+                    let arg_ty = infer_contract_expr_types(
+                        arg, pure_fns, enum_defs, spec_scope, local_tys, false, result_ty, inferred,
+                    )?;
+                    constrain_expr_ty(inferred, &arg_ty, &param.ty)?;
+                }
+            }
+            crate::spec::GhostStmt::Match {
+                scrutinee,
+                arms,
+                default,
+            } => {
+                let scrutinee_ty = infer_contract_expr_types(
+                    scrutinee, pure_fns, enum_defs, spec_scope, local_tys, false, result_ty,
+                    inferred,
+                )?;
+                let InferredExprTy::Known(SpecTy::Named {
+                    name: scrutinee_enum_name,
+                    args: scrutinee_type_args,
+                }) = scrutinee_ty
+                else {
+                    return Err("match scrutinee must have a named enum type".to_owned());
+                };
+                let enum_def = enum_defs
+                    .get(&scrutinee_enum_name)
+                    .ok_or_else(|| format!("unknown spec enum `{scrutinee_enum_name}`"))?;
+                let mut reserved_names = local_tys.keys().cloned().collect::<HashSet<_>>();
+                reserved_names.extend(spec_scope.visible.iter().cloned());
+                let mut seen_ctors = HashSet::new();
+                for arm in arms {
+                    let GhostMatchArm { pattern, body } = arm;
+                    let MatchPattern::Constructor {
+                        enum_name,
+                        ctor_name,
+                        bindings,
+                    } = pattern;
+                    if *enum_name != scrutinee_enum_name {
+                        return Err(format!(
+                            "match arm constructor `{enum_name}::{ctor_name}` does not match scrutinee type `{scrutinee_enum_name}`"
+                        ));
+                    }
+                    let Some(ctor_index) = enum_def
+                        .ctors
+                        .iter()
+                        .position(|ctor| ctor.name == *ctor_name)
+                    else {
+                        return Err(format!(
+                            "enum `{enum_name}` does not define constructor `{ctor_name}`"
+                        ));
+                    };
+                    if !seen_ctors.insert(ctor_index) {
+                        return Err(format!(
+                            "match statement contains duplicate arm for `{enum_name}::{ctor_name}`"
+                        ));
+                    }
+                    let field_tys = instantiate_named_ctor_field_tys(
+                        enum_def,
+                        ctor_index,
+                        &scrutinee_type_args,
+                    )?;
+                    let (_typed_bindings, match_env) =
+                        typed_match_bindings(bindings, &field_tys, &reserved_names)?;
+                    let mut arm_tys = local_tys.clone();
+                    arm_tys.extend(match_env);
+                    let mut arm_scope = spec_scope.clone();
+                    infer_lemma_stmts(
+                        body,
+                        available_lemmas,
+                        all_lemmas,
+                        pure_fns,
+                        enum_defs,
+                        &mut arm_scope,
+                        &arm_tys,
+                        result_ty,
+                        inferred,
+                    )?;
+                }
+                if let Some(default) = default {
+                    let mut default_scope = spec_scope.clone();
+                    infer_lemma_stmts(
+                        default,
+                        available_lemmas,
+                        all_lemmas,
+                        pure_fns,
+                        enum_defs,
+                        &mut default_scope,
+                        local_tys,
+                        result_ty,
+                        inferred,
+                    )?;
+                } else if seen_ctors.len() != enum_def.ctors.len() {
+                    return Err(format!(
+                        "match statement over `{scrutinee_enum_name}` is not exhaustive"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_lemma_stmts(
+    stmts: &[crate::spec::GhostStmt],
+    available_lemmas: &HashMap<String, LemmaDef>,
+    all_lemmas: &HashMap<String, LemmaDef>,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    local_tys: &HashMap<String, SpecTy>,
+    result_ty: &SpecTy,
+    inferred: &mut SpecTypeInference,
+) -> Result<Vec<TypedGhostStmt>, String> {
+    let mut typed = Vec::with_capacity(stmts.len());
+    for stmt in stmts {
+        match stmt {
+            crate::spec::GhostStmt::Assert(expr) => {
+                typed.push(TypedGhostStmt::Assert(typed_contract_expr(
+                    expr, pure_fns, enum_defs, spec_scope, local_tys, false, result_ty, inferred,
+                )?))
+            }
+            crate::spec::GhostStmt::Assume(expr) => {
+                typed.push(TypedGhostStmt::Assume(typed_contract_expr(
+                    expr, pure_fns, enum_defs, spec_scope, local_tys, false, result_ty, inferred,
+                )?))
+            }
+            crate::spec::GhostStmt::Call { name, args } => {
+                let callee = lemma_body_callee(name, available_lemmas, all_lemmas)?;
+                if callee.params.len() != args.len() {
+                    return Err(format!(
+                        "lemma `{name}` expects {} arguments, found {}",
+                        callee.params.len(),
+                        args.len()
+                    ));
+                }
+                let mut typed_args = Vec::with_capacity(args.len());
+                for (arg, param) in args.iter().zip(&callee.params) {
+                    let typed_arg = typed_contract_expr(
+                        arg, pure_fns, enum_defs, spec_scope, local_tys, false, result_ty, inferred,
+                    )?;
+                    let unified = unify_spec_tys(&typed_arg.ty, &param.ty)?;
+                    if unified != param.ty {
+                        return Err(format!(
+                            "lemma `{name}` parameter `{}` expects `{}`, found `{}`",
+                            param.name,
+                            display_spec_ty(&param.ty),
+                            display_spec_ty(&typed_arg.ty)
+                        ));
+                    }
+                    typed_args.push(typed_arg);
+                }
+                typed.push(TypedGhostStmt::Call {
+                    lemma_name: name.clone(),
+                    args: typed_args,
+                });
+            }
+            crate::spec::GhostStmt::Match {
+                scrutinee,
+                arms,
+                default,
+            } => {
+                let scrutinee = typed_contract_expr(
+                    scrutinee, pure_fns, enum_defs, spec_scope, local_tys, false, result_ty,
+                    inferred,
+                )?;
+                let SpecTy::Named {
+                    name: scrutinee_enum_name,
+                    args: scrutinee_type_args,
+                } = &scrutinee.ty
+                else {
+                    return Err("match scrutinee must have a named enum type".to_owned());
+                };
+                let enum_def = enum_defs
+                    .get(scrutinee_enum_name)
+                    .ok_or_else(|| format!("unknown spec enum `{scrutinee_enum_name}`"))?;
+                let mut reserved_names = local_tys.keys().cloned().collect::<HashSet<_>>();
+                reserved_names.extend(spec_scope.visible.iter().cloned());
+                let mut seen_ctors = HashSet::new();
+                let mut typed_arms = Vec::with_capacity(arms.len());
+                for arm in arms {
+                    let GhostMatchArm { pattern, body } = arm;
+                    let MatchPattern::Constructor {
+                        enum_name,
+                        ctor_name,
+                        bindings,
+                    } = pattern;
+                    if *enum_name != *scrutinee_enum_name {
+                        return Err(format!(
+                            "match arm constructor `{enum_name}::{ctor_name}` does not match scrutinee type `{scrutinee_enum_name}`"
+                        ));
+                    }
+                    let Some(ctor_index) = enum_def
+                        .ctors
+                        .iter()
+                        .position(|ctor| ctor.name == *ctor_name)
+                    else {
+                        return Err(format!(
+                            "enum `{enum_name}` does not define constructor `{ctor_name}`"
+                        ));
+                    };
+                    if !seen_ctors.insert(ctor_index) {
+                        return Err(format!(
+                            "match statement contains duplicate arm for `{enum_name}::{ctor_name}`"
+                        ));
+                    }
+                    let field_tys = instantiate_named_ctor_field_tys(
+                        enum_def,
+                        ctor_index,
+                        scrutinee_type_args,
+                    )?;
+                    let (typed_bindings, match_env) =
+                        typed_match_bindings(bindings, &field_tys, &reserved_names)?;
+                    let mut arm_tys = local_tys.clone();
+                    arm_tys.extend(match_env);
+                    let mut arm_scope = spec_scope.clone();
+                    let body = typed_lemma_stmts(
+                        body,
+                        available_lemmas,
+                        all_lemmas,
+                        pure_fns,
+                        enum_defs,
+                        &mut arm_scope,
+                        &arm_tys,
+                        result_ty,
+                        inferred,
+                    )?;
+                    typed_arms.push(TypedGhostMatchArm {
+                        ctor_index,
+                        bindings: typed_bindings,
+                        body,
+                    });
+                }
+                let typed_default = if let Some(default) = default {
+                    let mut default_scope = spec_scope.clone();
+                    Some(typed_lemma_stmts(
+                        default,
+                        available_lemmas,
+                        all_lemmas,
+                        pure_fns,
+                        enum_defs,
+                        &mut default_scope,
+                        local_tys,
+                        result_ty,
+                        inferred,
+                    )?)
+                } else {
+                    None
+                };
+                if typed_default.is_none() && seen_ctors.len() != enum_def.ctors.len() {
+                    return Err(format!(
+                        "match statement over `{scrutinee_enum_name}` is not exhaustive"
+                    ));
+                }
+                typed.push(TypedGhostStmt::Match {
+                    scrutinee,
+                    arms: typed_arms,
+                    default: typed_default,
+                });
+            }
+        }
+    }
+    Ok(typed)
+}
+
+fn typed_ghost_stmts_call_lemma(stmts: &[TypedGhostStmt], name: &str) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        TypedGhostStmt::Call { lemma_name, .. } => lemma_name == name,
+        TypedGhostStmt::Match { arms, default, .. } => {
+            arms.iter()
+                .any(|arm| typed_ghost_stmts_call_lemma(&arm.body, name))
+                || default
+                    .as_deref()
+                    .is_some_and(|body| typed_ghost_stmts_call_lemma(body, name))
+        }
+        TypedGhostStmt::Assert(_) | TypedGhostStmt::Assume(_) => false,
+    })
+}
+
+struct RecursiveLemmaContext<'a> {
+    lemma_name: &'a str,
+    induction_param_index: usize,
+    params: &'a [ContractParam],
+}
+
+fn recursive_lemma_measure(
+    arg: &TypedExpr,
+    param: &ContractParam,
+    size_map: &HashMap<String, (String, i32)>,
+) -> Option<i32> {
+    match &arg.kind {
+        TypedExprKind::Var(name) if name == &param.name => Some(0),
+        TypedExprKind::Var(name) => size_map
+            .get(name)
+            .and_then(|(root, depth)| (root == &param.name).then_some(*depth)),
+        _ => None,
+    }
+}
+
+fn validate_recursive_lemma_stmts(
+    stmts: &[TypedGhostStmt],
+    ctx: &RecursiveLemmaContext<'_>,
+    size_map: &HashMap<String, (String, i32)>,
+) -> Result<(), String> {
+    for stmt in stmts {
+        match stmt {
+            TypedGhostStmt::Assert(_) | TypedGhostStmt::Assume(_) => {}
+            TypedGhostStmt::Call { lemma_name, args } => {
+                if lemma_name != ctx.lemma_name {
+                    continue;
+                }
+                if ctx.induction_param_index == 0 {
+                    let mut found_smaller = false;
+                    for (param, arg) in ctx.params.iter().zip(args.iter()) {
+                        match recursive_lemma_measure(arg, param, size_map) {
+                            Some(depth) if depth < 0 => {
+                                found_smaller = true;
+                                break;
+                            }
+                            Some(0) => {}
+                            _ => return Err(
+                                "recursive lemma call does not decrease the inductive parameter(s)"
+                                    .to_owned(),
+                            ),
+                        }
+                    }
+                    if !found_smaller {
+                        return Err(
+                            "recursive lemma call does not decrease the inductive parameter(s)"
+                                .to_owned(),
+                        );
+                    }
+                } else {
+                    let param = &ctx.params[ctx.induction_param_index];
+                    if !matches!(
+                        args.get(ctx.induction_param_index)
+                            .and_then(|arg| recursive_lemma_measure(arg, param, size_map)),
+                        Some(depth) if depth < 0
+                    ) {
+                        return Err(
+                            "recursive lemma call does not decrease the inductive parameter(s)"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+            TypedGhostStmt::Match {
+                scrutinee,
+                arms,
+                default,
+            } => {
+                let branch_root = match &scrutinee.kind {
+                    TypedExprKind::Var(name) => size_map.get(name).cloned(),
+                    _ => None,
+                };
+                for arm in arms {
+                    let mut arm_size_map = size_map.clone();
+                    if let Some((root, depth)) = &branch_root {
+                        for binding in &arm.bindings {
+                            if let TypedMatchBinding::Var { name, .. } = binding {
+                                arm_size_map.insert(name.clone(), (root.clone(), depth - 1));
+                            }
+                        }
+                    }
+                    validate_recursive_lemma_stmts(&arm.body, ctx, &arm_size_map)?;
+                }
+                if let Some(default) = default {
+                    validate_recursive_lemma_stmts(default, ctx, size_map)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_recursive_lemma(def: &TypedLemmaDef) -> Result<(), String> {
+    if !typed_ghost_stmts_call_lemma(&def.body, &def.name) {
+        return Ok(());
+    }
+    let [TypedGhostStmt::Match { scrutinee, .. }] = def.body.as_slice() else {
+        return Err("recursive lemmas must use `match` as the only top-level statement".to_owned());
+    };
+    let TypedExprKind::Var(scrutinee_name) = &scrutinee.kind else {
+        return Err("recursive lemmas must match on a parameter variable".to_owned());
+    };
+    let Some(induction_param_index) = def
+        .params
+        .iter()
+        .position(|param| param.name == *scrutinee_name)
+    else {
+        return Err("recursive lemmas must match on one of their parameters".to_owned());
+    };
+    if !matches!(def.params[induction_param_index].ty, SpecTy::Named { .. }) {
+        return Err("recursive lemmas require a named enum parameter".to_owned());
+    }
+    let ctx = RecursiveLemmaContext {
+        lemma_name: &def.name,
+        induction_param_index,
+        params: &def.params,
+    };
+    let mut size_map = HashMap::new();
+    size_map.insert(
+        def.params[induction_param_index].name.clone(),
+        (def.params[induction_param_index].name.clone(), 0),
+    );
+    validate_recursive_lemma_stmts(&def.body, &ctx, &size_map)
+}
+
 fn type_lemmas(
     lemmas: &HashMap<String, LemmaDef>,
+    declaration_order: &[String],
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
     span: Span,
-) -> Result<HashMap<String, TypedLemmaDef>, LoopPrepassError> {
-    let mut typed = HashMap::new();
-    for lemma in lemmas.values() {
+) -> Result<Vec<TypedLemmaDef>, LoopPrepassError> {
+    let mut typed = Vec::with_capacity(declaration_order.len());
+    let mut available_lemmas = HashMap::new();
+    for name in declaration_order {
+        let lemma = lemmas
+            .get(name)
+            .expect("lemma declaration order must stay in sync");
         let param_tys: HashMap<_, _> = lemma
             .params
             .iter()
@@ -3764,6 +4231,8 @@ fn type_lemmas(
                 ty: param.ty.clone(),
             })
             .collect::<Vec<_>>();
+        let mut visible_lemmas = available_lemmas.clone();
+        visible_lemmas.insert(lemma.name.clone(), lemma.clone());
         let result_ty = SpecTy::Bool;
         let mut inferred = SpecTypeInference::default();
         let mut infer_scope = SpecScope::default();
@@ -3783,90 +4252,22 @@ fn type_lemmas(
             message: format!("lemma `{}` req: {message}", lemma.name),
         })?;
         let mut body_infer_scope = infer_scope.clone();
-        for stmt in &lemma.body {
-            match stmt {
-                crate::spec::GhostStmt::Assert(expr) => {
-                    infer_contract_expr_types(
-                        expr,
-                        pure_fns,
-                        enum_defs,
-                        &mut body_infer_scope,
-                        &param_tys,
-                        false,
-                        &result_ty,
-                        &mut inferred,
-                    )
-                    .map_err(|message| LoopPrepassError {
-                        span,
-                        display_span: None,
-                        message: format!("lemma `{}` body: {message}", lemma.name),
-                    })?;
-                }
-                crate::spec::GhostStmt::Assume(expr) => {
-                    infer_contract_expr_types(
-                        expr,
-                        pure_fns,
-                        enum_defs,
-                        &mut body_infer_scope,
-                        &param_tys,
-                        false,
-                        &result_ty,
-                        &mut inferred,
-                    )
-                    .map_err(|message| LoopPrepassError {
-                        span,
-                        display_span: None,
-                        message: format!("lemma `{}` body: {message}", lemma.name),
-                    })?;
-                }
-                crate::spec::GhostStmt::Call { name, args } => {
-                    let callee = lemmas.get(name).ok_or_else(|| LoopPrepassError {
-                        span,
-                        display_span: None,
-                        message: format!(
-                            "lemma `{}` body references unknown lemma `{name}`",
-                            lemma.name
-                        ),
-                    })?;
-                    if callee.params.len() != args.len() {
-                        return Err(LoopPrepassError {
-                            span,
-                            display_span: None,
-                            message: format!(
-                                "lemma `{}` body calls `{name}` with {} arguments; expected {}",
-                                lemma.name,
-                                args.len(),
-                                callee.params.len()
-                            ),
-                        });
-                    }
-                    for (arg, param) in args.iter().zip(&callee.params) {
-                        let arg_ty = infer_contract_expr_types(
-                            arg,
-                            pure_fns,
-                            enum_defs,
-                            &mut body_infer_scope,
-                            &param_tys,
-                            false,
-                            &result_ty,
-                            &mut inferred,
-                        )
-                        .map_err(|message| LoopPrepassError {
-                            span,
-                            display_span: None,
-                            message: format!("lemma `{}` body: {message}", lemma.name),
-                        })?;
-                        constrain_expr_ty(&mut inferred, &arg_ty, &param.ty).map_err(
-                            |message| LoopPrepassError {
-                                span,
-                                display_span: None,
-                                message: format!("lemma `{}` body: {message}", lemma.name),
-                            },
-                        )?;
-                    }
-                }
-            }
-        }
+        infer_lemma_stmts(
+            &lemma.body,
+            &visible_lemmas,
+            lemmas,
+            pure_fns,
+            enum_defs,
+            &mut body_infer_scope,
+            &param_tys,
+            &result_ty,
+            &mut inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span,
+            display_span: None,
+            message: format!("lemma `{}` body: {message}", lemma.name),
+        })?;
         infer_contract_expr_types(
             &lemma.ens,
             pure_fns,
@@ -3899,101 +4300,22 @@ fn type_lemmas(
             display_span: None,
             message: format!("lemma `{}` req: {message}", lemma.name),
         })?;
-        let mut body = Vec::with_capacity(lemma.body.len());
-        for stmt in &lemma.body {
-            match stmt {
-                crate::spec::GhostStmt::Assert(expr) => {
-                    let typed_expr = typed_contract_expr(
-                        expr,
-                        pure_fns,
-                        enum_defs,
-                        &mut type_scope,
-                        &param_tys,
-                        false,
-                        &result_ty,
-                        &mut inferred,
-                    )
-                    .map_err(|message| LoopPrepassError {
-                        span,
-                        display_span: None,
-                        message: format!("lemma `{}` body: {message}", lemma.name),
-                    })?;
-                    body.push(TypedGhostStmt::Assert(typed_expr));
-                }
-                crate::spec::GhostStmt::Assume(expr) => {
-                    let typed_expr = typed_contract_expr(
-                        expr,
-                        pure_fns,
-                        enum_defs,
-                        &mut type_scope,
-                        &param_tys,
-                        false,
-                        &result_ty,
-                        &mut inferred,
-                    )
-                    .map_err(|message| LoopPrepassError {
-                        span,
-                        display_span: None,
-                        message: format!("lemma `{}` body: {message}", lemma.name),
-                    })?;
-                    body.push(TypedGhostStmt::Assume(typed_expr));
-                }
-                crate::spec::GhostStmt::Call { name, args } => {
-                    let callee = lemmas.get(name).ok_or_else(|| LoopPrepassError {
-                        span,
-                        display_span: None,
-                        message: format!(
-                            "lemma `{}` body references unknown lemma `{name}`",
-                            lemma.name
-                        ),
-                    })?;
-                    let mut typed_args = Vec::with_capacity(args.len());
-                    for (arg, param) in args.iter().zip(&callee.params) {
-                        let typed_arg = typed_contract_expr(
-                            arg,
-                            pure_fns,
-                            enum_defs,
-                            &mut type_scope,
-                            &param_tys,
-                            false,
-                            &result_ty,
-                            &mut inferred,
-                        )
-                        .map_err(|message| LoopPrepassError {
-                            span,
-                            display_span: None,
-                            message: format!("lemma `{}` body: {message}", lemma.name),
-                        })?;
-                        let unified =
-                            unify_spec_tys(&typed_arg.ty, &param.ty).map_err(|message| {
-                                LoopPrepassError {
-                                    span,
-                                    display_span: None,
-                                    message: format!("lemma `{}` body: {message}", lemma.name),
-                                }
-                            })?;
-                        if unified != param.ty {
-                            return Err(LoopPrepassError {
-                                span,
-                                display_span: None,
-                                message: format!(
-                                    "lemma `{}` body calls `{name}` with `{}` for parameter `{}` of type `{}`",
-                                    lemma.name,
-                                    display_spec_ty(&typed_arg.ty),
-                                    param.name,
-                                    display_spec_ty(&param.ty)
-                                ),
-                            });
-                        }
-                        typed_args.push(typed_arg);
-                    }
-                    body.push(TypedGhostStmt::Call {
-                        lemma_name: name.clone(),
-                        args: typed_args,
-                    });
-                }
-            }
-        }
+        let body = typed_lemma_stmts(
+            &lemma.body,
+            &visible_lemmas,
+            lemmas,
+            pure_fns,
+            enum_defs,
+            &mut type_scope,
+            &param_tys,
+            &result_ty,
+            &mut inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span,
+            display_span: None,
+            message: format!("lemma `{}` body: {message}", lemma.name),
+        })?;
         let ens = typed_contract_expr(
             &lemma.ens,
             pure_fns,
@@ -4017,55 +4339,23 @@ fn type_lemmas(
                     display_span: None,
                     message: format!("lemma `{}`: {message}", lemma.name),
                 })?;
-        typed.insert(
-            lemma.name.clone(),
-            TypedLemmaDef {
-                name: lemma.name.clone(),
-                params,
-                req,
-                ens,
-                body,
-                spec_vars,
-            },
-        );
+        let typed_def = TypedLemmaDef {
+            name: lemma.name.clone(),
+            params,
+            req,
+            ens,
+            body,
+            spec_vars,
+        };
+        validate_recursive_lemma(&typed_def).map_err(|message| LoopPrepassError {
+            span,
+            display_span: None,
+            message: format!("lemma `{}` body: {message}", lemma.name),
+        })?;
+        typed.push(typed_def);
+        available_lemmas.insert(lemma.name.clone(), lemma.clone());
     }
     Ok(typed)
-}
-
-fn order_lemmas(
-    lemmas: &HashMap<String, TypedLemmaDef>,
-    declaration_order: &[String],
-) -> Vec<TypedLemmaDef> {
-    let mut ordered = Vec::new();
-    let mut visiting = HashSet::new();
-    let mut visited = HashSet::new();
-    for name in declaration_order {
-        visit_lemma(name, lemmas, &mut visiting, &mut visited, &mut ordered);
-    }
-    ordered
-}
-
-fn visit_lemma(
-    name: &str,
-    lemmas: &HashMap<String, TypedLemmaDef>,
-    visiting: &mut HashSet<String>,
-    visited: &mut HashSet<String>,
-    ordered: &mut Vec<TypedLemmaDef>,
-) {
-    if visited.contains(name) || !visiting.insert(name.to_owned()) {
-        return;
-    }
-    if let Some(lemma) = lemmas.get(name) {
-        for stmt in &lemma.body {
-            if let TypedGhostStmt::Call { lemma_name, .. } = stmt {
-                visit_lemma(lemma_name, lemmas, visiting, visited, ordered);
-            }
-        }
-    }
-    visiting.remove(name);
-    if visited.insert(name.to_owned()) {
-        ordered.push(lemmas.get(name).expect("typed lemma").clone());
-    }
 }
 
 fn lemma_call_parts(expr: &Expr) -> Result<(&str, &[Expr]), String> {

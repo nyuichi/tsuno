@@ -217,7 +217,21 @@ pub struct PureFnDef {
 pub enum GhostStmt {
     Assert(Expr),
     Assume(Expr),
-    Call { name: String, args: Vec<Expr> },
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
+    Match {
+        scrutinee: Expr,
+        arms: Vec<GhostMatchArm>,
+        default: Option<Vec<GhostStmt>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhostMatchArm {
+    pub pattern: MatchPattern,
+    pub body: Vec<GhostStmt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,6 +367,15 @@ pub fn parse_raw_expr(_kind: &str, text: &str) -> Result<Expr, ParseError> {
     let expr = parser.parse_expr()?;
     parser.expect_end()?;
     Ok(expr)
+}
+
+fn parse_raw_match_pattern(text: &str) -> Result<MatchPattern, ParseError> {
+    let mut parser = Parser::new(text)?;
+    let pattern = parser
+        .parse_match_arm_pattern()?
+        .ok_or_else(|| ParseError::new("expected match arm pattern"))?;
+    parser.expect_end()?;
+    Ok(pattern)
 }
 
 fn decode_legacy_string_literal(text: &str) -> Result<Option<String>, ParseError> {
@@ -1322,77 +1345,107 @@ impl<'a> PureFnParser<'a> {
         Err(ParseError::new("unclosed `{` in pure function block"))
     }
 
-    fn parse_lemma_body(&self, body: &str) -> Result<Vec<GhostStmt>, ParseError> {
-        let mut stmts = Vec::new();
-        let mut cursor = 0usize;
-        while cursor < body.len() {
-            while let Some(ch) = body[cursor..].chars().next() {
-                if ch.is_whitespace() {
-                    cursor += ch.len_utf8();
-                } else {
-                    break;
-                }
-                if cursor >= body.len() {
-                    return Ok(stmts);
-                }
-            }
-            if cursor >= body.len() {
-                break;
-            }
-            if body[cursor..].starts_with("assert") {
-                cursor += "assert".len();
-                let (expr_text, next) = self.parse_stmt_expr_text(body, cursor)?;
-                cursor = next;
-                stmts.push(GhostStmt::Assert(parse_source_expr(
-                    "lemma assert",
-                    expr_text,
-                )?));
-                continue;
-            }
-            if body[cursor..].starts_with("assume") {
-                cursor += "assume".len();
-                let (expr_text, next) = self.parse_stmt_expr_text(body, cursor)?;
-                cursor = next;
-                stmts.push(GhostStmt::Assume(parse_source_expr(
-                    "lemma assume",
-                    expr_text,
-                )?));
-                continue;
-            }
+    fn parse_lemma_body(&self, body: &'a str) -> Result<Vec<GhostStmt>, ParseError> {
+        let mut parser = Self::new(body);
+        parser.parse_lemma_stmts()
+    }
 
-            let name_start = cursor;
-            let mut chars = body[cursor..].chars();
-            let Some(first) = chars.next() else {
-                break;
-            };
-            if !(first.is_ascii_alphabetic() || first == '_') {
-                return Err(ParseError::new("expected lemma statement"));
-            }
-            cursor += first.len_utf8();
-            while let Some(ch) = body[cursor..].chars().next() {
-                if ch.is_ascii_alphanumeric() || ch == '_' {
-                    cursor += ch.len_utf8();
-                } else {
-                    break;
-                }
-            }
-            let name = body[name_start..cursor].to_owned();
-            while let Some(ch) = body[cursor..].chars().next() {
-                if ch.is_whitespace() {
-                    cursor += ch.len_utf8();
-                } else {
-                    break;
-                }
-            }
-            if !body[cursor..].starts_with('(') {
-                return Err(ParseError::new("expected `(` in lemma call"));
-            }
-            let (args_body, next) = self.parse_paren_body(body, cursor)?;
-            cursor = self.expect_stmt_terminator(body, next)?;
-            let args = self.parse_call_args(args_body)?;
-            stmts.push(GhostStmt::Call { name, args });
+    fn parse_lemma_stmts(&mut self) -> Result<Vec<GhostStmt>, ParseError> {
+        let mut stmts = Vec::new();
+        while self.skip_ws() {
+            stmts.push(self.parse_lemma_stmt()?);
         }
         Ok(stmts)
+    }
+
+    fn parse_lemma_stmt(&mut self) -> Result<GhostStmt, ParseError> {
+        if self.starts_with_keyword("assert") {
+            self.expect_keyword("assert")?;
+            let (expr_text, next) = self.parse_stmt_expr_text(self.text, self.cursor)?;
+            self.cursor = next;
+            return Ok(GhostStmt::Assert(parse_source_expr(
+                "lemma assert",
+                expr_text,
+            )?));
+        }
+        if self.starts_with_keyword("assume") {
+            self.expect_keyword("assume")?;
+            let (expr_text, next) = self.parse_stmt_expr_text(self.text, self.cursor)?;
+            self.cursor = next;
+            return Ok(GhostStmt::Assume(parse_source_expr(
+                "lemma assume",
+                expr_text,
+            )?));
+        }
+        if self.starts_with_keyword("match") {
+            self.expect_keyword("match")?;
+            return self.parse_lemma_match_stmt();
+        }
+
+        let name = self.parse_ident()?;
+        self.skip_ws();
+        if !self.text[self.cursor..].starts_with('(') {
+            return Err(ParseError::new("expected `(` in lemma call"));
+        }
+        let (args_body, next) = self.parse_paren_body(self.text, self.cursor)?;
+        self.cursor = self.expect_stmt_terminator(self.text, next)?;
+        Ok(GhostStmt::Call {
+            name,
+            args: self.parse_call_args(args_body)?,
+        })
+    }
+
+    fn parse_lemma_match_stmt(&mut self) -> Result<GhostStmt, ParseError> {
+        let (scrutinee_text, cursor) = self.parse_until_top_level_char('{')?;
+        self.cursor = cursor;
+        let scrutinee = parse_source_expr("lemma match scrutinee", scrutinee_text)?;
+        self.expect_char('{')?;
+        let mut arms = Vec::new();
+        let mut default = None;
+        let mut seen_default = false;
+        loop {
+            self.skip_ws();
+            if self.eat_char('}') {
+                break;
+            }
+            if seen_default {
+                return Err(ParseError::new("default match arm must be last"));
+            }
+            let (pattern_text, next) = self.parse_until_top_level_fat_arrow()?;
+            self.cursor = next;
+            self.expect_char('{')?;
+            let body_text = self.parse_braced_body()?;
+            let body = self.parse_lemma_body(body_text)?;
+            let pattern_text = pattern_text.trim();
+            if pattern_text == "_" {
+                if default.is_some() {
+                    return Err(ParseError::new("duplicate default match arm"));
+                }
+                default = Some(body);
+                seen_default = true;
+            } else {
+                arms.push(GhostMatchArm {
+                    pattern: parse_raw_match_pattern(pattern_text)?,
+                    body,
+                });
+            }
+            self.skip_ws();
+            if self.eat_char(',') {
+                continue;
+            }
+            if self.eat_char('}') {
+                break;
+            }
+            if matches!(self.peek_char(), Some(ch) if ch == '_' || ch.is_ascii_alphabetic()) {
+                continue;
+            }
+            return Err(ParseError::new("expected `,` or `}` after match arm"));
+        }
+        Ok(GhostStmt::Match {
+            scrutinee,
+            arms,
+            default,
+        })
     }
 
     fn parse_call_args(&self, text: &str) -> Result<Vec<Expr>, ParseError> {
@@ -1508,6 +1561,54 @@ impl<'a> PureFnParser<'a> {
             cursor += ch.len_utf8();
         }
         Err(ParseError::new("unclosed `(` in lemma call"))
+    }
+
+    fn parse_until_top_level_char(&self, target: char) -> Result<(&'a str, usize), ParseError> {
+        let start = self.cursor;
+        let mut cursor = self.cursor;
+        let mut depth = 0usize;
+        while cursor < self.text.len() {
+            let ch = self.text[cursor..].chars().next().expect("char");
+            match ch {
+                '(' | '[' | '<' => depth += 1,
+                ')' | ']' | '>' => depth = depth.saturating_sub(1),
+                _ if ch == target && depth == 0 => {
+                    let text = self.text[start..cursor].trim_end();
+                    if text.is_empty() {
+                        return Err(ParseError::new("expected spec expression"));
+                    }
+                    return Ok((text, cursor));
+                }
+                _ => {}
+            }
+            cursor += ch.len_utf8();
+        }
+        Err(ParseError::new(format!(
+            "expected `{target}` in lemma match"
+        )))
+    }
+
+    fn parse_until_top_level_fat_arrow(&self) -> Result<(&'a str, usize), ParseError> {
+        let start = self.cursor;
+        let mut cursor = self.cursor;
+        let mut depth = 0usize;
+        while cursor < self.text.len() {
+            let ch = self.text[cursor..].chars().next().expect("char");
+            match ch {
+                '(' | '[' | '<' => depth += 1,
+                ')' | ']' | '>' => depth = depth.saturating_sub(1),
+                '=' if depth == 0 && self.text[cursor..].starts_with("=>") => {
+                    let text = self.text[start..cursor].trim_end();
+                    if text.is_empty() {
+                        return Err(ParseError::new("expected match arm pattern"));
+                    }
+                    return Ok((text, cursor + 2));
+                }
+                _ => {}
+            }
+            cursor += ch.len_utf8();
+        }
+        Err(ParseError::new("expected `=>` in lemma match arm"))
     }
 
     fn expect_stmt_terminator(&self, text: &str, mut cursor: usize) -> Result<usize, ParseError> {
@@ -1981,6 +2082,33 @@ fn add1_done(x: i32)
                 }],
             }
         );
+    }
+
+    #[test]
+    fn parses_lemma_match_statement() {
+        let block = parse_ghost_block(
+            r#"
+enum List<T> {
+    Nil,
+    Cons(T, List<T>),
+}
+
+fn check(xs: List<i32>)
+  req true
+  ens true
+{
+    match xs {
+        List::Nil => {
+            assert true;
+        }
+        List::Cons(_, xs0) => {
+            check(xs0);
+        }
+    }
+}
+"#,
+        );
+        assert!(block.is_ok(), "{block:?}");
     }
 
     #[test]

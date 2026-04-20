@@ -36,8 +36,8 @@ use z3::{FuncDecl, SatResult, Solver, SortKind};
 use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
     FunctionContract, LemmaCallContract, LoopContract, LoopContracts, ProgramPrepass,
-    ResolvedExprEnv, SpecVarBinding, TypedGhostStmt, TypedLemmaDef, TypedPureFnDef,
-    spec_ty_for_rust_ty,
+    ResolvedExprEnv, SpecVarBinding, TypedGhostMatchArm, TypedGhostStmt, TypedLemmaDef,
+    TypedPureFnDef, spec_ty_for_rust_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{BinaryOp, SpecTy, TypedExpr, TypedExprKind, TypedMatchBinding, UnaryOp};
@@ -185,8 +185,7 @@ impl<'tcx> Verifier<'tcx> {
             .insert(lemma.name.clone(), lemma.clone())
             .is_none();
         assert!(inserted, "duplicate lemma `{}`", lemma.name);
-        let mut stack = Vec::new();
-        self.verify_lemma(lemma, &mut stack)
+        self.verify_lemma(lemma)
     }
 
     pub fn verify_function(
@@ -939,18 +938,7 @@ impl<'tcx> Verifier<'tcx> {
         Ok(())
     }
 
-    fn verify_lemma(
-        &self,
-        lemma: &TypedLemmaDef,
-        stack: &mut Vec<String>,
-    ) -> Result<(), VerificationResult> {
-        if stack.iter().any(|name| name == &lemma.name) {
-            return Err(self.unsupported_result(
-                self.report_span(),
-                format!("recursive lemma `{}` is not supported", lemma.name),
-            ));
-        }
-        stack.push(lemma.name.clone());
+    fn verify_lemma(&self, lemma: &TypedLemmaDef) -> Result<(), VerificationResult> {
         let mut current = HashMap::new();
         for param in &lemma.params {
             let value =
@@ -968,7 +956,6 @@ impl<'tcx> Verifier<'tcx> {
         };
         let req = self.contract_expr_to_bool(&current, &spec, &lemma.req)?;
         if !self.assume_constraint(&mut state, req, self.report_span())? {
-            stack.pop();
             return Ok(());
         }
         for param in &lemma.params {
@@ -976,67 +963,181 @@ impl<'tcx> Verifier<'tcx> {
             if let Some(formula) = self.spec_ty_formula(&param.ty, value, self.report_span())?
                 && !self.assume_constraint(&mut state, formula, self.report_span())?
             {
-                stack.pop();
                 return Ok(());
             }
         }
-        for stmt in &lemma.body {
-            match stmt {
-                TypedGhostStmt::Assert(expr) => {
-                    let formula = self.contract_expr_to_bool(&current, &spec, expr)?;
-                    self.assert_expr_constraint(
-                        &mut state,
-                        expr,
-                        formula,
-                        self.report_span(),
-                        format!("lemma `{}`", lemma.name),
-                        format!("lemma `{}` assertion failed", lemma.name),
-                    )?;
+        let final_states = self.execute_lemma_stmts(lemma, &current, &spec, state, &lemma.body)?;
+        for mut final_state in final_states {
+            let ens = self.contract_expr_to_bool(&current, &spec, &lemma.ens)?;
+            self.assert_expr_constraint(
+                &mut final_state,
+                &lemma.ens,
+                ens,
+                self.report_span(),
+                format!("lemma `{}`", lemma.name),
+                format!("lemma `{}` postcondition failed", lemma.name),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn execute_lemma_stmts(
+        &self,
+        lemma: &TypedLemmaDef,
+        current: &HashMap<String, SymValue>,
+        spec: &HashMap<String, SymValue>,
+        mut state: State,
+        stmts: &[TypedGhostStmt],
+    ) -> Result<Vec<State>, VerificationResult> {
+        let Some((stmt, rest)) = stmts.split_first() else {
+            return Ok(vec![state]);
+        };
+        match stmt {
+            TypedGhostStmt::Assert(expr) => {
+                let formula = self.contract_expr_to_bool(current, spec, expr)?;
+                self.assert_expr_constraint(
+                    &mut state,
+                    expr,
+                    formula,
+                    self.report_span(),
+                    format!("lemma `{}`", lemma.name),
+                    format!("lemma `{}` assertion failed", lemma.name),
+                )?;
+                self.execute_lemma_stmts(lemma, current, spec, state, rest)
+            }
+            TypedGhostStmt::Assume(expr) => {
+                let formula = self.contract_expr_to_bool(current, spec, expr)?;
+                if !self.assume_constraint(&mut state, formula, self.report_span())? {
+                    return Ok(Vec::new());
                 }
-                TypedGhostStmt::Assume(expr) => {
-                    let formula = self.contract_expr_to_bool(&current, &spec, expr)?;
-                    if !self.assume_constraint(&mut state, formula, self.report_span())? {
-                        stack.pop();
-                        return Ok(());
-                    }
-                }
-                TypedGhostStmt::Call { lemma_name, args } => {
-                    let callee = self.lemmas.get(lemma_name).ok_or_else(|| {
-                        self.unsupported_result(
-                            self.report_span(),
-                            format!("unknown lemma `{lemma_name}`"),
-                        )
-                    })?;
-                    self.verify_lemma(callee, stack)?;
-                    let env = self.lemma_env_from_contract_args(args, &current, &spec, callee)?;
-                    let req = self.contract_expr_to_bool(&env.current, &env.spec, &callee.req)?;
-                    self.assert_expr_constraint(
-                        &mut state,
-                        &callee.req,
-                        req,
+                self.execute_lemma_stmts(lemma, current, spec, state, rest)
+            }
+            TypedGhostStmt::Call { lemma_name, args } => {
+                let callee = self.lemmas.get(lemma_name).ok_or_else(|| {
+                    self.unsupported_result(
                         self.report_span(),
-                        format!("lemma `{}`", lemma.name),
-                        format!("lemma `{}` precondition failed", callee.name),
-                    )?;
-                    let ens = self.contract_expr_to_bool(&env.current, &env.spec, &callee.ens)?;
-                    if !self.assume_constraint(&mut state, ens, self.report_span())? {
-                        stack.pop();
-                        return Ok(());
-                    }
+                        format!("unknown lemma `{lemma_name}`"),
+                    )
+                })?;
+                let env = self.lemma_env_from_contract_args(args, current, spec, callee)?;
+                let req = self.contract_expr_to_bool(&env.current, &env.spec, &callee.req)?;
+                self.assert_expr_constraint(
+                    &mut state,
+                    &callee.req,
+                    req,
+                    self.report_span(),
+                    format!("lemma `{}`", lemma.name),
+                    format!("lemma `{}` precondition failed", callee.name),
+                )?;
+                let ens = self.contract_expr_to_bool(&env.current, &env.spec, &callee.ens)?;
+                if !self.assume_constraint(&mut state, ens, self.report_span())? {
+                    return Ok(Vec::new());
+                }
+                self.execute_lemma_stmts(lemma, current, spec, state, rest)
+            }
+            TypedGhostStmt::Match {
+                scrutinee,
+                arms,
+                default,
+            } => self.execute_lemma_match(
+                lemma,
+                current,
+                spec,
+                state,
+                scrutinee,
+                arms,
+                default.as_deref(),
+                rest,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_lemma_match(
+        &self,
+        lemma: &TypedLemmaDef,
+        current: &HashMap<String, SymValue>,
+        spec: &HashMap<String, SymValue>,
+        state: State,
+        scrutinee: &TypedExpr,
+        arms: &[TypedGhostMatchArm],
+        default: Option<&[TypedGhostStmt]>,
+        rest: &[TypedGhostStmt],
+    ) -> Result<Vec<State>, VerificationResult> {
+        let scrutinee_value = self.contract_expr_to_value(current, spec, scrutinee)?;
+        let composite = self.composite_encoding(&scrutinee.ty)?;
+        let mut guard_formulas = Vec::with_capacity(arms.len());
+        let mut final_states = Vec::new();
+        for arm in arms {
+            let mut branch_state = state.clone();
+            let guard = self.composite_tag_formula_for_encoding(
+                &composite,
+                &scrutinee_value,
+                arm.ctor_index,
+                self.report_span(),
+            )?;
+            guard_formulas.push(guard.clone());
+            if !self.assume_constraint(&mut branch_state, guard, self.report_span())? {
+                continue;
+            }
+            let mut branch_current = current.clone();
+            let mut field_values = Vec::with_capacity(arm.bindings.len());
+            for (field_index, binding) in arm.bindings.iter().enumerate() {
+                let field_value = self
+                    .value_encoder
+                    .project_composite_ctor_field(
+                        &composite,
+                        arm.ctor_index,
+                        &scrutinee_value,
+                        field_index,
+                    )
+                    .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+                if let TypedMatchBinding::Var { name, .. } = binding {
+                    branch_current.insert(name.clone(), field_value.clone());
+                }
+                field_values.push(field_value);
+            }
+            let ctor_value =
+                self.construct_composite_ctor(&scrutinee.ty, arm.ctor_index, &field_values)?;
+            let branch_eq = self.eq_for_spec_ty(
+                &scrutinee.ty,
+                &scrutinee_value,
+                &ctor_value,
+                self.report_span(),
+            )?;
+            if !self.assume_constraint(&mut branch_state, branch_eq, self.report_span())? {
+                continue;
+            }
+            let branch_end_states =
+                self.execute_lemma_stmts(lemma, &branch_current, spec, branch_state, &arm.body)?;
+            for branch_end_state in branch_end_states {
+                final_states.extend(self.execute_lemma_stmts(
+                    lemma,
+                    current,
+                    spec,
+                    branch_end_state,
+                    rest,
+                )?);
+            }
+        }
+        if let Some(default) = default {
+            let mut default_state = state;
+            let default_guard = bool_and(guard_formulas.into_iter().map(bool_not).collect());
+            if self.assume_constraint(&mut default_state, default_guard, self.report_span())? {
+                let default_end_states =
+                    self.execute_lemma_stmts(lemma, current, spec, default_state, default)?;
+                for default_end_state in default_end_states {
+                    final_states.extend(self.execute_lemma_stmts(
+                        lemma,
+                        current,
+                        spec,
+                        default_end_state,
+                        rest,
+                    )?);
                 }
             }
         }
-        let ens = self.contract_expr_to_bool(&current, &spec, &lemma.ens)?;
-        let result = self.assert_expr_constraint(
-            &mut state,
-            &lemma.ens,
-            ens,
-            self.report_span(),
-            format!("lemma `{}`", lemma.name),
-            format!("lemma `{}` postcondition failed", lemma.name),
-        );
-        stack.pop();
-        result
+        Ok(final_states)
     }
 
     fn execute_lemma_call(

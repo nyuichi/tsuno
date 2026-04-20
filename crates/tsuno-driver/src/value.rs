@@ -78,6 +78,55 @@ constructor, or a `Cons` constructor whose head satisfies the `i32` range
 invariant and whose tail satisfies `inv_List<i32>`. For `List<bool>`, the same
 constructor family is reused, but the invariant changes to require boolean
 heads and recursive `inv_List<bool>` tails.
+
+Recursive pure functions are encoded in `engine.rs` on top of the enum
+constructor family described above. There is no separate fixpoint datatype here;
+the function still has type `value^n -> value`.
+
+Concrete example:
+
+  /*@
+  enum List<T> { Nil, Cons(T, List<T>) }
+
+  fn len(xs: List<i32>) -> i32 {
+      match xs {
+          List::Nil => 0i32,
+          List::Cons(_, xs0) => 1i32 + len(xs0),
+      }
+  }
+  */
+
+The engine creates a single uninterpreted symbol:
+
+  len : value -> value
+
+and then asserts one equation per constructor arm, schematically:
+
+  forall .
+    len(mk_List_Nil()) = (intbox)(0)
+
+  forall head tail.
+    i32_range((int)(head)) && inv_List<i32>(tail)
+      => len(mk_List_Cons(head, tail))
+           = (intbox)((int)(len(tail)) + 1)
+
+so recursion happens through the constructor argument `tail`, not by unfolding a
+separate recursive value encoding.
+
+When a proof or recursive lemma does
+
+  match xs {
+      List::Cons(x, xs0) => ...
+  }
+
+the branch uses the same constructor family:
+
+  x   = ctorinv_List_Cons_0(xs)
+  xs0 = ctorinv_List_Cons_1(xs)
+  xs  = mk_List_Cons(x, xs0)
+
+That last equality is what lets Z3 rewrite `len(xs)` using the constructor
+equation above.
 */
 
 #[derive(Debug, Clone, PartialEq, Eq)]
