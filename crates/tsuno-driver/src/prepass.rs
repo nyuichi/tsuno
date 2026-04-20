@@ -7,8 +7,8 @@ use crate::directive::{
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
-    EnumDef, Expr, LemmaDef, PureFnDef, SpecTy, StructFieldTy, StructTy, TypedExpr, TypedExprKind,
-    parse_ghost_block,
+    EnumDef, Expr, LemmaDef, MatchBinding, MatchPattern, PureFnDef, SpecTy, StructFieldTy,
+    StructTy, TypedExpr, TypedExprKind, TypedMatchArm, TypedMatchBinding, parse_ghost_block,
 };
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{HirId, Pat, PatKind};
@@ -372,14 +372,14 @@ pub fn compute_global_ghost_prepass<'tcx>(
         lemma_order.push(lemma.name);
     }
 
-    let typed_pure_fn_map = type_pure_fns(&pure_fns, &enums, anchor_span)?;
+    let typed_pure_fns = type_pure_fns(&pure_fns, &pure_fn_order, &enums, anchor_span)?;
     let typed_lemma_map = type_lemmas(&lemmas, &pure_fns, &enums, anchor_span)?;
 
     Ok(GlobalGhostPrepass {
         enums,
         pure_fns,
         lemmas,
-        typed_pure_fns: order_pure_fns(&typed_pure_fn_map, &pure_fn_order),
+        typed_pure_fns,
         typed_lemmas: order_lemmas(&typed_lemma_map, &lemma_order),
     })
 }
@@ -1212,6 +1212,352 @@ fn instantiate_enum_result_ty(
     Ok(enum_result_ty(enum_def, type_args))
 }
 
+fn instantiate_named_ctor_field_tys(
+    enum_def: &EnumDef,
+    ctor_index: usize,
+    type_args: &[SpecTy],
+) -> Result<Vec<SpecTy>, String> {
+    if enum_def.type_params.len() != type_args.len() {
+        return Err(format!(
+            "enum `{}` expects {} type arguments, found {}",
+            enum_def.name,
+            enum_def.type_params.len(),
+            type_args.len()
+        ));
+    }
+    let ctor = enum_def
+        .ctors
+        .get(ctor_index)
+        .ok_or_else(|| format!("constructor index {ctor_index} out of range"))?;
+    let bindings = enum_def
+        .type_params
+        .iter()
+        .cloned()
+        .zip(type_args.iter().cloned())
+        .collect::<HashMap<_, _>>();
+    ctor.fields
+        .iter()
+        .map(|field_ty| {
+            try_instantiate_spec_ty(field_ty, &bindings).ok_or_else(|| {
+                format!(
+                    "could not instantiate field type for constructor `{}`",
+                    ctor.name
+                )
+            })
+        })
+        .collect()
+}
+
+fn unsupported_match_expr_message() -> String {
+    "match expressions are only supported in pure function bodies".to_owned()
+}
+
+fn typed_match_bindings(
+    bindings: &[MatchBinding],
+    field_tys: &[SpecTy],
+    reserved_names: &HashSet<String>,
+) -> Result<(Vec<TypedMatchBinding>, HashMap<String, SpecTy>), String> {
+    if bindings.len() != field_tys.len() {
+        return Err(format!(
+            "match pattern expects {} bindings, found {}",
+            field_tys.len(),
+            bindings.len()
+        ));
+    }
+    let mut seen = HashSet::new();
+    let mut typed = Vec::with_capacity(bindings.len());
+    let mut env = HashMap::new();
+    for (binding, ty) in bindings.iter().zip(field_tys) {
+        match binding {
+            MatchBinding::Var(name) => {
+                if reserved_names.contains(name) {
+                    return Err(format!(
+                        "match pattern binding `{name}` shadows an existing binding"
+                    ));
+                }
+                if !seen.insert(name.clone()) {
+                    return Err(format!("match pattern binds `{name}` more than once"));
+                }
+                env.insert(name.clone(), ty.clone());
+                typed.push(TypedMatchBinding::Var {
+                    name: name.clone(),
+                    ty: ty.clone(),
+                });
+            }
+            MatchBinding::Wildcard => typed.push(TypedMatchBinding::Wildcard { ty: ty.clone() }),
+        }
+    }
+    Ok((typed, env))
+}
+
+fn merge_inferred_expr_tys(
+    inferred: &mut SpecTypeInference,
+    lhs: &InferredExprTy,
+    rhs: &InferredExprTy,
+) -> Result<InferredExprTy, String> {
+    unify_expr_tys(inferred, lhs, rhs)?;
+    Ok(match (lhs, rhs) {
+        (InferredExprTy::Known(lhs), InferredExprTy::Known(rhs)) => {
+            InferredExprTy::Known(unify_spec_tys(lhs, rhs)?)
+        }
+        (InferredExprTy::Known(ty), _) | (_, InferredExprTy::Known(ty)) => {
+            InferredExprTy::Known(ty.clone())
+        }
+        (InferredExprTy::SpecVar(name), InferredExprTy::SpecVar(_))
+        | (InferredExprTy::SpecVar(name), InferredExprTy::Unknown)
+        | (InferredExprTy::Unknown, InferredExprTy::SpecVar(name)) => inferred
+            .resolved_ty(name)
+            .map(InferredExprTy::Known)
+            .unwrap_or_else(|| InferredExprTy::SpecVar(name.clone())),
+        (InferredExprTy::Unknown, InferredExprTy::Unknown) => InferredExprTy::Unknown,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn infer_match_expr_types(
+    scrutinee: &Expr,
+    arms: &[crate::spec::MatchArm],
+    default: Option<&Expr>,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    inferred: &mut SpecTypeInference,
+    expected: Option<&SpecTy>,
+) -> Result<InferredExprTy, String> {
+    let scrutinee_ty = infer_contract_expr_types_with_expected(
+        scrutinee,
+        pure_fns,
+        enum_defs,
+        spec_scope,
+        params,
+        allow_result,
+        result_ty,
+        inferred,
+        None,
+    )?;
+    let InferredExprTy::Known(SpecTy::Named {
+        name: scrutinee_enum_name,
+        args: scrutinee_type_args,
+    }) = scrutinee_ty
+    else {
+        return Err("match scrutinee must have a named enum type".to_owned());
+    };
+    let enum_def = enum_defs
+        .get(&scrutinee_enum_name)
+        .ok_or_else(|| format!("unknown spec enum `{scrutinee_enum_name}`"))?;
+    let mut reserved_names = params.keys().cloned().collect::<HashSet<_>>();
+    reserved_names.extend(spec_scope.visible.iter().cloned());
+    let mut seen_ctors = HashSet::new();
+    let mut result_expr_ty = expected.cloned().map(InferredExprTy::Known);
+    for arm in arms {
+        let MatchPattern::Constructor {
+            enum_name,
+            ctor_name,
+            bindings,
+        } = &arm.pattern;
+        if *enum_name != scrutinee_enum_name {
+            return Err(format!(
+                "match arm constructor `{enum_name}::{ctor_name}` does not match scrutinee type `{scrutinee_enum_name}`"
+            ));
+        }
+        let Some(ctor_index) = enum_def
+            .ctors
+            .iter()
+            .position(|ctor| ctor.name == *ctor_name)
+        else {
+            return Err(format!(
+                "enum `{enum_name}` does not define constructor `{ctor_name}`"
+            ));
+        };
+        if !seen_ctors.insert(ctor_index) {
+            return Err(format!(
+                "match expression contains duplicate arm for `{enum_name}::{ctor_name}`"
+            ));
+        }
+        let field_tys =
+            instantiate_named_ctor_field_tys(enum_def, ctor_index, &scrutinee_type_args)?;
+        let (_typed_bindings, match_env) =
+            typed_match_bindings(bindings, &field_tys, &reserved_names)?;
+        let mut arm_params = params.clone();
+        arm_params.extend(match_env);
+        let mut arm_scope = spec_scope.clone();
+        let arm_ty = infer_contract_expr_types_with_expected(
+            &arm.body,
+            pure_fns,
+            enum_defs,
+            &mut arm_scope,
+            &arm_params,
+            allow_result,
+            result_ty,
+            inferred,
+            expected,
+        )?;
+        result_expr_ty = Some(if let Some(existing) = &result_expr_ty {
+            merge_inferred_expr_tys(inferred, existing, &arm_ty)?
+        } else {
+            arm_ty
+        });
+    }
+    if let Some(default) = default {
+        let mut default_scope = spec_scope.clone();
+        let default_ty = infer_contract_expr_types_with_expected(
+            default,
+            pure_fns,
+            enum_defs,
+            &mut default_scope,
+            params,
+            allow_result,
+            result_ty,
+            inferred,
+            expected,
+        )?;
+        result_expr_ty = Some(if let Some(existing) = &result_expr_ty {
+            merge_inferred_expr_tys(inferred, existing, &default_ty)?
+        } else {
+            default_ty
+        });
+    } else if seen_ctors.len() != enum_def.ctors.len() {
+        return Err(format!(
+            "match expression over `{scrutinee_enum_name}` is not exhaustive"
+        ));
+    }
+    result_expr_ty.ok_or_else(|| "match expression must contain at least one arm".to_owned())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_match_expr(
+    scrutinee: &Expr,
+    arms: &[crate::spec::MatchArm],
+    default: Option<&Expr>,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    inferred: &mut SpecTypeInference,
+    expected: Option<&SpecTy>,
+) -> Result<TypedExpr, String> {
+    let scrutinee = typed_contract_expr_with_expected(
+        scrutinee,
+        pure_fns,
+        enum_defs,
+        spec_scope,
+        params,
+        allow_result,
+        result_ty,
+        inferred,
+        None,
+    )?;
+    let SpecTy::Named {
+        name: scrutinee_enum_name,
+        args: scrutinee_type_args,
+    } = &scrutinee.ty
+    else {
+        return Err("match scrutinee must have a named enum type".to_owned());
+    };
+    let enum_def = enum_defs
+        .get(scrutinee_enum_name)
+        .ok_or_else(|| format!("unknown spec enum `{scrutinee_enum_name}`"))?;
+    let mut reserved_names = params.keys().cloned().collect::<HashSet<_>>();
+    reserved_names.extend(spec_scope.visible.iter().cloned());
+    let mut seen_ctors = HashSet::new();
+    let mut typed_arms = Vec::with_capacity(arms.len());
+    let mut typed_default = None;
+    let mut match_ty = expected.cloned();
+    for arm in arms {
+        let MatchPattern::Constructor {
+            enum_name,
+            ctor_name,
+            bindings,
+        } = &arm.pattern;
+        if *enum_name != *scrutinee_enum_name {
+            return Err(format!(
+                "match arm constructor `{enum_name}::{ctor_name}` does not match scrutinee type `{scrutinee_enum_name}`"
+            ));
+        }
+        let Some(ctor_index) = enum_def
+            .ctors
+            .iter()
+            .position(|ctor| ctor.name == *ctor_name)
+        else {
+            return Err(format!(
+                "enum `{enum_name}` does not define constructor `{ctor_name}`"
+            ));
+        };
+        if !seen_ctors.insert(ctor_index) {
+            return Err(format!(
+                "match expression contains duplicate arm for `{enum_name}::{ctor_name}`"
+            ));
+        }
+        let field_tys =
+            instantiate_named_ctor_field_tys(enum_def, ctor_index, scrutinee_type_args)?;
+        let (typed_bindings, match_env) =
+            typed_match_bindings(bindings, &field_tys, &reserved_names)?;
+        let mut arm_params = params.clone();
+        arm_params.extend(match_env);
+        let mut arm_scope = spec_scope.clone();
+        let body = typed_contract_expr_with_expected(
+            &arm.body,
+            pure_fns,
+            enum_defs,
+            &mut arm_scope,
+            &arm_params,
+            allow_result,
+            result_ty,
+            inferred,
+            expected,
+        )?;
+        match_ty = Some(if let Some(existing) = &match_ty {
+            unify_spec_tys(existing, &body.ty)?
+        } else {
+            body.ty.clone()
+        });
+        typed_arms.push(TypedMatchArm {
+            ctor_index,
+            enum_name: enum_name.clone(),
+            ctor_name: ctor_name.clone(),
+            bindings: typed_bindings,
+            body,
+        });
+    }
+    if let Some(default) = default {
+        let mut default_scope = spec_scope.clone();
+        let body = typed_contract_expr_with_expected(
+            default,
+            pure_fns,
+            enum_defs,
+            &mut default_scope,
+            params,
+            allow_result,
+            result_ty,
+            inferred,
+            expected,
+        )?;
+        match_ty = Some(if let Some(existing) = &match_ty {
+            unify_spec_tys(existing, &body.ty)?
+        } else {
+            body.ty.clone()
+        });
+        typed_default = Some(Box::new(body));
+    } else if seen_ctors.len() != enum_def.ctors.len() {
+        return Err(format!(
+            "match expression over `{scrutinee_enum_name}` is not exhaustive"
+        ));
+    }
+    Ok(TypedExpr {
+        ty: match_ty.ok_or_else(|| "match expression must contain at least one arm".to_owned())?,
+        kind: TypedExprKind::Match {
+            scrutinee: Box::new(scrutinee),
+            arms: typed_arms,
+            default: typed_default,
+        },
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn infer_ctor_call_result_ty(
     func: &str,
@@ -1365,6 +1711,23 @@ fn infer_contract_expr_types_with_expected(
             }
             Err(format!("unresolved binding `{name}` in function contract"))
         }
+        Expr::Match {
+            scrutinee,
+            arms,
+            default,
+        } => infer_match_expr_types(
+            scrutinee,
+            arms,
+            default.as_deref(),
+            pure_fns,
+            enum_defs,
+            spec_scope,
+            params,
+            allow_result,
+            result_ty,
+            inferred,
+            expected,
+        ),
         Expr::Bind(name) => {
             spec_scope
                 .bind(
@@ -1604,6 +1967,7 @@ fn infer_body_expr_types_with_expected(
                 .map(InferredExprTy::Known)
                 .ok_or_else(|| format!("unresolved binding `{name}` in //@ {}", kind.keyword()))
         }
+        Expr::Match { .. } => Err(unsupported_match_expr_message()),
         Expr::Bind(name) => {
             spec_scope
                 .bind(name, Span::default(), None, kind.keyword())
@@ -1879,6 +2243,23 @@ fn typed_contract_expr_with_expected(
             }
             Err(format!("unresolved binding `{name}` in function contract"))
         }
+        Expr::Match {
+            scrutinee,
+            arms,
+            default,
+        } => typed_match_expr(
+            scrutinee,
+            arms,
+            default.as_deref(),
+            pure_fns,
+            enum_defs,
+            spec_scope,
+            params,
+            allow_result,
+            result_ty,
+            inferred,
+            expected,
+        ),
         Expr::Bind(name) => {
             spec_scope
                 .bind(
@@ -2115,6 +2496,7 @@ fn typed_body_expr_with_expected(
                 kind: TypedExprKind::Var(name.clone()),
             })
         }
+        Expr::Match { .. } => Err(unsupported_match_expr_message()),
         Expr::Bind(name) => {
             spec_scope
                 .bind(name, Span::default(), None, kind.keyword())
@@ -3075,13 +3457,194 @@ fn typed_lemma_call(
     })
 }
 
+fn typed_expr_calls_pure_fn(expr: &TypedExpr, name: &str) -> bool {
+    match &expr.kind {
+        TypedExprKind::PureCall { func, args } => {
+            func == name || args.iter().any(|arg| typed_expr_calls_pure_fn(arg, name))
+        }
+        TypedExprKind::Match {
+            scrutinee,
+            arms,
+            default,
+        } => {
+            typed_expr_calls_pure_fn(scrutinee, name)
+                || arms
+                    .iter()
+                    .any(|arm| typed_expr_calls_pure_fn(&arm.body, name))
+                || default
+                    .as_deref()
+                    .is_some_and(|body| typed_expr_calls_pure_fn(body, name))
+        }
+        TypedExprKind::CtorCall { args, .. } => {
+            args.iter().any(|arg| typed_expr_calls_pure_fn(arg, name))
+        }
+        TypedExprKind::Field { base, .. }
+        | TypedExprKind::TupleField { base, .. }
+        | TypedExprKind::Deref { base }
+        | TypedExprKind::Fin { base }
+        | TypedExprKind::Unary { arg: base, .. } => typed_expr_calls_pure_fn(base, name),
+        TypedExprKind::Binary { lhs, rhs, .. } => {
+            typed_expr_calls_pure_fn(lhs, name) || typed_expr_calls_pure_fn(rhs, name)
+        }
+        TypedExprKind::Bool(_)
+        | TypedExprKind::Int(_)
+        | TypedExprKind::Var(_)
+        | TypedExprKind::Bind(_) => false,
+    }
+}
+
+struct RecursivePureFnContext<'a> {
+    function_name: &'a str,
+    recursive_param_index: usize,
+    recursive_param_name: &'a str,
+    recursive_param_ty: &'a SpecTy,
+}
+
+fn validate_recursive_pure_expr(
+    expr: &TypedExpr,
+    ctx: &RecursivePureFnContext<'_>,
+    allowed_recursive_vars: &HashSet<String>,
+) -> Result<(), String> {
+    match &expr.kind {
+        TypedExprKind::PureCall { func, args } => {
+            if func == ctx.function_name {
+                let Some(recursion_arg) = args.get(ctx.recursive_param_index) else {
+                    return Err(format!(
+                        "recursive call to `{}` has the wrong arity",
+                        ctx.function_name
+                    ));
+                };
+                match &recursion_arg.kind {
+                    TypedExprKind::Var(name) if allowed_recursive_vars.contains(name) => {}
+                    _ => {
+                        return Err(format!(
+                            "recursive call to `{}` must pass a pattern-bound subcomponent as parameter `{}`",
+                            ctx.function_name, ctx.recursive_param_name
+                        ));
+                    }
+                }
+            }
+            for arg in args {
+                validate_recursive_pure_expr(arg, ctx, allowed_recursive_vars)?;
+            }
+            Ok(())
+        }
+        TypedExprKind::Match {
+            scrutinee,
+            arms,
+            default,
+        } => {
+            validate_recursive_pure_expr(scrutinee, ctx, allowed_recursive_vars)?;
+            let allows_descent = matches!(
+                &scrutinee.kind,
+                TypedExprKind::Var(name)
+                    if (name == ctx.recursive_param_name || allowed_recursive_vars.contains(name))
+                        && scrutinee.ty == *ctx.recursive_param_ty
+            );
+            for arm in arms {
+                let mut arm_allowed = allowed_recursive_vars.clone();
+                if allows_descent {
+                    for binding in &arm.bindings {
+                        if let TypedMatchBinding::Var { name, ty } = binding
+                            && *ty == *ctx.recursive_param_ty
+                        {
+                            arm_allowed.insert(name.clone());
+                        }
+                    }
+                }
+                validate_recursive_pure_expr(&arm.body, ctx, &arm_allowed)?;
+            }
+            if let Some(default) = default {
+                validate_recursive_pure_expr(default, ctx, allowed_recursive_vars)?;
+            }
+            Ok(())
+        }
+        TypedExprKind::CtorCall { args, .. } => {
+            for arg in args {
+                validate_recursive_pure_expr(arg, ctx, allowed_recursive_vars)?;
+            }
+            Ok(())
+        }
+        TypedExprKind::Field { base, .. }
+        | TypedExprKind::TupleField { base, .. }
+        | TypedExprKind::Deref { base }
+        | TypedExprKind::Fin { base }
+        | TypedExprKind::Unary { arg: base, .. } => {
+            validate_recursive_pure_expr(base, ctx, allowed_recursive_vars)
+        }
+        TypedExprKind::Binary { lhs, rhs, .. } => {
+            validate_recursive_pure_expr(lhs, ctx, allowed_recursive_vars)?;
+            validate_recursive_pure_expr(rhs, ctx, allowed_recursive_vars)
+        }
+        TypedExprKind::Bool(_)
+        | TypedExprKind::Int(_)
+        | TypedExprKind::Var(_)
+        | TypedExprKind::Bind(_) => Ok(()),
+    }
+}
+
+fn validate_recursive_pure_fn(def: &TypedPureFnDef) -> Result<(), String> {
+    if !typed_expr_calls_pure_fn(&def.body, &def.name) {
+        return Ok(());
+    }
+    let TypedExprKind::Match {
+        scrutinee,
+        arms,
+        default,
+    } = &def.body.kind
+    else {
+        return Err("recursive pure functions must use `match` at the top level".to_owned());
+    };
+    let TypedExprKind::Var(scrutinee_name) = &scrutinee.kind else {
+        return Err("recursive pure functions must match on a parameter variable".to_owned());
+    };
+    let Some(recursive_param_index) = def
+        .params
+        .iter()
+        .position(|param| param.name == *scrutinee_name)
+    else {
+        return Err("recursive pure functions must match on one of their parameters".to_owned());
+    };
+    let recursive_param = &def.params[recursive_param_index];
+    if !matches!(recursive_param.ty, SpecTy::Named { .. }) {
+        return Err("recursive pure functions require a named enum parameter".to_owned());
+    }
+    let ctx = RecursivePureFnContext {
+        function_name: &def.name,
+        recursive_param_index,
+        recursive_param_name: &recursive_param.name,
+        recursive_param_ty: &recursive_param.ty,
+    };
+    for arm in arms {
+        let mut allowed_recursive_vars = HashSet::new();
+        for binding in &arm.bindings {
+            if let TypedMatchBinding::Var { name, ty } = binding
+                && *ty == recursive_param.ty
+            {
+                allowed_recursive_vars.insert(name.clone());
+            }
+        }
+        validate_recursive_pure_expr(&arm.body, &ctx, &allowed_recursive_vars)?;
+    }
+    if let Some(default) = default {
+        validate_recursive_pure_expr(default, &ctx, &HashSet::new())?;
+    }
+    Ok(())
+}
+
 fn type_pure_fns(
     pure_fns: &HashMap<String, PureFnDef>,
+    declaration_order: &[String],
     enum_defs: &HashMap<String, EnumDef>,
     span: Span,
-) -> Result<HashMap<String, TypedPureFnDef>, LoopPrepassError> {
-    let mut typed = HashMap::new();
-    for def in pure_fns.values() {
+) -> Result<Vec<TypedPureFnDef>, LoopPrepassError> {
+    let mut available_pure_fns = HashMap::new();
+    let mut typed = Vec::with_capacity(declaration_order.len());
+    for name in declaration_order {
+        let def = pure_fns
+            .get(name)
+            .expect("pure function declaration order must stay in sync");
+        available_pure_fns.insert(def.name.clone(), def.clone());
         let param_tys: HashMap<_, _> = def
             .params
             .iter()
@@ -3099,7 +3662,7 @@ fn type_pure_fns(
         let mut infer_scope = SpecScope::default();
         infer_contract_expr_types(
             &def.body,
-            pure_fns,
+            &available_pure_fns,
             enum_defs,
             &mut infer_scope,
             &param_tys,
@@ -3115,7 +3678,7 @@ fn type_pure_fns(
         let mut type_scope = SpecScope::default();
         let body = typed_contract_expr(
             &def.body,
-            pure_fns,
+            &available_pure_fns,
             enum_defs,
             &mut type_scope,
             &param_tys,
@@ -3164,15 +3727,18 @@ fn type_pure_fns(
                 ),
             });
         }
-        typed.insert(
-            def.name.clone(),
-            TypedPureFnDef {
-                name: def.name.clone(),
-                params,
-                result_ty: def.result_ty.clone(),
-                body,
-            },
-        );
+        let typed_def = TypedPureFnDef {
+            name: def.name.clone(),
+            params,
+            result_ty: def.result_ty.clone(),
+            body,
+        };
+        validate_recursive_pure_fn(&typed_def).map_err(|message| LoopPrepassError {
+            span,
+            display_span: None,
+            message: format!("pure function `{}` body: {message}", def.name),
+        })?;
+        typed.push(typed_def);
     }
     Ok(typed)
 }
@@ -3464,75 +4030,6 @@ fn type_lemmas(
         );
     }
     Ok(typed)
-}
-
-fn order_pure_fns(
-    pure_fns: &HashMap<String, TypedPureFnDef>,
-    declaration_order: &[String],
-) -> Vec<TypedPureFnDef> {
-    let mut ordered = Vec::new();
-    let mut visiting = HashSet::new();
-    let mut visited = HashSet::new();
-    for name in declaration_order {
-        visit_pure_fn(name, pure_fns, &mut visiting, &mut visited, &mut ordered);
-    }
-    ordered
-}
-
-fn visit_pure_fn(
-    name: &str,
-    pure_fns: &HashMap<String, TypedPureFnDef>,
-    visiting: &mut HashSet<String>,
-    visited: &mut HashSet<String>,
-    ordered: &mut Vec<TypedPureFnDef>,
-) {
-    if visited.contains(name) || !visiting.insert(name.to_owned()) {
-        return;
-    }
-    if let Some(pure_fn) = pure_fns.get(name) {
-        visit_pure_fn_expr(&pure_fn.body, pure_fns, visiting, visited, ordered);
-    }
-    visiting.remove(name);
-    if visited.insert(name.to_owned()) {
-        ordered.push(pure_fns.get(name).expect("typed pure fn").clone());
-    }
-}
-
-fn visit_pure_fn_expr(
-    expr: &TypedExpr,
-    pure_fns: &HashMap<String, TypedPureFnDef>,
-    visiting: &mut HashSet<String>,
-    visited: &mut HashSet<String>,
-    ordered: &mut Vec<TypedPureFnDef>,
-) {
-    match &expr.kind {
-        TypedExprKind::PureCall { func, args } => {
-            visit_pure_fn(func, pure_fns, visiting, visited, ordered);
-            for arg in args {
-                visit_pure_fn_expr(arg, pure_fns, visiting, visited, ordered);
-            }
-        }
-        TypedExprKind::CtorCall { args, .. } => {
-            for arg in args {
-                visit_pure_fn_expr(arg, pure_fns, visiting, visited, ordered);
-            }
-        }
-        TypedExprKind::Field { base, .. }
-        | TypedExprKind::TupleField { base, .. }
-        | TypedExprKind::Deref { base }
-        | TypedExprKind::Fin { base }
-        | TypedExprKind::Unary { arg: base, .. } => {
-            visit_pure_fn_expr(base, pure_fns, visiting, visited, ordered);
-        }
-        TypedExprKind::Binary { lhs, rhs, .. } => {
-            visit_pure_fn_expr(lhs, pure_fns, visiting, visited, ordered);
-            visit_pure_fn_expr(rhs, pure_fns, visiting, visited, ordered);
-        }
-        TypedExprKind::Bool(_)
-        | TypedExprKind::Int(_)
-        | TypedExprKind::Var(_)
-        | TypedExprKind::Bind(_) => {}
-    }
 }
 
 fn order_lemmas(
@@ -3849,6 +4346,7 @@ fn validate_contract_expr_core(
             }
             Err(format!("unresolved binding `{name}` in function contract"))
         }
+        Expr::Match { .. } => Err(unsupported_match_expr_message()),
         Expr::Bind(name) => spec_scope
             .bind(
                 name,
@@ -3989,6 +4487,11 @@ fn resolve_expr_env_into(
             resolved.locals.insert(name.clone(), local);
             Ok(())
         }
+        Expr::Match { .. } => Err(LoopPrepassError {
+            span: ctx.span,
+            display_span: None,
+            message: unsupported_match_expr_message(),
+        }),
         Expr::Bind(name) => {
             ctx.spec_scope
                 .bind(name, ctx.span, None, ctx.kind.keyword())?;

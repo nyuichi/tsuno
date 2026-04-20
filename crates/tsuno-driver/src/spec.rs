@@ -4,6 +4,11 @@ pub enum Expr {
     Int(IntLiteral),
     Var(String),
     Bind(String),
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+        default: Option<Box<Expr>>,
+    },
     Call {
         func: String,
         type_args: Vec<SpecTy>,
@@ -38,11 +43,37 @@ pub struct TypedExpr {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchArm {
+    pub pattern: MatchPattern,
+    pub body: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchPattern {
+    Constructor {
+        enum_name: String,
+        ctor_name: String,
+        bindings: Vec<MatchBinding>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchBinding {
+    Var(String),
+    Wildcard,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypedExprKind {
     Bool(bool),
     Int(IntLiteral),
     Var(String),
     Bind(String),
+    Match {
+        scrutinee: Box<TypedExpr>,
+        arms: Vec<TypedMatchArm>,
+        default: Option<Box<TypedExpr>>,
+    },
     PureCall {
         func: String,
         args: Vec<TypedExpr>,
@@ -77,6 +108,21 @@ pub enum TypedExprKind {
         lhs: Box<TypedExpr>,
         rhs: Box<TypedExpr>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedMatchArm {
+    pub ctor_index: usize,
+    pub enum_name: String,
+    pub ctor_name: String,
+    pub bindings: Vec<TypedMatchBinding>,
+    pub body: TypedExpr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypedMatchBinding {
+    Var { name: String, ty: SpecTy },
+    Wildcard { ty: SpecTy },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -411,9 +457,12 @@ enum Token {
     Bool(bool),
     LParen,
     RParen,
+    LBrace,
+    RBrace,
     Comma,
     Dot,
     ColonColon,
+    FatArrow,
     Question,
     Plus,
     Minus,
@@ -493,6 +542,14 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
                 chars.next();
                 tokens.push(Token::RParen);
             }
+            '{' => {
+                chars.next();
+                tokens.push(Token::LBrace);
+            }
+            '}' => {
+                chars.next();
+                tokens.push(Token::RBrace);
+            }
             ',' => {
                 chars.next();
                 tokens.push(Token::Comma);
@@ -536,7 +593,10 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
             }
             '=' => {
                 chars.next();
-                if chars.next() == Some('=') {
+                if chars.peek() == Some(&'>') {
+                    chars.next();
+                    tokens.push(Token::FatArrow);
+                } else if chars.next() == Some('=') {
                     tokens.push(Token::EqEq);
                 } else {
                     return Err(ParseError::new("unexpected `=` in spec expression"));
@@ -805,6 +865,90 @@ impl Parser {
         }
     }
 
+    fn parse_match_bindings(&mut self) -> Result<Vec<MatchBinding>, ParseError> {
+        let mut bindings = Vec::new();
+        self.expect(&Token::LParen)?;
+        if self.eat(&Token::RParen) {
+            return Ok(bindings);
+        }
+        loop {
+            bindings.push(match self.next().cloned() {
+                Some(Token::Ident(name)) if name == "_" => MatchBinding::Wildcard,
+                Some(Token::Ident(name)) => MatchBinding::Var(name),
+                _ => {
+                    return Err(ParseError::new(
+                        "expected a variable name or `_` in match pattern",
+                    ));
+                }
+            });
+            if self.eat(&Token::RParen) {
+                return Ok(bindings);
+            }
+            self.expect(&Token::Comma)?;
+        }
+    }
+
+    fn parse_match_arm_pattern(&mut self) -> Result<Option<MatchPattern>, ParseError> {
+        let Some(Token::Ident(enum_name)) = self.next().cloned() else {
+            return Err(ParseError::new("expected constructor pattern or `_`"));
+        };
+        if enum_name == "_" {
+            return Ok(None);
+        }
+        self.expect(&Token::ColonColon)?;
+        let Some(Token::Ident(ctor_name)) = self.next().cloned() else {
+            return Err(ParseError::new(
+                "expected constructor name in match pattern",
+            ));
+        };
+        let bindings = if self.tokens.get(self.cursor) == Some(&Token::LParen) {
+            self.parse_match_bindings()?
+        } else {
+            Vec::new()
+        };
+        Ok(Some(MatchPattern::Constructor {
+            enum_name,
+            ctor_name,
+            bindings,
+        }))
+    }
+
+    fn parse_match_expr(&mut self) -> Result<Expr, ParseError> {
+        let scrutinee = self.parse_expr()?;
+        self.expect(&Token::LBrace)?;
+        let mut arms = Vec::new();
+        let mut default = None;
+        loop {
+            if self.eat(&Token::RBrace) {
+                break;
+            }
+            let pattern = self.parse_match_arm_pattern()?;
+            self.expect(&Token::FatArrow)?;
+            let body = self.parse_expr()?;
+            match pattern {
+                Some(pattern) => arms.push(MatchArm { pattern, body }),
+                None => {
+                    if default.is_some() {
+                        return Err(ParseError::new(
+                            "match expression cannot contain multiple `_` arms",
+                        ));
+                    }
+                    default = Some(Box::new(body));
+                }
+            }
+            if self.eat(&Token::Comma) {
+                continue;
+            }
+            self.expect(&Token::RBrace)?;
+            break;
+        }
+        Ok(Expr::Match {
+            scrutinee: Box::new(scrutinee),
+            arms,
+            default,
+        })
+    }
+
     fn parse_token_spec_ty(&mut self) -> Result<SpecTy, ParseError> {
         let Some(Token::Ident(ident)) = self.next().cloned() else {
             return Err(ParseError::new("expected a type argument"));
@@ -879,6 +1023,7 @@ impl Parser {
                 };
                 Ok(Expr::Bind(ident))
             }
+            Some(Token::Ident(ident)) if ident == "match" => self.parse_match_expr(),
             Some(Token::Ident(ident)) => {
                 let type_args = self.try_parse_call_type_args()?.unwrap_or_default();
                 if self.eat(&Token::ColonColon) {
@@ -1466,8 +1611,8 @@ impl<'a> PureFnParser<'a> {
 mod tests {
     use super::{
         BinaryOp, EnumCtorDef, EnumDef, Expr, GhostBlock, GhostStmt, IntLiteral, IntSuffix,
-        LemmaDef, PureFnDef, PureFnParam, SpecTy, UnaryOp, parse_expr, parse_ghost_block,
-        parse_pure_fn_block,
+        LemmaDef, MatchArm, MatchBinding, MatchPattern, PureFnDef, PureFnParam, SpecTy, UnaryOp,
+        parse_expr, parse_ghost_block, parse_pure_fn_block, parse_raw_expr,
     };
 
     #[test]
@@ -1645,6 +1790,50 @@ mod tests {
     fn parses_generic_enum_constructor_expression() {
         let expr = parse_expr("assert", r#"List::<i32>::Cons(1i32, List::<i32>::Nil)"#);
         assert!(expr.is_ok(), "{expr:?}");
+    }
+
+    #[test]
+    fn parses_match_expression() {
+        let expr = parse_raw_expr(
+            "pure function body",
+            r#"match xs { List::Nil => 0i32, List::Cons(_, xs0) => len(xs0) }"#,
+        )
+        .expect("match expr");
+        assert_eq!(
+            expr,
+            Expr::Match {
+                scrutinee: Box::new(Expr::Var("xs".to_owned())),
+                arms: vec![
+                    MatchArm {
+                        pattern: MatchPattern::Constructor {
+                            enum_name: "List".to_owned(),
+                            ctor_name: "Nil".to_owned(),
+                            bindings: vec![],
+                        },
+                        body: Expr::Int(IntLiteral {
+                            digits: "0".to_owned(),
+                            suffix: Some(IntSuffix::I32),
+                        }),
+                    },
+                    MatchArm {
+                        pattern: MatchPattern::Constructor {
+                            enum_name: "List".to_owned(),
+                            ctor_name: "Cons".to_owned(),
+                            bindings: vec![
+                                MatchBinding::Wildcard,
+                                MatchBinding::Var("xs0".to_owned()),
+                            ],
+                        },
+                        body: Expr::Call {
+                            func: "len".to_owned(),
+                            type_args: vec![],
+                            args: vec![Expr::Var("xs0".to_owned())],
+                        },
+                    },
+                ],
+                default: None,
+            }
+        );
     }
 
     #[test]
@@ -1871,6 +2060,26 @@ enum List<T> {
 
 fn singleton(x: i32) -> List<i32> {
     List::Cons(x, List::Nil)
+}
+"#,
+        );
+        assert!(block.is_ok(), "{block:?}");
+    }
+
+    #[test]
+    fn parses_recursive_pure_function_with_match_body() {
+        let block = parse_ghost_block(
+            r#"
+enum List<T> {
+    Nil,
+    Cons(T, List<T>),
+}
+
+fn len(xs: List<i32>) -> i32 {
+    match xs {
+        List::Nil => 0i32,
+        List::Cons(_, xs0) => 1i32 + len(xs0),
+    }
 }
 "#,
         );
