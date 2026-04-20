@@ -16,11 +16,14 @@
 // - `Mut<T>` additionally requires `cur(x) == fin(x)` when the mutable reference is closed.
 // - Structs with `Drop`, generic structs, and recursive structs are unsupported.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Once;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::mir::{
@@ -31,7 +34,7 @@ use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::source_map::Spanned;
 use rustc_span::{DUMMY_SP, Span};
 use z3::ast::{Ast, Bool, Dynamic, Int};
-use z3::{FuncDecl, SatResult, Solver, SortKind};
+use z3::{Config, Context, RecFuncDecl, SatResult, Solver, SortKind};
 
 use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
@@ -43,18 +46,26 @@ use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{BinaryOp, SpecTy, TypedExpr, TypedExprKind, TypedMatchBinding, UnaryOp};
 use crate::value::{CompositeEncoding, SymValue, TypeEncoding, TypeEncodingKind, ValueEncoder};
 
+const SOLVER_TIMEOUT_MS: u32 = 1_000;
+const GHOST_LOAD_TIMEOUT: Duration = Duration::from_millis(1_000);
+
 thread_local! {
-    static GLOBAL_SOLVER: Solver = {
-        init_z3();
-        let solver = Solver::new();
-        let mut params = z3::Params::new();
-        params.set_u32("timeout", 1_000);
-        solver.set_params(&params);
-        solver
-    };
+    static GLOBAL_SOLVER: RefCell<Solver> = RefCell::new(build_solver());
 }
 
 static Z3_INIT: Once = Once::new();
+
+#[derive(Clone, Copy)]
+struct UnsafeCallbackArg<T>(T);
+
+unsafe impl<T> Send for UnsafeCallbackArg<T> {}
+unsafe impl<T> Sync for UnsafeCallbackArg<T> {}
+
+impl<T: Copy> UnsafeCallbackArg<T> {
+    fn get(self) -> T {
+        self.0
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ControlPoint {
@@ -84,6 +95,7 @@ pub struct Verifier<'tcx> {
     loop_contracts: LoopContracts,
     control_point_directives: ControlPointDirectives,
     pure_fns: HashMap<String, TypedPureFnDef>,
+    pure_fn_decls: HashMap<String, RecFuncDecl>,
     lemmas: HashMap<String, TypedLemmaDef>,
     next_sym: Cell<usize>,
     value_encoder: ValueEncoder,
@@ -95,39 +107,79 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
         functions,
         contracts,
     } = program;
-    let mut verifier = Verifier::new(tcx, contracts);
-    for enum_def in ghosts.enums.values() {
-        verifier.value_encoder.register_enum_def(enum_def.clone());
-    }
-    for pure_fn in &ghosts.typed_pure_fns {
-        if let Err(error) = verifier.load_ghost_function(pure_fn) {
-            return vec![VerificationResult {
-                function: "prepass".to_owned(),
-                ..error
-            }];
+    let tcx_capture = UnsafeCallbackArg(tcx);
+    let ghosts_capture = UnsafeCallbackArg(&ghosts);
+    let prepass_error = z3::with_z3_config(&Config::new(), move || {
+        let tcx = tcx_capture.get();
+        let ghosts = ghosts_capture.get();
+        let mut verifier = Verifier::new(tcx, HashMap::new());
+        for enum_def in ghosts.enums.values() {
+            verifier.value_encoder.register_enum_def(enum_def.clone());
         }
-    }
-    for lemma in &ghosts.typed_lemmas {
-        if let Err(error) = verifier.load_ghost_lemma(lemma) {
-            return vec![VerificationResult {
-                function: "prepass".to_owned(),
-                ..error
-            }];
+        for pure_fn in &ghosts.typed_pure_fns {
+            if let Err(error) = verifier.load_ghost_function(pure_fn) {
+                return Some(VerificationResult {
+                    function: "prepass".to_owned(),
+                    ..error
+                });
+            }
         }
+        for lemma in &ghosts.typed_lemmas {
+            if let Err(error) = verifier.load_ghost_lemma(lemma) {
+                return Some(VerificationResult {
+                    function: "prepass".to_owned(),
+                    ..error
+                });
+            }
+        }
+        None
+    });
+    if let Some(error) = prepass_error {
+        return vec![error];
     }
+
     let mut results = Vec::new();
+    let contracts_capture = UnsafeCallbackArg(&contracts);
     for function in functions {
         let body = tcx
             .mir_drops_elaborated_and_const_checked(function.def_id)
             .steal();
-        results.push(verifier.verify_function(function.def_id, body, function.prepass));
+        let needed_pure_fns = collect_needed_pure_fns(
+            &function.prepass,
+            &ghosts.typed_lemmas,
+            &ghosts.typed_pure_fns,
+        );
+        let def_id = function.def_id;
+        let prepass = function.prepass;
+        let result = z3::with_z3_config(&Config::new(), move || {
+            let tcx = tcx_capture.get();
+            let ghosts = ghosts_capture.get();
+            let contracts = contracts_capture.get().clone();
+            let mut verifier = Verifier::new(tcx, contracts);
+            for enum_def in ghosts.enums.values() {
+                verifier.value_encoder.register_enum_def(enum_def.clone());
+            }
+            for pure_fn in &needed_pure_fns {
+                if let Err(error) = verifier.load_ghost_function(pure_fn) {
+                    return VerificationResult {
+                        function: "prepass".to_owned(),
+                        ..error
+                    };
+                }
+            }
+            for lemma in &ghosts.typed_lemmas {
+                verifier.lemmas.insert(lemma.name.clone(), lemma.clone());
+            }
+            verifier.verify_function(def_id, body, prepass)
+        });
+        results.push(result);
     }
     results
 }
 
 impl<'tcx> Verifier<'tcx> {
     pub fn new(tcx: TyCtxt<'tcx>, contracts: HashMap<LocalDefId, FunctionContract>) -> Self {
-        reset_solver();
+        rebuild_solver();
         Self {
             tcx,
             def_id: None,
@@ -137,6 +189,7 @@ impl<'tcx> Verifier<'tcx> {
             loop_contracts: LoopContracts::empty(),
             control_point_directives: ControlPointDirectives::empty(),
             pure_fns: HashMap::new(),
+            pure_fn_decls: HashMap::new(),
             lemmas: HashMap::new(),
             next_sym: Cell::new(0),
             value_encoder: ValueEncoder::new(tcx.data_layout.pointer_size().bits()),
@@ -166,26 +219,41 @@ impl<'tcx> Verifier<'tcx> {
             .unwrap_or_else(|| "prepass".to_owned())
     }
 
+    fn reset_solver_state(&self) {
+        reset_solver();
+        self.value_encoder.reset_solver_state();
+    }
+
     pub fn load_ghost_function(
         &mut self,
         pure_fn: &TypedPureFnDef,
     ) -> Result<(), VerificationResult> {
+        let load_context = format!("loading pure function `{}`", pure_fn.name);
         let inserted = self
             .pure_fns
             .insert(pure_fn.name.clone(), pure_fn.clone())
             .is_none();
         assert!(inserted, "duplicate pure function `{}`", pure_fn.name);
-        self.register_pure_fn(pure_fn)?;
-        Ok(())
+        let (result, timed_out) =
+            with_z3_deadline(GHOST_LOAD_TIMEOUT, || self.register_pure_fn(pure_fn));
+        if timed_out {
+            return Err(self.timeout_solver_result(self.report_span(), &load_context));
+        }
+        result
     }
 
     pub fn load_ghost_lemma(&mut self, lemma: &TypedLemmaDef) -> Result<(), VerificationResult> {
+        let load_context = format!("loading lemma `{}`", lemma.name);
         let inserted = self
             .lemmas
             .insert(lemma.name.clone(), lemma.clone())
             .is_none();
         assert!(inserted, "duplicate lemma `{}`", lemma.name);
-        self.verify_lemma(lemma)
+        let (result, timed_out) = with_z3_deadline(GHOST_LOAD_TIMEOUT, || self.verify_lemma(lemma));
+        if timed_out {
+            return Err(self.timeout_solver_result(self.report_span(), &load_context));
+        }
+        result
     }
 
     pub fn verify_function(
@@ -194,6 +262,7 @@ impl<'tcx> Verifier<'tcx> {
         body: Body<'tcx>,
         prepass: DirectivePrepass,
     ) -> VerificationResult {
+        self.reset_solver_state();
         self.def_id = Some(def_id);
         self.body = Some(body);
         let DirectivePrepass {
@@ -238,18 +307,10 @@ impl<'tcx> Verifier<'tcx> {
                 for directive in directives {
                     match directive {
                         ControlPointDirective::Assert(assertion) => {
-                            let formula = match self.spec_expr_to_bool(
-                                &state,
-                                &assertion.assertion,
-                                &assertion.resolution,
-                            ) {
-                                Ok(formula) => formula,
-                                Err(err) => return err,
-                            };
-                            if let Err(err) = self.assert_expr_constraint(
+                            if let Err(err) = self.assert_spec_expr_constraint(
                                 &mut state,
                                 &assertion.assertion,
-                                formula,
+                                &assertion.resolution,
                                 self.control_span(ctrl),
                                 assertion.assertion_span.clone(),
                                 "assertion failed".to_owned(),
@@ -266,17 +327,10 @@ impl<'tcx> Verifier<'tcx> {
                                 Ok(formula) => formula,
                                 Err(err) => return err,
                             };
-                            match self.assume_constraint(
-                                &mut state,
-                                formula,
-                                self.control_span(ctrl),
-                            ) {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    pruned = true;
-                                    break;
-                                }
-                                Err(err) => return err,
+                            if self.assume_checked_path_condition(&mut state, formula) {
+                            } else {
+                                pruned = true;
+                                break;
                             }
                         }
                         ControlPointDirective::LemmaCall(lemma_call) => {
@@ -349,7 +403,7 @@ impl<'tcx> Verifier<'tcx> {
             let env =
                 CallEnv::for_function(self, &state, contract, self.function_spec_vars.clone())?;
             let req = self.contract_req_to_z3(contract, &env, self.report_span())?;
-            if !self.assume_constraint(&mut state, req, self.report_span())? {
+            if !self.assume_path_condition(&mut state, req) {
                 return Ok(None);
             }
         }
@@ -407,11 +461,17 @@ impl<'tcx> Verifier<'tcx> {
             }
             TerminatorKind::Return => {
                 if let Some(contract) = self.contracts.get(&self.current_def_id()) {
-                    let formula = self.function_postcondition_to_z3(&state, contract)?;
-                    self.assert_expr_constraint(
+                    let env = CallEnv::for_function(
+                        self,
+                        &state,
+                        contract,
+                        self.function_spec_vars.clone(),
+                    )?;
+                    self.assert_contract_expr_constraint(
                         &mut state,
                         &contract.ens,
-                        formula,
+                        &env.current,
+                        &env.spec,
                         term.source_info.span,
                         contract.ens_span.clone(),
                         "postcondition failed".to_owned(),
@@ -547,11 +607,11 @@ impl<'tcx> Verifier<'tcx> {
                 .ok_or_else(|| self.missing_local_contract_result(def_id, span))?;
             let spec = self.instantiate_contract_spec_vars(contract);
             let env = self.call_env(&state, args, contract, span, spec.clone())?;
-            let req = self.contract_req_to_z3(contract, &env, span)?;
-            self.assert_expr_constraint(
+            self.assert_contract_expr_constraint(
                 &mut state,
                 &contract.req,
-                req,
+                &env.current,
+                &env.spec,
                 span,
                 contract.req_span.clone(),
                 "precondition failed".to_owned(),
@@ -564,7 +624,7 @@ impl<'tcx> Verifier<'tcx> {
             self.consume_call_move_args(&mut state, args, span)?;
             env.current.insert("result".to_owned(), result_value);
             let ens = self.contract_ens_to_z3(contract, &env, span)?;
-            if !self.assume_constraint(&mut state, ens, span)? {
+            if !self.assume_path_condition(&mut state, ens) {
                 return Ok(Vec::new());
             }
         } else {
@@ -606,18 +666,18 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Option<State>, VerificationResult> {
         if let Some(loop_contract) = self.loop_contracts.contract_by_header(target) {
+            self.assert_spec_expr_constraint(
+                &mut state,
+                &loop_contract.invariant,
+                &loop_contract.resolution,
+                span,
+                loop_contract.invariant_span.clone(),
+                "loop invariant does not hold".to_owned(),
+            )?;
             let invariant = self.spec_expr_to_bool(
                 &state,
                 &loop_contract.invariant,
                 &loop_contract.resolution,
-            )?;
-            self.assert_expr_constraint(
-                &mut state,
-                &loop_contract.invariant,
-                invariant.clone(),
-                span,
-                loop_contract.invariant_span.clone(),
-                "loop invariant does not hold".to_owned(),
             )?;
             if self.is_backedge(state.ctrl.basic_block, target, loop_contract) {
                 if self.has_loop_marker(&state.pc, target) {
@@ -625,7 +685,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 let mut abstract_state = state;
                 self.havoc_loop_written_locals(&mut abstract_state, loop_contract)?;
-                if !self.assume_constraint(&mut abstract_state, invariant, span)? {
+                if !self.assume_path_condition(&mut abstract_state, invariant) {
                     return Ok(None);
                 }
                 abstract_state.pc = bool_and(vec![abstract_state.pc, self.loop_marker(target)]);
@@ -645,7 +705,7 @@ impl<'tcx> Verifier<'tcx> {
                 &loop_contract.invariant,
                 &loop_contract.resolution,
             )?;
-            if !self.assume_constraint(&mut state, invariant, span)? {
+            if !self.assume_path_condition(&mut state, invariant) {
                 return Ok(None);
             }
         }
@@ -751,18 +811,20 @@ impl<'tcx> Verifier<'tcx> {
         None
     }
 
-    fn register_pure_fn(&self, pure_fn: &TypedPureFnDef) -> Result<(), VerificationResult> {
-        if Self::typed_expr_calls_pure_fn(&pure_fn.body, &pure_fn.name) {
-            return self.register_recursive_pure_fn(pure_fn);
-        }
-        self.register_nonrecursive_pure_fn(pure_fn)
-    }
-
-    fn register_nonrecursive_pure_fn(
-        &self,
-        pure_fn: &TypedPureFnDef,
-    ) -> Result<(), VerificationResult> {
-        let decl = self.pure_fn_decl(pure_fn)?;
+    fn register_pure_fn(&mut self, pure_fn: &TypedPureFnDef) -> Result<(), VerificationResult> {
+        let domain_sorts = vec![self.value_encoder.value_sort().clone(); pure_fn.params.len()];
+        let domain_refs: Vec<_> = domain_sorts.iter().collect();
+        let result_sort = self.value_encoder.value_sort().clone();
+        let decl = RecFuncDecl::new(
+            format!("pure_fn_{}", pure_fn.name),
+            &domain_refs,
+            &result_sort,
+        );
+        let inserted = self
+            .pure_fn_decls
+            .insert(pure_fn.name.clone(), decl)
+            .is_none();
+        assert!(inserted, "duplicate pure function decl `{}`", pure_fn.name);
         let mut current = HashMap::new();
         let mut vars = Vec::with_capacity(pure_fn.params.len());
         for param in &pure_fn.params {
@@ -775,166 +837,12 @@ impl<'tcx> Verifier<'tcx> {
         }
         let spec = HashMap::new();
         let body = self.contract_expr_to_value(&current, &spec, &pure_fn.body)?;
-        let fn_value = self.apply_pure_fn_decl(&decl, &vars)?;
-        let mut consequent =
-            vec![self.eq_for_spec_ty(&pure_fn.result_ty, &fn_value, &body, self.report_span())?];
-        if let Some(formula) =
-            self.spec_ty_formula(&pure_fn.result_ty, &fn_value, self.report_span())?
-        {
-            consequent.push(formula);
-        }
-        let mut antecedent = Vec::new();
-        for (param, value) in pure_fn.params.iter().zip(vars.iter()) {
-            if let Some(formula) = self.spec_ty_formula(&param.ty, value, self.report_span())? {
-                antecedent.push(formula);
-            }
-        }
-        let body = if antecedent.is_empty() {
-            bool_and(consequent)
-        } else {
-            bool_and(antecedent).implies(bool_and(consequent))
-        };
-        let asts: Vec<&dyn Ast> = vars.iter().map(|value| value.ast()).collect();
-        with_solver(|solver| {
-            solver.assert(z3::ast::forall_const(&asts, &[], &body));
-        });
-        Ok(())
-    }
-
-    fn register_recursive_pure_fn(
-        &self,
-        pure_fn: &TypedPureFnDef,
-    ) -> Result<(), VerificationResult> {
-        let TypedExprKind::Match {
-            scrutinee,
-            arms,
-            default,
-        } = &pure_fn.body.kind
-        else {
-            return Err(self.unsupported_result(
-                self.report_span(),
-                format!(
-                    "recursive pure function `{}` must use a top-level match",
-                    pure_fn.name
-                ),
-            ));
-        };
-        let TypedExprKind::Var(scrutinee_name) = &scrutinee.kind else {
-            return Err(self.unsupported_result(
-                self.report_span(),
-                format!(
-                    "recursive pure function `{}` must match on a parameter",
-                    pure_fn.name
-                ),
-            ));
-        };
-        let Some(recursive_param_index) = pure_fn
-            .params
-            .iter()
-            .position(|param| param.name == *scrutinee_name)
-        else {
-            return Err(self.unsupported_result(
-                self.report_span(),
-                format!(
-                    "recursive pure function `{}` must match on a parameter",
-                    pure_fn.name
-                ),
-            ));
-        };
-        let recursive_param = &pure_fn.params[recursive_param_index];
-        let composite = self.composite_encoding(&recursive_param.ty)?;
-        let decl = self.pure_fn_decl(pure_fn)?;
-        for ctor_index in 0..composite.constructors.len() {
-            let arm = arms.iter().find(|arm| arm.ctor_index == ctor_index);
-            let branch_body = if let Some(arm) = arm {
-                &arm.body
-            } else if let Some(default) = default {
-                default.as_ref()
-            } else {
-                unreachable!("typed recursive pure match must be exhaustive")
-            };
-            let mut current = HashMap::new();
-            let mut fn_args = Vec::with_capacity(pure_fn.params.len());
-            let mut quantified = Vec::new();
-            let mut antecedent = Vec::new();
-            let mut ctor_fields = Vec::new();
-            for (param_index, param) in pure_fn.params.iter().enumerate() {
-                if param_index == recursive_param_index {
-                    let ctor = composite
-                        .constructors
-                        .get(ctor_index)
-                        .expect("constructor index from composite encoding");
-                    ctor_fields.clear();
-                    for (field_index, field) in ctor.fields.iter().enumerate() {
-                        let value = SymValue::new(Dynamic::new_const(
-                            self.fresh_name(&format!(
-                                "pure_{}_{}_{}_{}",
-                                pure_fn.name, param.name, ctor_index, field_index
-                            )),
-                            self.value_encoder.value_sort(),
-                        ));
-                        if let Some(formula) =
-                            self.spec_ty_formula(&field.ty, &value, self.report_span())?
-                        {
-                            antecedent.push(formula);
-                        }
-                        quantified.push(value.clone());
-                        ctor_fields.push(value);
-                    }
-                    let recursive_value =
-                        self.construct_composite_ctor(&param.ty, ctor_index, &ctor_fields)?;
-                    current.insert(param.name.clone(), recursive_value.clone());
-                    fn_args.push(recursive_value);
-                    if let Some(arm) = arm {
-                        for (binding, field_value) in arm.bindings.iter().zip(ctor_fields.iter()) {
-                            if let TypedMatchBinding::Var { name, .. } = binding {
-                                current.insert(name.clone(), field_value.clone());
-                            }
-                        }
-                    }
-                    continue;
-                }
-                let value = SymValue::new(Dynamic::new_const(
-                    self.fresh_name(&format!("pure_{}_{}", pure_fn.name, param.name)),
-                    self.value_encoder.value_sort(),
-                ));
-                if let Some(formula) =
-                    self.spec_ty_formula(&param.ty, &value, self.report_span())?
-                {
-                    antecedent.push(formula);
-                }
-                current.insert(param.name.clone(), value.clone());
-                fn_args.push(value.clone());
-                quantified.push(value);
-            }
-            let spec = HashMap::new();
-            let body = self.contract_expr_to_value(&current, &spec, branch_body)?;
-            let fn_value = self.apply_pure_fn_decl(&decl, &fn_args)?;
-            let mut consequent = vec![self.eq_for_spec_ty(
-                &pure_fn.result_ty,
-                &fn_value,
-                &body,
-                self.report_span(),
-            )?];
-            if let Some(formula) =
-                self.spec_ty_formula(&pure_fn.result_ty, &fn_value, self.report_span())?
-            {
-                consequent.push(formula);
-            }
-            let clause = if antecedent.is_empty() {
-                bool_and(consequent)
-            } else {
-                bool_and(antecedent).implies(bool_and(consequent))
-            };
-            let asts: Vec<&dyn Ast> = quantified.iter().map(SymValue::ast).collect();
-            with_solver(|solver| {
-                if asts.is_empty() {
-                    solver.assert(&clause);
-                } else {
-                    solver.assert(z3::ast::forall_const(&asts, &[], &clause));
-                }
-            });
-        }
+        let args: Vec<&dyn Ast> = vars.iter().map(SymValue::ast).collect();
+        let decl = self
+            .pure_fn_decls
+            .get(&pure_fn.name)
+            .expect("pure function decl must be inserted before lowering the body");
+        decl.add_def(&args, body.dynamic());
         Ok(())
     }
 
@@ -955,24 +863,25 @@ impl<'tcx> Verifier<'tcx> {
             },
         };
         let req = self.contract_expr_to_bool(&current, &spec, &lemma.req)?;
-        if !self.assume_constraint(&mut state, req, self.report_span())? {
+        if !self.assume_path_condition(&mut state, req) {
             return Ok(());
         }
         for param in &lemma.params {
             let value = current.get(&param.name).expect("lemma parameter value");
             if let Some(formula) = self.spec_ty_formula(&param.ty, value, self.report_span())?
-                && !self.assume_constraint(&mut state, formula, self.report_span())?
+                && !self.assume_path_condition(&mut state, formula)
             {
                 return Ok(());
             }
         }
         let final_states = self.execute_lemma_stmts(lemma, &current, &spec, state, &lemma.body)?;
-        for mut final_state in final_states {
-            let ens = self.contract_expr_to_bool(&current, &spec, &lemma.ens)?;
-            self.assert_expr_constraint(
+        for final_exec in final_states {
+            let mut final_state = final_exec.state;
+            self.assert_contract_expr_constraint(
                 &mut final_state,
                 &lemma.ens,
-                ens,
+                &final_exec.current,
+                &spec,
                 self.report_span(),
                 format!("lemma `{}`", lemma.name),
                 format!("lemma `{}` postcondition failed", lemma.name),
@@ -988,17 +897,20 @@ impl<'tcx> Verifier<'tcx> {
         spec: &HashMap<String, SymValue>,
         mut state: State,
         stmts: &[TypedGhostStmt],
-    ) -> Result<Vec<State>, VerificationResult> {
+    ) -> Result<Vec<LemmaExecState>, VerificationResult> {
         let Some((stmt, rest)) = stmts.split_first() else {
-            return Ok(vec![state]);
+            return Ok(vec![LemmaExecState {
+                current: current.clone(),
+                state,
+            }]);
         };
         match stmt {
             TypedGhostStmt::Assert(expr) => {
-                let formula = self.contract_expr_to_bool(current, spec, expr)?;
-                self.assert_expr_constraint(
+                self.assert_contract_expr_constraint(
                     &mut state,
                     expr,
-                    formula,
+                    current,
+                    spec,
                     self.report_span(),
                     format!("lemma `{}`", lemma.name),
                     format!("lemma `{}` assertion failed", lemma.name),
@@ -1007,7 +919,7 @@ impl<'tcx> Verifier<'tcx> {
             }
             TypedGhostStmt::Assume(expr) => {
                 let formula = self.contract_expr_to_bool(current, spec, expr)?;
-                if !self.assume_constraint(&mut state, formula, self.report_span())? {
+                if !self.assume_path_condition(&mut state, formula) {
                     return Ok(Vec::new());
                 }
                 self.execute_lemma_stmts(lemma, current, spec, state, rest)
@@ -1020,17 +932,17 @@ impl<'tcx> Verifier<'tcx> {
                     )
                 })?;
                 let env = self.lemma_env_from_contract_args(args, current, spec, callee)?;
-                let req = self.contract_expr_to_bool(&env.current, &env.spec, &callee.req)?;
-                self.assert_expr_constraint(
+                self.assert_contract_expr_constraint(
                     &mut state,
                     &callee.req,
-                    req,
+                    &env.current,
+                    &env.spec,
                     self.report_span(),
                     format!("lemma `{}`", lemma.name),
                     format!("lemma `{}` precondition failed", callee.name),
                 )?;
                 let ens = self.contract_expr_to_bool(&env.current, &env.spec, &callee.ens)?;
-                if !self.assume_constraint(&mut state, ens, self.report_span())? {
+                if !self.assume_path_condition(&mut state, ens) {
                     return Ok(Vec::new());
                 }
                 self.execute_lemma_stmts(lemma, current, spec, state, rest)
@@ -1063,7 +975,7 @@ impl<'tcx> Verifier<'tcx> {
         arms: &[TypedGhostMatchArm],
         default: Option<&[TypedGhostStmt]>,
         rest: &[TypedGhostStmt],
-    ) -> Result<Vec<State>, VerificationResult> {
+    ) -> Result<Vec<LemmaExecState>, VerificationResult> {
         let scrutinee_value = self.contract_expr_to_value(current, spec, scrutinee)?;
         let composite = self.composite_encoding(&scrutinee.ty)?;
         let mut guard_formulas = Vec::with_capacity(arms.len());
@@ -1077,7 +989,7 @@ impl<'tcx> Verifier<'tcx> {
                 self.report_span(),
             )?;
             guard_formulas.push(guard.clone());
-            if !self.assume_constraint(&mut branch_state, guard, self.report_span())? {
+            if !self.assume_path_condition(&mut branch_state, guard) {
                 continue;
             }
             let mut branch_current = current.clone();
@@ -1099,13 +1011,16 @@ impl<'tcx> Verifier<'tcx> {
             }
             let ctor_value =
                 self.construct_composite_ctor(&scrutinee.ty, arm.ctor_index, &field_values)?;
+            if let TypedExprKind::Var(name) = &scrutinee.kind {
+                branch_current.insert(name.clone(), ctor_value.clone());
+            }
             let branch_eq = self.eq_for_spec_ty(
                 &scrutinee.ty,
                 &scrutinee_value,
                 &ctor_value,
                 self.report_span(),
             )?;
-            if !self.assume_constraint(&mut branch_state, branch_eq, self.report_span())? {
+            if !self.assume_path_condition(&mut branch_state, branch_eq) {
                 continue;
             }
             let branch_end_states =
@@ -1113,9 +1028,9 @@ impl<'tcx> Verifier<'tcx> {
             for branch_end_state in branch_end_states {
                 final_states.extend(self.execute_lemma_stmts(
                     lemma,
-                    current,
+                    &branch_end_state.current,
                     spec,
-                    branch_end_state,
+                    branch_end_state.state,
                     rest,
                 )?);
             }
@@ -1123,15 +1038,15 @@ impl<'tcx> Verifier<'tcx> {
         if let Some(default) = default {
             let mut default_state = state;
             let default_guard = bool_and(guard_formulas.into_iter().map(bool_not).collect());
-            if self.assume_constraint(&mut default_state, default_guard, self.report_span())? {
+            if self.assume_path_condition(&mut default_state, default_guard) {
                 let default_end_states =
                     self.execute_lemma_stmts(lemma, current, spec, default_state, default)?;
                 for default_end_state in default_end_states {
                     final_states.extend(self.execute_lemma_stmts(
                         lemma,
-                        current,
+                        &default_end_state.current,
                         spec,
-                        default_end_state,
+                        default_end_state.state,
                         rest,
                     )?);
                 }
@@ -1150,17 +1065,17 @@ impl<'tcx> Verifier<'tcx> {
             self.unsupported_result(span, format!("unknown lemma `{}`", call.lemma_name))
         })?;
         let env = self.lemma_env_from_state_exprs(state, &call.args, &call.resolution, lemma)?;
-        let req = self.contract_expr_to_bool(&env.current, &env.spec, &lemma.req)?;
-        self.assert_expr_constraint(
+        self.assert_contract_expr_constraint(
             state,
             &lemma.req,
-            req,
+            &env.current,
+            &env.spec,
             span,
             call.span_text.clone(),
             format!("lemma `{}` precondition failed", lemma.name),
         )?;
         let ens = self.contract_expr_to_bool(&env.current, &env.spec, &lemma.ens)?;
-        self.assume_constraint(state, ens, span)
+        Ok(self.assume_path_condition(state, ens))
     }
 
     fn lemma_env_from_state_exprs(
@@ -2276,86 +2191,185 @@ impl<'tcx> Verifier<'tcx> {
         Ok(result)
     }
 
-    fn typed_expr_calls_pure_fn(expr: &TypedExpr, name: &str) -> bool {
-        match &expr.kind {
-            TypedExprKind::PureCall { func, args } => {
-                func == name
-                    || args
-                        .iter()
-                        .any(|arg| Self::typed_expr_calls_pure_fn(arg, name))
-            }
-            TypedExprKind::Match {
-                scrutinee,
-                arms,
-                default,
-            } => {
-                Self::typed_expr_calls_pure_fn(scrutinee, name)
-                    || arms
-                        .iter()
-                        .any(|arm| Self::typed_expr_calls_pure_fn(&arm.body, name))
-                    || default
-                        .as_deref()
-                        .is_some_and(|body| Self::typed_expr_calls_pure_fn(body, name))
-            }
-            TypedExprKind::CtorCall { args, .. } => args
-                .iter()
-                .any(|arg| Self::typed_expr_calls_pure_fn(arg, name)),
-            TypedExprKind::Field { base, .. }
-            | TypedExprKind::TupleField { base, .. }
-            | TypedExprKind::Deref { base }
-            | TypedExprKind::Fin { base }
-            | TypedExprKind::Unary { arg: base, .. } => Self::typed_expr_calls_pure_fn(base, name),
-            TypedExprKind::Binary { lhs, rhs, .. } => {
-                Self::typed_expr_calls_pure_fn(lhs, name)
-                    || Self::typed_expr_calls_pure_fn(rhs, name)
-            }
-            TypedExprKind::Bool(_)
-            | TypedExprKind::Int(_)
-            | TypedExprKind::Var(_)
-            | TypedExprKind::Bind(_) => false,
-        }
-    }
-
     fn eval_pure_call(
         &self,
         func: &str,
         values: Vec<SymValue>,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let Some(pure_fn) = self.pure_fns.get(func) else {
+        if let Some(value) = self.try_eval_ground_pure_call(func, &values, span)? {
+            return Ok(value);
+        }
+        let Some(decl) = self.pure_fn_decls.get(func) else {
             return Err(self.unsupported_result(span, format!("unknown pure function `{func}`")));
         };
-        let decl = self.pure_fn_decl(pure_fn)?;
-        self.apply_pure_fn_decl(&decl, &values)
-    }
-
-    fn pure_fn_decl(&self, pure_fn: &TypedPureFnDef) -> Result<FuncDecl, VerificationResult> {
-        let domain_sorts = vec![self.value_encoder.value_sort().clone(); pure_fn.params.len()];
-        let domain_refs: Vec<_> = domain_sorts.iter().collect();
-        let result_sort = self.value_encoder.value_sort().clone();
-        Ok(FuncDecl::new(
-            format!("pure_fn_{}", pure_fn.name),
-            &domain_refs,
-            &result_sort,
-        ))
-    }
-
-    fn apply_pure_fn_decl(
-        &self,
-        decl: &FuncDecl,
-        values: &[SymValue],
-    ) -> Result<SymValue, VerificationResult> {
         let args: Vec<&dyn Ast> = values.iter().map(SymValue::ast).collect();
         Ok(SymValue::new(decl.apply(&args)))
     }
 
-    fn function_postcondition_to_z3(
+    fn try_eval_ground_pure_call(
         &self,
-        state: &State,
-        contract: &FunctionContract,
-    ) -> Result<Bool, VerificationResult> {
-        let env = CallEnv::for_function(self, state, contract, self.function_spec_vars.clone())?;
-        self.contract_ens_to_z3(contract, &env, self.report_span())
+        func: &str,
+        values: &[SymValue],
+        span: Span,
+    ) -> Result<Option<SymValue>, VerificationResult> {
+        let Some(pure_fn) = self.pure_fns.get(func) else {
+            return Ok(None);
+        };
+        if pure_fn.params.len() != values.len() {
+            return Ok(None);
+        }
+        let mut env = HashMap::new();
+        for (param, value) in pure_fn.params.iter().zip(values.iter()) {
+            env.insert(param.name.clone(), value.clone());
+        }
+        self.try_eval_ground_pure_expr(&pure_fn.body, &env, span)
+    }
+
+    fn try_eval_ground_pure_expr(
+        &self,
+        expr: &TypedExpr,
+        env: &HashMap<String, SymValue>,
+        span: Span,
+    ) -> Result<Option<SymValue>, VerificationResult> {
+        Ok(match &expr.kind {
+            TypedExprKind::Bool(value) => Some(self.value_bool(*value)),
+            TypedExprKind::Int(value) => Some(self.value_decimal_int(&value.digits, span)?),
+            TypedExprKind::Var(name) => env.get(name).cloned(),
+            TypedExprKind::Bind(_) => None,
+            TypedExprKind::CtorCall {
+                ctor_index, args, ..
+            } => {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    let Some(value) = self.try_eval_ground_pure_expr(arg, env, span)? else {
+                        return Ok(None);
+                    };
+                    values.push(value);
+                }
+                Some(self.construct_composite_ctor(&expr.ty, *ctor_index, &values)?)
+            }
+            TypedExprKind::PureCall { func, args } => {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    let Some(value) = self.try_eval_ground_pure_expr(arg, env, span)? else {
+                        return Ok(None);
+                    };
+                    values.push(value);
+                }
+                if let Some(value) = self.try_eval_ground_pure_call(func, &values, span)? {
+                    Some(value)
+                } else {
+                    let Some(decl) = self.pure_fn_decls.get(func) else {
+                        return Err(self
+                            .unsupported_result(span, format!("unknown pure function `{func}`")));
+                    };
+                    let args: Vec<&dyn Ast> = values.iter().map(SymValue::ast).collect();
+                    Some(SymValue::new(decl.apply(&args)))
+                }
+            }
+            TypedExprKind::Match {
+                scrutinee,
+                arms,
+                default,
+            } => {
+                let Some(scrutinee_value) = self.try_eval_ground_pure_expr(scrutinee, env, span)?
+                else {
+                    return Ok(None);
+                };
+                let Some(ctor_index) =
+                    self.ground_ctor_index(&scrutinee.ty, &scrutinee_value, span)?
+                else {
+                    return Ok(None);
+                };
+                if let Some(arm) = arms.iter().find(|arm| arm.ctor_index == ctor_index) {
+                    let composite = self.composite_encoding(&scrutinee.ty)?;
+                    let mut arm_env = env.clone();
+                    for (field_index, binding) in arm.bindings.iter().enumerate() {
+                        if let TypedMatchBinding::Var { name, .. } = binding {
+                            let field_value = self
+                                .value_encoder
+                                .project_composite_ctor_field(
+                                    &composite,
+                                    ctor_index,
+                                    &scrutinee_value,
+                                    field_index,
+                                )
+                                .map_err(|err| self.unsupported_result(span, err))?;
+                            arm_env.insert(name.clone(), field_value);
+                        }
+                    }
+                    self.try_eval_ground_pure_expr(&arm.body, &arm_env, span)?
+                } else if let Some(default) = default {
+                    self.try_eval_ground_pure_expr(default, env, span)?
+                } else {
+                    return Ok(None);
+                }
+            }
+            TypedExprKind::Field { base, index, .. } => {
+                let Some(value) = self.try_eval_ground_pure_expr(base, env, span)? else {
+                    return Ok(None);
+                };
+                Some(self.project_field(value, &base.ty, *index, span)?)
+            }
+            TypedExprKind::TupleField { base, index } => {
+                let Some(value) = self.try_eval_ground_pure_expr(base, env, span)? else {
+                    return Ok(None);
+                };
+                Some(self.project_field(value, &base.ty, *index, span)?)
+            }
+            TypedExprKind::Deref { base } => {
+                let Some(value) = self.try_eval_ground_pure_expr(base, env, span)? else {
+                    return Ok(None);
+                };
+                Some(match &base.ty {
+                    SpecTy::Ref(inner) => self.ref_deref(&value, inner, span)?,
+                    SpecTy::Mut(inner) => self.mut_cur(&value, inner, span)?,
+                    _ => return Ok(None),
+                })
+            }
+            TypedExprKind::Fin { base } => {
+                let Some(value) = self.try_eval_ground_pure_expr(base, env, span)? else {
+                    return Ok(None);
+                };
+                let SpecTy::Mut(inner) = &base.ty else {
+                    return Ok(None);
+                };
+                Some(self.mut_fin(&value, inner, span)?)
+            }
+            TypedExprKind::Unary { op, arg } => {
+                let Some(value) = self.try_eval_ground_pure_expr(arg, env, span)? else {
+                    return Ok(None);
+                };
+                Some(self.lower_unary_value(*op, &value))
+            }
+            TypedExprKind::Binary { op, lhs, rhs } => {
+                let Some(lhs_value) = self.try_eval_ground_pure_expr(lhs, env, span)? else {
+                    return Ok(None);
+                };
+                let Some(rhs_value) = self.try_eval_ground_pure_expr(rhs, env, span)? else {
+                    return Ok(None);
+                };
+                Some(self.lower_binary_value(*op, &lhs.ty, &lhs_value, &rhs_value, span)?)
+            }
+        })
+    }
+
+    fn ground_ctor_index(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+        span: Span,
+    ) -> Result<Option<usize>, VerificationResult> {
+        let composite = self.composite_encoding(ty)?;
+        let decl_name = value.dynamic().decl().name();
+        for (ctor_index, ctor) in composite.constructors.iter().enumerate() {
+            if decl_name == ctor.symbol.name() {
+                return Ok(Some(ctor_index));
+            }
+        }
+        let _ = span;
+        Ok(None)
     }
 
     fn assert_constraint(
@@ -2397,12 +2411,9 @@ impl<'tcx> Verifier<'tcx> {
                     self.add_path_condition(state, constraint);
                     Ok(())
                 }
-                SatResult::Unknown => Err(VerificationResult {
-                    function: self.report_function(),
-                    status: VerificationStatus::Fail,
-                    span: diagnostic_span,
-                    message,
-                }),
+                SatResult::Unknown => {
+                    Err(self.unknown_solver_result(span, "checking a universal assertion"))
+                }
             },
             AssertionKind::Existential => {
                 match self.check_sat(&[state.pc.clone(), constraint.clone()]) {
@@ -2417,9 +2428,7 @@ impl<'tcx> Verifier<'tcx> {
                         message,
                     }),
                     SatResult::Unknown => {
-                        let _ = span;
-                        self.add_path_condition(state, constraint);
-                        Ok(())
+                        Err(self.unknown_solver_result(span, "checking an existential assertion"))
                     }
                 }
             }
@@ -2445,31 +2454,285 @@ impl<'tcx> Verifier<'tcx> {
         )
     }
 
-    fn assume_constraint(
+    fn assert_spec_expr_constraint(
         &self,
         state: &mut State,
-        constraint: Bool,
+        expr: &TypedExpr,
+        resolved: &ResolvedExprEnv,
         span: Span,
+        diagnostic_span: String,
+        message: String,
+    ) -> Result<(), VerificationResult> {
+        if self.try_assert_spec_bind_witnesses(
+            state,
+            expr,
+            resolved,
+            span,
+            diagnostic_span.clone(),
+            message.clone(),
+        )? {
+            return Ok(());
+        }
+        let constraint = self.spec_expr_to_bool(state, expr, resolved)?;
+        self.assert_expr_constraint(state, expr, constraint, span, diagnostic_span, message)
+    }
+
+    fn assert_contract_expr_constraint(
+        &self,
+        state: &mut State,
+        expr: &TypedExpr,
+        current: &HashMap<String, SymValue>,
+        spec: &HashMap<String, SymValue>,
+        span: Span,
+        diagnostic_span: String,
+        message: String,
+    ) -> Result<(), VerificationResult> {
+        if self.try_assert_contract_bind_witnesses(
+            state,
+            expr,
+            current,
+            spec,
+            span,
+            diagnostic_span.clone(),
+            message.clone(),
+        )? {
+            return Ok(());
+        }
+        let constraint = self.contract_expr_to_bool(current, spec, expr)?;
+        self.assert_expr_constraint(state, expr, constraint, span, diagnostic_span, message)
+    }
+
+    fn try_assert_spec_bind_witnesses(
+        &self,
+        state: &mut State,
+        expr: &TypedExpr,
+        resolved: &ResolvedExprEnv,
+        span: Span,
+        diagnostic_span: String,
+        message: String,
     ) -> Result<bool, VerificationResult> {
+        let (witnesses, residuals) = Self::split_bind_witness_conjuncts(expr);
+        if witnesses.is_empty() {
+            return Ok(false);
+        }
+        for (bind_expr, witness_expr) in witnesses {
+            let bind_value = self.spec_expr_to_value(state, bind_expr, resolved)?;
+            let witness_value = self.spec_expr_to_value(state, witness_expr, resolved)?;
+            let equality = self.eq_for_spec_ty(&bind_expr.ty, &bind_value, &witness_value, span)?;
+            self.add_path_condition(state, equality);
+        }
+        if residuals.is_empty() {
+            return Ok(true);
+        }
+        let residual_formulas = residuals
+            .iter()
+            .map(|residual| self.spec_expr_to_bool(state, residual, resolved))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.assert_constraint(
+            state,
+            bool_and(residual_formulas),
+            Self::conjunct_assertion_kind(&residuals),
+            span,
+            diagnostic_span,
+            message,
+        )?;
+        Ok(true)
+    }
+
+    fn try_assert_contract_bind_witnesses(
+        &self,
+        state: &mut State,
+        expr: &TypedExpr,
+        current: &HashMap<String, SymValue>,
+        spec: &HashMap<String, SymValue>,
+        span: Span,
+        diagnostic_span: String,
+        message: String,
+    ) -> Result<bool, VerificationResult> {
+        let (witnesses, residuals) = Self::split_bind_witness_conjuncts(expr);
+        if witnesses.is_empty() {
+            return Ok(false);
+        }
+        for (bind_expr, witness_expr) in witnesses {
+            let bind_value = self.contract_expr_to_value(current, spec, bind_expr)?;
+            let witness_value = self.contract_expr_to_value(current, spec, witness_expr)?;
+            let equality = self.eq_for_spec_ty(&bind_expr.ty, &bind_value, &witness_value, span)?;
+            self.add_path_condition(state, equality);
+        }
+        if residuals.is_empty() {
+            return Ok(true);
+        }
+        let residual_formulas = residuals
+            .iter()
+            .map(|residual| self.contract_expr_to_bool(current, spec, residual))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.assert_constraint(
+            state,
+            bool_and(residual_formulas),
+            Self::conjunct_assertion_kind(&residuals),
+            span,
+            diagnostic_span,
+            message,
+        )?;
+        Ok(true)
+    }
+
+    fn split_bind_witness_conjuncts<'a>(
+        expr: &'a TypedExpr,
+    ) -> (Vec<(&'a TypedExpr, &'a TypedExpr)>, Vec<&'a TypedExpr>) {
+        let mut witnesses = Vec::new();
+        let mut residuals = Vec::new();
+        Self::collect_bind_witness_conjuncts(expr, &mut witnesses, &mut residuals);
+        (witnesses, residuals)
+    }
+
+    fn collect_bind_witness_conjuncts<'a>(
+        expr: &'a TypedExpr,
+        witnesses: &mut Vec<(&'a TypedExpr, &'a TypedExpr)>,
+        residuals: &mut Vec<&'a TypedExpr>,
+    ) {
+        match &expr.kind {
+            TypedExprKind::Binary {
+                op: BinaryOp::And,
+                lhs,
+                rhs,
+            } => {
+                Self::collect_bind_witness_conjuncts(lhs, witnesses, residuals);
+                Self::collect_bind_witness_conjuncts(rhs, witnesses, residuals);
+            }
+            TypedExprKind::Binary {
+                op: BinaryOp::Eq,
+                lhs,
+                rhs,
+            } => {
+                if let Some(witness) = Self::bind_witness_from_equality(lhs, rhs) {
+                    witnesses.push(witness);
+                } else {
+                    residuals.push(expr);
+                }
+            }
+            _ => residuals.push(expr),
+        }
+    }
+
+    fn bind_witness_from_equality<'a>(
+        lhs: &'a TypedExpr,
+        rhs: &'a TypedExpr,
+    ) -> Option<(&'a TypedExpr, &'a TypedExpr)> {
+        match (&lhs.kind, &rhs.kind) {
+            (TypedExprKind::Bind(name), _) if !Self::typed_expr_mentions_bind(rhs, name) => {
+                Some((lhs, rhs))
+            }
+            (_, TypedExprKind::Bind(name)) if !Self::typed_expr_mentions_bind(lhs, name) => {
+                Some((rhs, lhs))
+            }
+            _ => None,
+        }
+    }
+
+    fn typed_expr_mentions_bind(expr: &TypedExpr, name: &str) -> bool {
+        match &expr.kind {
+            TypedExprKind::Bind(other) => other == name,
+            TypedExprKind::Bool(_) | TypedExprKind::Int(_) | TypedExprKind::Var(_) => false,
+            TypedExprKind::Match {
+                scrutinee,
+                arms,
+                default,
+            } => {
+                Self::typed_expr_mentions_bind(scrutinee, name)
+                    || arms
+                        .iter()
+                        .any(|arm| Self::typed_expr_mentions_bind(&arm.body, name))
+                    || default
+                        .as_deref()
+                        .is_some_and(|body| Self::typed_expr_mentions_bind(body, name))
+            }
+            TypedExprKind::PureCall { args, .. } | TypedExprKind::CtorCall { args, .. } => args
+                .iter()
+                .any(|arg| Self::typed_expr_mentions_bind(arg, name)),
+            TypedExprKind::Field { base, .. }
+            | TypedExprKind::TupleField { base, .. }
+            | TypedExprKind::Deref { base }
+            | TypedExprKind::Fin { base }
+            | TypedExprKind::Unary { arg: base, .. } => Self::typed_expr_mentions_bind(base, name),
+            TypedExprKind::Binary { lhs, rhs, .. } => {
+                Self::typed_expr_mentions_bind(lhs, name)
+                    || Self::typed_expr_mentions_bind(rhs, name)
+            }
+        }
+    }
+
+    fn conjunct_assertion_kind(exprs: &[&TypedExpr]) -> AssertionKind {
+        if exprs.iter().any(|expr| Self::expr_has_bind(expr)) {
+            AssertionKind::Existential
+        } else {
+            AssertionKind::Universal
+        }
+    }
+
+    // Assumptions only strengthen the current path condition; asking Z3 whether they
+    // are satisfiable is optional and was the main source of spurious `unknown`s
+    // once recursive prelude definitions were loaded.
+    fn assume_path_condition(&self, state: &mut State, constraint: Bool) -> bool {
+        let constraint = constraint.simplify();
+        match constraint.as_bool() {
+            Some(true) => {
+                self.add_path_condition(state, constraint);
+                true
+            }
+            Some(false) => false,
+            None => {
+                self.add_path_condition(state, constraint);
+                true
+            }
+        }
+    }
+
+    fn assume_checked_path_condition(&self, state: &mut State, constraint: Bool) -> bool {
         let constraint = constraint.simplify();
         if let Some(value) = constraint.as_bool() {
             if value {
                 self.add_path_condition(state, constraint);
-                return Ok(true);
+                return true;
             }
-            return Ok(false);
+            return false;
         }
         match self.check_sat(&[state.pc.clone(), constraint.clone()]) {
             SatResult::Sat => {
                 self.add_path_condition(state, constraint);
-                Ok(true)
+                true
             }
-            SatResult::Unsat => Ok(false),
+            SatResult::Unsat => false,
             SatResult::Unknown => {
-                let _ = span;
                 self.add_path_condition(state, constraint);
-                Ok(true)
+                true
             }
+        }
+    }
+
+    fn unknown_solver_result(&self, span: Span, context: &str) -> VerificationResult {
+        VerificationResult {
+            function: self.report_function(),
+            status: VerificationStatus::Fail,
+            span: if span == DUMMY_SP {
+                "no-location".to_owned()
+            } else {
+                self.tcx.sess.source_map().span_to_diagnostic_string(span)
+            },
+            message: format!("solver returned unknown while {context}"),
+        }
+    }
+
+    fn timeout_solver_result(&self, span: Span, context: &str) -> VerificationResult {
+        VerificationResult {
+            function: self.report_function(),
+            status: VerificationStatus::Fail,
+            span: if span == DUMMY_SP {
+                "no-location".to_owned()
+            } else {
+                self.tcx.sess.source_map().span_to_diagnostic_string(span)
+            },
+            message: format!("solver timed out while {context}"),
         }
     }
 
@@ -2477,12 +2740,26 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         mut state: State,
         constraint: Bool,
-        span: Span,
+        _span: Span,
     ) -> Result<Option<State>, VerificationResult> {
-        if self.assume_constraint(&mut state, constraint, span)? {
-            Ok(Some(state))
-        } else {
-            Ok(None)
+        let constraint = constraint.simplify();
+        if let Some(value) = constraint.as_bool() {
+            if value {
+                self.add_path_condition(&mut state, constraint);
+                return Ok(Some(state));
+            }
+            return Ok(None);
+        }
+        match self.check_sat(&[state.pc.clone(), constraint.clone()]) {
+            SatResult::Sat => {
+                self.add_path_condition(&mut state, constraint);
+                Ok(Some(state))
+            }
+            SatResult::Unsat => Ok(None),
+            SatResult::Unknown => {
+                self.add_path_condition(&mut state, constraint);
+                Ok(Some(state))
+            }
         }
     }
 
@@ -2492,15 +2769,7 @@ impl<'tcx> Verifier<'tcx> {
 
     fn check_sat(&self, assumptions: &[Bool]) -> SatResult {
         let assumptions = assumptions.iter().map(Bool::simplify).collect::<Vec<_>>();
-        with_solver(|solver| {
-            solver.push();
-            for assumption in &assumptions {
-                solver.assert(assumption);
-            }
-            let result = solver.check();
-            solver.pop(1);
-            result
-        })
+        with_solver(|solver| solver.check_assumptions(&assumptions))
     }
 
     fn expr_has_bind(expr: &TypedExpr) -> bool {
@@ -3406,6 +3675,12 @@ struct CallEnv {
     spec: HashMap<String, SymValue>,
 }
 
+#[derive(Debug, Clone)]
+struct LemmaExecState {
+    current: HashMap<String, SymValue>,
+    state: State,
+}
+
 impl CallEnv {
     fn for_function<'tcx>(
         verifier: &Verifier<'tcx>,
@@ -3434,11 +3709,149 @@ impl CallEnv {
     }
 }
 
+fn collect_needed_pure_fns(
+    prepass: &DirectivePrepass,
+    lemmas: &[TypedLemmaDef],
+    pure_fns: &[TypedPureFnDef],
+) -> Vec<TypedPureFnDef> {
+    let pure_fn_defs = pure_fns
+        .iter()
+        .cloned()
+        .map(|pure_fn| (pure_fn.name.clone(), pure_fn))
+        .collect::<HashMap<_, _>>();
+    let lemma_map = lemmas
+        .iter()
+        .cloned()
+        .map(|lemma| (lemma.name.clone(), lemma))
+        .collect::<HashMap<_, _>>();
+    let mut needed = BTreeSet::new();
+    collect_directive_prepass_pure_fn_refs(prepass, &lemma_map, &mut needed);
+    let mut agenda = needed.iter().cloned().collect::<VecDeque<_>>();
+    while let Some(name) = agenda.pop_front() {
+        let Some(pure_fn) = pure_fn_defs.get(&name) else {
+            continue;
+        };
+        let mut refs = BTreeSet::new();
+        collect_typed_expr_pure_fn_refs(&pure_fn.body, &mut refs);
+        for reference in refs {
+            if needed.insert(reference.clone()) {
+                agenda.push_back(reference);
+            }
+        }
+    }
+    pure_fns
+        .iter()
+        .filter(|pure_fn| needed.contains(&pure_fn.name))
+        .cloned()
+        .collect()
+}
+
+fn collect_directive_prepass_pure_fn_refs(
+    prepass: &DirectivePrepass,
+    lemmas: &HashMap<String, TypedLemmaDef>,
+    out: &mut BTreeSet<String>,
+) {
+    if let Some(contract) = &prepass.function_contract {
+        collect_typed_expr_pure_fn_refs(&contract.req, out);
+        collect_typed_expr_pure_fn_refs(&contract.ens, out);
+    }
+    for loop_contract in prepass.loop_contracts.by_header.values() {
+        collect_typed_expr_pure_fn_refs(&loop_contract.invariant, out);
+    }
+    let mut needed_lemmas = VecDeque::new();
+    for directives in prepass.control_point_directives.by_control_point.values() {
+        for directive in directives {
+            match directive {
+                ControlPointDirective::Assert(assertion) => {
+                    collect_typed_expr_pure_fn_refs(&assertion.assertion, out);
+                }
+                ControlPointDirective::Assume(assumption) => {
+                    collect_typed_expr_pure_fn_refs(&assumption.assumption, out);
+                }
+                ControlPointDirective::LemmaCall(call) => {
+                    for arg in &call.args {
+                        collect_typed_expr_pure_fn_refs(arg, out);
+                    }
+                    needed_lemmas.push_back(call.lemma_name.clone());
+                }
+            }
+        }
+    }
+    let mut seen_lemmas = BTreeSet::new();
+    while let Some(lemma_name) = needed_lemmas.pop_front() {
+        if !seen_lemmas.insert(lemma_name.clone()) {
+            continue;
+        }
+        let Some(lemma) = lemmas.get(&lemma_name) else {
+            continue;
+        };
+        collect_typed_expr_pure_fn_refs(&lemma.req, out);
+        collect_typed_expr_pure_fn_refs(&lemma.ens, out);
+    }
+}
+
+fn collect_typed_expr_pure_fn_refs(expr: &TypedExpr, out: &mut BTreeSet<String>) {
+    match &expr.kind {
+        TypedExprKind::Bool(_)
+        | TypedExprKind::Int(_)
+        | TypedExprKind::Var(_)
+        | TypedExprKind::Bind(_) => {}
+        TypedExprKind::Match {
+            scrutinee,
+            arms,
+            default,
+        } => {
+            collect_typed_expr_pure_fn_refs(scrutinee, out);
+            for arm in arms {
+                collect_typed_expr_pure_fn_refs(&arm.body, out);
+            }
+            if let Some(default) = default {
+                collect_typed_expr_pure_fn_refs(default, out);
+            }
+        }
+        TypedExprKind::PureCall { func, args } => {
+            out.insert(func.clone());
+            for arg in args {
+                collect_typed_expr_pure_fn_refs(arg, out);
+            }
+        }
+        TypedExprKind::CtorCall { args, .. } => {
+            for arg in args {
+                collect_typed_expr_pure_fn_refs(arg, out);
+            }
+        }
+        TypedExprKind::Field { base, .. }
+        | TypedExprKind::TupleField { base, .. }
+        | TypedExprKind::Deref { base }
+        | TypedExprKind::Fin { base }
+        | TypedExprKind::Unary { arg: base, .. } => collect_typed_expr_pure_fn_refs(base, out),
+        TypedExprKind::Binary { lhs, rhs, .. } => {
+            collect_typed_expr_pure_fn_refs(lhs, out);
+            collect_typed_expr_pure_fn_refs(rhs, out);
+        }
+    }
+}
+
 fn init_z3() {
     Z3_INIT.call_once(|| {
         z3::set_global_param("model", "true");
         z3::set_global_param("smt.auto_config", "false");
         z3::set_global_param("smt.mbqi", "false");
+    });
+}
+
+fn build_solver() -> Solver {
+    init_z3();
+    let solver = Solver::new();
+    let mut params = z3::Params::new();
+    params.set_u32("timeout", SOLVER_TIMEOUT_MS);
+    solver.set_params(&params);
+    solver
+}
+
+fn rebuild_solver() {
+    GLOBAL_SOLVER.with(|solver| {
+        *solver.borrow_mut() = build_solver();
     });
 }
 
@@ -3449,7 +3862,27 @@ fn reset_solver() {
 }
 
 fn with_solver<T>(f: impl FnOnce(&Solver) -> T) -> T {
-    GLOBAL_SOLVER.with(|solver| f(solver))
+    GLOBAL_SOLVER.with(|solver| f(&solver.borrow()))
+}
+
+fn with_z3_deadline<T>(budget: Duration, f: impl FnOnce() -> T) -> (T, bool) {
+    let ctx = Context::thread_local();
+    let handle = ctx.handle();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    thread::scope(|scope| {
+        let watchdog = scope.spawn(move || {
+            if done_rx.recv_timeout(budget).is_err() {
+                handle.interrupt();
+                true
+            } else {
+                false
+            }
+        });
+        let result = f();
+        let _ = done_tx.send(());
+        let timed_out = watchdog.join().expect("watchdog thread");
+        (result, timed_out)
+    })
 }
 
 fn bool_and(exprs: Vec<Bool>) -> Bool {
@@ -3487,4 +3920,61 @@ fn spec_ty_contains_mut_ref(ty: &SpecTy) -> bool {
 
 fn span_text(tcx: TyCtxt<'_>, span: Span) -> String {
     tcx.sess.source_map().span_to_diagnostic_string(span)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rebuild_solver, with_solver};
+    use z3::ast::Int;
+    use z3::{Config, SatResult};
+
+    #[test]
+    fn thread_local_solver_distinguishes_sat_from_unsat() {
+        rebuild_solver();
+        let x = Int::new_const("x");
+        let sat = with_solver(|solver| {
+            solver.push();
+            solver.assert(x.eq(1));
+            let result = solver.check();
+            solver.pop(1);
+            result
+        });
+        assert_eq!(sat, SatResult::Sat);
+
+        let unsat = with_solver(|solver| {
+            solver.push();
+            solver.assert(x.eq(1));
+            solver.assert(x.eq(2));
+            let result = solver.check();
+            solver.pop(1);
+            result
+        });
+        assert_eq!(unsat, SatResult::Unsat);
+    }
+
+    #[test]
+    fn with_z3_config_solver_distinguishes_sat_from_unsat() {
+        let result = z3::with_z3_config(&Config::new(), || {
+            rebuild_solver();
+            let x = Int::new_const("x");
+            let sat = with_solver(|solver| {
+                solver.push();
+                solver.assert(x.eq(1));
+                let result = solver.check();
+                solver.pop(1);
+                result
+            });
+            let unsat = with_solver(|solver| {
+                solver.push();
+                solver.assert(x.eq(1));
+                solver.assert(x.eq(2));
+                let result = solver.check();
+                solver.pop(1);
+                result
+            });
+            (sat, unsat)
+        });
+        assert_eq!(result.0, SatResult::Sat);
+        assert_eq!(result.1, SatResult::Unsat);
+    }
 }

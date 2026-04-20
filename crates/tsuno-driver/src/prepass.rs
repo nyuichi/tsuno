@@ -18,6 +18,8 @@ use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{DUMMY_SP, Span, Symbol};
 
+const PRELUDE_GHOST_SOURCE: &str = include_str!("../lib/prelude.rs");
+
 #[derive(Debug, Clone, Default)]
 pub struct HirBindingInfo {
     pub spans: HashMap<HirId, Span>,
@@ -306,22 +308,12 @@ pub fn compute_program_prepass<'tcx>(
 pub fn compute_global_ghost_prepass<'tcx>(
     tcx: TyCtxt<'tcx>,
 ) -> Result<GlobalGhostPrepass, LoopPrepassError> {
-    let mut sources = Vec::new();
-    let mut seen_sources = HashSet::new();
-    for item_id in tcx.hir_free_items() {
-        let item = tcx.hir_item(item_id);
-        let loc = tcx.sess.source_map().lookup_char_pos(item.span.lo());
-        let key = loc.file.start_pos;
-        if seen_sources.insert(key) {
-            sources.push((
-                item.span,
-                loc.file
-                    .src
-                    .as_ref()
-                    .map_or_else(String::new, |src| src.as_str().to_owned()),
-            ));
-        }
-    }
+    let anchor_span = tcx
+        .hir_free_items()
+        .next()
+        .map(|item_id| tcx.hir_item(item_id).span)
+        .unwrap_or(DUMMY_SP);
+    let sources = collect_global_ghost_sources(tcx, anchor_span);
 
     let mut enum_defs = Vec::new();
     let mut pure_fn_defs = Vec::new();
@@ -335,12 +327,6 @@ pub fn compute_global_ghost_prepass<'tcx>(
             &mut lemma_defs,
         )?;
     }
-
-    let anchor_span = tcx
-        .hir_free_items()
-        .next()
-        .map(|item_id| tcx.hir_item(item_id).span)
-        .unwrap_or(DUMMY_SP);
 
     let mut enums = HashMap::new();
     for enum_def in enum_defs {
@@ -395,6 +381,26 @@ pub fn compute_global_ghost_prepass<'tcx>(
         typed_pure_fns,
         typed_lemmas,
     })
+}
+
+fn collect_global_ghost_sources<'tcx>(tcx: TyCtxt<'tcx>, anchor_span: Span) -> Vec<(Span, String)> {
+    let mut sources = vec![(anchor_span, PRELUDE_GHOST_SOURCE.to_owned())];
+    let mut seen_sources = HashSet::new();
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
+        let loc = tcx.sess.source_map().lookup_char_pos(item.span.lo());
+        let key = loc.file.start_pos;
+        if seen_sources.insert(key) {
+            sources.push((
+                item.span,
+                loc.file
+                    .src
+                    .as_ref()
+                    .map_or_else(String::new, |src| src.as_str().to_owned()),
+            ));
+        }
+    }
+    sources
 }
 
 pub fn compute_hir_locals<'tcx>(
