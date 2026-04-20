@@ -14,119 +14,102 @@ All spec values inhabit one uninterpreted Z3 sort:
 
   value
 
-Primitive values use dedicated boxing/unboxing symbols:
+Primitive values still use dedicated boxing/unboxing symbols:
 
-  (boolbox) : Bool -> value
-  (bool)    : value -> Bool
-  (intbox)  : Int -> value
-  (int)     : value -> Int
+  boolbox : Bool -> value
+  bool    : value -> Bool
+  intbox  : Int -> value
+  int     : value -> Int
 
-The backend asserts the following primitive axioms:
+Important: we intentionally do not assert quantified primitive reboxing axioms
+such as
 
-  forall b: Bool. (bool)((boolbox)(b)) = b
-    pattern: ((boolbox)(b))
+  forall v: value. boolbox(bool(v)) = v
+  forall v: value. intbox(int(v)) = v
 
-  forall v: value. (boolbox)((bool)(v)) = v
-    pattern: ((bool)(v))
+Those axioms made the shared `value` sort too strong and could collapse
+distinct representations. Instead, `bool_term` / `int_term` only unwrap
+syntactically obvious boxed terms:
 
-  forall i: Int. (int)((intbox)(i)) = i
-    pattern: ((intbox)(i))
+  bool_term(boolbox(b)) = b
+  int_term(intbox(i)) = i
 
-  forall v: value. (intbox)((int)(v)) = v
-    pattern: ((int)(v))
+For an opaque `v: value`, `bool(v)` and `int(v)` remain uninterpreted.
 
-  (bool)((intbox)(0)) = false
+Composite values are arranged like constructor families.
 
-Composite values are arranged like VeriFast constructor families.
+- Structural composites (`Tuple`, `Struct`, `Ref<T>`, `Mut<T>`) get fresh
+  per-type constructor/tag/projection symbols, but unlike named spec types we
+  do not assert general `forall` laws for them, e.g.
 
-For structural composites such as tuples, structs, Ref<T>, and Mut<T>, each
-concrete spec type gets a fresh subtype id `s` and, today, one constructor
-layout.
+    forall x0 .. xn-1. ctortag<family>(mk_<name>(x0, .., xn-1)) = TAG_<name>
+    forall x0 .. xn-1. ctorinv_<name>_<i>(mk_<name>(x0, .., xn-1)) = xi
 
-For named spec enums, the constructor family is nominal and shared across all
-instantiations of the same enum declaration. This matches VeriFast's erased
-encoding of inductive datatype constructors: for `enum List<T> { Nil, Cons(T,
-List<T>) }`, both `List<i32>` and `List<bool>` reuse the same constructor/tag
-symbols. Type arguments are enforced only through per-instantiation invariant
-predicates.
+  We only exploit those equalities syntactically when the term already is a
+  visible constructor application.
+- Named spec types (`SpecTy::Named`, i.e. ghost enums such as `List<T>`) reuse
+  one nominal constructor family across all instantiations of the same enum
+  declaration. Type arguments are enforced through per-instantiation invariant
+  predicates.
 
-For a constructor family whose sanitized name is `<name>`, the backend creates:
+For a constructor family whose sanitized constructor name is `<name>`, the
+backend creates:
 
-  mk_<name>             : value^n -> value
-  ctortag<s>            : value -> Int
-  ctorinv_<name>_<i>    : value -> value
-  TAG_<name>            : Int literal unique to the constructor
+  mk_<name>          : value^n -> value
+  ctortag<family>    : value -> Int
+  ctorinv_<name>_<i> : value -> value
+  TAG_<name>         : Int literal unique to the constructor
 
-and asserts:
+For named spec types only, the backend asserts:
 
-  forall x0 .. xn-1. ctortag<s>(mk_<name>(x0, .., xn-1)) = TAG_<name>
+  forall x0 .. xn-1. ctortag<family>(mk_<name>(x0, .., xn-1)) = TAG_<name>
     pattern: mk_<name>(x0, .., xn-1)
 
   forall x0 .. xn-1. ctorinv_<name>_<i>(mk_<name>(x0, .., xn-1)) = xi
     pattern: mk_<name>(x0, .., xn-1)
 
-Single-constructor structural composites additionally get the eta-style axiom:
+If a named family has exactly one non-empty constructor, it also gets the
+eta-style axiom:
 
-  forall v: value. mk_<name>(ctorinv_<name>_0(v), .., ctorinv_<name>_n(v)) = v
+  forall v: value.
+    mk_<name>(ctorinv_<name>_0(v), .., ctorinv_<name>_n(v)) = v
 
-Named spec enums also get a per-instantiation invariant predicate:
+Named spec types also get a per-instantiation invariant predicate:
 
   inv_<name<args>> : value -> Bool
 
-For `List<i32>`, this invariant says exactly that a value is either a `Nil`
-constructor, or a `Cons` constructor whose head satisfies the `i32` range
-invariant and whose tail satisfies `inv_List<i32>`. For `List<bool>`, the same
-constructor family is reused, but the invariant changes to require boolean
-heads and recursive `inv_List<bool>` tails.
+The asserted invariant axioms have two directions.
 
-Recursive pure functions are encoded in `engine.rs` on top of the enum
-constructor family described above. There is no separate fixpoint datatype here;
-the function still has type `value^n -> value`.
+Constructor introduction:
 
-Concrete example:
+  forall x0 .. xn-1.
+    field_inv_0(x0) && .. && field_inv_n(xn-1)
+      => inv_<name<args>>(mk_<name>(x0, .., xn-1))
 
-  /*@
-  enum List<T> { Nil, Cons(T, List<T>) }
+Invariant elimination:
 
-  fn len(xs: List<i32>) -> i32 {
-      match xs {
-          List::Nil => 0i32,
-          List::Cons(_, xs0) => 1i32 + len(xs0),
-      }
-  }
-  */
+  forall v: value.
+    inv_<name<args>>(v)
+      => OR_over_ctors(
+           ctortag<family>(v) = TAG_<name_k>
+           && field_inv_0(ctorinv_<name_k>_0(v))
+           && ..
+         )
 
-The engine creates a single uninterpreted symbol:
+For structural composites we do not assert those quantified constructor laws.
+Instead, a few operations perform syntactic reasoning when the term is already a
+constructor application:
 
-  len : value -> value
+  project_composite_field(mk_<name>(...), i)  ==> syntactically returns arg_i
+  tag_formula(mk_<name>(...), k)              ==> true/false syntactically
 
-and then asserts one equation per constructor arm, schematically:
+If the value is opaque, those operations fall back to uninterpreted projection
+or tag terms; there is no global eta/extensionality axiom for tuples, refs, or
+plain structs.
 
-  forall .
-    len(mk_List_Nil()) = (intbox)(0)
-
-  forall head tail.
-    i32_range((int)(head)) && inv_List<i32>(tail)
-      => len(mk_List_Cons(head, tail))
-           = (intbox)((int)(len(tail)) + 1)
-
-so recursion happens through the constructor argument `tail`, not by unfolding a
-separate recursive value encoding.
-
-When a proof or recursive lemma does
-
-  match xs {
-      List::Cons(x, xs0) => ...
-  }
-
-the branch uses the same constructor family:
-
-  x   = ctorinv_List_Cons_0(xs)
-  xs0 = ctorinv_List_Cons_1(xs)
-  xs  = mk_List_Cons(x, xs0)
-
-That last equality is what lets Z3 rewrite `len(xs)` using the constructor
-equation above.
+Pure functions are encoded in `engine.rs` on top of these symbols using
+`RecFuncDecl`. This file only defines the value-level constructor/tag/invariant
+encoding that those recursive definitions refer to.
 */
 
 #[derive(Debug, Clone, PartialEq, Eq)]
