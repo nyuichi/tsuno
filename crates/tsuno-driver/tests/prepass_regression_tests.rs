@@ -10,6 +10,12 @@ fn fixture_file(name: &str) -> PathBuf {
         .join(format!("{name}.rs"))
 }
 
+fn pass_fixture_file(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/snapshots/pass")
+        .join(format!("{name}.rs"))
+}
+
 fn prepass_fixture_file(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/prepass")
@@ -110,6 +116,27 @@ fn rejects_invalid_ghosts_without_toplevel_functions() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("lemma `bad` assertion failed"),
+        "unexpected stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn prelude_definitions_are_available_by_default() {
+    let output = run_fixture_file(pass_fixture_file("uses_prelude_definitions"));
+    assert!(
+        output.status.success(),
+        "unexpected stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn redefining_prelude_definition_is_rejected() {
+    let output = run_prepass_fixture("rejects_duplicate_prelude_definition");
+    assert!(!output.status.success(), "fixture unexpectedly passed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("duplicate pure function name"),
         "unexpected stdout:\n{stdout}"
     );
 }
