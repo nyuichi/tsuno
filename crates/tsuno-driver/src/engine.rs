@@ -858,7 +858,7 @@ impl<'tcx> Verifier<'tcx> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let domain_refs: Vec<_> = domain_sorts.iter().collect();
-        let result_sort = self.type_encoding(&pure_fn.result_ty)?.sort.clone();
+        let result_sort = self.type_encoding(&pure_fn.body.ty)?.sort.clone();
         let decl = RecFuncDecl::new(
             format!("pure_fn_{}", pure_fn.name),
             &domain_refs,
