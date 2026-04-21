@@ -392,6 +392,17 @@ pub fn parse_raw_expr(_kind: &str, text: &str) -> Result<Expr, ParseError> {
     parse_raw_expr_with_type_params(_kind, text, &[])
 }
 
+fn parse_spec_ty_text_with_params(
+    text: &str,
+    type_params: &[String],
+) -> Result<SpecTy, ParseError> {
+    let mut parser = Parser::new(text)?;
+    parser.type_params = type_params.to_vec();
+    let ty = parser.parse_spec_ty()?;
+    parser.expect_end()?;
+    Ok(ty)
+}
+
 fn parse_raw_expr_with_type_params(
     _kind: &str,
     text: &str,
@@ -1051,7 +1062,7 @@ impl Parser {
         })
     }
 
-    fn parse_token_spec_ty(&mut self) -> Result<SpecTy, ParseError> {
+    fn parse_spec_ty(&mut self) -> Result<SpecTy, ParseError> {
         let Some(Token::Ident(ident)) = self.next().cloned() else {
             return Err(ParseError::new("expected a type argument"));
         };
@@ -1059,7 +1070,7 @@ impl Parser {
             let mut args = Vec::new();
             if !self.eat(&Token::Gt) {
                 loop {
-                    args.push(self.parse_token_spec_ty()?);
+                    args.push(self.parse_spec_ty()?);
                     if self.eat(&Token::Gt) {
                         break;
                     }
@@ -1104,7 +1115,7 @@ impl Parser {
         let mut args = Vec::new();
         if !self.eat(&Token::Gt) {
             loop {
-                args.push(self.parse_token_spec_ty()?);
+                args.push(self.parse_spec_ty()?);
                 if self.eat(&Token::Gt) {
                     break;
                 }
@@ -1219,7 +1230,7 @@ pub fn parse_pure_fn_block(text: &str) -> Result<Vec<PureFnDef>, ParseError> {
 }
 
 pub fn parse_ghost_block(text: &str) -> Result<GhostBlock, ParseError> {
-    let mut parser = PureFnParser::new(text);
+    let mut parser = GhostBlockParser::new(text);
     let mut block = GhostBlock::default();
     while parser.skip_ws() {
         match parser.parse_item()? {
@@ -1237,19 +1248,14 @@ enum GhostItem {
     Lemma(LemmaDef),
 }
 
-struct PureFnParser<'a> {
+struct GhostBlockParser<'a> {
     text: &'a str,
     cursor: usize,
-    type_params: Vec<String>,
 }
 
-impl<'a> PureFnParser<'a> {
+impl<'a> GhostBlockParser<'a> {
     fn new(text: &'a str) -> Self {
-        Self {
-            text,
-            cursor: 0,
-            type_params: Vec::new(),
-        }
+        Self { text, cursor: 0 }
     }
 
     fn skip_ws(&mut self) -> bool {
@@ -1278,7 +1284,7 @@ impl<'a> PureFnParser<'a> {
             loop {
                 let param_name = self.parse_ident()?;
                 self.expect_char(':')?;
-                let ty = self.parse_spec_ty_with_params(&type_params)?;
+                let ty = self.parse_spec_ty_annotation(&type_params, &[',', ')'])?;
                 params.push(PureFnParam {
                     name: param_name,
                     ty,
@@ -1323,7 +1329,7 @@ impl<'a> PureFnParser<'a> {
                 self.skip_ws();
                 if !self.eat_char(')') {
                     loop {
-                        fields.push(self.parse_spec_ty_with_params(&type_params)?);
+                        fields.push(self.parse_spec_ty_annotation(&type_params, &[',', ')'])?);
                         self.skip_ws();
                         if self.eat_char(')') {
                             break;
@@ -1356,7 +1362,7 @@ impl<'a> PureFnParser<'a> {
         params: Vec<PureFnParam>,
     ) -> Result<PureFnDef, ParseError> {
         self.expect_arrow()?;
-        let result_ty = self.parse_spec_ty_with_params(&[])?;
+        let result_ty = self.parse_spec_ty_annotation(&[], &['{'])?;
         self.expect_char('{')?;
         let body = self.parse_braced_body()?;
         Ok(PureFnDef {
@@ -1373,23 +1379,21 @@ impl<'a> PureFnParser<'a> {
         type_params: Vec<String>,
         params: Vec<PureFnParam>,
     ) -> Result<LemmaDef, ParseError> {
-        let saved_type_params = std::mem::replace(&mut self.type_params, type_params.clone());
         self.expect_keyword("req")?;
-        let req = self.parse_line_expr("lemma req")?;
+        let req = self.parse_line_expr("lemma req", &type_params)?;
         self.expect_keyword("ens")?;
-        let ens = self.parse_line_expr("lemma ens")?;
+        let ens = self.parse_line_expr("lemma ens", &type_params)?;
         self.expect_char('{')?;
         let body = self.parse_braced_body()?;
-        let lemma = LemmaDef {
+        let body = self.parse_lemma_body(body, &type_params)?;
+        Ok(LemmaDef {
             name,
-            type_params: type_params.clone(),
+            type_params,
             params,
             req,
             ens,
-            body: self.parse_lemma_body(body, &type_params)?,
-        };
-        self.type_params = saved_type_params;
-        Ok(lemma)
+            body,
+        })
     }
 
     fn parse_type_params(&mut self) -> Result<Vec<String>, ParseError> {
@@ -1405,50 +1409,6 @@ impl<'a> PureFnParser<'a> {
                 return Ok(type_params);
             }
             self.expect_char(',')?;
-        }
-    }
-
-    fn parse_spec_ty_with_params(&mut self, type_params: &[String]) -> Result<SpecTy, ParseError> {
-        let ident = self.parse_ident()?;
-        self.skip_ws();
-        let args = if self.eat_char('<') {
-            let mut args = Vec::new();
-            self.skip_ws();
-            if !self.eat_char('>') {
-                loop {
-                    args.push(self.parse_spec_ty_with_params(type_params)?);
-                    self.skip_ws();
-                    if self.eat_char('>') {
-                        break;
-                    }
-                    self.expect_char(',')?;
-                }
-            }
-            args
-        } else {
-            Vec::new()
-        };
-        match ident.as_str() {
-            "bool" if args.is_empty() => Ok(SpecTy::Bool),
-            "i8" if args.is_empty() => Ok(SpecTy::I8),
-            "i16" if args.is_empty() => Ok(SpecTy::I16),
-            "i32" if args.is_empty() => Ok(SpecTy::I32),
-            "i64" if args.is_empty() => Ok(SpecTy::I64),
-            "isize" if args.is_empty() => Ok(SpecTy::Isize),
-            "u8" if args.is_empty() => Ok(SpecTy::U8),
-            "u16" if args.is_empty() => Ok(SpecTy::U16),
-            "u32" if args.is_empty() => Ok(SpecTy::U32),
-            "u64" if args.is_empty() => Ok(SpecTy::U64),
-            "usize" if args.is_empty() => Ok(SpecTy::Usize),
-            "Seq" if args.len() == 1 => Ok(SpecTy::Seq(Box::new(args[0].clone()))),
-            "Seq" => Err(ParseError::new(format!(
-                "spec type `Seq` expects 1 type argument, found {}",
-                args.len()
-            ))),
-            _ if args.is_empty() && type_params.iter().any(|param| param == &ident) => {
-                Ok(SpecTy::TypeParam(ident))
-            }
-            _ => Ok(SpecTy::Named { name: ident, args }),
         }
     }
 
@@ -1478,44 +1438,45 @@ impl<'a> PureFnParser<'a> {
         type_params: &[String],
     ) -> Result<Vec<GhostStmt>, ParseError> {
         let mut parser = Self::new(body);
-        parser.type_params = type_params.to_vec();
-        parser.parse_lemma_stmts()
+        parser.parse_lemma_stmts(type_params)
     }
 
-    fn parse_lemma_stmts(&mut self) -> Result<Vec<GhostStmt>, ParseError> {
+    fn parse_lemma_stmts(&mut self, type_params: &[String]) -> Result<Vec<GhostStmt>, ParseError> {
         let mut stmts = Vec::new();
         while self.skip_ws() {
-            stmts.push(self.parse_lemma_stmt()?);
+            stmts.push(self.parse_lemma_stmt(type_params)?);
         }
         Ok(stmts)
     }
 
-    fn parse_lemma_stmt(&mut self) -> Result<GhostStmt, ParseError> {
+    fn parse_lemma_stmt(&mut self, type_params: &[String]) -> Result<GhostStmt, ParseError> {
         if self.starts_with_keyword("assert") {
             self.expect_keyword("assert")?;
             let (expr_text, next) = self.parse_stmt_expr_text(self.text, self.cursor)?;
             self.cursor = next;
-            return Ok(GhostStmt::Assert(parse_source_expr(
+            return Ok(GhostStmt::Assert(parse_source_expr_with_type_params(
                 "lemma assert",
                 expr_text,
+                type_params,
             )?));
         }
         if self.starts_with_keyword("assume") {
             self.expect_keyword("assume")?;
             let (expr_text, next) = self.parse_stmt_expr_text(self.text, self.cursor)?;
             self.cursor = next;
-            return Ok(GhostStmt::Assume(parse_source_expr(
+            return Ok(GhostStmt::Assume(parse_source_expr_with_type_params(
                 "lemma assume",
                 expr_text,
+                type_params,
             )?));
         }
         if self.starts_with_keyword("match") {
             self.expect_keyword("match")?;
-            return self.parse_lemma_match_stmt();
+            return self.parse_lemma_match_stmt(type_params);
         }
         let (expr_text, next) = self.parse_stmt_expr_text(self.text, self.cursor)?;
         self.cursor = next;
-        match parse_source_expr_with_type_params("lemma call", expr_text, &self.type_params)? {
+        match parse_source_expr_with_type_params("lemma call", expr_text, type_params)? {
             Expr::Call {
                 func,
                 type_args,
@@ -1531,10 +1492,14 @@ impl<'a> PureFnParser<'a> {
         }
     }
 
-    fn parse_lemma_match_stmt(&mut self) -> Result<GhostStmt, ParseError> {
+    fn parse_lemma_match_stmt(&mut self, type_params: &[String]) -> Result<GhostStmt, ParseError> {
         let (scrutinee_text, cursor) = self.parse_until_top_level_char('{')?;
         self.cursor = cursor;
-        let scrutinee = parse_source_expr("lemma match scrutinee", scrutinee_text)?;
+        let scrutinee = parse_source_expr_with_type_params(
+            "lemma match scrutinee",
+            scrutinee_text,
+            type_params,
+        )?;
         self.expect_char('{')?;
         let mut arms = Vec::new();
         let mut default = None;
@@ -1551,7 +1516,7 @@ impl<'a> PureFnParser<'a> {
             self.cursor = next;
             self.expect_char('{')?;
             let body_text = self.parse_braced_body()?;
-            let body = self.parse_lemma_body(body_text, &self.type_params)?;
+            let body = self.parse_lemma_body(body_text, type_params)?;
             let pattern_text = pattern_text.trim();
             if pattern_text == "_" {
                 if default.is_some() {
@@ -1584,10 +1549,20 @@ impl<'a> PureFnParser<'a> {
         })
     }
 
-    fn parse_line_expr(&mut self, kind: &str) -> Result<Expr, ParseError> {
+    fn parse_line_expr(&mut self, kind: &str, type_params: &[String]) -> Result<Expr, ParseError> {
         let (text, next) = self.parse_line_expr_text(self.text, self.cursor)?;
         self.cursor = next;
-        parse_source_expr_with_type_params(kind, text, &self.type_params)
+        parse_source_expr_with_type_params(kind, text, type_params)
+    }
+
+    fn parse_spec_ty_annotation(
+        &mut self,
+        type_params: &[String],
+        terminators: &[char],
+    ) -> Result<SpecTy, ParseError> {
+        let (text, next) = self.capture_until_top_level_char(terminators)?;
+        self.cursor = next;
+        parse_spec_ty_text_with_params(text, type_params)
     }
 
     fn parse_line_expr_text(
@@ -1640,6 +1615,39 @@ impl<'a> PureFnParser<'a> {
             cursor += ch.len_utf8();
         }
         Err(ParseError::new("expected `;` after ghost statement"))
+    }
+
+    fn capture_until_top_level_char(
+        &self,
+        terminators: &[char],
+    ) -> Result<(&'a str, usize), ParseError> {
+        let mut cursor = self.cursor;
+        while let Some(ch) = self.text[cursor..].chars().next() {
+            if ch.is_whitespace() {
+                cursor += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let start = cursor;
+        let mut depth = 0usize;
+        while cursor < self.text.len() {
+            let ch = self.text[cursor..].chars().next().expect("char");
+            match ch {
+                _ if depth == 0 && terminators.contains(&ch) => {
+                    let text = self.text[start..cursor].trim_end();
+                    if text.is_empty() {
+                        return Err(ParseError::new("expected spec type"));
+                    }
+                    return Ok((text, cursor));
+                }
+                '(' | '[' | '<' => depth += 1,
+                ')' | ']' | '>' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            cursor += ch.len_utf8();
+        }
+        Err(ParseError::new("expected spec type"))
     }
 
     fn parse_until_top_level_char(&self, target: char) -> Result<(&'a str, usize), ParseError> {
@@ -1779,6 +1787,7 @@ mod tests {
         BinaryOp, EnumCtorDef, EnumDef, Expr, GhostBlock, GhostStmt, IntLiteral, IntSuffix,
         LemmaDef, MatchArm, MatchBinding, MatchPattern, PureFnDef, PureFnParam, SpecTy, UnaryOp,
         parse_expr, parse_ghost_block, parse_pure_fn_block, parse_raw_expr,
+        parse_spec_ty_text_with_params,
     };
 
     #[test]
@@ -2048,6 +2057,22 @@ mod tests {
                     type_args: vec![],
                     args: vec![],
                 }),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_spec_type_text_with_type_params() {
+        let ty =
+            parse_spec_ty_text_with_params("Seq<T>", &["T".to_owned()]).expect("generic spec type");
+        assert_eq!(ty, SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned()))));
+
+        let ty = parse_spec_ty_text_with_params("List<i32>", &[]).expect("named generic spec type");
+        assert_eq!(
+            ty,
+            SpecTy::Named {
+                name: "List".to_owned(),
+                args: vec![SpecTy::I32],
             }
         );
     }
