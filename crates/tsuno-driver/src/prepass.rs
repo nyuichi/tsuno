@@ -45,7 +45,7 @@ pub struct LoopContract {
     pub written_locals: BTreeSet<rustc_middle::mir::Local>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LoopContracts {
     pub by_header: HashMap<BasicBlock, LoopContract>,
     pub by_invariant_block: HashMap<BasicBlock, BasicBlock>,
@@ -79,7 +79,7 @@ pub enum ControlPointDirective {
     LemmaCall(LemmaCallContract),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ControlPointDirectives {
     pub by_control_point: HashMap<(BasicBlock, usize), Vec<ControlPointDirective>>,
 }
@@ -88,7 +88,6 @@ pub struct ControlPointDirectives {
 pub struct TypedPureFnDef {
     pub name: String,
     pub params: Vec<ContractParam>,
-    pub result_ty: SpecTy,
     pub body: TypedExpr,
 }
 
@@ -148,32 +147,8 @@ pub struct FunctionContract {
     pub result: SpecTy,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub enum LoweredDirectiveTarget {
-    FunctionEntry,
-    FunctionExit,
-    ControlPoint(BasicBlock, usize),
-    Loop {
-        header: BasicBlock,
-        invariant_block: BasicBlock,
-    },
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct LoweredDirective {
-    pub span: Span,
-    pub span_text: String,
-    pub kind: DirectiveKind,
-    pub target: LoweredDirectiveTarget,
-    pub expr: Expr,
-}
-
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DirectivePrepass {
-    pub directives: Vec<LoweredDirective>,
     pub loop_contracts: LoopContracts,
     pub control_point_directives: ControlPointDirectives,
     pub function_contract: Option<FunctionContract>,
@@ -181,10 +156,17 @@ pub struct DirectivePrepass {
 }
 
 #[derive(Debug, Clone)]
-pub struct GlobalGhostPrepass {
+struct RawGlobalGhostPrepass {
     pub enums: HashMap<String, EnumDef>,
     pub pure_fns: HashMap<String, PureFnDef>,
     pub lemmas: HashMap<String, LemmaDef>,
+    pure_fn_order: Vec<String>,
+    lemma_order: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GlobalGhostPrepass {
+    pub enums: HashMap<String, EnumDef>,
     pub typed_pure_fns: Vec<TypedPureFnDef>,
     pub typed_lemmas: Vec<TypedLemmaDef>,
 }
@@ -203,13 +185,6 @@ pub struct ProgramPrepass {
 }
 
 impl LoopContracts {
-    pub fn empty() -> Self {
-        Self {
-            by_header: HashMap::new(),
-            by_invariant_block: HashMap::new(),
-        }
-    }
-
     pub fn contract_by_header(&self, header: BasicBlock) -> Option<&LoopContract> {
         self.by_header.get(&header)
     }
@@ -220,12 +195,6 @@ impl LoopContracts {
 }
 
 impl ControlPointDirectives {
-    pub fn empty() -> Self {
-        Self {
-            by_control_point: HashMap::new(),
-        }
-    }
-
     pub fn directives_at(
         &self,
         block: BasicBlock,
@@ -237,12 +206,12 @@ impl ControlPointDirectives {
     }
 }
 
-pub fn compute_function_prepass<'tcx>(
+fn compute_function_prepass<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     item_span: Span,
     body: &Body<'tcx>,
-    ghosts: &GlobalGhostPrepass,
+    ghosts: &RawGlobalGhostPrepass,
 ) -> Result<DirectivePrepass, VerificationResult> {
     compute_directives(tcx, def_id, item_span, body, ghosts).map_err(|error| VerificationResult {
         function: tcx.def_path_str(def_id.to_def_id()),
@@ -257,7 +226,21 @@ pub fn compute_function_prepass<'tcx>(
 pub fn compute_program_prepass<'tcx>(
     tcx: TyCtxt<'tcx>,
 ) -> Result<ProgramPrepass, Vec<VerificationResult>> {
-    let ghosts = match compute_global_ghost_prepass(tcx) {
+    let anchor_span = global_ghost_anchor_span(tcx);
+    let raw_ghosts = match compute_raw_global_ghost_prepass(tcx, anchor_span) {
+        Ok(ghosts) => ghosts,
+        Err(error) => {
+            return Err(vec![VerificationResult {
+                function: "prepass".to_owned(),
+                status: VerificationStatus::Unsupported,
+                span: error
+                    .display_span
+                    .unwrap_or_else(|| tcx.sess.source_map().span_to_diagnostic_string(error.span)),
+                message: error.message,
+            }]);
+        }
+    };
+    let ghosts = match type_global_ghost_prepass(&raw_ghosts, anchor_span) {
         Ok(ghosts) => ghosts,
         Err(error) => {
             return Err(vec![VerificationResult {
@@ -281,7 +264,7 @@ pub fn compute_program_prepass<'tcx>(
         };
         let def_id = item.owner_id.def_id;
         let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
-        match compute_function_prepass(tcx, def_id, item.span, &body.borrow(), &ghosts) {
+        match compute_function_prepass(tcx, def_id, item.span, &body.borrow(), &raw_ghosts) {
             Ok(prepass) => {
                 let contract = prepass
                     .function_contract
@@ -305,14 +288,17 @@ pub fn compute_program_prepass<'tcx>(
     }
 }
 
-pub fn compute_global_ghost_prepass<'tcx>(
-    tcx: TyCtxt<'tcx>,
-) -> Result<GlobalGhostPrepass, LoopPrepassError> {
-    let anchor_span = tcx
-        .hir_free_items()
+fn global_ghost_anchor_span<'tcx>(tcx: TyCtxt<'tcx>) -> Span {
+    tcx.hir_free_items()
         .next()
         .map(|item_id| tcx.hir_item(item_id).span)
-        .unwrap_or(DUMMY_SP);
+        .unwrap_or(DUMMY_SP)
+}
+
+fn compute_raw_global_ghost_prepass<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    anchor_span: Span,
+) -> Result<RawGlobalGhostPrepass, LoopPrepassError> {
     let sources = collect_global_ghost_sources(tcx, anchor_span);
 
     let mut enum_defs = Vec::new();
@@ -371,13 +357,29 @@ pub fn compute_global_ghost_prepass<'tcx>(
         lemma_order.push(lemma.name);
     }
 
-    let typed_pure_fns = type_pure_fns(&pure_fns, &pure_fn_order, &enums, anchor_span)?;
-    let typed_lemmas = type_lemmas(&lemmas, &lemma_order, &pure_fns, &enums, anchor_span)?;
-
-    Ok(GlobalGhostPrepass {
+    Ok(RawGlobalGhostPrepass {
         enums,
         pure_fns,
         lemmas,
+        pure_fn_order,
+        lemma_order,
+    })
+}
+
+fn type_global_ghost_prepass(
+    raw: &RawGlobalGhostPrepass,
+    anchor_span: Span,
+) -> Result<GlobalGhostPrepass, LoopPrepassError> {
+    let typed_pure_fns = type_pure_fns(&raw.pure_fns, &raw.pure_fn_order, &raw.enums, anchor_span)?;
+    let typed_lemmas = type_lemmas(
+        &raw.lemmas,
+        &raw.lemma_order,
+        &raw.pure_fns,
+        &raw.enums,
+        anchor_span,
+    )?;
+    Ok(GlobalGhostPrepass {
+        enums: raw.enums.clone(),
         typed_pure_fns,
         typed_lemmas,
     })
@@ -3245,12 +3247,12 @@ fn type_tuple_field_expr(base: TypedExpr, index: usize) -> Result<TypedExpr, Str
     })
 }
 
-pub fn compute_directives<'tcx>(
+fn compute_directives<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     item_span: Span,
     body: &Body<'tcx>,
-    ghosts: &GlobalGhostPrepass,
+    ghosts: &RawGlobalGhostPrepass,
 ) -> Result<DirectivePrepass, LoopPrepassError> {
     let enum_defs = &ghosts.enums;
     let pure_fns = &ghosts.pure_fns;
@@ -3646,25 +3648,11 @@ pub fn compute_directives<'tcx>(
     };
     let loop_contracts =
         collect_loop_contracts(tcx, body, &directives, &resolved_exprs, &typed_body_exprs)?;
-    let mut control_point_directives = ControlPointDirectives::empty();
-    let mut lowered = Vec::with_capacity(directives.directives.len());
+    let mut control_point_directives = ControlPointDirectives::default();
 
     for directive in directives.directives {
         match directive.kind {
-            DirectiveKind::Req => lowered.push(LoweredDirective {
-                span: directive.span,
-                span_text: directive.span_text,
-                kind: directive.kind,
-                target: LoweredDirectiveTarget::FunctionEntry,
-                expr: directive.expr,
-            }),
-            DirectiveKind::Ens => lowered.push(LoweredDirective {
-                span: directive.span,
-                span_text: directive.span_text,
-                kind: directive.kind,
-                target: LoweredDirectiveTarget::FunctionExit,
-                expr: directive.expr,
-            }),
+            DirectiveKind::Req | DirectiveKind::Ens => {}
             DirectiveKind::Assert => {
                 let control = control_point_after(body, directive_anchor_span(&directive.attach))
                     .ok_or_else(|| LoopPrepassError {
@@ -3693,13 +3681,6 @@ pub fn compute_directives<'tcx>(
                         resolution,
                         assertion_span: directive.span_text.clone(),
                     }));
-                lowered.push(LoweredDirective {
-                    span: directive.span,
-                    span_text: directive.span_text,
-                    kind: directive.kind,
-                    target: LoweredDirectiveTarget::ControlPoint(control.0, control.1),
-                    expr: directive.expr,
-                });
             }
             DirectiveKind::Assume => {
                 let control = control_point_after(body, directive_anchor_span(&directive.attach))
@@ -3728,33 +3709,8 @@ pub fn compute_directives<'tcx>(
                             .expect("typed assumption expression"),
                         resolution,
                     }));
-                lowered.push(LoweredDirective {
-                    span: directive.span,
-                    span_text: directive.span_text,
-                    kind: directive.kind,
-                    target: LoweredDirectiveTarget::ControlPoint(control.0, control.1),
-                    expr: directive.expr,
-                });
             }
-            DirectiveKind::Inv => {
-                let Some(contract) = loop_contracts
-                    .by_header
-                    .values()
-                    .find(|contract| contract.invariant_span == directive.span_text)
-                else {
-                    continue;
-                };
-                lowered.push(LoweredDirective {
-                    span: directive.span,
-                    span_text: directive.span_text,
-                    kind: directive.kind,
-                    target: LoweredDirectiveTarget::Loop {
-                        header: contract.header,
-                        invariant_block: contract.invariant_block,
-                    },
-                    expr: directive.expr,
-                });
-            }
+            DirectiveKind::Inv => {}
             DirectiveKind::LemmaCall => {
                 let control = control_point_after(body, directive_anchor_span(&directive.attach))
                     .ok_or_else(|| LoopPrepassError {
@@ -3781,19 +3737,11 @@ pub fn compute_directives<'tcx>(
                     .entry(control)
                     .or_default()
                     .push(ControlPointDirective::LemmaCall(contract));
-                lowered.push(LoweredDirective {
-                    span: directive.span,
-                    span_text: directive.span_text,
-                    kind: directive.kind,
-                    target: LoweredDirectiveTarget::ControlPoint(control.0, control.1),
-                    expr: directive.expr,
-                });
             }
         }
     }
 
     Ok(DirectivePrepass {
-        directives: lowered,
         loop_contracts,
         control_point_directives,
         function_contract,
@@ -4268,7 +4216,6 @@ fn type_pure_fns(
         let typed_def = TypedPureFnDef {
             name: def.name.clone(),
             params,
-            result_ty: def.result_ty.clone(),
             body,
         };
         validate_recursive_pure_fn(&typed_def).map_err(|message| LoopPrepassError {
@@ -6002,5 +5949,27 @@ mod tests {
 
         assert_eq!(typed.args.len(), 1);
         assert_eq!(typed.args[0].ty, SpecTy::Seq(Box::new(SpecTy::I32)));
+    }
+
+    #[test]
+    fn global_ghost_prepass_exposes_only_typed_output() {
+        let ghosts = GlobalGhostPrepass {
+            enums: HashMap::new(),
+            typed_pure_fns: vec![TypedPureFnDef {
+                name: "id".to_owned(),
+                params: Vec::new(),
+                body: TypedExpr {
+                    ty: SpecTy::I32,
+                    kind: TypedExprKind::Int(IntLiteral {
+                        digits: "1".to_owned(),
+                        suffix: Some(crate::spec::IntSuffix::I32),
+                    }),
+                },
+            }],
+            typed_lemmas: Vec::new(),
+        };
+
+        assert_eq!(ghosts.typed_pure_fns.len(), 1);
+        assert!(ghosts.typed_lemmas.is_empty());
     }
 }
