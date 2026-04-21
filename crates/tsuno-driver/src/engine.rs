@@ -1791,11 +1791,8 @@ impl<'tcx> Verifier<'tcx> {
             | SpecTy::U32
             | SpecTy::U64
             | SpecTy::Named { .. }
-            | SpecTy::Usize => Ok(value.clone()),
-            SpecTy::TypeParam(name) => Err(self.unsupported_result(
-                span,
-                format!("unresolved spec type parameter `{name}` reached verifier"),
-            )),
+            | SpecTy::Usize
+            | SpecTy::TypeParam(_) => Ok(value.clone()),
         }
     }
 
@@ -3207,6 +3204,10 @@ impl<'tcx> Verifier<'tcx> {
             TypeEncodingKind::Int => Ok(self
                 .value_encoder
                 .wrap_int(&Int::new_const(self.fresh_name(hint)))),
+            TypeEncodingKind::Opaque => Ok(SymValue::new(Dynamic::new_const(
+                self.fresh_name(hint),
+                self.value_encoder.value_sort(),
+            ))),
             TypeEncodingKind::Seq => Ok(SymValue::new(Dynamic::from(Z3Seq::new_const(
                 self.fresh_name(hint),
                 self.value_encoder.value_sort(),
@@ -3720,10 +3721,7 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(Some(bool_and(formulas)))
             }
             SpecTy::Named { .. } => self.named_invariant_formula(ty, value, span).map(Some),
-            SpecTy::TypeParam(name) => Err(self.unsupported_result(
-                span,
-                format!("unresolved spec type parameter `{name}` reached verifier"),
-            )),
+            SpecTy::TypeParam(_) => Ok(None),
         }
     }
 
@@ -3788,10 +3786,7 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(bool_and(formulas))
             }
             SpecTy::Named { .. } => self.named_invariant_formula(ty, value, span),
-            SpecTy::TypeParam(name) => Err(self.unsupported_result(
-                span,
-                format!("unresolved spec type parameter `{name}` reached verifier"),
-            )),
+            SpecTy::TypeParam(_) => Ok(Bool::from_bool(true)),
         }
     }
 

@@ -3819,7 +3819,7 @@ fn resolve_lemma_call_expr_env(
     lemmas: &HashMap<String, LemmaDef>,
     spec_scope: &mut SpecScope,
 ) -> Result<ResolvedExprEnv, LoopPrepassError> {
-    let (lemma_name, args) = lemma_call_parts(expr).map_err(|message| LoopPrepassError {
+    let (lemma_name, _, args) = lemma_call_parts(expr).map_err(|message| LoopPrepassError {
         span,
         display_span: None,
         message,
@@ -3859,7 +3859,7 @@ fn infer_lemma_call(
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
 ) -> Result<(), String> {
-    let (lemma_name, args) = lemma_call_parts(expr)?;
+    let (lemma_name, type_args, args) = lemma_call_parts(expr)?;
     let lemma = lemmas
         .get(lemma_name)
         .ok_or_else(|| format!("unknown lemma `{lemma_name}`"))?;
@@ -3870,8 +3870,18 @@ fn infer_lemma_call(
             args.len()
         ));
     }
+    let type_param_scope = HashSet::new();
+    let mut bindings = seed_lemma_type_bindings(
+        lemma_name,
+        &lemma.type_params,
+        type_args,
+        enum_defs,
+        &type_param_scope,
+    )?;
+    let mut arg_tys = Vec::with_capacity(args.len());
     for (arg, param) in args.iter().zip(&lemma.params) {
-        let arg_ty = infer_body_expr_types(
+        let expected = try_instantiate_spec_ty(&param.ty, &bindings);
+        let arg_ty = infer_body_expr_types_with_expected(
             arg,
             pure_fns,
             enum_defs,
@@ -3879,8 +3889,22 @@ fn infer_lemma_call(
             spec_scope,
             local_tys,
             inferred,
+            expected.as_ref(),
         )?;
-        constrain_expr_ty(inferred, &arg_ty, &param.ty)?;
+        if let Some(actual) = known_spec_ty(&arg_ty) {
+            infer_type_param_bindings(&param.ty, &actual, &mut bindings)?;
+        }
+        arg_tys.push(arg_ty);
+    }
+    if lemma
+        .type_params
+        .iter()
+        .all(|type_param| bindings.contains_key(type_param))
+    {
+        let param_tys = instantiate_lemma_param_tys(lemma_name, lemma, &bindings)?;
+        for (arg_ty, param_ty) in arg_tys.iter().zip(param_tys.iter()) {
+            constrain_expr_ty(inferred, arg_ty, param_ty)?;
+        }
     }
     Ok(())
 }
@@ -3896,7 +3920,7 @@ fn typed_lemma_call(
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
 ) -> Result<LemmaCallContract, String> {
-    let (lemma_name, args) = lemma_call_parts(expr)?;
+    let (lemma_name, type_args, args) = lemma_call_parts(expr)?;
     let lemma = lemmas
         .get(lemma_name)
         .ok_or_else(|| format!("unknown lemma `{lemma_name}`"))?;
@@ -3907,9 +3931,18 @@ fn typed_lemma_call(
             args.len()
         ));
     }
+    let type_param_scope = HashSet::new();
+    let mut bindings = seed_lemma_type_bindings(
+        lemma_name,
+        &lemma.type_params,
+        type_args,
+        enum_defs,
+        &type_param_scope,
+    )?;
     let mut typed_args = Vec::with_capacity(args.len());
     for (arg, param) in args.iter().zip(&lemma.params) {
-        let typed = typed_body_expr(
+        let expected = try_instantiate_spec_ty(&param.ty, &bindings);
+        let typed = typed_body_expr_with_expected(
             arg,
             pure_fns,
             enum_defs,
@@ -3917,17 +3950,26 @@ fn typed_lemma_call(
             spec_scope,
             local_tys,
             inferred,
+            expected.as_ref(),
         )?;
-        let unified = unify_spec_tys(&typed.ty, &param.ty)?;
-        if unified != param.ty {
+        infer_type_param_bindings(&param.ty, &typed.ty, &mut bindings)?;
+        typed_args.push(typed);
+    }
+    let param_tys = instantiate_lemma_param_tys(lemma_name, lemma, &bindings)?;
+    for ((typed_arg, param), param_ty) in typed_args
+        .iter()
+        .zip(lemma.params.iter())
+        .zip(param_tys.iter())
+    {
+        let unified = unify_spec_tys(&typed_arg.ty, param_ty)?;
+        if unified != *param_ty {
             return Err(format!(
                 "lemma `{lemma_name}` parameter `{}` expects `{}`, found `{}`",
                 param.name,
-                display_spec_ty(&param.ty),
-                display_spec_ty(&typed.ty)
+                display_spec_ty(param_ty),
+                display_spec_ty(&typed_arg.ty)
             ));
         }
-        typed_args.push(typed);
     }
     Ok(LemmaCallContract {
         lemma_name: lemma_name.to_owned(),
@@ -4260,6 +4302,7 @@ fn infer_lemma_stmts(
     all_lemmas: &HashMap<String, LemmaDef>,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    type_param_scope: &HashSet<String>,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     result_ty: &SpecTy,
@@ -4272,7 +4315,11 @@ fn infer_lemma_stmts(
                     expr, pure_fns, enum_defs, spec_scope, local_tys, false, result_ty, inferred,
                 )?;
             }
-            crate::spec::GhostStmt::Call { name, args } => {
+            crate::spec::GhostStmt::Call {
+                name,
+                type_args,
+                args,
+            } => {
                 let callee = lemma_body_callee(name, available_lemmas, all_lemmas)?;
                 if callee.params.len() != args.len() {
                     return Err(format!(
@@ -4281,11 +4328,41 @@ fn infer_lemma_stmts(
                         args.len()
                     ));
                 }
+                let mut bindings = seed_lemma_type_bindings(
+                    name,
+                    &callee.type_params,
+                    type_args,
+                    enum_defs,
+                    type_param_scope,
+                )?;
+                let mut arg_tys = Vec::with_capacity(args.len());
                 for (arg, param) in args.iter().zip(&callee.params) {
-                    let arg_ty = infer_contract_expr_types(
-                        arg, pure_fns, enum_defs, spec_scope, local_tys, false, result_ty, inferred,
+                    let expected = try_instantiate_spec_ty(&param.ty, &bindings);
+                    let arg_ty = infer_contract_expr_types_with_expected(
+                        arg,
+                        pure_fns,
+                        enum_defs,
+                        spec_scope,
+                        local_tys,
+                        false,
+                        result_ty,
+                        inferred,
+                        expected.as_ref(),
                     )?;
-                    constrain_expr_ty(inferred, &arg_ty, &param.ty)?;
+                    if let Some(actual) = known_spec_ty(&arg_ty) {
+                        infer_type_param_bindings(&param.ty, &actual, &mut bindings)?;
+                    }
+                    arg_tys.push(arg_ty);
+                }
+                if callee
+                    .type_params
+                    .iter()
+                    .all(|type_param| bindings.contains_key(type_param))
+                {
+                    let param_tys = instantiate_lemma_param_tys(name, callee, &bindings)?;
+                    for (arg_ty, param_ty) in arg_tys.iter().zip(param_tys.iter()) {
+                        constrain_expr_ty(inferred, arg_ty, param_ty)?;
+                    }
                 }
             }
             crate::spec::GhostStmt::Match {
@@ -4352,6 +4429,7 @@ fn infer_lemma_stmts(
                         all_lemmas,
                         pure_fns,
                         enum_defs,
+                        type_param_scope,
                         &mut arm_scope,
                         &arm_tys,
                         result_ty,
@@ -4366,6 +4444,7 @@ fn infer_lemma_stmts(
                         all_lemmas,
                         pure_fns,
                         enum_defs,
+                        type_param_scope,
                         &mut default_scope,
                         local_tys,
                         result_ty,
@@ -4389,6 +4468,7 @@ fn typed_lemma_stmts(
     all_lemmas: &HashMap<String, LemmaDef>,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    type_param_scope: &HashSet<String>,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     result_ty: &SpecTy,
@@ -4407,7 +4487,11 @@ fn typed_lemma_stmts(
                     expr, pure_fns, enum_defs, spec_scope, local_tys, false, result_ty, inferred,
                 )?))
             }
-            crate::spec::GhostStmt::Call { name, args } => {
+            crate::spec::GhostStmt::Call {
+                name,
+                type_args,
+                args,
+            } => {
                 let callee = lemma_body_callee(name, available_lemmas, all_lemmas)?;
                 if callee.params.len() != args.len() {
                     return Err(format!(
@@ -4416,21 +4500,45 @@ fn typed_lemma_stmts(
                         args.len()
                     ));
                 }
+                let mut bindings = seed_lemma_type_bindings(
+                    name,
+                    &callee.type_params,
+                    type_args,
+                    enum_defs,
+                    type_param_scope,
+                )?;
                 let mut typed_args = Vec::with_capacity(args.len());
                 for (arg, param) in args.iter().zip(&callee.params) {
-                    let typed_arg = typed_contract_expr(
-                        arg, pure_fns, enum_defs, spec_scope, local_tys, false, result_ty, inferred,
+                    let expected = try_instantiate_spec_ty(&param.ty, &bindings);
+                    let typed_arg = typed_contract_expr_with_expected(
+                        arg,
+                        pure_fns,
+                        enum_defs,
+                        spec_scope,
+                        local_tys,
+                        false,
+                        result_ty,
+                        inferred,
+                        expected.as_ref(),
                     )?;
-                    let unified = unify_spec_tys(&typed_arg.ty, &param.ty)?;
-                    if unified != param.ty {
+                    infer_type_param_bindings(&param.ty, &typed_arg.ty, &mut bindings)?;
+                    typed_args.push(typed_arg);
+                }
+                let param_tys = instantiate_lemma_param_tys(name, callee, &bindings)?;
+                for ((typed_arg, param), param_ty) in typed_args
+                    .iter()
+                    .zip(callee.params.iter())
+                    .zip(param_tys.iter())
+                {
+                    let unified = unify_spec_tys(&typed_arg.ty, param_ty)?;
+                    if unified != *param_ty {
                         return Err(format!(
                             "lemma `{name}` parameter `{}` expects `{}`, found `{}`",
                             param.name,
-                            display_spec_ty(&param.ty),
+                            display_spec_ty(param_ty),
                             display_spec_ty(&typed_arg.ty)
                         ));
                     }
-                    typed_args.push(typed_arg);
                 }
                 typed.push(TypedGhostStmt::Call {
                     lemma_name: name.clone(),
@@ -4502,6 +4610,7 @@ fn typed_lemma_stmts(
                         all_lemmas,
                         pure_fns,
                         enum_defs,
+                        type_param_scope,
                         &mut arm_scope,
                         &arm_tys,
                         result_ty,
@@ -4521,6 +4630,7 @@ fn typed_lemma_stmts(
                         all_lemmas,
                         pure_fns,
                         enum_defs,
+                        type_param_scope,
                         &mut default_scope,
                         local_tys,
                         result_ty,
@@ -4701,6 +4811,19 @@ fn type_lemmas(
         let lemma = lemmas
             .get(name)
             .expect("lemma declaration order must stay in sync");
+        let type_param_scope: HashSet<_> = lemma.type_params.iter().cloned().collect();
+        for param in &lemma.params {
+            validate_named_spec_ty(&param.ty, enum_defs, &type_param_scope).map_err(|message| {
+                LoopPrepassError {
+                    span,
+                    display_span: None,
+                    message: format!(
+                        "lemma `{}` parameter `{}`: {message}",
+                        lemma.name, param.name
+                    ),
+                }
+            })?;
+        }
         let param_tys: HashMap<_, _> = lemma
             .params
             .iter()
@@ -4741,6 +4864,7 @@ fn type_lemmas(
             lemmas,
             pure_fns,
             enum_defs,
+            &type_param_scope,
             &mut body_infer_scope,
             &param_tys,
             &result_ty,
@@ -4789,6 +4913,7 @@ fn type_lemmas(
             lemmas,
             pure_fns,
             enum_defs,
+            &type_param_scope,
             &mut type_scope,
             &param_tys,
             &result_ty,
@@ -4841,22 +4966,66 @@ fn type_lemmas(
     Ok(typed)
 }
 
-fn lemma_call_parts(expr: &Expr) -> Result<(&str, &[Expr]), String> {
+fn lemma_call_parts(expr: &Expr) -> Result<(&str, &[SpecTy], &[Expr]), String> {
     match expr {
         Expr::Call {
             func,
             type_args,
             args,
-        } => {
-            if !type_args.is_empty() {
-                return Err(format!(
-                    "lemma call does not support type arguments, found `{func}`"
-                ));
-            }
-            Ok((func, args))
-        }
+        } => Ok((func, type_args, args)),
         _ => Err("lemma call must be of the form `name(args...)`".to_owned()),
     }
+}
+
+fn seed_lemma_type_bindings(
+    lemma_name: &str,
+    type_params: &[String],
+    type_args: &[SpecTy],
+    enum_defs: &HashMap<String, EnumDef>,
+    type_param_scope: &HashSet<String>,
+) -> Result<HashMap<String, SpecTy>, String> {
+    if type_args.is_empty() {
+        return Ok(HashMap::new());
+    }
+    if type_args.len() != type_params.len() {
+        return Err(format!(
+            "lemma `{lemma_name}` expects {} type arguments, found {}",
+            type_params.len(),
+            type_args.len()
+        ));
+    }
+    let mut bindings = HashMap::with_capacity(type_params.len());
+    for (type_param, type_arg) in type_params.iter().zip(type_args.iter()) {
+        validate_named_spec_ty(type_arg, enum_defs, type_param_scope)?;
+        bindings.insert(type_param.clone(), type_arg.clone());
+    }
+    Ok(bindings)
+}
+
+fn instantiate_lemma_param_tys(
+    lemma_name: &str,
+    lemma: &LemmaDef,
+    bindings: &HashMap<String, SpecTy>,
+) -> Result<Vec<SpecTy>, String> {
+    for type_param in &lemma.type_params {
+        if !bindings.contains_key(type_param) {
+            return Err(format!(
+                "could not infer a type for lemma `{lemma_name}` type parameter `{type_param}`"
+            ));
+        }
+    }
+    lemma
+        .params
+        .iter()
+        .map(|param| {
+            try_instantiate_spec_ty(&param.ty, bindings).ok_or_else(|| {
+                format!(
+                    "could not resolve type parameter(s) for lemma `{lemma_name}` parameter `{}`",
+                    param.name
+                )
+            })
+        })
+        .collect()
 }
 
 fn directive_error_to_prepass(err: DirectiveError) -> LoopPrepassError {
@@ -5676,7 +5845,8 @@ fn written_locals<'tcx>(
 mod tests {
     use super::*;
     use crate::spec::{
-        EnumCtorDef, EnumDef, Expr, IntLiteral, PureFnDef, PureFnParam, SpecTy, TypedExprKind,
+        EnumCtorDef, EnumDef, Expr, IntLiteral, LemmaDef, PureFnDef, PureFnParam, SpecTy,
+        TypedExprKind,
     };
 
     #[test]
@@ -5795,5 +5965,42 @@ mod tests {
                 ..
             } if enum_name == "List" && ctor_name == "Cons"
         ));
+    }
+
+    #[test]
+    fn types_generic_lemma_call_with_inferred_type_args() {
+        let lemmas = HashMap::from([(
+            "seq_concat_empty_right".to_owned(),
+            LemmaDef {
+                name: "seq_concat_empty_right".to_owned(),
+                type_params: vec!["T".to_owned()],
+                params: vec![PureFnParam {
+                    name: "xs".to_owned(),
+                    ty: SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned()))),
+                }],
+                req: Expr::Bool(true),
+                ens: Expr::Bool(true),
+                body: vec![],
+            },
+        )]);
+
+        let typed = typed_lemma_call(
+            &Expr::Call {
+                func: "seq_concat_empty_right".to_owned(),
+                type_args: vec![],
+                args: vec![Expr::Var("xs".to_owned())],
+            },
+            "seq_concat_empty_right(xs)",
+            &lemmas,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut SpecScope::default(),
+            &HashMap::from([("xs".to_owned(), SpecTy::Seq(Box::new(SpecTy::I32)))]),
+            &mut SpecTypeInference::default(),
+        )
+        .expect("typed generic lemma call");
+
+        assert_eq!(typed.args.len(), 1);
+        assert_eq!(typed.args[0].ty, SpecTy::Seq(Box::new(SpecTy::I32)));
     }
 }

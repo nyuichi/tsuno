@@ -141,6 +141,7 @@ pub(crate) struct TypeEncoding {
 pub(crate) enum TypeEncodingKind {
     Bool,
     Int,
+    Opaque,
     Seq,
     Composite(Rc<CompositeEncoding>),
 }
@@ -441,6 +442,7 @@ impl ValueEncoder {
         Ok(match &encoding.kind {
             TypeEncodingKind::Bool => self.bool_term(lhs).eq(self.bool_term(rhs)),
             TypeEncodingKind::Int => self.int_term(lhs).eq(self.int_term(rhs)),
+            TypeEncodingKind::Opaque => lhs.dynamic().eq(rhs.dynamic()),
             TypeEncodingKind::Seq => lhs.dynamic().eq(rhs.dynamic()),
             TypeEncodingKind::Composite(_) => lhs.dynamic().eq(rhs.dynamic()),
         })
@@ -641,11 +643,7 @@ impl ValueEncoder {
                 TypeEncodingKind::Composite(self.build_composite_encoding(ty)?),
                 self.value_sort.clone(),
             ),
-            SpecTy::TypeParam(name) => {
-                return Err(format!(
-                    "unresolved spec type parameter `{name}` reached value encoding"
-                ));
-            }
+            SpecTy::TypeParam(_) => (TypeEncodingKind::Opaque, self.value_sort.clone()),
         };
         Ok(Rc::new(TypeEncoding { kind, sort }))
     }
@@ -845,7 +843,10 @@ impl ValueEncoder {
         solver: &Solver,
     ) -> Result<(), String> {
         match &encoding.kind {
-            TypeEncodingKind::Bool | TypeEncodingKind::Int | TypeEncodingKind::Seq => Ok(()),
+            TypeEncodingKind::Bool
+            | TypeEncodingKind::Int
+            | TypeEncodingKind::Opaque
+            | TypeEncodingKind::Seq => Ok(()),
             TypeEncodingKind::Composite(composite) => {
                 if matches!(ty, SpecTy::Named { .. }) {
                     self.assert_composite_axioms(composite, solver);
@@ -1018,6 +1019,7 @@ impl ValueEncoder {
                     self.int_term(value).le(upper),
                 ])
             })),
+            SpecTy::TypeParam(_) => Ok(None),
             SpecTy::Seq(_) => Ok(None),
             SpecTy::Named { name, args } => {
                 let invariant = self
@@ -1178,9 +1180,7 @@ impl ValueEncoder {
     fn sort_for_spec_ty(&self, ty: &SpecTy) -> Result<Sort, String> {
         match ty {
             SpecTy::Seq(_) => Ok(self.seq_value_sort.clone()),
-            SpecTy::TypeParam(name) => Err(format!(
-                "unresolved spec type parameter `{name}` reached value encoding"
-            )),
+            SpecTy::TypeParam(_) => Ok(self.value_sort.clone()),
             _ => Ok(self.value_sort.clone()),
         }
     }
