@@ -93,14 +93,24 @@ enum AssertionKind {
     Existential,
 }
 
-pub struct Verifier<'tcx> {
-    tcx: TyCtxt<'tcx>,
-    def_id: Option<LocalDefId>,
-    body: Option<Body<'tcx>>,
-    contracts: HashMap<LocalDefId, FunctionContract>,
+struct FunctionContext<'tcx> {
+    def_id: LocalDefId,
+    body: Body<'tcx>,
+    contract: FunctionContract,
     function_spec_vars: HashMap<String, SymValue>,
     loop_contracts: LoopContracts,
     control_point_directives: ControlPointDirectives,
+}
+
+enum VerifierContext<'tcx> {
+    Ghost,
+    Function(FunctionContext<'tcx>),
+}
+
+pub struct Verifier<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    context: VerifierContext<'tcx>,
+    contracts: HashMap<LocalDefId, FunctionContract>,
     pure_fns: HashMap<String, TypedPureFnDef>,
     pure_fn_decls: HashMap<String, RecFuncDecl>,
     lemmas: HashMap<String, TypedLemmaDef>,
@@ -190,12 +200,8 @@ impl<'tcx> Verifier<'tcx> {
         rebuild_solver();
         Self {
             tcx,
-            def_id: None,
-            body: None,
+            context: VerifierContext::Ghost,
             contracts,
-            function_spec_vars: HashMap::new(),
-            loop_contracts: LoopContracts::empty(),
-            control_point_directives: ControlPointDirectives::empty(),
             pure_fns: HashMap::new(),
             pure_fn_decls: HashMap::new(),
             lemmas: HashMap::new(),
@@ -205,27 +211,45 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn current_def_id(&self) -> LocalDefId {
-        self.def_id
-            .expect("function verifier must load a function before use")
+    fn function_context(&self) -> &FunctionContext<'tcx> {
+        match &self.context {
+            VerifierContext::Function(context) => context,
+            VerifierContext::Ghost => panic!("function verifier context is unavailable"),
+        }
     }
 
     fn body(&self) -> &Body<'tcx> {
-        self.body
-            .as_ref()
-            .expect("function verifier must load a body before use")
+        &self.function_context().body
+    }
+
+    fn current_contract(&self) -> &FunctionContract {
+        &self.function_context().contract
+    }
+
+    fn function_spec_vars(&self) -> &HashMap<String, SymValue> {
+        &self.function_context().function_spec_vars
+    }
+
+    fn loop_contracts(&self) -> &LoopContracts {
+        &self.function_context().loop_contracts
+    }
+
+    fn control_point_directives(&self) -> &ControlPointDirectives {
+        &self.function_context().control_point_directives
     }
 
     fn report_span(&self) -> Span {
-        self.def_id
-            .map(|def_id| self.tcx.def_span(def_id))
-            .unwrap_or(DUMMY_SP)
+        match &self.context {
+            VerifierContext::Ghost => DUMMY_SP,
+            VerifierContext::Function(context) => self.tcx.def_span(context.def_id),
+        }
     }
 
     fn report_function(&self) -> String {
-        self.def_id
-            .map(|def_id| self.tcx.def_path_str(def_id.to_def_id()))
-            .unwrap_or_else(|| "prepass".to_owned())
+        match &self.context {
+            VerifierContext::Ghost => "prepass".to_owned(),
+            VerifierContext::Function(context) => self.tcx.def_path_str(context.def_id.to_def_id()),
+        }
     }
 
     fn reset_solver_state(&self) {
@@ -272,20 +296,22 @@ impl<'tcx> Verifier<'tcx> {
         prepass: DirectivePrepass,
     ) -> VerificationResult {
         self.reset_solver_state();
-        self.def_id = Some(def_id);
-        self.body = Some(body);
         let DirectivePrepass {
-            directives: _,
             loop_contracts,
             control_point_directives,
             function_contract,
             spec_vars,
         } = prepass;
         let contract = function_contract.expect("successful function prepass must yield contract");
-        self.contracts.insert(self.current_def_id(), contract);
-        self.loop_contracts = loop_contracts;
-        self.control_point_directives = control_point_directives;
-        self.function_spec_vars = self.instantiate_spec_vars(&spec_vars);
+        self.contracts.insert(def_id, contract.clone());
+        self.context = VerifierContext::Function(FunctionContext {
+            def_id,
+            body,
+            contract,
+            function_spec_vars: self.instantiate_spec_vars(&spec_vars),
+            loop_contracts,
+            control_point_directives,
+        });
 
         let initial_state = match self.initial_state() {
             Ok(Some(state)) => state,
@@ -309,7 +335,7 @@ impl<'tcx> Verifier<'tcx> {
             };
             let mut state = state;
             if let Some(directives) = self
-                .control_point_directives
+                .control_point_directives()
                 .directives_at(ctrl.basic_block, ctrl.statement_index)
             {
                 let mut pruned = false;
@@ -408,9 +434,10 @@ impl<'tcx> Verifier<'tcx> {
             let value = self.fresh_for_rust_ty(ty, &format!("arg_{}", local.as_usize()))?;
             state.model.insert(local, value);
         }
-        if let Some(contract) = self.contracts.get(&self.current_def_id()) {
+        {
+            let contract = self.current_contract();
             let env =
-                CallEnv::for_function(self, &state, contract, self.function_spec_vars.clone())?;
+                CallEnv::for_function(self, &state, contract, self.function_spec_vars().clone())?;
             let req = self.contract_req_to_z3(contract, &env, self.report_span())?;
             if !self.assume_path_condition(&mut state, req) {
                 return Ok(None);
@@ -469,12 +496,13 @@ impl<'tcx> Verifier<'tcx> {
                 self.goto_target(state, *target, term.source_info.span)
             }
             TerminatorKind::Return => {
-                if let Some(contract) = self.contracts.get(&self.current_def_id()) {
+                {
+                    let contract = self.current_contract();
                     let env = CallEnv::for_function(
                         self,
                         &state,
                         contract,
-                        self.function_spec_vars.clone(),
+                        self.function_spec_vars().clone(),
                     )?;
                     self.assert_contract_expr_constraint(
                         &mut state,
@@ -674,7 +702,7 @@ impl<'tcx> Verifier<'tcx> {
         target: BasicBlock,
         span: Span,
     ) -> Result<Option<State>, VerificationResult> {
-        if let Some(loop_contract) = self.loop_contracts.contract_by_header(target) {
+        if let Some(loop_contract) = self.loop_contracts().contract_by_header(target) {
             self.assert_spec_expr_constraint(
                 &mut state,
                 &loop_contract.invariant,
@@ -706,8 +734,8 @@ impl<'tcx> Verifier<'tcx> {
             }
         }
 
-        if let Some(header) = self.loop_contracts.header_for_invariant_block(target)
-            && let Some(loop_contract) = self.loop_contracts.contract_by_header(header)
+        if let Some(header) = self.loop_contracts().header_for_invariant_block(target)
+            && let Some(loop_contract) = self.loop_contracts().contract_by_header(header)
         {
             let invariant = self.spec_expr_to_bool(
                 &state,
@@ -1904,7 +1932,7 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(self.seq_literal_value(&values))
             }
             TypedExprKind::Var(name) if resolved.spec_vars.contains(name) => {
-                self.function_spec_vars.get(name).cloned().ok_or_else(|| {
+                self.function_spec_vars().get(name).cloned().ok_or_else(|| {
                     self.unsupported_result(
                         self.control_span(state.ctrl),
                         format!("missing spec binding `{name}`"),
@@ -1926,7 +1954,7 @@ impl<'tcx> Verifier<'tcx> {
                 })
             }
             TypedExprKind::Bind(name) => {
-                self.function_spec_vars.get(name).cloned().ok_or_else(|| {
+                self.function_spec_vars().get(name).cloned().ok_or_else(|| {
                     self.unsupported_result(
                         self.control_span(state.ctrl),
                         format!("missing spec binding `{name}`"),
@@ -4275,7 +4303,12 @@ fn span_text(tcx: TyCtxt<'_>, span: Span) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{rebuild_solver, with_solver};
+    use super::{collect_needed_pure_fns, rebuild_solver, with_solver};
+    use crate::prepass::{
+        AssertionContract, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
+        FunctionContract, LoopContracts, ResolvedExprEnv, TypedPureFnDef,
+    };
+    use crate::spec::{SpecTy, TypedExpr, TypedExprKind};
     use z3::ast::Int;
     use z3::{Config, SatResult};
 
@@ -4327,5 +4360,76 @@ mod tests {
         });
         assert_eq!(result.0, SatResult::Sat);
         assert_eq!(result.1, SatResult::Unsat);
+    }
+
+    #[test]
+    fn collect_needed_pure_fns_depends_only_on_live_prepass_output() {
+        let bool_true = TypedExpr {
+            ty: SpecTy::Bool,
+            kind: TypedExprKind::Bool(true),
+        };
+        let id_call = TypedExpr {
+            ty: SpecTy::I32,
+            kind: TypedExprKind::PureCall {
+                func: "id".to_owned(),
+                args: vec![TypedExpr {
+                    ty: SpecTy::I32,
+                    kind: TypedExprKind::Int(crate::spec::IntLiteral {
+                        digits: "1".to_owned(),
+                        suffix: Some(crate::spec::IntSuffix::I32),
+                    }),
+                }],
+            },
+        };
+        let prepass = DirectivePrepass {
+            loop_contracts: LoopContracts::default(),
+            control_point_directives: ControlPointDirectives {
+                by_control_point: std::collections::HashMap::from([(
+                    (rustc_middle::mir::BasicBlock::from_usize(0), 0usize),
+                    vec![ControlPointDirective::Assert(AssertionContract {
+                        assertion: id_call,
+                        resolution: ResolvedExprEnv::default(),
+                        assertion_span: "fixture.rs:1:1".to_owned(),
+                    })],
+                )]),
+            },
+            function_contract: Some(FunctionContract {
+                params: Vec::new(),
+                req: bool_true.clone(),
+                req_span: "fixture.rs:1:1".to_owned(),
+                ens: bool_true,
+                ens_span: "fixture.rs:1:1".to_owned(),
+                spec_vars: Vec::new(),
+                result: SpecTy::Bool,
+            }),
+            spec_vars: Vec::new(),
+        };
+        let pure_fns = vec![
+            TypedPureFnDef {
+                name: "id".to_owned(),
+                params: Vec::new(),
+                body: TypedExpr {
+                    ty: SpecTy::I32,
+                    kind: TypedExprKind::Int(crate::spec::IntLiteral {
+                        digits: "1".to_owned(),
+                        suffix: Some(crate::spec::IntSuffix::I32),
+                    }),
+                },
+            },
+            TypedPureFnDef {
+                name: "unused".to_owned(),
+                params: Vec::new(),
+                body: TypedExpr {
+                    ty: SpecTy::I32,
+                    kind: TypedExprKind::Int(crate::spec::IntLiteral {
+                        digits: "0".to_owned(),
+                        suffix: Some(crate::spec::IntSuffix::I32),
+                    }),
+                },
+            },
+        ];
+        let needed = collect_needed_pure_fns(&prepass, &[], &pure_fns);
+        assert_eq!(needed.len(), 1);
+        assert_eq!(needed[0].name, "id");
     }
 }
