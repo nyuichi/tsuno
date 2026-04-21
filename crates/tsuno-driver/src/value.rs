@@ -4,8 +4,8 @@ use std::rc::Rc;
 use std::str::FromStr;
 
 use crate::spec::{BinaryOp, EnumDef, SpecTy, StructTy, UnaryOp};
-use z3::ast::{self, Ast, Bool, Dynamic, Int};
-use z3::{FuncDecl, Pattern, Solver, Sort, Symbol};
+use z3::ast::{self, Ast, Bool, Dynamic, Int, Seq as Z3Seq};
+use z3::{DeclKind, FuncDecl, Pattern, Solver, Sort, Symbol};
 
 /*
 Value encoding overview
@@ -134,12 +134,15 @@ impl SymValue {
 #[derive(Debug)]
 pub(crate) struct TypeEncoding {
     pub(crate) kind: TypeEncodingKind,
+    pub(crate) sort: Sort,
 }
 
 #[derive(Debug)]
 pub(crate) enum TypeEncodingKind {
     Bool,
     Int,
+    Opaque,
+    Seq,
     Composite(Rc<CompositeEncoding>),
 }
 
@@ -201,6 +204,7 @@ type CtorSpecs = Vec<(String, CtorFields)>;
 pub(crate) struct ValueEncoder {
     pointer_width_bits: u64,
     value_sort: Sort,
+    seq_value_sort: Sort,
     bool_encoding: Rc<PrimitiveEncoding>,
     int_encoding: Rc<PrimitiveEncoding>,
     primitive_axioms_asserted: Cell<bool>,
@@ -215,6 +219,7 @@ pub(crate) struct ValueEncoder {
 impl ValueEncoder {
     pub(crate) fn new(pointer_width_bits: u64) -> Self {
         let value_sort = Sort::uninterpreted(Symbol::String("value".to_owned()));
+        let seq_value_sort = Sort::seq(&value_sort);
         let bool_encoding = Rc::new(PrimitiveEncoding {
             boxed: FuncDecl::new("(boolbox)", &[&Sort::bool()], &value_sort),
             unboxed: FuncDecl::new("(bool)", &[&value_sort], &Sort::bool()),
@@ -227,6 +232,7 @@ impl ValueEncoder {
         Self {
             pointer_width_bits,
             value_sort,
+            seq_value_sort,
             bool_encoding,
             int_encoding,
             primitive_axioms_asserted: Cell::new(false),
@@ -250,6 +256,10 @@ impl ValueEncoder {
 
     pub(crate) fn value_sort(&self) -> &Sort {
         &self.value_sort
+    }
+
+    pub(crate) fn seq_value_sort(&self) -> &Sort {
+        &self.seq_value_sort
     }
 
     pub(crate) fn type_encoding(
@@ -301,6 +311,76 @@ impl ValueEncoder {
 
     pub(crate) fn wrap_int(&self, value: &Int) -> SymValue {
         SymValue::new(self.int_encoding.boxed.apply(&[value]))
+    }
+
+    pub(crate) fn empty_seq_value(&self) -> SymValue {
+        SymValue::new(Dynamic::from(Z3Seq::empty(&self.value_sort)))
+    }
+
+    pub(crate) fn seq_literal_value(&self, items: &[SymValue]) -> SymValue {
+        if items.is_empty() {
+            return self.empty_seq_value();
+        }
+        let parts = items
+            .iter()
+            .map(|item| Z3Seq::unit(item.dynamic()))
+            .collect::<Vec<_>>();
+        let part_refs = parts.iter().collect::<Vec<_>>();
+        SymValue::new(Dynamic::from(Z3Seq::concat(&part_refs)))
+    }
+
+    pub(crate) fn seq_term(&self, value: &SymValue) -> Result<Z3Seq, String> {
+        value
+            .dynamic()
+            .as_seq()
+            .ok_or_else(|| "expected sequence-backed symbolic value".to_owned())
+    }
+
+    pub(crate) fn seq_len_int(&self, value: &SymValue) -> Result<Int, String> {
+        Ok(self.seq_term(value)?.length())
+    }
+
+    pub(crate) fn seq_nth_value(&self, value: &SymValue, index: &Int) -> Result<SymValue, String> {
+        if let Some(index) = index.as_i64().filter(|index| *index >= 0)
+            && let Some(item) = Self::ground_seq_nth(value.dynamic(), index as usize)
+        {
+            return Ok(SymValue::new(item));
+        }
+        Ok(SymValue::new(
+            self.seq_term(value)?.nth(index.clone()).simplify(),
+        ))
+    }
+
+    fn ground_seq_nth(ast: &Dynamic, index: usize) -> Option<Dynamic> {
+        match ast.decl().kind() {
+            DeclKind::SEQ_UNIT => ast.children().first().cloned().filter(|_| index == 0),
+            DeclKind::SEQ_EMPTY => None,
+            DeclKind::SEQ_CONCAT => {
+                let mut remaining = index;
+                for child in ast.children() {
+                    let child_len = Self::ground_seq_len(&child)?;
+                    if remaining < child_len {
+                        return Self::ground_seq_nth(&child, remaining);
+                    }
+                    remaining -= child_len;
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn ground_seq_len(ast: &Dynamic) -> Option<usize> {
+        match ast.decl().kind() {
+            DeclKind::SEQ_UNIT => Some(1),
+            DeclKind::SEQ_EMPTY => Some(0),
+            DeclKind::SEQ_CONCAT => ast
+                .children()
+                .into_iter()
+                .map(|child| Self::ground_seq_len(&child))
+                .sum(),
+            _ => None,
+        }
     }
 
     pub(crate) fn bool_value(&self, value: bool) -> SymValue {
@@ -362,6 +442,8 @@ impl ValueEncoder {
         Ok(match &encoding.kind {
             TypeEncodingKind::Bool => self.bool_term(lhs).eq(self.bool_term(rhs)),
             TypeEncodingKind::Int => self.int_term(lhs).eq(self.int_term(rhs)),
+            TypeEncodingKind::Opaque => lhs.dynamic().eq(rhs.dynamic()),
+            TypeEncodingKind::Seq => lhs.dynamic().eq(rhs.dynamic()),
             TypeEncodingKind::Composite(_) => lhs.dynamic().eq(rhs.dynamic()),
         })
     }
@@ -397,6 +479,11 @@ impl ValueEncoder {
             BinaryOp::Add => self.wrap_int(&(self.int_term(lhs) + self.int_term(rhs))),
             BinaryOp::Sub => self.wrap_int(&(self.int_term(lhs) - self.int_term(rhs))),
             BinaryOp::Mul => self.wrap_int(&(self.int_term(lhs) * self.int_term(rhs))),
+            BinaryOp::Concat => {
+                let lhs = self.seq_term(lhs)?;
+                let rhs = self.seq_term(rhs)?;
+                SymValue::new(Dynamic::from(Z3Seq::concat(&[&lhs, &rhs])))
+            }
         })
     }
 
@@ -534,8 +621,8 @@ impl ValueEncoder {
     }
 
     fn build_type_encoding(&self, ty: &SpecTy) -> Result<Rc<TypeEncoding>, String> {
-        let kind = match ty {
-            SpecTy::Bool => TypeEncodingKind::Bool,
+        let (kind, sort) = match ty {
+            SpecTy::Bool => (TypeEncodingKind::Bool, self.value_sort.clone()),
             SpecTy::IntLiteral
             | SpecTy::I8
             | SpecTy::I16
@@ -546,19 +633,19 @@ impl ValueEncoder {
             | SpecTy::U16
             | SpecTy::U32
             | SpecTy::U64
-            | SpecTy::Usize => TypeEncodingKind::Int,
+            | SpecTy::Usize => (TypeEncodingKind::Int, self.value_sort.clone()),
+            SpecTy::Seq(_) => (TypeEncodingKind::Seq, self.seq_value_sort.clone()),
             SpecTy::Tuple(_)
             | SpecTy::Struct(_)
             | SpecTy::Named { .. }
             | SpecTy::Ref(_)
-            | SpecTy::Mut(_) => TypeEncodingKind::Composite(self.build_composite_encoding(ty)?),
-            SpecTy::TypeParam(name) => {
-                return Err(format!(
-                    "unresolved spec type parameter `{name}` reached value encoding"
-                ));
-            }
+            | SpecTy::Mut(_) => (
+                TypeEncodingKind::Composite(self.build_composite_encoding(ty)?),
+                self.value_sort.clone(),
+            ),
+            SpecTy::TypeParam(_) => (TypeEncodingKind::Opaque, self.value_sort.clone()),
         };
-        Ok(Rc::new(TypeEncoding { kind }))
+        Ok(Rc::new(TypeEncoding { kind, sort }))
     }
 
     fn build_composite_encoding(&self, ty: &SpecTy) -> Result<Rc<CompositeEncoding>, String> {
@@ -578,40 +665,48 @@ impl ValueEncoder {
         );
         let constructors = ctor_specs
             .into_iter()
-            .map(|(ctor_name, fields)| {
-                let constructor_name = if ctor_name.is_empty() {
-                    format!("mk_{sort_name}")
-                } else {
-                    format!("mk_{sort_name}_{ctor_name}")
-                };
-                let constructor_tag = Int::from_u64(u64::from(self.next_ctor_tag.get()));
-                self.next_ctor_tag.set(self.next_ctor_tag.get() + 1);
-                let domain_sorts = fields.iter().map(|_| &self.value_sort).collect::<Vec<_>>();
-                let constructor_symbol =
-                    FuncDecl::new(constructor_name.as_str(), &domain_sorts, &self.value_sort);
-                let fields = fields
-                    .into_iter()
-                    .map(|(label, field_ty)| FieldEncoding {
-                        inverse: FuncDecl::new(
-                            if ctor_name.is_empty() {
-                                format!("ctorinv_{sort_name}_{label}")
-                            } else {
-                                format!("ctorinv_{sort_name}_{ctor_name}_{label}")
-                            },
-                            &[&self.value_sort],
-                            &self.value_sort,
-                        ),
-                        ty: field_ty,
-                    })
-                    .collect::<Vec<_>>();
-                Rc::new(ConstructorEncoding {
-                    name: constructor_name,
-                    symbol: constructor_symbol,
-                    fields,
-                    tag: constructor_tag,
-                })
-            })
-            .collect::<Vec<_>>();
+            .map(
+                |(ctor_name, fields)| -> Result<Rc<ConstructorEncoding>, String> {
+                    let constructor_name = if ctor_name.is_empty() {
+                        format!("mk_{sort_name}")
+                    } else {
+                        format!("mk_{sort_name}_{ctor_name}")
+                    };
+                    let constructor_tag = Int::from_u64(u64::from(self.next_ctor_tag.get()));
+                    self.next_ctor_tag.set(self.next_ctor_tag.get() + 1);
+                    let field_sorts = fields
+                        .iter()
+                        .map(|(_, field_ty)| self.sort_for_spec_ty(field_ty))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let domain_sorts = field_sorts.iter().collect::<Vec<_>>();
+                    let constructor_symbol =
+                        FuncDecl::new(constructor_name.as_str(), &domain_sorts, &self.value_sort);
+                    let fields = fields
+                        .into_iter()
+                        .map(|(label, field_ty)| {
+                            Ok(FieldEncoding {
+                                inverse: FuncDecl::new(
+                                    if ctor_name.is_empty() {
+                                        format!("ctorinv_{sort_name}_{label}")
+                                    } else {
+                                        format!("ctorinv_{sort_name}_{ctor_name}_{label}")
+                                    },
+                                    &[&self.value_sort],
+                                    &self.sort_for_spec_ty(&field_ty)?,
+                                ),
+                                ty: field_ty,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
+                    Ok(Rc::new(ConstructorEncoding {
+                        name: constructor_name,
+                        symbol: constructor_symbol,
+                        fields,
+                        tag: constructor_tag,
+                    }))
+                },
+            )
+            .collect::<Result<Vec<_>, String>>()?;
         let composite = Rc::new(CompositeEncoding {
             tag_function,
             constructors,
@@ -645,34 +740,39 @@ impl ValueEncoder {
             .constructors
             .iter()
             .zip(ctor_specs)
-            .map(|(family_ctor, (_ctor_name, fields))| {
-                let field_count = fields.len();
-                let domain_sorts = (0..field_count)
-                    .map(|_| &self.value_sort)
-                    .collect::<Vec<_>>();
-                Rc::new(ConstructorEncoding {
-                    name: family_ctor.symbol_name.clone(),
-                    symbol: FuncDecl::new(
-                        family_ctor.symbol_name.as_str(),
-                        &domain_sorts,
-                        &self.value_sort,
-                    ),
-                    fields: fields
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, (_label, ty))| FieldEncoding {
-                            inverse: FuncDecl::new(
-                                family_ctor.inverse_names[index].as_str(),
-                                &[&self.value_sort],
-                                &self.value_sort,
-                            ),
-                            ty,
-                        })
-                        .collect(),
-                    tag: Int::from_u64(u64::from(family_ctor.tag_value)),
-                })
-            })
-            .collect::<Vec<_>>();
+            .map(
+                |(family_ctor, (_ctor_name, fields))| -> Result<Rc<ConstructorEncoding>, String> {
+                    let field_sorts = fields
+                        .iter()
+                        .map(|(_, ty)| self.sort_for_spec_ty(ty))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let domain_sorts = field_sorts.iter().collect::<Vec<_>>();
+                    Ok(Rc::new(ConstructorEncoding {
+                        name: family_ctor.symbol_name.clone(),
+                        symbol: FuncDecl::new(
+                            family_ctor.symbol_name.as_str(),
+                            &domain_sorts,
+                            &self.value_sort,
+                        ),
+                        fields: fields
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, (_label, ty))| {
+                                Ok(FieldEncoding {
+                                    inverse: FuncDecl::new(
+                                        family_ctor.inverse_names[index].as_str(),
+                                        &[&self.value_sort],
+                                        &self.sort_for_spec_ty(&ty)?,
+                                    ),
+                                    ty,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, String>>()?,
+                        tag: Int::from_u64(u64::from(family_ctor.tag_value)),
+                    }))
+                },
+            )
+            .collect::<Result<Vec<_>, String>>()?;
 
         let invariant_name = format!("inv_{}", self.instantiated_named_type_name(name, type_args));
         Ok(Rc::new(CompositeEncoding {
@@ -743,7 +843,10 @@ impl ValueEncoder {
         solver: &Solver,
     ) -> Result<(), String> {
         match &encoding.kind {
-            TypeEncodingKind::Bool | TypeEncodingKind::Int => Ok(()),
+            TypeEncodingKind::Bool
+            | TypeEncodingKind::Int
+            | TypeEncodingKind::Opaque
+            | TypeEncodingKind::Seq => Ok(()),
             TypeEncodingKind::Composite(composite) => {
                 if matches!(ty, SpecTy::Named { .. }) {
                     self.assert_composite_axioms(composite, solver);
@@ -916,6 +1019,8 @@ impl ValueEncoder {
                     self.int_term(value).le(upper),
                 ])
             })),
+            SpecTy::TypeParam(_) => Ok(None),
+            SpecTy::Seq(_) => Ok(None),
             SpecTy::Named { name, args } => {
                 let invariant = self
                     .named_invariant(
@@ -1033,6 +1138,9 @@ impl ValueEncoder {
             SpecTy::U32 => Ok(SpecTy::U32),
             SpecTy::U64 => Ok(SpecTy::U64),
             SpecTy::Usize => Ok(SpecTy::Usize),
+            SpecTy::Seq(inner) => Ok(SpecTy::Seq(Box::new(
+                self.instantiate_named_field_ty(inner, bindings)?,
+            ))),
             SpecTy::Tuple(items) => Ok(SpecTy::Tuple(
                 items
                     .iter()
@@ -1069,6 +1177,14 @@ impl ValueEncoder {
         }
     }
 
+    fn sort_for_spec_ty(&self, ty: &SpecTy) -> Result<Sort, String> {
+        match ty {
+            SpecTy::Seq(_) => Ok(self.seq_value_sort.clone()),
+            SpecTy::TypeParam(_) => Ok(self.value_sort.clone()),
+            _ => Ok(self.value_sort.clone()),
+        }
+    }
+
     fn type_name(&self, ty: &SpecTy) -> String {
         fn sanitize(raw: &str) -> String {
             raw.chars()
@@ -1099,6 +1215,7 @@ impl ValueEncoder {
             ),
             SpecTy::Struct(struct_ty) => format!("struct_{}", sanitize(&struct_ty.name)),
             SpecTy::Named { name, args } => self.instantiated_named_type_name(name, args),
+            SpecTy::Seq(inner) => format!("seq_{}", self.type_name(inner)),
             SpecTy::Ref(inner) => format!("ref_{}", self.type_name(inner)),
             SpecTy::Mut(inner) => format!("mut_{}", self.type_name(inner)),
             SpecTy::TypeParam(name) => format!("typeparam_{}", sanitize(name)),
