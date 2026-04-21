@@ -33,8 +33,8 @@ use rustc_middle::mir::{
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::source_map::Spanned;
 use rustc_span::{DUMMY_SP, Span};
-use z3::ast::{Ast, Bool, Dynamic, Int};
-use z3::{Config, Context, RecFuncDecl, SatResult, Solver, SortKind};
+use z3::ast::{Ast, Bool, Dynamic, Int, Seq as Z3Seq};
+use z3::{Config, Context, RecFuncDecl, SatResult, Solver, Sort, SortKind};
 
 use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
@@ -80,6 +80,13 @@ pub struct State {
     ctrl: ControlPoint,
 }
 
+struct BuiltinSeqDecls {
+    nat_to_int: RecFuncDecl,
+    int_to_nat: RecFuncDecl,
+    _seq_rev_prefix: RecFuncDecl,
+    seq_rev: RecFuncDecl,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AssertionKind {
     Universal,
@@ -97,6 +104,7 @@ pub struct Verifier<'tcx> {
     pure_fns: HashMap<String, TypedPureFnDef>,
     pure_fn_decls: HashMap<String, RecFuncDecl>,
     lemmas: HashMap<String, TypedLemmaDef>,
+    builtin_seq_decls: RefCell<Option<Rc<BuiltinSeqDecls>>>,
     next_sym: Cell<usize>,
     value_encoder: ValueEncoder,
 }
@@ -191,6 +199,7 @@ impl<'tcx> Verifier<'tcx> {
             pure_fns: HashMap::new(),
             pure_fn_decls: HashMap::new(),
             lemmas: HashMap::new(),
+            builtin_seq_decls: RefCell::new(None),
             next_sym: Cell::new(0),
             value_encoder: ValueEncoder::new(tcx.data_layout.pointer_size().bits()),
         }
@@ -812,9 +821,16 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn register_pure_fn(&mut self, pure_fn: &TypedPureFnDef) -> Result<(), VerificationResult> {
-        let domain_sorts = vec![self.value_encoder.value_sort().clone(); pure_fn.params.len()];
+        let domain_sorts = pure_fn
+            .params
+            .iter()
+            .map(|param| {
+                self.type_encoding(&param.ty)
+                    .map(|encoding| encoding.sort.clone())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let domain_refs: Vec<_> = domain_sorts.iter().collect();
-        let result_sort = self.value_encoder.value_sort().clone();
+        let result_sort = self.type_encoding(&pure_fn.result_ty)?.sort.clone();
         let decl = RecFuncDecl::new(
             format!("pure_fn_{}", pure_fn.name),
             &domain_refs,
@@ -828,9 +844,10 @@ impl<'tcx> Verifier<'tcx> {
         let mut current = HashMap::new();
         let mut vars = Vec::with_capacity(pure_fn.params.len());
         for param in &pure_fn.params {
+            let sort = self.type_encoding(&param.ty)?.sort.clone();
             let value = SymValue::new(Dynamic::new_const(
                 self.fresh_name(&format!("pure_{}_{}", pure_fn.name, param.name)),
-                self.value_encoder.value_sort(),
+                &sort,
             ));
             current.insert(param.name.clone(), value.clone());
             vars.push(value);
@@ -1761,6 +1778,7 @@ impl<'tcx> Verifier<'tcx> {
                 self.construct_composite(spec_ty, &[fresh, fin])
             }
             SpecTy::Ref(_)
+            | SpecTy::Seq(_)
             | SpecTy::Bool
             | SpecTy::IntLiteral
             | SpecTy::I8
@@ -1858,6 +1876,10 @@ impl<'tcx> Verifier<'tcx> {
                     let value = self.spec_expr_to_value(state, expr, resolved)?;
                     Ok(self.value_is_true(&value))
                 }
+                BinaryOp::Concat => Err(self.unsupported_result(
+                    self.control_span(state.ctrl),
+                    "sequence value used where `bool` was required".to_owned(),
+                )),
             },
             TypedExprKind::Match { .. } => {
                 Ok(self.value_is_true(&self.spec_expr_to_value(state, expr, resolved)?))
@@ -1876,6 +1898,13 @@ impl<'tcx> Verifier<'tcx> {
             TypedExprKind::Bool(value) => Ok(self.value_bool(*value)),
             TypedExprKind::Int(value) => {
                 self.value_decimal_int(&value.digits, self.control_span(state.ctrl))
+            }
+            TypedExprKind::SeqLit(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.spec_expr_to_value(state, item, resolved)?);
+                }
+                Ok(self.seq_literal_value(&values))
             }
             TypedExprKind::Var(name) if resolved.spec_vars.contains(name) => {
                 self.function_spec_vars.get(name).cloned().ok_or_else(|| {
@@ -1934,6 +1963,13 @@ impl<'tcx> Verifier<'tcx> {
             TypedExprKind::TupleField { base, index } => {
                 let value = self.spec_expr_to_value(state, base, resolved)?;
                 self.project_field(value, &base.ty, *index, self.control_span(state.ctrl))
+            }
+            TypedExprKind::Index { base, index } => {
+                let value = self.spec_expr_to_value(state, base, resolved)?;
+                let index_value = self.spec_expr_to_value(state, index, resolved)?;
+                let index_int =
+                    self.nat_to_int_term(&index_value, self.control_span(state.ctrl))?;
+                self.seq_nth_value(&value, &index_int, self.control_span(state.ctrl))
             }
             TypedExprKind::Deref { base } => {
                 let value = self.spec_expr_to_value(state, base, resolved)?;
@@ -2039,6 +2075,10 @@ impl<'tcx> Verifier<'tcx> {
                     let value = self.contract_expr_to_value(current, spec, expr)?;
                     Ok(self.value_is_true(&value))
                 }
+                BinaryOp::Concat => Err(self.unsupported_result(
+                    self.report_span(),
+                    "sequence value used where `bool` was required".to_owned(),
+                )),
             },
             TypedExprKind::Match { .. } => {
                 Ok(self.value_is_true(&self.contract_expr_to_value(current, spec, expr)?))
@@ -2056,6 +2096,13 @@ impl<'tcx> Verifier<'tcx> {
         match &expr.kind {
             TypedExprKind::Bool(value) => Ok(self.value_bool(*value)),
             TypedExprKind::Int(value) => self.value_decimal_int(&value.digits, self.report_span()),
+            TypedExprKind::SeqLit(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.contract_expr_to_value(current, spec, item)?);
+                }
+                Ok(self.seq_literal_value(&values))
+            }
             TypedExprKind::Var(name) if spec.contains_key(name) => {
                 spec.get(name).cloned().ok_or_else(|| {
                     self.unsupported_result(
@@ -2104,6 +2151,12 @@ impl<'tcx> Verifier<'tcx> {
             TypedExprKind::TupleField { base, index } => {
                 let value = self.contract_expr_to_value(current, spec, base)?;
                 self.project_field(value, &base.ty, *index, self.report_span())
+            }
+            TypedExprKind::Index { base, index } => {
+                let value = self.contract_expr_to_value(current, spec, base)?;
+                let index_value = self.contract_expr_to_value(current, spec, index)?;
+                let index_int = self.nat_to_int_term(&index_value, self.report_span())?;
+                self.seq_nth_value(&value, &index_int, self.report_span())
             }
             TypedExprKind::Deref { base } => {
                 let value = self.contract_expr_to_value(current, spec, base)?;
@@ -2197,6 +2250,9 @@ impl<'tcx> Verifier<'tcx> {
         values: Vec<SymValue>,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
+        if let Some(value) = self.eval_builtin_pure_call(func, &values, span)? {
+            return Ok(value);
+        }
         if let Some(value) = self.try_eval_ground_pure_call(func, &values, span)? {
             return Ok(value);
         }
@@ -2213,6 +2269,9 @@ impl<'tcx> Verifier<'tcx> {
         values: &[SymValue],
         span: Span,
     ) -> Result<Option<SymValue>, VerificationResult> {
+        if let Some(value) = self.eval_builtin_pure_call(func, values, span)? {
+            return Ok(Some(value));
+        }
         let Some(pure_fn) = self.pure_fns.get(func) else {
             return Ok(None);
         };
@@ -2226,6 +2285,31 @@ impl<'tcx> Verifier<'tcx> {
         self.try_eval_ground_pure_expr(&pure_fn.body, &env, span)
     }
 
+    fn eval_builtin_pure_call(
+        &self,
+        func: &str,
+        values: &[SymValue],
+        span: Span,
+    ) -> Result<Option<SymValue>, VerificationResult> {
+        match (func, values) {
+            ("seq_len", [value]) => {
+                let length = self.seq_len_int(value, span)?;
+                if let Some(length) = length.simplify().as_i64()
+                    && length >= 0
+                {
+                    return Ok(Some(self.concrete_nat_value(length as u64)?));
+                }
+                Ok(Some(self.int_to_nat_value(&length, span)?))
+            }
+            ("seq_rev", [value]) => Ok(Some(self.seq_rev_value(value, span)?)),
+            ("seq_len" | "seq_rev", _) => Err(self.unsupported_result(
+                span,
+                format!("builtin pure function `{func}` expects 1 argument"),
+            )),
+            _ => Ok(None),
+        }
+    }
+
     fn try_eval_ground_pure_expr(
         &self,
         expr: &TypedExpr,
@@ -2235,6 +2319,16 @@ impl<'tcx> Verifier<'tcx> {
         Ok(match &expr.kind {
             TypedExprKind::Bool(value) => Some(self.value_bool(*value)),
             TypedExprKind::Int(value) => Some(self.value_decimal_int(&value.digits, span)?),
+            TypedExprKind::SeqLit(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    let Some(value) = self.try_eval_ground_pure_expr(item, env, span)? else {
+                        return Ok(None);
+                    };
+                    values.push(value);
+                }
+                Some(self.seq_literal_value(&values))
+            }
             TypedExprKind::Var(name) => env.get(name).cloned(),
             TypedExprKind::Bind(_) => None,
             TypedExprKind::CtorCall {
@@ -2317,6 +2411,16 @@ impl<'tcx> Verifier<'tcx> {
                     return Ok(None);
                 };
                 Some(self.project_field(value, &base.ty, *index, span)?)
+            }
+            TypedExprKind::Index { base, index } => {
+                let Some(value) = self.try_eval_ground_pure_expr(base, env, span)? else {
+                    return Ok(None);
+                };
+                let Some(index_value) = self.try_eval_ground_pure_expr(index, env, span)? else {
+                    return Ok(None);
+                };
+                let index_int = self.nat_to_int_term(&index_value, span)?;
+                Some(self.seq_nth_value(&value, &index_int, span)?)
             }
             TypedExprKind::Deref { base } => {
                 let Some(value) = self.try_eval_ground_pure_expr(base, env, span)? else {
@@ -2634,6 +2738,9 @@ impl<'tcx> Verifier<'tcx> {
         match &expr.kind {
             TypedExprKind::Bind(other) => other == name,
             TypedExprKind::Bool(_) | TypedExprKind::Int(_) | TypedExprKind::Var(_) => false,
+            TypedExprKind::SeqLit(items) => items
+                .iter()
+                .any(|item| Self::typed_expr_mentions_bind(item, name)),
             TypedExprKind::Match {
                 scrutinee,
                 arms,
@@ -2655,6 +2762,10 @@ impl<'tcx> Verifier<'tcx> {
             | TypedExprKind::Deref { base }
             | TypedExprKind::Fin { base }
             | TypedExprKind::Unary { arg: base, .. } => Self::typed_expr_mentions_bind(base, name),
+            TypedExprKind::Index { base, index } => {
+                Self::typed_expr_mentions_bind(base, name)
+                    || Self::typed_expr_mentions_bind(index, name)
+            }
             TypedExprKind::Binary { lhs, rhs, .. } => {
                 Self::typed_expr_mentions_bind(lhs, name)
                     || Self::typed_expr_mentions_bind(rhs, name)
@@ -2776,6 +2887,7 @@ impl<'tcx> Verifier<'tcx> {
         match &expr.kind {
             TypedExprKind::Bind(_) => true,
             TypedExprKind::Bool(_) | TypedExprKind::Int(_) | TypedExprKind::Var(_) => false,
+            TypedExprKind::SeqLit(items) => items.iter().any(Self::expr_has_bind),
             TypedExprKind::Match {
                 scrutinee,
                 arms,
@@ -2792,6 +2904,9 @@ impl<'tcx> Verifier<'tcx> {
             | TypedExprKind::Deref { base }
             | TypedExprKind::Fin { base }
             | TypedExprKind::Unary { arg: base, .. } => Self::expr_has_bind(base),
+            TypedExprKind::Index { base, index } => {
+                Self::expr_has_bind(base) || Self::expr_has_bind(index)
+            }
             TypedExprKind::Binary { lhs, rhs, .. } => {
                 Self::expr_has_bind(lhs) || Self::expr_has_bind(rhs)
             }
@@ -2964,6 +3079,27 @@ impl<'tcx> Verifier<'tcx> {
         self.value_encoder.int_term(value)
     }
 
+    fn seq_literal_value(&self, items: &[SymValue]) -> SymValue {
+        self.value_encoder.seq_literal_value(items)
+    }
+
+    fn seq_len_int(&self, value: &SymValue, span: Span) -> Result<Int, VerificationResult> {
+        self.value_encoder
+            .seq_len_int(value)
+            .map_err(|err| self.unsupported_result(span, err))
+    }
+
+    fn seq_nth_value(
+        &self,
+        value: &SymValue,
+        index: &Int,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        self.value_encoder
+            .seq_nth_value(value, index)
+            .map_err(|err| self.unsupported_result(span, err))
+    }
+
     fn eq_for_spec_ty(
         &self,
         ty: &SpecTy,
@@ -3031,8 +3167,14 @@ impl<'tcx> Verifier<'tcx> {
             .map_err(|err| self.unsupported_result(self.report_span(), err))?;
         if let TyKind::Adt(adt_def, args) = ty.kind() {
             debug_assert!(adt_def.is_struct());
-            debug_assert!(args.is_empty());
-            if adt_def.has_dtor(self.tcx) {
+            let is_seq_model = matches!(spec_ty, SpecTy::Seq(_));
+            if !args.is_empty() && !is_seq_model {
+                return Err(self.unsupported_result(
+                    self.report_span(),
+                    format!("generic structs are unsupported: {ty:?}"),
+                ));
+            }
+            if adt_def.has_dtor(self.tcx) && !is_seq_model {
                 return Err(self.unsupported_result(
                     self.report_span(),
                     format!("structs with Drop are unsupported: {ty:?}"),
@@ -3065,6 +3207,10 @@ impl<'tcx> Verifier<'tcx> {
             TypeEncodingKind::Int => Ok(self
                 .value_encoder
                 .wrap_int(&Int::new_const(self.fresh_name(hint)))),
+            TypeEncodingKind::Seq => Ok(SymValue::new(Dynamic::from(Z3Seq::new_const(
+                self.fresh_name(hint),
+                self.value_encoder.value_sort(),
+            )))),
             TypeEncodingKind::Composite(composite) => {
                 let ctor = composite
                     .single_constructor()
@@ -3121,6 +3267,204 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<SymValue, VerificationResult> {
         let encoding = self.composite_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
         self.decode_composite_field(&encoding, value, 1, span)
+    }
+
+    fn builtin_seq_decls(&self, span: Span) -> Result<Rc<BuiltinSeqDecls>, VerificationResult> {
+        if let Some(decls) = self.builtin_seq_decls.borrow().as_ref().cloned() {
+            return Ok(decls);
+        }
+        let decls = with_solver(|solver| {
+            let nat_ty = SpecTy::Named {
+                name: "Nat".to_owned(),
+                args: vec![],
+            };
+            let nat_composite = self.value_encoder.composite_encoding(&nat_ty, solver)?;
+            let (zero_index, zero_ctor) = nat_composite
+                .constructors
+                .iter()
+                .enumerate()
+                .find(|(_, ctor)| ctor.fields.is_empty())
+                .ok_or_else(|| "Nat is missing `Zero`".to_owned())?;
+            let (succ_index, succ_ctor) = nat_composite
+                .constructors
+                .iter()
+                .enumerate()
+                .find(|(_, ctor)| ctor.fields.len() == 1)
+                .ok_or_else(|| "Nat is missing `Succ`".to_owned())?;
+
+            let nat_to_int = RecFuncDecl::new(
+                "builtin_nat_to_int",
+                &[self.value_encoder.value_sort()],
+                &Sort::int(),
+            );
+            let int_to_nat = RecFuncDecl::new(
+                "builtin_int_to_nat",
+                &[&Sort::int()],
+                self.value_encoder.value_sort(),
+            );
+            let seq_rev_prefix = RecFuncDecl::new(
+                "builtin_seq_rev_prefix",
+                &[self.value_encoder.seq_value_sort(), &Sort::int()],
+                self.value_encoder.seq_value_sort(),
+            );
+            let seq_rev = RecFuncDecl::new(
+                "builtin_seq_rev",
+                &[self.value_encoder.seq_value_sort()],
+                self.value_encoder.seq_value_sort(),
+            );
+
+            let int_arg = Int::new_const(self.fresh_name("builtin_int_to_nat_arg"));
+            let zero_value = zero_ctor.symbol.apply(&[]);
+            let int_minus_one = int_arg.clone() - Int::from_i64(1);
+            let succ_tail = int_to_nat.apply(&[&int_minus_one]);
+            let succ_value = succ_ctor.symbol.apply(&[&succ_tail]);
+            let int_to_nat_body = int_arg.le(0).ite(&zero_value, &succ_value);
+            int_to_nat.add_def(&[&int_arg], &int_to_nat_body);
+
+            let nat_arg = Dynamic::new_const(
+                self.fresh_name("builtin_nat_to_int_arg"),
+                self.value_encoder.value_sort(),
+            );
+            let nat_value = SymValue::new(nat_arg.clone());
+            let zero_case =
+                self.value_encoder
+                    .tag_formula(&nat_composite, zero_index, &nat_value)?;
+            let succ_field = self.value_encoder.project_composite_ctor_field(
+                &nat_composite,
+                succ_index,
+                &nat_value,
+                0,
+            )?;
+            let succ_int = nat_to_int
+                .apply(&[succ_field.ast()])
+                .as_int()
+                .ok_or_else(|| "builtin_nat_to_int must return Int".to_owned())?;
+            let nat_to_int_body = zero_case.ite(&Int::from_i64(0), &(Int::from_i64(1) + succ_int));
+            nat_to_int.add_def(&[&nat_arg], &nat_to_int_body);
+
+            let seq_arg = Z3Seq::new_const(
+                self.fresh_name("builtin_seq_rev_arg"),
+                self.value_encoder.value_sort(),
+            );
+            let len_arg = Int::new_const(self.fresh_name("builtin_seq_rev_len"));
+            let empty_seq = Z3Seq::empty(self.value_encoder.value_sort());
+            let last_index = len_arg.clone() - Int::from_i64(1);
+            let last_item = seq_arg.nth(last_index.clone());
+            let rev_rest = seq_rev_prefix
+                .apply(&[&seq_arg, &(len_arg.clone() - Int::from_i64(1))])
+                .as_seq()
+                .ok_or_else(|| "builtin_seq_rev_prefix must return Seq".to_owned())?;
+            let seq_rev_prefix_body = len_arg.le(0).ite(
+                &empty_seq,
+                &Z3Seq::concat(&[&Z3Seq::unit(&last_item), &rev_rest]),
+            );
+            seq_rev_prefix.add_def(&[&seq_arg, &len_arg], &seq_rev_prefix_body);
+
+            let seq_input = Z3Seq::new_const(
+                self.fresh_name("builtin_seq_rev_input"),
+                self.value_encoder.value_sort(),
+            );
+            let seq_rev_body = seq_rev_prefix
+                .apply(&[&seq_input, &seq_input.length()])
+                .as_seq()
+                .ok_or_else(|| "builtin_seq_rev must return Seq".to_owned())?;
+            seq_rev.add_def(&[&seq_input], &seq_rev_body);
+
+            Ok(Rc::new(BuiltinSeqDecls {
+                nat_to_int,
+                int_to_nat,
+                _seq_rev_prefix: seq_rev_prefix,
+                seq_rev,
+            }))
+        })
+        .map_err(|err: String| self.unsupported_result(span, err))?;
+        self.builtin_seq_decls.replace(Some(decls.clone()));
+        Ok(decls)
+    }
+
+    fn nat_to_int_term(&self, value: &SymValue, span: Span) -> Result<Int, VerificationResult> {
+        if let Some(n) = self.try_concrete_nat_usize(value, span)? {
+            return Ok(Int::from_u64(n));
+        }
+        let decls = self.builtin_seq_decls(span)?;
+        decls
+            .nat_to_int
+            .apply(&[value.ast()])
+            .as_int()
+            .ok_or_else(|| {
+                self.unsupported_result(span, "builtin_nat_to_int must return Int".to_owned())
+            })
+    }
+
+    fn int_to_nat_value(&self, value: &Int, span: Span) -> Result<SymValue, VerificationResult> {
+        let decls = self.builtin_seq_decls(span)?;
+        Ok(SymValue::new(decls.int_to_nat.apply(&[value])))
+    }
+
+    fn seq_rev_value(&self, value: &SymValue, span: Span) -> Result<SymValue, VerificationResult> {
+        let decls = self.builtin_seq_decls(span)?;
+        Ok(SymValue::new(decls.seq_rev.apply(&[value.ast()])))
+    }
+
+    fn nat_spec_ty() -> SpecTy {
+        SpecTy::Named {
+            name: "Nat".to_owned(),
+            args: vec![],
+        }
+    }
+
+    fn nat_ctor_indices(&self) -> Result<(usize, usize), VerificationResult> {
+        let composite = self.composite_encoding(&Self::nat_spec_ty())?;
+        let zero = composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| ctor.fields.is_empty())
+            .map(|(index, _)| index)
+            .ok_or_else(|| {
+                self.unsupported_result(self.report_span(), "Nat is missing `Zero`".to_owned())
+            })?;
+        let succ = composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| ctor.fields.len() == 1)
+            .map(|(index, _)| index)
+            .ok_or_else(|| {
+                self.unsupported_result(self.report_span(), "Nat is missing `Succ`".to_owned())
+            })?;
+        Ok((zero, succ))
+    }
+
+    fn try_concrete_nat_usize(
+        &self,
+        value: &SymValue,
+        span: Span,
+    ) -> Result<Option<u64>, VerificationResult> {
+        let nat_ty = Self::nat_spec_ty();
+        let (zero, succ) = self.nat_ctor_indices()?;
+        match self.ground_ctor_index(&nat_ty, value, span)? {
+            Some(index) if index == zero => Ok(Some(0)),
+            Some(index) if index == succ => {
+                let composite = self.composite_encoding(&nat_ty)?;
+                let tail = self
+                    .value_encoder
+                    .project_composite_ctor_field(&composite, succ, value, 0)
+                    .map_err(|err| self.unsupported_result(span, err))?;
+                Ok(self.try_concrete_nat_usize(&tail, span)?.map(|n| n + 1))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn concrete_nat_value(&self, n: u64) -> Result<SymValue, VerificationResult> {
+        let nat_ty = Self::nat_spec_ty();
+        let (zero, succ) = self.nat_ctor_indices()?;
+        let mut value = self.construct_composite_ctor(&nat_ty, zero, &[])?;
+        for _ in 0..n {
+            value = self.construct_composite_ctor(&nat_ty, succ, &[value])?;
+        }
+        Ok(value)
     }
 
     fn spec_ty_for_place_ty(&self, ty: Ty<'tcx>, span: Span) -> Result<SpecTy, VerificationResult> {
@@ -3329,6 +3673,7 @@ impl<'tcx> Verifier<'tcx> {
                     .map_err(|err| self.unsupported_result(span, err))?,
                 &self.value_int_data(value),
             )),
+            SpecTy::Seq(_) => Ok(None),
             SpecTy::Ref(inner) => {
                 let composite = self.composite_encoding(ty)?;
                 let deref = self.decode_composite_field(&composite, value, 0, span)?;
@@ -3401,6 +3746,7 @@ impl<'tcx> Verifier<'tcx> {
             | SpecTy::U32
             | SpecTy::U64
             | SpecTy::Usize => Ok(Bool::from_bool(true)),
+            SpecTy::Seq(_) => Ok(Bool::from_bool(true)),
             SpecTy::Ref(_) => {
                 let composite = self.composite_encoding(ty)?;
                 self.composite_tag_formula_for_encoding(&composite, value, 0, span)
@@ -3796,6 +4142,11 @@ fn collect_typed_expr_pure_fn_refs(expr: &TypedExpr, out: &mut BTreeSet<String>)
         | TypedExprKind::Int(_)
         | TypedExprKind::Var(_)
         | TypedExprKind::Bind(_) => {}
+        TypedExprKind::SeqLit(items) => {
+            for item in items {
+                collect_typed_expr_pure_fn_refs(item, out);
+            }
+        }
         TypedExprKind::Match {
             scrutinee,
             arms,
@@ -3825,6 +4176,10 @@ fn collect_typed_expr_pure_fn_refs(expr: &TypedExpr, out: &mut BTreeSet<String>)
         | TypedExprKind::Deref { base }
         | TypedExprKind::Fin { base }
         | TypedExprKind::Unary { arg: base, .. } => collect_typed_expr_pure_fn_refs(base, out),
+        TypedExprKind::Index { base, index } => {
+            collect_typed_expr_pure_fn_refs(base, out);
+            collect_typed_expr_pure_fn_refs(index, out);
+        }
         TypedExprKind::Binary { lhs, rhs, .. } => {
             collect_typed_expr_pure_fn_refs(lhs, out);
             collect_typed_expr_pure_fn_refs(rhs, out);
@@ -3909,6 +4264,7 @@ fn spec_ty_contains_mut_ref(ty: &SpecTy) -> bool {
     match ty {
         SpecTy::Mut(_) => true,
         SpecTy::Ref(inner) => spec_ty_contains_mut_ref(inner),
+        SpecTy::Seq(inner) => spec_ty_contains_mut_ref(inner),
         SpecTy::Tuple(items) => items.iter().any(spec_ty_contains_mut_ref),
         SpecTy::Struct(struct_ty) => struct_ty
             .fields

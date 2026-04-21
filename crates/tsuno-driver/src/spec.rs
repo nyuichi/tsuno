@@ -4,6 +4,7 @@ pub enum Expr {
     Int(IntLiteral),
     Var(String),
     Bind(String),
+    SeqLit(Vec<Expr>),
     Match {
         scrutinee: Box<Expr>,
         arms: Vec<MatchArm>,
@@ -21,6 +22,10 @@ pub enum Expr {
     TupleField {
         base: Box<Expr>,
         index: usize,
+    },
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
     },
     Deref {
         base: Box<Expr>,
@@ -69,6 +74,7 @@ pub enum TypedExprKind {
     Int(IntLiteral),
     Var(String),
     Bind(String),
+    SeqLit(Vec<TypedExpr>),
     Match {
         scrutinee: Box<TypedExpr>,
         arms: Vec<TypedMatchArm>,
@@ -92,6 +98,10 @@ pub enum TypedExprKind {
     TupleField {
         base: Box<TypedExpr>,
         index: usize,
+    },
+    Index {
+        base: Box<TypedExpr>,
+        index: Box<TypedExpr>,
     },
     Deref {
         base: Box<TypedExpr>,
@@ -191,6 +201,7 @@ pub enum SpecTy {
     U32,
     U64,
     Usize,
+    Seq(Box<SpecTy>),
     Tuple(Vec<SpecTy>),
     Struct(StructTy),
     Named { name: String, args: Vec<SpecTy> },
@@ -304,6 +315,7 @@ pub enum BinaryOp {
     Add,
     Sub,
     Mul,
+    Concat,
     Eq,
     Ne,
     Gt,
@@ -482,11 +494,14 @@ enum Token {
     RParen,
     LBrace,
     RBrace,
+    LBracket,
+    RBracket,
     Comma,
     Dot,
     ColonColon,
     FatArrow,
     Question,
+    Concat,
     Plus,
     Minus,
     Star,
@@ -573,6 +588,14 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
                 chars.next();
                 tokens.push(Token::RBrace);
             }
+            '[' => {
+                chars.next();
+                tokens.push(Token::LBracket);
+            }
+            ']' => {
+                chars.next();
+                tokens.push(Token::RBracket);
+            }
             ',' => {
                 chars.next();
                 tokens.push(Token::Comma);
@@ -595,7 +618,12 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
             }
             '+' => {
                 chars.next();
-                tokens.push(Token::Plus);
+                if chars.peek() == Some(&'+') {
+                    chars.next();
+                    tokens.push(Token::Concat);
+                } else {
+                    tokens.push(Token::Plus);
+                }
             }
             '-' => {
                 chars.next();
@@ -764,7 +792,7 @@ impl Parser {
     }
 
     fn parse_cmp(&mut self) -> Result<Expr, ParseError> {
-        let mut expr = self.parse_add()?;
+        let mut expr = self.parse_concat()?;
         loop {
             let op = if self.eat(&Token::Lt) {
                 Some(BinaryOp::Lt)
@@ -780,9 +808,22 @@ impl Parser {
             let Some(op) = op else {
                 break;
             };
-            let rhs = self.parse_add()?;
+            let rhs = self.parse_concat()?;
             expr = Expr::Binary {
                 op,
+                lhs: Box::new(expr),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_concat(&mut self) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_add()?;
+        while self.eat(&Token::Concat) {
+            let rhs = self.parse_add()?;
+            expr = Expr::Binary {
+                op: BinaryOp::Concat,
                 lhs: Box::new(expr),
                 rhs: Box::new(rhs),
             };
@@ -849,26 +890,39 @@ impl Parser {
 
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_primary()?;
-        while self.eat(&Token::Dot) {
-            expr = match self.next() {
-                Some(Token::Int(value)) if value.as_unsuffixed_usize().is_some() => {
-                    Expr::TupleField {
-                        base: Box::new(expr),
-                        index: value
-                            .as_unsuffixed_usize()
-                            .expect("checked tuple field index"),
+        loop {
+            if self.eat(&Token::Dot) {
+                expr = match self.next() {
+                    Some(Token::Int(value)) if value.as_unsuffixed_usize().is_some() => {
+                        Expr::TupleField {
+                            base: Box::new(expr),
+                            index: value
+                                .as_unsuffixed_usize()
+                                .expect("checked tuple field index"),
+                        }
                     }
-                }
-                Some(Token::Ident(ident)) => Expr::Field {
+                    Some(Token::Ident(ident)) => Expr::Field {
+                        base: Box::new(expr),
+                        name: ident.clone(),
+                    },
+                    _ => {
+                        return Err(ParseError::new(
+                            "unsupported field access in spec expression",
+                        ));
+                    }
+                };
+                continue;
+            }
+            if self.eat(&Token::LBracket) {
+                let index = self.parse_expr()?;
+                self.expect(&Token::RBracket)?;
+                expr = Expr::Index {
                     base: Box::new(expr),
-                    name: ident.clone(),
-                },
-                _ => {
-                    return Err(ParseError::new(
-                        "unsupported field access in spec expression",
-                    ));
-                }
-            };
+                    index: Box::new(index),
+                };
+                continue;
+            }
+            break;
         }
         Ok(expr)
     }
@@ -1003,6 +1057,11 @@ impl Parser {
             "u32" if args.is_empty() => Ok(SpecTy::U32),
             "u64" if args.is_empty() => Ok(SpecTy::U64),
             "usize" if args.is_empty() => Ok(SpecTy::Usize),
+            "Seq" if args.len() == 1 => Ok(SpecTy::Seq(Box::new(args[0].clone()))),
+            "Seq" => Err(ParseError::new(format!(
+                "spec type `Seq` expects 1 type argument, found {}",
+                args.len()
+            ))),
             _ => Ok(SpecTy::Named { name: ident, args }),
         }
     }
@@ -1081,7 +1140,22 @@ impl Parser {
                 self.expect(&Token::RParen)?;
                 Ok(expr)
             }
+            Some(Token::LBracket) => self.parse_seq_literal(),
             _ => Err(ParseError::new("expected a spec expression")),
+        }
+    }
+
+    fn parse_seq_literal(&mut self) -> Result<Expr, ParseError> {
+        let mut items = Vec::new();
+        if self.eat(&Token::RBracket) {
+            return Ok(Expr::SeqLit(items));
+        }
+        loop {
+            items.push(self.parse_expr()?);
+            if self.eat(&Token::RBracket) {
+                return Ok(Expr::SeqLit(items));
+            }
+            self.expect(&Token::Comma)?;
         }
     }
 
@@ -1318,6 +1392,11 @@ impl<'a> PureFnParser<'a> {
             "u32" if args.is_empty() => Ok(SpecTy::U32),
             "u64" if args.is_empty() => Ok(SpecTy::U64),
             "usize" if args.is_empty() => Ok(SpecTy::Usize),
+            "Seq" if args.len() == 1 => Ok(SpecTy::Seq(Box::new(args[0].clone()))),
+            "Seq" => Err(ParseError::new(format!(
+                "spec type `Seq` expects 1 type argument, found {}",
+                args.len()
+            ))),
             _ if args.is_empty() && type_params.iter().any(|param| param == &ident) => {
                 Ok(SpecTy::TypeParam(ident))
             }
@@ -1938,6 +2017,56 @@ mod tests {
     }
 
     #[test]
+    fn parses_sequence_literal_expression() {
+        let expr = parse_raw_expr("assert", r#"[1i32, 2i32]"#).expect("seq literal");
+        assert_eq!(
+            expr,
+            Expr::SeqLit(vec![
+                Expr::Int(IntLiteral {
+                    digits: "1".to_owned(),
+                    suffix: Some(IntSuffix::I32),
+                }),
+                Expr::Int(IntLiteral {
+                    digits: "2".to_owned(),
+                    suffix: Some(IntSuffix::I32),
+                }),
+            ])
+        );
+    }
+
+    #[test]
+    fn parses_sequence_concat_expression() {
+        let expr = parse_raw_expr("assert", r#"[1i32] ++ xs"#).expect("seq concat");
+        assert_eq!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::Concat,
+                lhs: Box::new(Expr::SeqLit(vec![Expr::Int(IntLiteral {
+                    digits: "1".to_owned(),
+                    suffix: Some(IntSuffix::I32),
+                })])),
+                rhs: Box::new(Expr::Var("xs".to_owned())),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_sequence_index_expression() {
+        let expr = parse_raw_expr("assert", r#"xs[Nat::Zero]"#).expect("seq index");
+        assert_eq!(
+            expr,
+            Expr::Index {
+                base: Box::new(Expr::Var("xs".to_owned())),
+                index: Box::new(Expr::Call {
+                    func: "Nat::Zero".to_owned(),
+                    type_args: vec![],
+                    args: vec![],
+                }),
+            }
+        );
+    }
+
+    #[test]
     fn parses_statement_expression_with_trailing_semicolon() {
         let expr = super::parse_statement_expr("assert", r#"{x} == 1i32;"#).expect("expr");
         assert_eq!(
@@ -1994,13 +2123,7 @@ fn is_rev(x: Seq<i32>) -> bool {
 "#,
         )
         .expect("generic named type should parse");
-        assert_eq!(
-            defs[0].params[0].ty,
-            SpecTy::Named {
-                name: "Seq".to_owned(),
-                args: vec![SpecTy::I32],
-            }
-        );
+        assert_eq!(defs[0].params[0].ty, SpecTy::Seq(Box::new(SpecTy::I32)));
     }
 
     #[test]

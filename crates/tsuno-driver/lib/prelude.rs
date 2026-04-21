@@ -111,4 +111,25 @@ fn list_len_append(xs: List<i32>, ys: List<i32>)
         }
     }
 }
+
+fn seq_concat_assoc_i32(xs: Seq<i32>, ys: Seq<i32>, zs: Seq<i32>)
+  req true
+  ens (xs ++ ys) ++ zs == xs ++ (ys ++ zs)
+{
+    assert (xs ++ ys) ++ zs == xs ++ (ys ++ zs);
+}
+
+fn seq_concat_empty_right_i32(xs: Seq<i32>)
+  req true
+  ens xs ++ [] == xs
+{
+    assert xs ++ [] == xs;
+}
+
+fn seq_rev_empty_i32(xs: Seq<i32>)
+  req xs == []
+  ens seq_rev(xs) == []
+{
+    assert seq_rev(xs) == [];
+}
 */
