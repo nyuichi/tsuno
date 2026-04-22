@@ -2814,16 +2814,16 @@ fn typed_contract_expr_with_expected(
             Err(format!("unresolved binding `{name}` in function contract"))
         }
         Expr::Interpolated(name) => {
-            if let Some(ty) = params.get(name) {
-                return Ok(TypedExpr {
-                    ty: ty.clone(),
-                    kind: TypedExprKind::Var(name.clone()),
-                });
-            }
             if allow_result && name == "result" {
                 return Ok(TypedExpr {
                     ty: result_ty.clone(),
                     kind: TypedExprKind::Var(name.clone()),
+                });
+            }
+            if let Some(ty) = params.get(name) {
+                return Ok(TypedExpr {
+                    ty: ty.clone(),
+                    kind: TypedExprKind::RustVar(name.clone()),
                 });
             }
             if name == "result" {
@@ -3138,7 +3138,7 @@ fn typed_body_expr_with_expected(
                 .ok_or_else(|| format!("unresolved binding `{name}` in //@ {}", kind.keyword()))?;
             Ok(TypedExpr {
                 ty,
-                kind: TypedExprKind::Var(name.clone()),
+                kind: TypedExprKind::RustVar(name.clone()),
             })
         }
         Expr::Interpolated(name) => {
@@ -3148,7 +3148,7 @@ fn typed_body_expr_with_expected(
                 .ok_or_else(|| format!("unresolved binding `{name}` in //@ {}", kind.keyword()))?;
             Ok(TypedExpr {
                 ty,
-                kind: TypedExprKind::Var(name.clone()),
+                kind: TypedExprKind::RustVar(name.clone()),
             })
         }
         Expr::SeqLit(items) => type_seq_lit_expr(items, expected, &mut |item, expected| {
@@ -4243,6 +4243,7 @@ fn typed_expr_calls_pure_fn(expr: &TypedExpr, name: &str) -> bool {
         TypedExprKind::Bool(_)
         | TypedExprKind::Int(_)
         | TypedExprKind::Var(_)
+        | TypedExprKind::RustVar(_)
         | TypedExprKind::Bind(_) => false,
     }
 }
@@ -4343,6 +4344,7 @@ fn validate_recursive_pure_expr(
         TypedExprKind::Bool(_)
         | TypedExprKind::Int(_)
         | TypedExprKind::Var(_)
+        | TypedExprKind::RustVar(_)
         | TypedExprKind::Bind(_) => Ok(()),
     }
 }
@@ -4912,6 +4914,7 @@ fn recursive_lemma_measure(
         TypedExprKind::Var(name) => size_map
             .get(name)
             .and_then(|(root, depth)| (root == &param.name).then_some(*depth)),
+        TypedExprKind::RustVar(_) => None,
         _ => None,
     }
 }
@@ -4970,6 +4973,7 @@ fn validate_recursive_lemma_stmts(
             } => {
                 let branch_root = match &scrutinee.kind {
                     TypedExprKind::Var(name) => size_map.get(name).cloned(),
+                    TypedExprKind::RustVar(_) => None,
                     _ => None,
                 };
                 for arm in arms {
@@ -6310,6 +6314,52 @@ mod tests {
 
         assert_eq!(typed.args.len(), 1);
         assert_eq!(typed.args[0].ty, SpecTy::Seq(Box::new(SpecTy::I32)));
+    }
+
+    #[test]
+    fn runtime_contract_interpolation_becomes_rust_var() {
+        let typed = typed_runtime_contract_expr(
+            &Expr::Interpolated("x".to_owned()),
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut SpecScope::default(),
+            &HashMap::from([("x".to_owned(), SpecTy::I32)]),
+            false,
+            &SpecTy::Bool,
+            &mut SpecTypeInference::default(),
+        )
+        .expect("typed runtime contract expr");
+
+        assert_eq!(
+            typed,
+            TypedExpr {
+                ty: SpecTy::I32,
+                kind: TypedExprKind::RustVar("x".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_postcondition_result_stays_spec_var() {
+        let typed = typed_runtime_contract_expr(
+            &Expr::Var("result".to_owned()),
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut SpecScope::default(),
+            &HashMap::new(),
+            true,
+            &SpecTy::I32,
+            &mut SpecTypeInference::default(),
+        )
+        .expect("typed runtime postcondition expr");
+
+        assert_eq!(
+            typed,
+            TypedExpr {
+                ty: SpecTy::I32,
+                kind: TypedExprKind::Var("result".to_owned()),
+            }
+        );
     }
 
     #[test]

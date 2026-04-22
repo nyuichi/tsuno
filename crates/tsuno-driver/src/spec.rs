@@ -74,6 +74,7 @@ pub enum TypedExprKind {
     Bool(bool),
     Int(IntLiteral),
     Var(String),
+    RustVar(String),
     Bind(String),
     SeqLit(Vec<TypedExpr>),
     Match {

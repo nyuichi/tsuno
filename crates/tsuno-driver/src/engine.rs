@@ -1931,7 +1931,13 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(self.seq_literal_value(&values))
             }
-            TypedExprKind::Var(name) if resolved.spec_vars.contains(name) => {
+            TypedExprKind::Var(name) => {
+                if !resolved.spec_vars.contains(name) {
+                    return Err(self.unsupported_result(
+                        self.control_span(state.ctrl),
+                        format!("missing spec binding `{name}`"),
+                    ));
+                }
                 self.function_spec_vars().get(name).cloned().ok_or_else(|| {
                     self.unsupported_result(
                         self.control_span(state.ctrl),
@@ -1939,7 +1945,7 @@ impl<'tcx> Verifier<'tcx> {
                     )
                 })
             }
-            TypedExprKind::Var(name) => {
+            TypedExprKind::RustVar(name) => {
                 let Some(local) = resolved.locals.get(name) else {
                     return Err(self.unsupported_result(
                         self.control_span(state.ctrl),
@@ -2128,18 +2134,21 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(self.seq_literal_value(&values))
             }
-            TypedExprKind::Var(name) if spec.contains_key(name) => {
-                spec.get(name).cloned().ok_or_else(|| {
+            TypedExprKind::Var(name) => {
+                if let Some(value) = spec.get(name).cloned() {
+                    return Ok(value);
+                }
+                current.get(name).cloned().ok_or_else(|| {
                     self.unsupported_result(
                         self.report_span(),
                         format!("missing spec binding `{name}`"),
                     )
                 })
             }
-            TypedExprKind::Var(name) => current.get(name).cloned().ok_or_else(|| {
+            TypedExprKind::RustVar(name) => current.get(name).cloned().ok_or_else(|| {
                 self.unsupported_result(
                     self.report_span(),
-                    format!("missing contract binding `{name}`"),
+                    format!("missing Rust binding `{name}`"),
                 )
             }),
             TypedExprKind::Bind(name) => spec.get(name).cloned().ok_or_else(|| {
@@ -2354,7 +2363,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Some(self.seq_literal_value(&values))
             }
-            TypedExprKind::Var(name) => env.get(name).cloned(),
+            TypedExprKind::Var(name) | TypedExprKind::RustVar(name) => env.get(name).cloned(),
             TypedExprKind::Bind(_) => None,
             TypedExprKind::CtorCall {
                 ctor_index, args, ..
@@ -2715,7 +2724,10 @@ impl<'tcx> Verifier<'tcx> {
     fn expr_has_bind(expr: &TypedExpr) -> bool {
         match &expr.kind {
             TypedExprKind::Bind(_) => true,
-            TypedExprKind::Bool(_) | TypedExprKind::Int(_) | TypedExprKind::Var(_) => false,
+            TypedExprKind::Bool(_)
+            | TypedExprKind::Int(_)
+            | TypedExprKind::Var(_)
+            | TypedExprKind::RustVar(_) => false,
             TypedExprKind::SeqLit(items) => items.iter().any(Self::expr_has_bind),
             TypedExprKind::Match {
                 scrutinee,
@@ -3859,7 +3871,7 @@ impl CallEnv {
         verifier: &Verifier<'tcx>,
         state: &State,
         contract: &FunctionContract,
-        spec: HashMap<String, SymValue>,
+        mut spec: HashMap<String, SymValue>,
     ) -> Result<Self, VerificationResult> {
         let mut current = HashMap::new();
         for (param, local) in contract
@@ -3876,7 +3888,8 @@ impl CallEnv {
             current.insert(param.name.clone(), value);
         }
         if let Some(result) = state.model.get(&Local::from_usize(0)).cloned() {
-            current.insert("result".to_owned(), result);
+            current.insert("result".to_owned(), result.clone());
+            spec.insert("result".to_owned(), result);
         }
         Ok(Self { current, spec })
     }
@@ -3968,6 +3981,7 @@ fn collect_typed_expr_pure_fn_refs(expr: &TypedExpr, out: &mut BTreeSet<String>)
         TypedExprKind::Bool(_)
         | TypedExprKind::Int(_)
         | TypedExprKind::Var(_)
+        | TypedExprKind::RustVar(_)
         | TypedExprKind::Bind(_) => {}
         TypedExprKind::SeqLit(items) => {
             for item in items {
