@@ -363,9 +363,6 @@ fn parse_source_expr_with_type_params(
     text: &str,
     type_params: &[String],
 ) -> Result<Expr, ParseError> {
-    if let Some(decoded) = decode_legacy_string_literal(text)? {
-        return parse_templated_expr_with_type_params(kind, &decoded, type_params);
-    }
     parse_templated_expr_with_type_params(kind, text.trim(), type_params)
 }
 
@@ -422,45 +419,6 @@ fn parse_raw_match_pattern(text: &str) -> Result<MatchPattern, ParseError> {
         .ok_or_else(|| ParseError::new("expected match arm pattern"))?;
     parser.expect_end()?;
     Ok(pattern)
-}
-
-fn decode_legacy_string_literal(text: &str) -> Result<Option<String>, ParseError> {
-    let Some(inner) = text
-        .trim()
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-    else {
-        return Ok(None);
-    };
-
-    let mut out = String::new();
-    let mut chars = inner.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            out.push(ch);
-            continue;
-        }
-        let Some(esc) = chars.next() else {
-            return Err(ParseError::new(
-                "failed to parse spec expression: trailing escape in string literal".to_string(),
-            ));
-        };
-        match esc {
-            '\\' => out.push('\\'),
-            '"' => out.push('"'),
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            't' => out.push('\t'),
-            '0' => out.push('\0'),
-            _ => {
-                return Err(ParseError::new(format!(
-                    "failed to parse spec expression: unsupported escape `\\{esc}`"
-                )));
-            }
-        }
-    }
-
-    Ok(Some(out))
 }
 
 fn expand_template(kind: &str, raw: &str) -> Result<String, ParseError> {
@@ -1844,6 +1802,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_negated_call_with_bind_argument() {
+        let expr = parse_expr("assert", r#"!P(?x)"#).expect("expr");
+        assert_eq!(
+            expr,
+            Expr::Unary {
+                op: UnaryOp::Not,
+                arg: Box::new(Expr::Call {
+                    func: "P".to_owned(),
+                    type_args: vec![],
+                    args: vec![Expr::Bind("x".to_owned())],
+                }),
+            }
+        );
+    }
+
+    #[test]
     fn keeps_operator_precedence() {
         let expr = parse_expr("assert", r#"!false || 1 + 2 * 3 == 7"#).expect("expr");
         assert_eq!(
@@ -2090,6 +2064,19 @@ mod tests {
                     suffix: Some(IntSuffix::I32),
                 })),
             }
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_string_literal_statement_expression() {
+        let err = super::parse_statement_expr("assert", r#""{x} == 1i32";"#)
+            .expect_err("legacy string literal form should be rejected");
+        assert!(
+            err.to_string().contains("expected a spec expression")
+                || err
+                    .to_string()
+                    .contains("unexpected character `\"` in spec expression"),
+            "{err}"
         );
     }
 
