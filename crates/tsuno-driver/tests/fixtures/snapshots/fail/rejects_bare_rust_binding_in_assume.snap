@@ -5,8 +5,8 @@ expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
-UNSUPPORTED rejects_body_spec_var_in_ens
-  unresolved binding `Y` in function contract
-  src/main.rs:3:1: 3:26
+UNSUPPORTED main
+  unresolved binding `x` in //@ assume
+  src/main.rs:4:2: 4:2
 
 stderr:

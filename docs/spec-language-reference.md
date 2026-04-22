@@ -14,7 +14,7 @@ Function contracts are written immediately before the function body.
 ```rust
 fn add1(x: i32) -> i32
 //@ req {x} >= 0
-//@ ens {result} == {x} + 1
+//@ ens result == {x} + 1
 {
     x + 1
 }
@@ -25,7 +25,7 @@ Rules:
 - a function may omit the contract entirely
 - if a contract is present, it must contain exactly one `//@ req` and exactly one `//@ ens`
 - both lines must appear immediately before the body
-- `result` is only available in `//@ ens`
+- `result` is only available bare in `//@ ens`
 
 Assertions, assumptions, and lemma calls appear inside executable Rust code.
 
@@ -57,22 +57,31 @@ Rules:
 
 ## 2. Writing Expressions
 
-Spec expressions are written directly. In-scope names may be used directly, and `{...}` may be used to splice a Rust expression into spec syntax.
+Spec expressions are written directly. In runtime specs (`req`, `ens`, `assert`, `assume`, `inv`, and runtime lemma calls), a bare identifier refers only to a visible spec binder. The only built-in bare name is `result` in `ens`. A Rust binding must be written as `{name}`.
 
 ```rust
-//@ assert x == 1i32;
 //@ assert {x} == 1i32;
 //@ assert *{r} == 1i32;
 //@ assert {pair}.left == 1i32;
 //@ assert {pair}.0 == 1i32;
 ```
 
-Interpolation is syntactic. The inserted Rust expression is parenthesized before parsing as spec syntax.
+Inside ghost blocks, ordinary ghost parameters and local names are written bare.
+
+```rust
+/*@
+fn add1(x: i32) -> i32 {
+    x + 1i32
+}
+*/
+```
+
+Interpolation composes with the surrounding spec syntax. The content of `{...}` is a single Rust binding name, not a general Rust expression.
 
 ```text
-{x}      => (x)
-*{r}     => *(r)
-{pair}.0 => (pair).0
+{x}
+*{r}
+{pair}.0
 ```
 
 String-literal wrappers are not part of the language.
@@ -93,7 +102,9 @@ false
 0
 1i32
 42usize
+result
 x
+{x}
 ?x
 f(x, y)
 Enum::Ctor(x, y)
@@ -168,10 +179,9 @@ fn read_ref(x: &i32) -> i32
 }
 ```
 
-An unprefixed name such as `V` refers to:
+In runtime specs, an unprefixed name such as `V` refers to a spec binder that has already been introduced and is visible at that point.
 
-- a spec binder that has already been introduced and is visible at that point
-- otherwise a visible Rust binding
+In ghost blocks, an unprefixed name may also refer to an ordinary ghost parameter or local binding.
 
 If no visible binding exists, the expression is rejected.
 
@@ -203,34 +213,7 @@ assert !P(?x);
 
 So `assert !P(?x);` does not mean `!exists x. P(x)` and does not mean `forall x. !P(x)`. The `!` still applies only to `P(?x)`, and the enclosing assertion is then checked existentially.
 
-### 3.2 Witness Equalities
-
-The verifier also has an implementation-specific proof shortcut for top-level conjunctions. Inside a `&&` chain, equalities of the following forms are extracted eagerly as witnesses:
-
-```text
-?x == e
-e == ?x
-```
-
-Example:
-
-```text
-?x == e && ?y == f(x) && R(x, y)
-```
-
-The extracted witnesses are `x = e` and `y = f(x)`, then `R(x, y)` is checked.
-
-Other shapes are still existential, but they are not extracted as direct witnesses.
-
-```text
-!P(?x)
-P(?x) || Q
-?x == f(?x)
-```
-
-This shortcut does not define binder scope. It only changes how certain conjunctions are discharged.
-
-### 3.3 Scope Across `req`, Body Directives, and `ens`
+### 3.2 Scope Across `req`, Body Directives, and `ens`
 
 Function-level binder visibility is staged in source order:
 
@@ -434,26 +417,3 @@ Rules:
 - explicit type arguments are supported for enum constructors and lemma calls, but not for pure function calls
 - statement-level `match` default arms must come last
 - expression-level `match` may contain at most one `_` arm
-
-## 7. Current Restrictions
-
-The following forms are rejected by the current implementation:
-
-- string-literal-wrapped spec expressions such as `//@ assert "{x} == 1";`
-- `match` expressions in `req`, `ens`, `assert`, `assume`, or `inv`
-- use of `result` outside `ens`
-- equality or inequality on `Ref<T>` or `Mut<T>`
-- tuple projection on non-tuples
-- tuple projection on structs
-- named field access on non-structs, except `.fin` on `Mut<T>`
-- loops without exactly one attached `//@ inv`
-- function contracts that are not placed immediately before the body
-
-Examples of rejected forms:
-
-```rust
-//@ req {result} == 1
-//@ assert {r} == {r}
-//@ assert match xs { ... }
-//@ assert "{x} == 1i32";
-```

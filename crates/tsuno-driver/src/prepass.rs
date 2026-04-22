@@ -499,6 +499,7 @@ struct ExprResolutionContext<'a> {
     anchor_span: Span,
     kind: DirectiveKind,
     spec_scope: &'a mut SpecScope,
+    allow_bare_names: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1599,6 +1600,7 @@ fn infer_match_expr_types(
     allow_result: bool,
     result_ty: &SpecTy,
     inferred: &mut SpecTypeInference,
+    allow_bare_names: bool,
     expected: Option<&SpecTy>,
 ) -> Result<InferredExprTy, String> {
     let scrutinee_ty = infer_contract_expr_types_with_expected(
@@ -1610,6 +1612,7 @@ fn infer_match_expr_types(
         allow_result,
         result_ty,
         inferred,
+        allow_bare_names,
         None,
     )?;
     let InferredExprTy::Known(SpecTy::Named {
@@ -1667,6 +1670,7 @@ fn infer_match_expr_types(
             allow_result,
             result_ty,
             inferred,
+            allow_bare_names,
             expected,
         )?;
         result_expr_ty = Some(if let Some(existing) = &result_expr_ty {
@@ -1686,6 +1690,7 @@ fn infer_match_expr_types(
             allow_result,
             result_ty,
             inferred,
+            allow_bare_names,
             expected,
         )?;
         result_expr_ty = Some(if let Some(existing) = &result_expr_ty {
@@ -1713,6 +1718,7 @@ fn typed_match_expr(
     allow_result: bool,
     result_ty: &SpecTy,
     inferred: &mut SpecTypeInference,
+    allow_bare_names: bool,
     expected: Option<&SpecTy>,
 ) -> Result<TypedExpr, String> {
     let scrutinee = typed_contract_expr_with_expected(
@@ -1724,6 +1730,7 @@ fn typed_match_expr(
         allow_result,
         result_ty,
         inferred,
+        allow_bare_names,
         None,
     )?;
     let SpecTy::Named {
@@ -1783,6 +1790,7 @@ fn typed_match_expr(
             allow_result,
             result_ty,
             inferred,
+            allow_bare_names,
             expected,
         )?;
         match_ty = Some(if let Some(existing) = &match_ty {
@@ -1809,6 +1817,7 @@ fn typed_match_expr(
             allow_result,
             result_ty,
             inferred,
+            allow_bare_names,
             expected,
         )?;
         match_ty = Some(if let Some(existing) = &match_ty {
@@ -1947,6 +1956,32 @@ fn infer_contract_expr_types(
         allow_result,
         result_ty,
         inferred,
+        true,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn infer_runtime_contract_expr_types(
+    expr: &Expr,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    inferred: &mut SpecTypeInference,
+) -> Result<InferredExprTy, String> {
+    infer_contract_expr_types_with_expected(
+        expr,
+        pure_fns,
+        enum_defs,
+        spec_scope,
+        params,
+        allow_result,
+        result_ty,
+        inferred,
+        false,
         None,
     )
 }
@@ -1961,6 +1996,7 @@ fn infer_contract_expr_types_with_expected(
     allow_result: bool,
     result_ty: &SpecTy,
     inferred: &mut SpecTypeInference,
+    allow_bare_names: bool,
     expected: Option<&SpecTy>,
 ) -> Result<InferredExprTy, String> {
     match expr {
@@ -1974,6 +2010,18 @@ fn infer_contract_expr_types_with_expected(
                 }
                 return Ok(InferredExprTy::SpecVar(name.clone()));
             }
+            if allow_result && name == "result" {
+                return Ok(InferredExprTy::Known(result_ty.clone()));
+            }
+            if allow_bare_names && let Some(ty) = params.get(name) {
+                return Ok(InferredExprTy::Known(ty.clone()));
+            }
+            if name == "result" {
+                return Err("`result` is only supported in //@ ens predicates".to_owned());
+            }
+            Err(format!("unresolved binding `{name}` in function contract"))
+        }
+        Expr::Interpolated(name) => {
             if let Some(ty) = params.get(name) {
                 return Ok(InferredExprTy::Known(ty.clone()));
             }
@@ -1995,6 +2043,7 @@ fn infer_contract_expr_types_with_expected(
                 allow_result,
                 result_ty,
                 inferred,
+                allow_bare_names,
                 expected,
             )
         }),
@@ -2013,9 +2062,13 @@ fn infer_contract_expr_types_with_expected(
             allow_result,
             result_ty,
             inferred,
+            allow_bare_names,
             expected,
         ),
         Expr::Bind(name) => {
+            if allow_result && name == "result" {
+                return Err("duplicate spec binding `?result` in //@ ens".to_owned());
+            }
             spec_scope
                 .bind(
                     name,
@@ -2054,6 +2107,7 @@ fn infer_contract_expr_types_with_expected(
                             allow_result,
                             result_ty,
                             inferred,
+                            allow_bare_names,
                             expected,
                         )
                     },
@@ -2070,6 +2124,7 @@ fn infer_contract_expr_types_with_expected(
                             allow_result,
                             result_ty,
                             inferred,
+                            allow_bare_names,
                             expected,
                         )
                     })?
@@ -2101,6 +2156,7 @@ fn infer_contract_expr_types_with_expected(
                         allow_result,
                         result_ty,
                         inferred,
+                        allow_bare_names,
                         Some(&param.ty),
                     )?;
                     constrain_expr_ty(inferred, &arg_ty, &param.ty)?;
@@ -2109,7 +2165,7 @@ fn infer_contract_expr_types_with_expected(
             }
         }
         Expr::Field { base, name } => {
-            let base_ty = infer_contract_expr_types(
+            let base_ty = infer_contract_expr_types_with_expected(
                 base,
                 pure_fns,
                 enum_defs,
@@ -2118,11 +2174,13 @@ fn infer_contract_expr_types_with_expected(
                 allow_result,
                 result_ty,
                 inferred,
+                allow_bare_names,
+                None,
             )?;
             infer_named_field_expr_type(base_ty, name)
         }
         Expr::TupleField { base, .. } => {
-            let base_ty = infer_contract_expr_types(
+            let base_ty = infer_contract_expr_types_with_expected(
                 base,
                 pure_fns,
                 enum_defs,
@@ -2131,6 +2189,8 @@ fn infer_contract_expr_types_with_expected(
                 allow_result,
                 result_ty,
                 inferred,
+                allow_bare_names,
+                None,
             )?;
             infer_tuple_field_expr_type(base_ty)
         }
@@ -2145,12 +2205,13 @@ fn infer_contract_expr_types_with_expected(
                     allow_result,
                     result_ty,
                     inferred,
+                    allow_bare_names,
                     expected,
                 )
             })
         }
         Expr::Deref { base } => {
-            let base_ty = infer_contract_expr_types(
+            let base_ty = infer_contract_expr_types_with_expected(
                 base,
                 pure_fns,
                 enum_defs,
@@ -2159,6 +2220,8 @@ fn infer_contract_expr_types_with_expected(
                 allow_result,
                 result_ty,
                 inferred,
+                allow_bare_names,
+                None,
             )?;
             match base_ty {
                 InferredExprTy::Known(SpecTy::Ref(inner))
@@ -2171,7 +2234,7 @@ fn infer_contract_expr_types_with_expected(
             }
         }
         Expr::Unary { op, arg } => {
-            let arg_ty = infer_contract_expr_types(
+            let arg_ty = infer_contract_expr_types_with_expected(
                 arg,
                 pure_fns,
                 enum_defs,
@@ -2180,6 +2243,8 @@ fn infer_contract_expr_types_with_expected(
                 allow_result,
                 result_ty,
                 inferred,
+                allow_bare_names,
+                None,
             )?;
             match op {
                 crate::spec::UnaryOp::Not => {
@@ -2193,7 +2258,7 @@ fn infer_contract_expr_types_with_expected(
             }
         }
         Expr::Binary { op, lhs, rhs } => {
-            let lhs_ty = infer_contract_expr_types(
+            let lhs_ty = infer_contract_expr_types_with_expected(
                 lhs,
                 pure_fns,
                 enum_defs,
@@ -2202,6 +2267,8 @@ fn infer_contract_expr_types_with_expected(
                 allow_result,
                 result_ty,
                 inferred,
+                allow_bare_names,
+                None,
             )?;
             let rhs_expected = match (op, known_spec_ty(&lhs_ty)) {
                 (
@@ -2221,6 +2288,7 @@ fn infer_contract_expr_types_with_expected(
                 allow_result,
                 result_ty,
                 inferred,
+                allow_bare_names,
                 rhs_expected.as_ref(),
             )?;
             match op {
@@ -2281,7 +2349,7 @@ fn infer_body_expr_types(
     inferred: &mut SpecTypeInference,
 ) -> Result<InferredExprTy, String> {
     infer_body_expr_types_with_expected(
-        expr, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, None,
+        expr, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, false, None,
     )
 }
 
@@ -2294,6 +2362,7 @@ fn infer_body_expr_types_with_expected(
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
+    allow_bare_names: bool,
     expected: Option<&SpecTy>,
 ) -> Result<InferredExprTy, String> {
     match expr {
@@ -2307,15 +2376,36 @@ fn infer_body_expr_types_with_expected(
                 }
                 return Ok(InferredExprTy::SpecVar(name.clone()));
             }
-            local_tys
-                .get(name)
-                .cloned()
-                .map(InferredExprTy::Known)
-                .ok_or_else(|| format!("unresolved binding `{name}` in //@ {}", kind.keyword()))
+            if allow_bare_names {
+                return local_tys
+                    .get(name)
+                    .cloned()
+                    .map(InferredExprTy::Known)
+                    .ok_or_else(|| {
+                        format!("unresolved binding `{name}` in //@ {}", kind.keyword())
+                    });
+            }
+            Err(format!(
+                "unresolved binding `{name}` in //@ {}",
+                kind.keyword()
+            ))
         }
+        Expr::Interpolated(name) => local_tys
+            .get(name)
+            .cloned()
+            .map(InferredExprTy::Known)
+            .ok_or_else(|| format!("unresolved binding `{name}` in //@ {}", kind.keyword())),
         Expr::SeqLit(items) => infer_seq_lit_expr_types(items, expected, &mut |item, expected| {
             infer_body_expr_types_with_expected(
-                item, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, expected,
+                item,
+                pure_fns,
+                enum_defs,
+                kind,
+                spec_scope,
+                local_tys,
+                inferred,
+                allow_bare_names,
+                expected,
             )
         }),
         Expr::Match { .. } => Err(unsupported_match_expr_message()),
@@ -2345,7 +2435,14 @@ fn infer_body_expr_types_with_expected(
                     expected,
                     &mut |arg, expected| {
                         infer_body_expr_types_with_expected(
-                            arg, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred,
+                            arg,
+                            pure_fns,
+                            enum_defs,
+                            kind,
+                            spec_scope,
+                            local_tys,
+                            inferred,
+                            allow_bare_names,
                             expected,
                         )
                     },
@@ -2354,7 +2451,14 @@ fn infer_body_expr_types_with_expected(
                 if let Some(result) =
                     infer_builtin_pure_call(func, type_args, args, &mut |arg, expected| {
                         infer_body_expr_types_with_expected(
-                            arg, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred,
+                            arg,
+                            pure_fns,
+                            enum_defs,
+                            kind,
+                            spec_scope,
+                            local_tys,
+                            inferred,
+                            allow_bare_names,
                             expected,
                         )
                     })?
@@ -2385,6 +2489,7 @@ fn infer_body_expr_types_with_expected(
                         spec_scope,
                         local_tys,
                         inferred,
+                        allow_bare_names,
                         Some(&param.ty),
                     )?;
                     constrain_expr_ty(inferred, &arg_ty, &param.ty)?;
@@ -2393,7 +2498,7 @@ fn infer_body_expr_types_with_expected(
             }
         }
         Expr::Field { base, name } => {
-            let base_ty = infer_body_expr_types(
+            let base_ty = infer_body_expr_types_with_expected(
                 expr_base(base),
                 pure_fns,
                 enum_defs,
@@ -2401,11 +2506,13 @@ fn infer_body_expr_types_with_expected(
                 spec_scope,
                 local_tys,
                 inferred,
+                allow_bare_names,
+                None,
             )?;
             infer_named_field_expr_type(base_ty, name)
         }
         Expr::TupleField { base, .. } => {
-            let base_ty = infer_body_expr_types(
+            let base_ty = infer_body_expr_types_with_expected(
                 expr_base(base),
                 pure_fns,
                 enum_defs,
@@ -2413,19 +2520,37 @@ fn infer_body_expr_types_with_expected(
                 spec_scope,
                 local_tys,
                 inferred,
+                allow_bare_names,
+                None,
             )?;
             infer_tuple_field_expr_type(base_ty)
         }
         Expr::Index { base, index } => {
             infer_seq_index_expr_types(base, index, &mut |expr, expected| {
                 infer_body_expr_types_with_expected(
-                    expr, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, expected,
+                    expr,
+                    pure_fns,
+                    enum_defs,
+                    kind,
+                    spec_scope,
+                    local_tys,
+                    inferred,
+                    allow_bare_names,
+                    expected,
                 )
             })
         }
         Expr::Deref { base } => {
-            let base_ty = infer_body_expr_types(
-                base, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred,
+            let base_ty = infer_body_expr_types_with_expected(
+                base,
+                pure_fns,
+                enum_defs,
+                kind,
+                spec_scope,
+                local_tys,
+                inferred,
+                allow_bare_names,
+                None,
             )?;
             match base_ty {
                 InferredExprTy::Known(SpecTy::Ref(inner))
@@ -2438,8 +2563,16 @@ fn infer_body_expr_types_with_expected(
             }
         }
         Expr::Unary { op, arg } => {
-            let arg_ty = infer_body_expr_types(
-                arg, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred,
+            let arg_ty = infer_body_expr_types_with_expected(
+                arg,
+                pure_fns,
+                enum_defs,
+                kind,
+                spec_scope,
+                local_tys,
+                inferred,
+                allow_bare_names,
+                None,
             )?;
             match op {
                 crate::spec::UnaryOp::Not => {
@@ -2453,8 +2586,16 @@ fn infer_body_expr_types_with_expected(
             }
         }
         Expr::Binary { op, lhs, rhs } => {
-            let lhs_ty = infer_body_expr_types(
-                lhs, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred,
+            let lhs_ty = infer_body_expr_types_with_expected(
+                lhs,
+                pure_fns,
+                enum_defs,
+                kind,
+                spec_scope,
+                local_tys,
+                inferred,
+                allow_bare_names,
+                None,
             )?;
             let rhs_expected = match (op, known_spec_ty(&lhs_ty)) {
                 (
@@ -2473,6 +2614,7 @@ fn infer_body_expr_types_with_expected(
                 spec_scope,
                 local_tys,
                 inferred,
+                allow_bare_names,
                 rhs_expected.as_ref(),
             )?;
             match op {
@@ -2594,6 +2736,32 @@ fn typed_contract_expr(
         allow_result,
         result_ty,
         inferred,
+        true,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_runtime_contract_expr(
+    expr: &Expr,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    inferred: &mut SpecTypeInference,
+) -> Result<TypedExpr, String> {
+    typed_contract_expr_with_expected(
+        expr,
+        pure_fns,
+        enum_defs,
+        spec_scope,
+        params,
+        allow_result,
+        result_ty,
+        inferred,
+        false,
         None,
     )
 }
@@ -2608,6 +2776,7 @@ fn typed_contract_expr_with_expected(
     allow_result: bool,
     result_ty: &SpecTy,
     inferred: &mut SpecTypeInference,
+    allow_bare_names: bool,
     expected: Option<&SpecTy>,
 ) -> Result<TypedExpr, String> {
     match expr {
@@ -2627,6 +2796,24 @@ fn typed_contract_expr_with_expected(
                     kind: TypedExprKind::Var(name.clone()),
                 });
             }
+            if allow_result && name == "result" {
+                return Ok(TypedExpr {
+                    ty: result_ty.clone(),
+                    kind: TypedExprKind::Var(name.clone()),
+                });
+            }
+            if allow_bare_names && let Some(ty) = params.get(name) {
+                return Ok(TypedExpr {
+                    ty: ty.clone(),
+                    kind: TypedExprKind::Var(name.clone()),
+                });
+            }
+            if name == "result" {
+                return Err("`result` is only supported in //@ ens predicates".to_owned());
+            }
+            Err(format!("unresolved binding `{name}` in function contract"))
+        }
+        Expr::Interpolated(name) => {
             if let Some(ty) = params.get(name) {
                 return Ok(TypedExpr {
                     ty: ty.clone(),
@@ -2654,6 +2841,7 @@ fn typed_contract_expr_with_expected(
                 allow_result,
                 result_ty,
                 inferred,
+                allow_bare_names,
                 expected,
             )
         }),
@@ -2672,9 +2860,13 @@ fn typed_contract_expr_with_expected(
             allow_result,
             result_ty,
             inferred,
+            allow_bare_names,
             expected,
         ),
         Expr::Bind(name) => {
+            if allow_result && name == "result" {
+                return Err("duplicate spec binding `?result` in //@ ens".to_owned());
+            }
             spec_scope
                 .bind(
                     name,
@@ -2713,6 +2905,7 @@ fn typed_contract_expr_with_expected(
                             allow_result,
                             result_ty,
                             inferred,
+                            allow_bare_names,
                             expected,
                         )
                     },
@@ -2728,6 +2921,7 @@ fn typed_contract_expr_with_expected(
                         allow_result,
                         result_ty,
                         inferred,
+                        allow_bare_names,
                         expected,
                     )
                 })
@@ -2743,6 +2937,7 @@ fn typed_contract_expr_with_expected(
                 allow_result,
                 result_ty,
                 inferred,
+                allow_bare_names,
                 None,
             )?;
             type_named_field_expr(base, name)
@@ -2757,6 +2952,7 @@ fn typed_contract_expr_with_expected(
                 allow_result,
                 result_ty,
                 inferred,
+                allow_bare_names,
                 None,
             )?;
             type_tuple_field_expr(base, *index)
@@ -2771,6 +2967,7 @@ fn typed_contract_expr_with_expected(
                 allow_result,
                 result_ty,
                 inferred,
+                allow_bare_names,
                 expected,
             )
         }),
@@ -2784,6 +2981,7 @@ fn typed_contract_expr_with_expected(
                 allow_result,
                 result_ty,
                 inferred,
+                allow_bare_names,
                 None,
             )?;
             match &base.ty {
@@ -2809,6 +3007,7 @@ fn typed_contract_expr_with_expected(
                 allow_result,
                 result_ty,
                 inferred,
+                allow_bare_names,
                 None,
             )?;
             match op {
@@ -2854,6 +3053,7 @@ fn typed_contract_expr_with_expected(
                 allow_result,
                 result_ty,
                 inferred,
+                allow_bare_names,
                 None,
             )?;
             let rhs_expected = match op {
@@ -2875,6 +3075,7 @@ fn typed_contract_expr_with_expected(
                 allow_result,
                 result_ty,
                 inferred,
+                allow_bare_names,
                 rhs_expected.as_ref(),
             )?;
             type_binary_expr(*op, lhs, rhs)
@@ -2892,7 +3093,7 @@ fn typed_body_expr(
     inferred: &mut SpecTypeInference,
 ) -> Result<TypedExpr, String> {
     typed_body_expr_with_expected(
-        expr, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, None,
+        expr, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, false, None,
     )
 }
 
@@ -2905,6 +3106,7 @@ fn typed_body_expr_with_expected(
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
+    allow_bare_names: bool,
     expected: Option<&SpecTy>,
 ) -> Result<TypedExpr, String> {
     match expr {
@@ -2924,6 +3126,22 @@ fn typed_body_expr_with_expected(
                     kind: TypedExprKind::Var(name.clone()),
                 });
             }
+            if !allow_bare_names {
+                return Err(format!(
+                    "unresolved binding `{name}` in //@ {}",
+                    kind.keyword()
+                ));
+            }
+            let ty = local_tys
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("unresolved binding `{name}` in //@ {}", kind.keyword()))?;
+            Ok(TypedExpr {
+                ty,
+                kind: TypedExprKind::Var(name.clone()),
+            })
+        }
+        Expr::Interpolated(name) => {
             let ty = local_tys
                 .get(name)
                 .cloned()
@@ -2935,7 +3153,15 @@ fn typed_body_expr_with_expected(
         }
         Expr::SeqLit(items) => type_seq_lit_expr(items, expected, &mut |item, expected| {
             typed_body_expr_with_expected(
-                item, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, expected,
+                item,
+                pure_fns,
+                enum_defs,
+                kind,
+                spec_scope,
+                local_tys,
+                inferred,
+                allow_bare_names,
+                expected,
             )
         }),
         Expr::Match { .. } => Err(unsupported_match_expr_message()),
@@ -2965,7 +3191,14 @@ fn typed_body_expr_with_expected(
                     expected,
                     &mut |arg, expected| {
                         typed_body_expr_with_expected(
-                            arg, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred,
+                            arg,
+                            pure_fns,
+                            enum_defs,
+                            kind,
+                            spec_scope,
+                            local_tys,
+                            inferred,
+                            allow_bare_names,
                             expected,
                         )
                     },
@@ -2973,7 +3206,15 @@ fn typed_body_expr_with_expected(
             } else {
                 type_pure_call(func, type_args, args, pure_fns, &mut |arg, expected| {
                     typed_body_expr_with_expected(
-                        arg, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, expected,
+                        arg,
+                        pure_fns,
+                        enum_defs,
+                        kind,
+                        spec_scope,
+                        local_tys,
+                        inferred,
+                        allow_bare_names,
+                        expected,
                     )
                 })
             }
@@ -2987,6 +3228,7 @@ fn typed_body_expr_with_expected(
                 spec_scope,
                 local_tys,
                 inferred,
+                allow_bare_names,
                 None,
             )?;
             type_named_field_expr(base, name)
@@ -3000,18 +3242,35 @@ fn typed_body_expr_with_expected(
                 spec_scope,
                 local_tys,
                 inferred,
+                allow_bare_names,
                 None,
             )?;
             type_tuple_field_expr(base, *index)
         }
         Expr::Index { base, index } => type_seq_index_expr(base, index, &mut |expr, expected| {
             typed_body_expr_with_expected(
-                expr, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, expected,
+                expr,
+                pure_fns,
+                enum_defs,
+                kind,
+                spec_scope,
+                local_tys,
+                inferred,
+                allow_bare_names,
+                expected,
             )
         }),
         Expr::Deref { base } => {
             let base = typed_body_expr_with_expected(
-                base, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, None,
+                base,
+                pure_fns,
+                enum_defs,
+                kind,
+                spec_scope,
+                local_tys,
+                inferred,
+                allow_bare_names,
+                None,
             )?;
             match &base.ty {
                 SpecTy::Ref(inner) | SpecTy::Mut(inner) => Ok(TypedExpr {
@@ -3028,7 +3287,15 @@ fn typed_body_expr_with_expected(
         }
         Expr::Unary { op, arg } => {
             let arg = typed_body_expr_with_expected(
-                arg, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, None,
+                arg,
+                pure_fns,
+                enum_defs,
+                kind,
+                spec_scope,
+                local_tys,
+                inferred,
+                allow_bare_names,
+                None,
             )?;
             match op {
                 crate::spec::UnaryOp::Not => {
@@ -3065,7 +3332,15 @@ fn typed_body_expr_with_expected(
         }
         Expr::Binary { op, lhs, rhs } => {
             let lhs = typed_body_expr_with_expected(
-                lhs, pure_fns, enum_defs, kind, spec_scope, local_tys, inferred, None,
+                lhs,
+                pure_fns,
+                enum_defs,
+                kind,
+                spec_scope,
+                local_tys,
+                inferred,
+                allow_bare_names,
+                None,
             )?;
             let rhs_expected = match op {
                 crate::spec::BinaryOp::Eq
@@ -3085,6 +3360,7 @@ fn typed_body_expr_with_expected(
                 spec_scope,
                 local_tys,
                 inferred,
+                allow_bare_names,
                 rhs_expected.as_ref(),
             )?;
             type_binary_expr(*op, lhs, rhs)
@@ -3371,7 +3647,7 @@ fn compute_directives<'tcx>(
     let mut inferred = SpecTypeInference::default();
     let mut contract_infer_scope = SpecScope::default();
     if let Some(directive) = req_directive {
-        infer_contract_expr_types(
+        infer_runtime_contract_expr_types(
             &directive.expr,
             pure_fns,
             enum_defs,
@@ -3443,7 +3719,7 @@ fn compute_directives<'tcx>(
         }
     }
     if let Some(directive) = ens_directive {
-        infer_contract_expr_types(
+        infer_runtime_contract_expr_types(
             &directive.expr,
             pure_fns,
             enum_defs,
@@ -3467,7 +3743,7 @@ fn compute_directives<'tcx>(
         Some(directive) => {
             let mut scope = SpecScope::default();
             Some(
-                typed_contract_expr(
+                typed_runtime_contract_expr(
                     &directive.expr,
                     pure_fns,
                     enum_defs,
@@ -3490,7 +3766,7 @@ fn compute_directives<'tcx>(
     let mut body_type_scope = if req_directive.is_some() {
         let mut scope = SpecScope::default();
         if let Some(directive) = req_directive {
-            let _ = typed_contract_expr(
+            let _ = typed_runtime_contract_expr(
                 &directive.expr,
                 pure_fns,
                 enum_defs,
@@ -3570,7 +3846,7 @@ fn compute_directives<'tcx>(
         Some(directive) => {
             let mut scope = SpecScope::default();
             if let Some(req) = req_directive {
-                let _ = typed_contract_expr(
+                let _ = typed_runtime_contract_expr(
                     &req.expr,
                     pure_fns,
                     enum_defs,
@@ -3587,7 +3863,7 @@ fn compute_directives<'tcx>(
                 })?;
             }
             Some(
-                typed_contract_expr(
+                typed_runtime_contract_expr(
                     &directive.expr,
                     pure_fns,
                     enum_defs,
@@ -3837,6 +4113,7 @@ fn infer_lemma_call(
             spec_scope,
             local_tys,
             inferred,
+            false,
             expected.as_ref(),
         )?;
         if let Some(actual) = known_spec_ty(&arg_ty) {
@@ -3898,6 +4175,7 @@ fn typed_lemma_call(
             spec_scope,
             local_tys,
             inferred,
+            false,
             expected.as_ref(),
         )?;
         infer_type_param_bindings(&param.ty, &typed.ty, &mut bindings)?;
@@ -4294,6 +4572,7 @@ fn infer_lemma_stmts(
                         false,
                         result_ty,
                         inferred,
+                        true,
                         expected.as_ref(),
                     )?;
                     if let Some(actual) = known_spec_ty(&arg_ty) {
@@ -4466,6 +4745,7 @@ fn typed_lemma_stmts(
                         false,
                         result_ty,
                         inferred,
+                        true,
                         expected.as_ref(),
                     )?;
                     infer_type_param_bindings(&param.ty, &typed_arg.ty, &mut bindings)?;
@@ -5205,12 +5485,20 @@ fn validate_function_contract_expr_prepass(
     allow_result: bool,
     spec_scope: &mut SpecScope,
 ) -> Result<(), LoopPrepassError> {
-    validate_contract_expr_core(expr, pure_fns, enum_defs, spec_scope, params, allow_result)
-        .map_err(|message| LoopPrepassError {
-            span,
-            display_span: Some(span_text.to_owned()),
-            message,
-        })
+    validate_contract_expr_core(
+        expr,
+        pure_fns,
+        enum_defs,
+        spec_scope,
+        params,
+        allow_result,
+        false,
+    )
+    .map_err(|message| LoopPrepassError {
+        span,
+        display_span: Some(span_text.to_owned()),
+        message,
+    })
 }
 
 fn validate_contract_expr_core(
@@ -5220,14 +5508,27 @@ fn validate_contract_expr_core(
     spec_scope: &mut SpecScope,
     params: &[String],
     allow_result: bool,
+    allow_bare_names: bool,
 ) -> Result<(), String> {
     match expr {
         Expr::Bool(_) | Expr::Int(_) => Ok(()),
         Expr::Var(name) => {
-            if spec_scope.visible.contains(name)
-                || params.iter().any(|param| param == name)
-                || (allow_result && name == "result")
-            {
+            if spec_scope.visible.contains(name) {
+                return Ok(());
+            }
+            if allow_result && name == "result" {
+                return Ok(());
+            }
+            if allow_bare_names && params.iter().any(|param| param == name) {
+                return Ok(());
+            }
+            if name == "result" {
+                return Err("`result` is only supported in //@ ens predicates".to_owned());
+            }
+            Err(format!("unresolved binding `{name}` in function contract"))
+        }
+        Expr::Interpolated(name) => {
+            if params.iter().any(|param| param == name) || (allow_result && name == "result") {
                 return Ok(());
             }
             if name == "result" {
@@ -5244,19 +5545,25 @@ fn validate_contract_expr_core(
                     spec_scope,
                     params,
                     allow_result,
+                    allow_bare_names,
                 )?;
             }
             Ok(())
         }
         Expr::Match { .. } => Err(unsupported_match_expr_message()),
-        Expr::Bind(name) => spec_scope
-            .bind(
-                name,
-                Span::default(),
-                None,
-                if allow_result { "ens" } else { "req" },
-            )
-            .map_err(|err| err.message),
+        Expr::Bind(name) => {
+            if allow_result && name == "result" {
+                return Err("duplicate spec binding `?result` in //@ ens".to_owned());
+            }
+            spec_scope
+                .bind(
+                    name,
+                    Span::default(),
+                    None,
+                    if allow_result { "ens" } else { "req" },
+                )
+                .map_err(|err| err.message)
+        }
         Expr::Call {
             func,
             type_args,
@@ -5315,12 +5622,21 @@ fn validate_contract_expr_core(
                     spec_scope,
                     params,
                     allow_result,
+                    allow_bare_names,
                 )?;
             }
             Ok(())
         }
         Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Deref { base } => {
-            validate_contract_expr_core(base, pure_fns, enum_defs, spec_scope, params, allow_result)
+            validate_contract_expr_core(
+                base,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                allow_bare_names,
+            )
         }
         Expr::Index { base, index } => {
             validate_contract_expr_core(
@@ -5330,6 +5646,7 @@ fn validate_contract_expr_core(
                 spec_scope,
                 params,
                 allow_result,
+                allow_bare_names,
             )?;
             validate_contract_expr_core(
                 index,
@@ -5338,11 +5655,18 @@ fn validate_contract_expr_core(
                 spec_scope,
                 params,
                 allow_result,
+                allow_bare_names,
             )
         }
-        Expr::Unary { arg, .. } => {
-            validate_contract_expr_core(arg, pure_fns, enum_defs, spec_scope, params, allow_result)
-        }
+        Expr::Unary { arg, .. } => validate_contract_expr_core(
+            arg,
+            pure_fns,
+            enum_defs,
+            spec_scope,
+            params,
+            allow_result,
+            allow_bare_names,
+        ),
         Expr::Binary { lhs, rhs, .. } => {
             validate_contract_expr_core(
                 lhs,
@@ -5351,8 +5675,17 @@ fn validate_contract_expr_core(
                 spec_scope,
                 params,
                 allow_result,
+                allow_bare_names,
             )?;
-            validate_contract_expr_core(rhs, pure_fns, enum_defs, spec_scope, params, allow_result)
+            validate_contract_expr_core(
+                rhs,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                allow_bare_names,
+            )
         }
     }
 }
@@ -5379,6 +5712,7 @@ fn resolve_expr_env(
         anchor_span,
         kind,
         spec_scope,
+        allow_bare_names: false,
     };
     resolve_expr_env_into(expr, &mut ctx, &mut resolved)?;
     Ok(resolved)
@@ -5396,6 +5730,13 @@ fn resolve_expr_env_into(
                 resolved.spec_vars.insert(name.clone());
                 return Ok(());
             }
+            if !ctx.allow_bare_names {
+                return Err(LoopPrepassError {
+                    span: ctx.span,
+                    display_span: None,
+                    message: format!("unresolved binding `{name}` in //@ {}", ctx.kind.keyword()),
+                });
+            }
             let symbol = Symbol::intern(name);
             let Some(hir_id) = resolve_binding_hir_id(ctx.binding_info, symbol, ctx.anchor_span)
             else {
@@ -5410,6 +5751,26 @@ fn resolve_expr_env_into(
                     span: ctx.anchor_span,
                     display_span: None,
                     message: format!("missing MIR local for HIR id {:?}", hir_id),
+                });
+            };
+            resolved.locals.insert(name.clone(), local);
+            Ok(())
+        }
+        Expr::Interpolated(name) => {
+            let symbol = Symbol::intern(name);
+            let Some(hir_id) = resolve_binding_hir_id(ctx.binding_info, symbol, ctx.anchor_span)
+            else {
+                return Err(LoopPrepassError {
+                    span: ctx.span,
+                    display_span: None,
+                    message: format!("unresolved binding `{name}` in //@ {}", ctx.kind.keyword()),
+                });
+            };
+            let Some(local) = ctx.hir_locals.get(&hir_id).copied() else {
+                return Err(LoopPrepassError {
+                    span: ctx.span,
+                    display_span: None,
+                    message: format!("unsupported binding `{name}` in //@ {}", ctx.kind.keyword()),
                 });
             };
             resolved.locals.insert(name.clone(), local);
@@ -5935,9 +6296,9 @@ mod tests {
             &Expr::Call {
                 func: "seq_concat_empty_right".to_owned(),
                 type_args: vec![],
-                args: vec![Expr::Var("xs".to_owned())],
+                args: vec![Expr::Interpolated("xs".to_owned())],
             },
-            "seq_concat_empty_right(xs)",
+            "seq_concat_empty_right({xs})",
             &lemmas,
             &HashMap::new(),
             &HashMap::new(),
