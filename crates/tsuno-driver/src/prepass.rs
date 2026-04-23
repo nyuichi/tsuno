@@ -29,7 +29,6 @@ pub struct HirBindingInfo {
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedExprEnv {
     pub locals: HashMap<String, Local>,
-    pub spec_vars: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -4218,7 +4217,6 @@ fn resolve_lemma_call_expr_env(
             spec_scope,
         )?;
         resolved.locals.extend(arg_env.locals);
-        resolved.spec_vars.extend(arg_env.spec_vars);
     }
     Ok(resolved)
 }
@@ -5893,7 +5891,6 @@ fn resolve_expr_env_into(
         Expr::Bool(_) | Expr::Int(_) => Ok(()),
         Expr::Var(name) => {
             if ctx.spec_scope.visible.contains(name) {
-                resolved.spec_vars.insert(name.clone());
                 return Ok(());
             }
             if !ctx.allow_bare_names {
@@ -5956,7 +5953,6 @@ fn resolve_expr_env_into(
         Expr::Bind(name) => {
             ctx.spec_scope
                 .bind(name, ctx.span, None, ctx.kind.keyword())?;
-            resolved.spec_vars.insert(name.clone());
             Ok(())
         }
         Expr::Call {

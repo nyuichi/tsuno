@@ -87,7 +87,6 @@ struct BuiltinNatDecls {
 }
 
 struct BuiltinSeqDecls {
-    _seq_rev_prefix: RecFuncDecl,
     seq_rev: RecFuncDecl,
 }
 
@@ -1954,20 +1953,12 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(self.seq_literal_value(&values))
             }
-            TypedExprKind::Var(name) => {
-                if !resolved.spec_vars.contains(name) {
-                    return Err(self.unsupported_result(
-                        self.control_span(state.ctrl),
-                        format!("missing spec binding `{name}`"),
-                    ));
-                }
-                state.spec_env.get(name).cloned().ok_or_else(|| {
-                    self.unsupported_result(
-                        self.control_span(state.ctrl),
-                        format!("missing spec binding `{name}`"),
-                    )
-                })
-            }
+            TypedExprKind::Var(name) => state.spec_env.get(name).cloned().ok_or_else(|| {
+                self.unsupported_result(
+                    self.control_span(state.ctrl),
+                    format!("missing spec binding `{name}`"),
+                )
+            }),
             TypedExprKind::RustVar(name) => {
                 let Some(local) = resolved.locals.get(name) else {
                     return Err(self.unsupported_result(
@@ -3224,10 +3215,7 @@ impl<'tcx> Verifier<'tcx> {
                 .ok_or_else(|| "builtin_seq_rev must return Seq".to_owned())?;
             seq_rev.add_def(&[&seq_input], &seq_rev_body);
 
-            Ok(Rc::new(BuiltinSeqDecls {
-                _seq_rev_prefix: seq_rev_prefix,
-                seq_rev,
-            }))
+            Ok(Rc::new(BuiltinSeqDecls { seq_rev }))
         })
         .map_err(|err: String| self.unsupported_result(span, err))?;
         self.builtin_seq_decls.replace(Some(decls.clone()));
