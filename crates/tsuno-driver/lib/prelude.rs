@@ -112,6 +112,24 @@ fn list_len_append(xs: List<i32>, ys: List<i32>)
     }
 }
 
+fn seq_rev_prefix<T>(xs: Seq<T>, n: Nat, acc: Seq<T>) -> Seq<T> {
+    match n {
+        Nat::Zero => acc,
+        Nat::Succ(m) => seq_rev_prefix(xs, m, acc ++ [xs[m]]),
+    }
+}
+
+fn seq_rev<T>(xs: Seq<T>) -> Seq<T> {
+    seq_rev_prefix(xs, seq_len(xs), [])
+}
+
+fn seq_rev_empty<T>(xs: Seq<T>)
+  req xs == []
+  ens seq_rev(xs) == []
+{
+    assert seq_rev(xs) == [];
+}
+
 fn seq_concat_assoc<T>(xs: Seq<T>, ys: Seq<T>, zs: Seq<T>)
   req true
   ens (xs ++ ys) ++ zs == xs ++ (ys ++ zs)

@@ -333,6 +333,9 @@ impl ValueEncoder {
     }
 
     pub(crate) fn seq_len_int(&self, value: &SymValue) -> Result<Int, String> {
+        if let Some(length) = Self::ground_seq_len(value.dynamic()) {
+            return Ok(Int::from_u64(length as u64));
+        }
         Ok(self.seq_term(value)?.length())
     }
 
@@ -434,6 +437,9 @@ impl ValueEncoder {
         rhs: &SymValue,
         solver: &Solver,
     ) -> Result<Bool, String> {
+        if let Some(equal) = self.try_ground_eq_for_spec_ty(ty, lhs, rhs)? {
+            return Ok(Bool::from_bool(equal));
+        }
         let encoding = self.type_encoding(ty, solver)?;
         Ok(match &encoding.kind {
             TypeEncodingKind::Bool => self.bool_term(lhs).eq(self.bool_term(rhs)),
@@ -442,6 +448,72 @@ impl ValueEncoder {
             TypeEncodingKind::Seq => lhs.dynamic().eq(rhs.dynamic()),
             TypeEncodingKind::Composite(_) => lhs.dynamic().eq(rhs.dynamic()),
         })
+    }
+
+    fn try_ground_eq_for_spec_ty(
+        &self,
+        ty: &SpecTy,
+        lhs: &SymValue,
+        rhs: &SymValue,
+    ) -> Result<Option<bool>, String> {
+        match ty {
+            SpecTy::Seq(item_ty) => {
+                let Some(lhs_len) = Self::ground_seq_len(lhs.dynamic()) else {
+                    return Ok(None);
+                };
+                let Some(rhs_len) = Self::ground_seq_len(rhs.dynamic()) else {
+                    return Ok(None);
+                };
+                if lhs_len != rhs_len {
+                    return Ok(Some(false));
+                }
+                for index in 0..lhs_len {
+                    let lhs_item = SymValue::new(
+                        Self::ground_seq_nth(lhs.dynamic(), index)
+                            .expect("ground sequence length implies in-range nth"),
+                    );
+                    let rhs_item = SymValue::new(
+                        Self::ground_seq_nth(rhs.dynamic(), index)
+                            .expect("ground sequence length implies in-range nth"),
+                    );
+                    let Some(equal) =
+                        self.try_ground_eq_for_spec_ty(item_ty, &lhs_item, &rhs_item)?
+                    else {
+                        return Ok(None);
+                    };
+                    if !equal {
+                        return Ok(Some(false));
+                    }
+                }
+                Ok(Some(true))
+            }
+            SpecTy::Bool => Ok(self
+                .bool_term(lhs)
+                .as_bool()
+                .zip(self.bool_term(rhs).as_bool())
+                .map(|(lhs, rhs)| lhs == rhs)),
+            SpecTy::IntLiteral
+            | SpecTy::I8
+            | SpecTy::I16
+            | SpecTy::I32
+            | SpecTy::I64
+            | SpecTy::Isize
+            | SpecTy::U8
+            | SpecTy::U16
+            | SpecTy::U32
+            | SpecTy::U64
+            | SpecTy::Usize => Ok(self
+                .int_term(lhs)
+                .as_i64()
+                .zip(self.int_term(rhs).as_i64())
+                .map(|(lhs, rhs)| lhs == rhs)),
+            SpecTy::Tuple(_)
+            | SpecTy::Struct(_)
+            | SpecTy::Named { .. }
+            | SpecTy::Ref(_)
+            | SpecTy::Mut(_)
+            | SpecTy::TypeParam(_) => Ok(None),
+        }
     }
 
     pub(crate) fn lower_unary_value(&self, op: UnaryOp, value: &SymValue) -> SymValue {
@@ -1402,6 +1474,44 @@ mod tests {
             .expect("int encoding");
 
         assert_eq!(solver.check(), SatResult::Sat);
+    }
+
+    #[test]
+    fn sequence_literal_lengths_stay_ground() {
+        let encoder = ValueEncoder::new(64);
+        let seq = encoder.seq_literal_value(&[encoder.int_value(0), encoder.int_value(1)]);
+        let length = encoder.seq_len_int(&seq).expect("sequence length");
+        assert_eq!(length.as_i64(), Some(2));
+    }
+
+    #[test]
+    fn ground_sequence_equality_ignores_concat_shape() {
+        let solver = Solver::new();
+        let encoder = ValueEncoder::new(64);
+        let seq_ty = SpecTy::Seq(Box::new(SpecTy::I32));
+        let lhs_tail = encoder
+            .lower_binary_value(
+                BinaryOp::Concat,
+                &seq_ty,
+                &encoder.seq_literal_value(&[encoder.int_value(0)]),
+                &encoder.seq_literal_value(&[]),
+                &solver,
+            )
+            .expect("tail concat");
+        let lhs = encoder
+            .lower_binary_value(
+                BinaryOp::Concat,
+                &seq_ty,
+                &encoder.seq_literal_value(&[encoder.int_value(1)]),
+                &lhs_tail,
+                &solver,
+            )
+            .expect("lhs concat");
+        let rhs = encoder.seq_literal_value(&[encoder.int_value(1), encoder.int_value(0)]);
+        let equal = encoder
+            .eq_for_spec_ty(&seq_ty, &lhs, &rhs, &solver)
+            .expect("sequence equality");
+        assert_eq!(equal.as_bool(), Some(true));
     }
 
     #[test]

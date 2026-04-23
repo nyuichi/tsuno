@@ -378,7 +378,7 @@ fn append_len(xs: List<i32>, ys: List<i32>)
 Supported items:
 
 - `enum`
-- pure functions: `fn name(args...) -> Ty { expr }`
+- pure functions: `fn name<T>(args...) -> Ty { expr }`
 - lemmas: `fn name<T>(args...) req <expr> ens <expr> { stmts }`
 
 Pure function bodies are expression bodies. Lemma bodies are statement bodies.
@@ -389,6 +389,14 @@ Supported lemma statements:
 - `assume expr;`
 - `lemma_name(args...);`
 - `match scrutinee { ... }`
+
+Explicit type arguments use Rust-style `::<...>` syntax.
+
+```rust
+List::Cons::<i32>(0i32, List::Nil::<i32>)
+seq_rev::<i32>(xs)
+append_len::<i32>(xs, ys);
+```
 
 ### 6.1 Match
 
@@ -427,8 +435,6 @@ _
 
 Rules:
 
-- generic pure function definitions are rejected
-- generic lemmas are accepted
-- explicit type arguments are supported for enum constructors and lemma calls, but not for pure function calls
+- builtin pure functions do not accept explicit type arguments
 - statement-level `match` default arms must come last
 - expression-level `match` may contain at most one `_` arm
