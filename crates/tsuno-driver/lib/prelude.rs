@@ -115,7 +115,7 @@ fn list_len_append(xs: List<i32>, ys: List<i32>)
 fn seq_rev_prefix<T>(xs: Seq<T>, n: Nat, acc: Seq<T>) -> Seq<T> {
     match n {
         Nat::Zero => acc,
-        Nat::Succ(m) => seq_rev_prefix(xs, m, [xs[m]] ++ acc),
+        Nat::Succ(m) => seq_rev_prefix(xs, m, acc ++ [xs[m]]),
     }
 }
 
