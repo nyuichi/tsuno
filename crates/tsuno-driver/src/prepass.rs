@@ -1446,7 +1446,7 @@ fn infer_builtin_pure_call(
     args: &[Expr],
     infer_arg: &mut impl FnMut(&Expr, Option<&SpecTy>) -> Result<InferredExprTy, String>,
 ) -> Result<Option<InferredExprTy>, String> {
-    if !matches!(func, "seq_len" | "seq_rev") {
+    if !matches!(func, "seq_len") {
         return Ok(None);
     }
     if !type_args.is_empty() {
@@ -1464,7 +1464,7 @@ fn infer_builtin_pure_call(
     let Some(arg_ty) = known_spec_ty(&arg_ty) else {
         return Ok(Some(InferredExprTy::Unknown));
     };
-    let SpecTy::Seq(item_ty) = arg_ty else {
+    let SpecTy::Seq(_) = arg_ty else {
         return Err(format!(
             "builtin pure function `{func}` requires `Seq<T>`, found `{}`",
             display_spec_ty(&arg_ty)
@@ -1472,7 +1472,6 @@ fn infer_builtin_pure_call(
     };
     Ok(Some(match func {
         "seq_len" => InferredExprTy::Known(nat_spec_ty()),
-        "seq_rev" => InferredExprTy::Known(SpecTy::Seq(item_ty)),
         _ => unreachable!("checked builtin pure function"),
     }))
 }
@@ -1483,7 +1482,7 @@ fn type_builtin_pure_call(
     args: &[Expr],
     type_arg: &mut impl FnMut(&Expr, Option<&SpecTy>) -> Result<TypedExpr, String>,
 ) -> Result<Option<TypedExpr>, String> {
-    if !matches!(func, "seq_len" | "seq_rev") {
+    if !matches!(func, "seq_len") {
         return Ok(None);
     }
     if !type_args.is_empty() {
@@ -1498,7 +1497,7 @@ fn type_builtin_pure_call(
         ));
     }
     let typed_arg = type_arg(&args[0], None)?;
-    let SpecTy::Seq(item_ty) = &typed_arg.ty else {
+    let SpecTy::Seq(_) = &typed_arg.ty else {
         return Err(format!(
             "builtin pure function `{func}` requires `Seq<T>`, found `{}`",
             display_spec_ty(&typed_arg.ty)
@@ -1507,7 +1506,6 @@ fn type_builtin_pure_call(
     Ok(Some(TypedExpr {
         ty: match func {
             "seq_len" => nat_spec_ty(),
-            "seq_rev" => SpecTy::Seq(Box::new(item_ty.as_ref().clone())),
             _ => unreachable!("checked builtin pure function"),
         },
         kind: TypedExprKind::PureCall {
@@ -5767,7 +5765,7 @@ fn validate_contract_expr_core(
                             args.len()
                         ));
                     }
-                } else if matches!(func.as_str(), "seq_len" | "seq_rev") {
+                } else if matches!(func.as_str(), "seq_len") {
                     if args.len() != 1 {
                         return Err(format!(
                             "builtin pure function `{func}` expects 1 argument, found {}",
@@ -6006,7 +6004,7 @@ fn resolve_expr_env_into(
                             ),
                         });
                     }
-                } else if matches!(func.as_str(), "seq_len" | "seq_rev") {
+                } else if matches!(func.as_str(), "seq_len") {
                     if args.len() != 1 {
                         return Err(LoopPrepassError {
                             span: ctx.span,

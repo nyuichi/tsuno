@@ -86,10 +86,6 @@ struct BuiltinNatDecls {
     int_to_nat: RecFuncDecl,
 }
 
-struct BuiltinSeqDecls {
-    seq_rev: RecFuncDecl,
-}
-
 struct FunctionContext<'tcx> {
     def_id: LocalDefId,
     body: Body<'tcx>,
@@ -111,7 +107,6 @@ pub struct Verifier<'tcx> {
     pure_fn_decls: HashMap<String, RecFuncDecl>,
     lemmas: HashMap<String, TypedLemmaDef>,
     builtin_nat_decls: RefCell<Option<Rc<BuiltinNatDecls>>>,
-    builtin_seq_decls: RefCell<Option<Rc<BuiltinSeqDecls>>>,
     next_sym: Cell<usize>,
     value_encoder: ValueEncoder,
 }
@@ -203,7 +198,6 @@ impl<'tcx> Verifier<'tcx> {
             pure_fn_decls: HashMap::new(),
             lemmas: HashMap::new(),
             builtin_nat_decls: RefCell::new(None),
-            builtin_seq_decls: RefCell::new(None),
             next_sym: Cell::new(0),
             value_encoder: ValueEncoder::new(tcx.data_layout.pointer_size().bits()),
         }
@@ -848,11 +842,7 @@ impl<'tcx> Verifier<'tcx> {
         }
 
         merged.pc = merged.pc.simplify();
-        match self.check_sat(std::slice::from_ref(&merged.pc)) {
-            SatResult::Sat => Ok(Some(merged)),
-            SatResult::Unsat => Ok(None),
-            SatResult::Unknown => Ok(Some(merged)),
-        }
+        Ok(Some(merged))
     }
 
     fn enqueue_state(
@@ -2347,8 +2337,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(Some(self.int_to_nat_value(&length, span)?))
             }
-            ("seq_rev", [value]) => Ok(Some(self.seq_rev_value(value, span)?)),
-            ("seq_len" | "seq_rev", _) => Err(self.unsupported_result(
+            ("seq_len", _) => Err(self.unsupported_result(
                 span,
                 format!("builtin pure function `{func}` expects 1 argument"),
             )),
@@ -3171,57 +3160,6 @@ impl<'tcx> Verifier<'tcx> {
         Ok(decls)
     }
 
-    fn builtin_seq_decls(&self, span: Span) -> Result<Rc<BuiltinSeqDecls>, VerificationResult> {
-        if let Some(decls) = self.builtin_seq_decls.borrow().as_ref().cloned() {
-            return Ok(decls);
-        }
-        let decls = with_solver(|_solver| {
-            let seq_rev_prefix = RecFuncDecl::new(
-                "builtin_seq_rev_prefix",
-                &[self.value_encoder.seq_value_sort(), &Sort::int()],
-                self.value_encoder.seq_value_sort(),
-            );
-            let seq_rev = RecFuncDecl::new(
-                "builtin_seq_rev",
-                &[self.value_encoder.seq_value_sort()],
-                self.value_encoder.seq_value_sort(),
-            );
-
-            let seq_arg = Z3Seq::new_const(
-                self.fresh_name("builtin_seq_rev_arg"),
-                self.value_encoder.value_sort(),
-            );
-            let len_arg = Int::new_const(self.fresh_name("builtin_seq_rev_len"));
-            let empty_seq = Z3Seq::empty(self.value_encoder.value_sort());
-            let last_index = len_arg.clone() - Int::from_i64(1);
-            let last_item = seq_arg.nth(last_index.clone());
-            let rev_rest = seq_rev_prefix
-                .apply(&[&seq_arg, &(len_arg.clone() - Int::from_i64(1))])
-                .as_seq()
-                .ok_or_else(|| "builtin_seq_rev_prefix must return Seq".to_owned())?;
-            let seq_rev_prefix_body = len_arg.le(0).ite(
-                &empty_seq,
-                &Z3Seq::concat(&[&Z3Seq::unit(&last_item), &rev_rest]),
-            );
-            seq_rev_prefix.add_def(&[&seq_arg, &len_arg], &seq_rev_prefix_body);
-
-            let seq_input = Z3Seq::new_const(
-                self.fresh_name("builtin_seq_rev_input"),
-                self.value_encoder.value_sort(),
-            );
-            let seq_rev_body = seq_rev_prefix
-                .apply(&[&seq_input, &seq_input.length()])
-                .as_seq()
-                .ok_or_else(|| "builtin_seq_rev must return Seq".to_owned())?;
-            seq_rev.add_def(&[&seq_input], &seq_rev_body);
-
-            Ok(Rc::new(BuiltinSeqDecls { seq_rev }))
-        })
-        .map_err(|err: String| self.unsupported_result(span, err))?;
-        self.builtin_seq_decls.replace(Some(decls.clone()));
-        Ok(decls)
-    }
-
     fn nat_to_int_term(&self, value: &SymValue, span: Span) -> Result<Int, VerificationResult> {
         if let Some(n) = self.try_concrete_nat_usize(value, span)? {
             return Ok(Int::from_u64(n));
@@ -3239,11 +3177,6 @@ impl<'tcx> Verifier<'tcx> {
     fn int_to_nat_value(&self, value: &Int, span: Span) -> Result<SymValue, VerificationResult> {
         let decls = self.builtin_nat_decls(span)?;
         Ok(SymValue::new(decls.int_to_nat.apply(&[value])))
-    }
-
-    fn seq_rev_value(&self, value: &SymValue, span: Span) -> Result<SymValue, VerificationResult> {
-        let decls = self.builtin_seq_decls(span)?;
-        Ok(SymValue::new(decls.seq_rev.apply(&[value.ast()])))
     }
 
     fn nat_spec_ty() -> SpecTy {

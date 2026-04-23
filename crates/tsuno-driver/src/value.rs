@@ -258,10 +258,6 @@ impl ValueEncoder {
         &self.value_sort
     }
 
-    pub(crate) fn seq_value_sort(&self) -> &Sort {
-        &self.seq_value_sort
-    }
-
     pub(crate) fn type_encoding(
         &self,
         ty: &SpecTy,
