@@ -221,6 +221,7 @@ pub struct PureFnParam {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PureFnDef {
     pub name: String,
+    pub type_params: Vec<String>,
     pub params: Vec<PureFnParam>,
     pub result_ty: SpecTy,
     pub body: Expr,
@@ -378,6 +379,7 @@ pub fn parse_statement_expr(kind: &str, text: &str) -> Result<Expr, ParseError> 
     parse_source_expr(kind, text.trim_end())
 }
 
+#[cfg(test)]
 pub fn parse_raw_expr(_kind: &str, text: &str) -> Result<Expr, ParseError> {
     parse_raw_expr_with_type_params(_kind, text, &[])
 }
@@ -1210,12 +1212,11 @@ impl<'a> GhostBlockParser<'a> {
         }
         self.skip_ws();
         if self.text[self.cursor..].starts_with("->") {
-            if !type_params.is_empty() {
-                return Err(ParseError::new(
-                    "generic pure functions are unsupported in ghost blocks",
-                ));
-            }
-            return Ok(GhostItem::PureFn(self.parse_pure_fn_def(name, params)?));
+            return Ok(GhostItem::PureFn(self.parse_pure_fn_def(
+                name,
+                type_params,
+                params,
+            )?));
         }
         Ok(GhostItem::Lemma(self.parse_lemma_def(
             name,
@@ -1271,17 +1272,19 @@ impl<'a> GhostBlockParser<'a> {
     fn parse_pure_fn_def(
         &mut self,
         name: String,
+        type_params: Vec<String>,
         params: Vec<PureFnParam>,
     ) -> Result<PureFnDef, ParseError> {
         self.expect_arrow()?;
-        let result_ty = self.parse_spec_ty_annotation(&[], &['{'])?;
+        let result_ty = self.parse_spec_ty_annotation(&type_params, &['{'])?;
         self.expect_char('{')?;
         let body = self.parse_braced_body()?;
         Ok(PureFnDef {
             name,
+            type_params: type_params.clone(),
             params,
             result_ty,
-            body: parse_raw_expr("pure function body", body.trim())?,
+            body: parse_raw_expr_with_type_params("pure function body", body.trim(), &type_params)?,
         })
     }
 
@@ -2070,6 +2073,7 @@ fn add1(x: i32) -> i32 {
             defs,
             vec![PureFnDef {
                 name: "add1".to_owned(),
+                type_params: vec![],
                 params: vec![PureFnParam {
                     name: "x".to_owned(),
                     ty: SpecTy::I32,
@@ -2101,6 +2105,29 @@ fn is_rev(x: Seq<i32>) -> bool {
     }
 
     #[test]
+    fn parses_generic_pure_function_definition() {
+        let block = parse_ghost_block(
+            r#"
+fn id<T>(xs: Seq<T>) -> Seq<T> {
+    xs
+}
+"#,
+        )
+        .expect("generic pure function should parse");
+        assert_eq!(block.pure_fns.len(), 1);
+        assert_eq!(block.pure_fns[0].name, "id");
+        assert_eq!(block.pure_fns[0].type_params, vec!["T".to_owned()]);
+        assert_eq!(
+            block.pure_fns[0].params[0].ty,
+            SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned())))
+        );
+        assert_eq!(
+            block.pure_fns[0].result_ty,
+            SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned())))
+        );
+    }
+
+    #[test]
     fn parses_lemma_block() {
         let block = parse_ghost_block(
             r#"
@@ -2123,6 +2150,7 @@ fn add1_done(x: i32)
                 enums: vec![],
                 pure_fns: vec![PureFnDef {
                     name: "add1".to_owned(),
+                    type_params: vec![],
                     params: vec![PureFnParam {
                         name: "x".to_owned(),
                         ty: SpecTy::I32,
@@ -2282,6 +2310,7 @@ fn singleton(x: i32) -> IntList {
                 }],
                 pure_fns: vec![PureFnDef {
                     name: "singleton".to_owned(),
+                    type_params: vec![],
                     params: vec![PureFnParam {
                         name: "x".to_owned(),
                         ty: SpecTy::I32,

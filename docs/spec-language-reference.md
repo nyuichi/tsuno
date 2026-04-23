@@ -378,7 +378,7 @@ fn append_len(xs: List<i32>, ys: List<i32>)
 Supported items:
 
 - `enum`
-- pure functions: `fn name(args...) -> Ty { expr }`
+- pure functions: `fn name<T>(args...) -> Ty { expr }`
 - lemmas: `fn name<T>(args...) req <expr> ens <expr> { stmts }`
 
 Pure function bodies are expression bodies. Lemma bodies are statement bodies.
@@ -427,8 +427,9 @@ _
 
 Rules:
 
-- generic pure function definitions are rejected
+- generic pure function definitions are accepted
 - generic lemmas are accepted
 - explicit type arguments are supported for enum constructors and lemma calls, but not for pure function calls
+- generic pure function calls infer their type arguments from term arguments
 - statement-level `match` default arms must come last
 - expression-level `match` may contain at most one `_` arm

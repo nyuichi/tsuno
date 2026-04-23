@@ -1515,6 +1515,118 @@ fn type_builtin_pure_call(
     }))
 }
 
+fn unresolved_pure_fn_type_param<'a>(
+    def: &'a PureFnDef,
+    bindings: &HashMap<String, SpecTy>,
+) -> Option<&'a str> {
+    def.type_params
+        .iter()
+        .find(|type_param| !bindings.contains_key(*type_param))
+        .map(String::as_str)
+}
+
+fn instantiate_pure_fn_param_tys(
+    func: &str,
+    def: &PureFnDef,
+    bindings: &HashMap<String, SpecTy>,
+) -> Result<Vec<SpecTy>, String> {
+    def.params
+        .iter()
+        .map(|param| {
+            try_instantiate_spec_ty(&param.ty, bindings).ok_or_else(|| {
+                match unresolved_pure_fn_type_param(def, bindings) {
+                    Some(type_param) => format!(
+                        "could not infer a type for pure function `{func}` type parameter `{type_param}`"
+                    ),
+                    None => format!(
+                        "could not resolve type parameter(s) for pure function `{func}` parameter `{}`",
+                        param.name
+                    ),
+                }
+            })
+        })
+        .collect()
+}
+
+fn instantiate_pure_fn_result_ty(
+    func: &str,
+    def: &PureFnDef,
+    bindings: &HashMap<String, SpecTy>,
+) -> Result<SpecTy, String> {
+    try_instantiate_spec_ty(&def.result_ty, bindings).ok_or_else(|| {
+        match unresolved_pure_fn_type_param(def, bindings) {
+            Some(type_param) => format!(
+                "could not infer a type for pure function `{func}` type parameter `{type_param}`"
+            ),
+            None => {
+                format!("could not resolve type parameter(s) for pure function `{func}` result")
+            }
+        }
+    })
+}
+
+fn infer_pure_call_result_ty(
+    func: &str,
+    type_args: &[SpecTy],
+    args: &[Expr],
+    pure_fns: &HashMap<String, PureFnDef>,
+    inferred: &mut SpecTypeInference,
+    infer_arg: &mut impl FnMut(
+        &Expr,
+        Option<&SpecTy>,
+        &mut SpecTypeInference,
+    ) -> Result<InferredExprTy, String>,
+) -> Result<InferredExprTy, String> {
+    if let Some(result) = infer_builtin_pure_call(func, type_args, args, &mut |arg, expected| {
+        infer_arg(arg, expected, inferred)
+    })? {
+        return Ok(result);
+    }
+    if !type_args.is_empty() {
+        return Err(format!(
+            "type arguments are only supported on enum constructors, found `{func}`"
+        ));
+    }
+    let Some(def) = pure_fns.get(func) else {
+        return Err(format!("unknown pure function `{func}`"));
+    };
+    if def.params.len() != args.len() {
+        return Err(format!(
+            "pure function `{func}` expects {} arguments, found {}",
+            def.params.len(),
+            args.len()
+        ));
+    }
+    let mut bindings = HashMap::new();
+    let mut arg_tys = Vec::with_capacity(args.len());
+    for (arg, param) in args.iter().zip(&def.params) {
+        let expected = try_instantiate_spec_ty(&param.ty, &bindings);
+        let arg_ty = infer_arg(arg, expected.as_ref(), inferred)?;
+        let actual_ty = match &arg_ty {
+            InferredExprTy::Known(actual) => Some(actual.clone()),
+            InferredExprTy::SpecVar(name) => inferred.resolved_ty(name),
+            InferredExprTy::Unknown => None,
+        };
+        if let Some(actual) = actual_ty.as_ref() {
+            infer_type_param_bindings(&param.ty, actual, &mut bindings)?;
+        }
+        arg_tys.push(arg_ty);
+    }
+    if def
+        .type_params
+        .iter()
+        .all(|type_param| bindings.contains_key(type_param))
+    {
+        let param_tys = instantiate_pure_fn_param_tys(func, def, &bindings)?;
+        for (arg_ty, param_ty) in arg_tys.iter().zip(param_tys.iter()) {
+            constrain_expr_ty(inferred, arg_ty, param_ty)?;
+        }
+    }
+    Ok(InferredExprTy::Known(instantiate_pure_fn_result_ty(
+        func, def, &bindings,
+    )?))
+}
+
 fn type_pure_call(
     func: &str,
     type_args: &[SpecTy],
@@ -1540,22 +1652,33 @@ fn type_pure_call(
             args.len()
         ));
     }
+    let mut bindings = HashMap::new();
     let mut typed_args = Vec::with_capacity(args.len());
     for (arg, param) in args.iter().zip(&def.params) {
-        let typed_arg = type_arg(arg, Some(&param.ty))?;
-        let unified = unify_spec_tys(&typed_arg.ty, &param.ty)?;
-        if unified != param.ty {
+        let expected = try_instantiate_spec_ty(&param.ty, &bindings);
+        let typed_arg = type_arg(arg, expected.as_ref())?;
+        infer_type_param_bindings(&param.ty, &typed_arg.ty, &mut bindings)?;
+        typed_args.push(typed_arg);
+    }
+    let param_tys = instantiate_pure_fn_param_tys(func, def, &bindings)?;
+    for ((typed_arg, param), param_ty) in typed_args
+        .iter()
+        .zip(def.params.iter())
+        .zip(param_tys.iter())
+    {
+        let unified = unify_spec_tys(&typed_arg.ty, param_ty)?;
+        if unified != *param_ty {
             return Err(format!(
                 "pure function `{func}` parameter `{}` expects `{}`, found `{}`",
                 param.name,
-                display_spec_ty(&param.ty),
+                display_spec_ty(param_ty),
                 display_spec_ty(&typed_arg.ty)
             ));
         }
-        typed_args.push(typed_arg);
     }
+    let result_ty = instantiate_pure_fn_result_ty(func, def, &bindings)?;
     Ok(TypedExpr {
-        ty: def.result_ty.clone(),
+        ty: result_ty,
         kind: TypedExprKind::PureCall {
             func: func.to_owned(),
             args: typed_args,
@@ -2234,8 +2357,13 @@ fn infer_contract_expr_types_with_expected(
                     },
                 )?))
             } else {
-                if let Some(result) =
-                    infer_builtin_pure_call(func, type_args, args, &mut |arg, expected| {
+                infer_pure_call_result_ty(
+                    func,
+                    type_args,
+                    args,
+                    pure_fns,
+                    inferred,
+                    &mut |arg, expected, inferred| {
                         infer_contract_expr_types_with_expected(
                             arg,
                             pure_fns,
@@ -2248,41 +2376,8 @@ fn infer_contract_expr_types_with_expected(
                             allow_bare_names,
                             expected,
                         )
-                    })?
-                {
-                    return Ok(result);
-                }
-                if !type_args.is_empty() {
-                    return Err(format!(
-                        "type arguments are only supported on enum constructors, found `{func}`"
-                    ));
-                }
-                let Some(def) = pure_fns.get(func) else {
-                    return Err(format!("unknown pure function `{func}`"));
-                };
-                if def.params.len() != args.len() {
-                    return Err(format!(
-                        "pure function `{func}` expects {} arguments, found {}",
-                        def.params.len(),
-                        args.len()
-                    ));
-                }
-                for (arg, param) in args.iter().zip(&def.params) {
-                    let arg_ty = infer_contract_expr_types_with_expected(
-                        arg,
-                        pure_fns,
-                        enum_defs,
-                        spec_scope,
-                        params,
-                        allow_result,
-                        result_ty,
-                        inferred,
-                        allow_bare_names,
-                        Some(&param.ty),
-                    )?;
-                    constrain_expr_ty(inferred, &arg_ty, &param.ty)?;
-                }
-                Ok(InferredExprTy::Known(def.result_ty.clone()))
+                    },
+                )
             }
         }
         Expr::Field { base, name } => {
@@ -2569,8 +2664,13 @@ fn infer_body_expr_types_with_expected(
                     },
                 )?))
             } else {
-                if let Some(result) =
-                    infer_builtin_pure_call(func, type_args, args, &mut |arg, expected| {
+                infer_pure_call_result_ty(
+                    func,
+                    type_args,
+                    args,
+                    pure_fns,
+                    inferred,
+                    &mut |arg, expected, inferred| {
                         infer_body_expr_types_with_expected(
                             arg,
                             pure_fns,
@@ -2582,40 +2682,8 @@ fn infer_body_expr_types_with_expected(
                             allow_bare_names,
                             expected,
                         )
-                    })?
-                {
-                    return Ok(result);
-                }
-                if !type_args.is_empty() {
-                    return Err(format!(
-                        "type arguments are only supported on enum constructors, found `{func}`"
-                    ));
-                }
-                let Some(def) = pure_fns.get(func) else {
-                    return Err(format!("unknown pure function `{func}`"));
-                };
-                if def.params.len() != args.len() {
-                    return Err(format!(
-                        "pure function `{func}` expects {} arguments, found {}",
-                        def.params.len(),
-                        args.len()
-                    ));
-                }
-                for (arg, param) in args.iter().zip(&def.params) {
-                    let arg_ty = infer_body_expr_types_with_expected(
-                        arg,
-                        pure_fns,
-                        enum_defs,
-                        kind,
-                        spec_scope,
-                        local_tys,
-                        inferred,
-                        allow_bare_names,
-                        Some(&param.ty),
-                    )?;
-                    constrain_expr_ty(inferred, &arg_ty, &param.ty)?;
-                }
-                Ok(InferredExprTy::Known(def.result_ty.clone()))
+                    },
+                )
             }
         }
         Expr::Field { base, name } => {
@@ -4556,6 +4624,26 @@ fn type_pure_fns(
             .get(name)
             .expect("pure function declaration order must stay in sync");
         available_pure_fns.insert(def.name.clone(), def.clone());
+        let type_param_scope: HashSet<_> = def.type_params.iter().cloned().collect();
+        for param in &def.params {
+            validate_named_spec_ty(&param.ty, enum_defs, &type_param_scope).map_err(|message| {
+                LoopPrepassError {
+                    span,
+                    display_span: None,
+                    message: format!(
+                        "pure function `{}` parameter `{}`: {message}",
+                        def.name, param.name
+                    ),
+                }
+            })?;
+        }
+        validate_named_spec_ty(&def.result_ty, enum_defs, &type_param_scope).map_err(
+            |message| LoopPrepassError {
+                span,
+                display_span: None,
+                message: format!("pure function `{}` result: {message}", def.name),
+            },
+        )?;
         let param_tys: HashMap<_, _> = def
             .params
             .iter()
@@ -6323,6 +6411,7 @@ mod tests {
             "id".to_owned(),
             PureFnDef {
                 name: "id".to_owned(),
+                type_params: vec![],
                 params: vec![PureFnParam {
                     name: "x".to_owned(),
                     ty: SpecTy::I32,
@@ -6361,6 +6450,169 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn types_generic_pure_call_with_inferred_type_args() {
+        let pure_fns = HashMap::from([(
+            "seq_rev".to_owned(),
+            PureFnDef {
+                name: "seq_rev".to_owned(),
+                type_params: vec!["T".to_owned()],
+                params: vec![PureFnParam {
+                    name: "xs".to_owned(),
+                    ty: SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned()))),
+                }],
+                result_ty: SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned()))),
+                body: Expr::Var("xs".to_owned()),
+            },
+        )]);
+
+        let typed = type_pure_call(
+            "seq_rev",
+            &[],
+            &[Expr::Var("arg".to_owned())],
+            &pure_fns,
+            &mut |expr, expected| {
+                assert_eq!(expr, &Expr::Var("arg".to_owned()));
+                assert_eq!(expected, None);
+                Ok(TypedExpr {
+                    ty: SpecTy::Seq(Box::new(SpecTy::I32)),
+                    kind: TypedExprKind::Var("arg".to_owned()),
+                })
+            },
+        )
+        .expect("typed generic pure call");
+
+        assert_eq!(typed.ty, SpecTy::Seq(Box::new(SpecTy::I32)));
+        assert!(matches!(
+            typed.kind,
+            TypedExprKind::PureCall { func, .. } if func == "seq_rev"
+        ));
+    }
+
+    #[test]
+    fn types_generic_pure_call_with_sequence_literal_argument() {
+        let pure_fns = HashMap::from([(
+            "seq_rev".to_owned(),
+            PureFnDef {
+                name: "seq_rev".to_owned(),
+                type_params: vec!["T".to_owned()],
+                params: vec![PureFnParam {
+                    name: "xs".to_owned(),
+                    ty: SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned()))),
+                }],
+                result_ty: SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned()))),
+                body: Expr::Var("xs".to_owned()),
+            },
+        )]);
+
+        let typed = typed_contract_expr(
+            &Expr::Call {
+                func: "seq_rev".to_owned(),
+                type_args: vec![],
+                args: vec![Expr::SeqLit(vec![Expr::Int(IntLiteral {
+                    digits: "1".to_owned(),
+                    suffix: Some(crate::spec::IntSuffix::I32),
+                })])],
+            },
+            &pure_fns,
+            &HashMap::new(),
+            &mut SpecScope::default(),
+            &HashMap::new(),
+            false,
+            &SpecTy::Bool,
+            &mut SpecTypeInference::default(),
+        )
+        .expect("typed generic pure call from literal");
+
+        assert_eq!(typed.ty, SpecTy::Seq(Box::new(SpecTy::I32)));
+    }
+
+    #[test]
+    fn infers_generic_pure_call_in_body_context() {
+        let pure_fns = HashMap::from([(
+            "seq_rev".to_owned(),
+            PureFnDef {
+                name: "seq_rev".to_owned(),
+                type_params: vec!["T".to_owned()],
+                params: vec![PureFnParam {
+                    name: "xs".to_owned(),
+                    ty: SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned()))),
+                }],
+                result_ty: SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned()))),
+                body: Expr::Var("xs".to_owned()),
+            },
+        )]);
+
+        let inferred = infer_body_expr_types_with_expected(
+            &Expr::Call {
+                func: "seq_rev".to_owned(),
+                type_args: vec![],
+                args: vec![Expr::SeqLit(vec![Expr::Int(IntLiteral {
+                    digits: "1".to_owned(),
+                    suffix: Some(crate::spec::IntSuffix::I32),
+                })])],
+            },
+            &pure_fns,
+            &HashMap::new(),
+            DirectiveKind::Assert,
+            &mut SpecScope::default(),
+            &HashMap::new(),
+            &mut SpecTypeInference::default(),
+            false,
+            None,
+        )
+        .expect("inferred generic pure call in body");
+
+        assert_eq!(
+            known_spec_ty(&inferred),
+            Some(SpecTy::Seq(Box::new(SpecTy::I32)))
+        );
+    }
+
+    #[test]
+    fn types_generic_pure_call_equality_in_body_context() {
+        let pure_fns = HashMap::from([(
+            "seq_rev".to_owned(),
+            PureFnDef {
+                name: "seq_rev".to_owned(),
+                type_params: vec!["T".to_owned()],
+                params: vec![PureFnParam {
+                    name: "xs".to_owned(),
+                    ty: SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned()))),
+                }],
+                result_ty: SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned()))),
+                body: Expr::Var("xs".to_owned()),
+            },
+        )]);
+
+        let typed = typed_body_expr(
+            &Expr::Binary {
+                op: crate::spec::BinaryOp::Eq,
+                lhs: Box::new(Expr::Call {
+                    func: "seq_rev".to_owned(),
+                    type_args: vec![],
+                    args: vec![Expr::SeqLit(vec![Expr::Int(IntLiteral {
+                        digits: "1".to_owned(),
+                        suffix: Some(crate::spec::IntSuffix::I32),
+                    })])],
+                }),
+                rhs: Box::new(Expr::SeqLit(vec![Expr::Int(IntLiteral {
+                    digits: "1".to_owned(),
+                    suffix: Some(crate::spec::IntSuffix::I32),
+                })])),
+            },
+            &pure_fns,
+            &HashMap::new(),
+            DirectiveKind::Assert,
+            &mut SpecScope::default(),
+            &HashMap::new(),
+            &mut SpecTypeInference::default(),
+        )
+        .expect("typed body equality over generic pure call");
+
+        assert_eq!(typed.ty, SpecTy::Bool);
     }
 
     #[test]
