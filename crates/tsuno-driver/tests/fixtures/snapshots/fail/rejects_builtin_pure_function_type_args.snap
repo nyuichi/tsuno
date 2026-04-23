@@ -6,7 +6,7 @@ expression: snapshot_output(output)
 status: Some(1)
 stdout:
 UNSUPPORTED main
-  type arguments are only supported on enum constructors, found `seq_rev`
+  type arguments are not supported on builtin pure function `seq_len`
   src/main.rs:3:2: 3:2
 
 stderr:

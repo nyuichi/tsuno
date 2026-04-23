@@ -1,12 +1,3 @@
-/*@
-fn seq_rev_empty<T>(xs: Seq<T>)
-  req xs == []
-  ens seq_rev(xs) == []
-{
-    assert seq_rev(xs) == [];
-}
-*/
-
 fn vec_new() -> Vec<i32>
 //@ req true
 //@ ens {result} == []

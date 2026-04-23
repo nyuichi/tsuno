@@ -390,6 +390,14 @@ Supported lemma statements:
 - `lemma_name(args...);`
 - `match scrutinee { ... }`
 
+Explicit type arguments use Rust-style `::<...>` syntax.
+
+```rust
+List::Cons::<i32>(0i32, List::Nil::<i32>)
+seq_rev::<i32>(xs)
+append_len::<i32>(xs, ys);
+```
+
 ### 6.1 Match
 
 `match` expressions are supported in pure function bodies.
@@ -429,7 +437,8 @@ Rules:
 
 - generic pure function definitions are accepted
 - generic lemmas are accepted
-- explicit type arguments are supported for enum constructors and lemma calls, but not for pure function calls
+- explicit type arguments are supported for enum constructors, pure function calls, and lemma calls
 - generic pure function calls infer their type arguments from term arguments
+- builtin pure functions do not accept explicit type arguments
 - statement-level `match` default arms must come last
 - expression-level `match` may contain at most one `_` arm

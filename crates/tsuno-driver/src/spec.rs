@@ -2271,6 +2271,20 @@ fn refl<T>(xs: Seq<T>)
     }
 
     #[test]
+    fn parses_pure_function_call_with_explicit_type_args() {
+        let expr =
+            parse_expr("assert", "seq_rev::<i32>(xs)").expect("explicit pure call should parse");
+        assert_eq!(
+            expr,
+            Expr::Call {
+                func: "seq_rev".to_owned(),
+                type_args: vec![SpecTy::I32],
+                args: vec![Expr::Var("xs".to_owned())],
+            }
+        );
+    }
+
+    #[test]
     fn parses_enum_definitions_in_ghost_block() {
         let block = parse_ghost_block(
             r#"
