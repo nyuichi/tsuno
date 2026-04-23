@@ -161,9 +161,9 @@ This matters for binders as well. For example:
 !P(?x) == !(P(?x))
 ```
 
-## 3. Existential Binders
+## 3. Spec Binders
 
-The form `?x` introduces a spec binder. A binder can be introduced in a contract, assertion, assumption, or invariant, and then referred to later by its bare name.
+The form `?x` introduces a spec binder. A binder is not a general existential form. It is a witness-style binding syntax with a restricted shape.
 
 ```rust
 //@ assert ?V == *{r};
@@ -185,33 +185,41 @@ In ghost blocks, an unprefixed name may also refer to an ordinary ghost paramete
 
 If no visible binding exists, the expression is rejected.
 
-### 3.1 Introduction Order and Existential Checking
+### 3.1 Binder-Introducing Forms
 
-A binder is introduced by writing `?x`. Introduction is source-ordered: a later bare use may refer to that binder, but an earlier bare use may not.
+New binders may be introduced only in:
+
+- `req`
+- `//@ assert`
+- ghost `assert`
+
+In those positions, binder introduction is allowed only through top-level conjunctions whose conjunct has the form:
+
+```text
+?x == expr
+```
+
+Examples:
 
 ```text
 assert ?x == 42 && Q(x);   // ok
-assert Q(x) && ?x == 42;   // rejected: `x` is still unresolved at the left-hand use
+assert ?x == 42 && ?y == x && R(x, y);   // ok
+assert Q(x) && ?x == 42;   // rejected
+assert !P(?x);             // rejected
+assert 42 == ?x;           // rejected
 ```
 
-After parsing and name resolution, any assertion-like directive that contains at least one binder is checked existentially.
+The accepted form is processed left to right. Conceptually:
 
 ```text
-assert ?x == 42;
-== exists x. x == 42
+assert ?x == 42 && ?y == x && R(x, y);
+
+== let x = 42;
+   let y = x;
+   assert R(x, y);
 ```
 
-```text
-assert ?x == 42 && Q(x);
-== exists x. x == 42 && Q(x)
-```
-
-```text
-assert !P(?x);
-== exists x. !P(x)
-```
-
-So `assert !P(?x);` does not mean `!exists x. P(x)` and does not mean `forall x. !P(x)`. The `!` still applies only to `P(?x)`, and the enclosing assertion is then checked existentially.
+The surface language does not have `let`. This desugaring describes the implemented behavior.
 
 ### 3.2 Scope Across `req`, Body Directives, and `ens`
 
@@ -253,7 +261,14 @@ fn main() {
 }
 ```
 
-Binders introduced only in `ens` are not visible in the function body, and a binder introduced later in a directive does not retroactively bind an earlier bare use.
+Binders introduced only in one directive are visible to later directives, not earlier ones.
+
+New binders are rejected in:
+
+- `ens`
+- `//@ assume`
+- `//@ inv`
+- ghost `assume`
 
 ## 4. Types and Values
 

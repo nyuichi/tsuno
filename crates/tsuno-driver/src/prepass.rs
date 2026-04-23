@@ -53,7 +53,7 @@ pub struct LoopContracts {
 
 #[derive(Debug, Clone)]
 pub struct AssertionContract {
-    pub assertion: TypedExpr,
+    pub assertion: NormalizedPredicate,
     pub resolution: ResolvedExprEnv,
     pub assertion_span: String,
 }
@@ -62,6 +62,18 @@ pub struct AssertionContract {
 pub struct AssumptionContract {
     pub assumption: TypedExpr,
     pub resolution: ResolvedExprEnv,
+}
+
+#[derive(Debug, Clone)]
+pub struct NormalizedBinding {
+    pub name: String,
+    pub value: TypedExpr,
+}
+
+#[derive(Debug, Clone)]
+pub struct NormalizedPredicate {
+    pub bindings: Vec<NormalizedBinding>,
+    pub condition: TypedExpr,
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +105,7 @@ pub struct TypedPureFnDef {
 
 #[derive(Debug, Clone)]
 pub enum TypedGhostStmt {
-    Assert(TypedExpr),
+    Assert(NormalizedPredicate),
     Assume(TypedExpr),
     Call {
         lemma_name: String,
@@ -117,10 +129,9 @@ pub struct TypedGhostMatchArm {
 pub struct TypedLemmaDef {
     pub name: String,
     pub params: Vec<ContractParam>,
-    pub req: TypedExpr,
+    pub req: NormalizedPredicate,
     pub ens: TypedExpr,
     pub body: Vec<TypedGhostStmt>,
-    pub spec_vars: Vec<SpecVarBinding>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,12 +149,11 @@ pub struct SpecVarBinding {
 #[derive(Debug, Clone)]
 pub struct FunctionContract {
     pub params: Vec<ContractParam>,
-    pub req: TypedExpr,
+    pub req: NormalizedPredicate,
     #[allow(dead_code)]
     pub req_span: String,
     pub ens: TypedExpr,
     pub ens_span: String,
-    pub spec_vars: Vec<SpecVarBinding>,
     pub result: SpecTy,
 }
 
@@ -152,7 +162,6 @@ pub struct DirectivePrepass {
     pub loop_contracts: LoopContracts,
     pub control_point_directives: ControlPointDirectives,
     pub function_contract: Option<FunctionContract>,
-    pub spec_vars: Vec<SpecVarBinding>,
 }
 
 #[derive(Debug, Clone)]
@@ -463,31 +472,146 @@ impl SpecScope {
         Ok(())
     }
 
-    fn ordered_with(&self, other: &Self) -> Vec<String> {
-        let mut names = self.ordered.clone();
-        for name in &other.ordered {
-            if !self.bound.contains(name) {
-                names.push(name.clone());
-            }
-        }
-        names
-    }
-
     fn typed_ordered(
         &self,
         inferred: &mut SpecTypeInference,
     ) -> Result<Vec<SpecVarBinding>, String> {
         typed_spec_vars_for_names(&self.ordered, inferred)
     }
+}
 
-    fn typed_ordered_with(
-        &self,
-        other: &Self,
-        inferred: &mut SpecTypeInference,
-    ) -> Result<Vec<SpecVarBinding>, String> {
-        let names = self.ordered_with(other);
-        typed_spec_vars_for_names(&names, inferred)
+fn typed_expr_contains_bind(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        TypedExprKind::Bind(_) => true,
+        TypedExprKind::Bool(_)
+        | TypedExprKind::Int(_)
+        | TypedExprKind::Var(_)
+        | TypedExprKind::RustVar(_) => false,
+        TypedExprKind::SeqLit(items) => items.iter().any(typed_expr_contains_bind),
+        TypedExprKind::Match {
+            scrutinee,
+            arms,
+            default,
+        } => {
+            typed_expr_contains_bind(scrutinee)
+                || arms.iter().any(|arm| typed_expr_contains_bind(&arm.body))
+                || default.as_deref().is_some_and(typed_expr_contains_bind)
+        }
+        TypedExprKind::PureCall { args, .. } | TypedExprKind::CtorCall { args, .. } => {
+            args.iter().any(typed_expr_contains_bind)
+        }
+        TypedExprKind::Field { base, .. }
+        | TypedExprKind::TupleField { base, .. }
+        | TypedExprKind::Deref { base }
+        | TypedExprKind::Fin { base }
+        | TypedExprKind::Unary { arg: base, .. } => typed_expr_contains_bind(base),
+        TypedExprKind::Index { base, index } => {
+            typed_expr_contains_bind(base) || typed_expr_contains_bind(index)
+        }
+        TypedExprKind::Binary { lhs, rhs, .. } => {
+            typed_expr_contains_bind(lhs) || typed_expr_contains_bind(rhs)
+        }
     }
+}
+
+fn typed_bool_expr(value: bool) -> TypedExpr {
+    TypedExpr {
+        ty: SpecTy::Bool,
+        kind: TypedExprKind::Bool(value),
+    }
+}
+
+fn split_top_level_conjuncts(expr: TypedExpr, out: &mut Vec<TypedExpr>) {
+    match expr.kind {
+        TypedExprKind::Binary {
+            op: crate::spec::BinaryOp::And,
+            lhs,
+            rhs,
+        } => {
+            split_top_level_conjuncts(*lhs, out);
+            split_top_level_conjuncts(*rhs, out);
+        }
+        _ => out.push(expr),
+    }
+}
+
+fn join_top_level_conjuncts(exprs: Vec<TypedExpr>) -> TypedExpr {
+    exprs
+        .into_iter()
+        .reduce(|lhs, rhs| TypedExpr {
+            ty: SpecTy::Bool,
+            kind: TypedExprKind::Binary {
+                op: crate::spec::BinaryOp::And,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            },
+        })
+        .unwrap_or_else(|| typed_bool_expr(true))
+}
+
+fn normalize_assert_like_predicate(
+    expr: TypedExpr,
+    kind: &str,
+) -> Result<NormalizedPredicate, String> {
+    let mut conjuncts = Vec::new();
+    split_top_level_conjuncts(expr, &mut conjuncts);
+    let mut bindings = Vec::new();
+    let mut residual = Vec::new();
+    for conjunct in conjuncts {
+        match conjunct.kind {
+            TypedExprKind::Binary {
+                op: crate::spec::BinaryOp::Eq,
+                lhs,
+                rhs,
+            } => {
+                if let TypedExprKind::Bind(name) = &lhs.kind {
+                    if typed_expr_contains_bind(&rhs) {
+                        return Err(format!(
+                            "spec bindings in {kind} must have the form `?x == value` at the top level"
+                        ));
+                    }
+                    bindings.push(NormalizedBinding {
+                        name: name.clone(),
+                        value: *rhs,
+                    });
+                    continue;
+                }
+                let expr = TypedExpr {
+                    ty: SpecTy::Bool,
+                    kind: TypedExprKind::Binary {
+                        op: crate::spec::BinaryOp::Eq,
+                        lhs,
+                        rhs,
+                    },
+                };
+                if typed_expr_contains_bind(&expr) {
+                    return Err(format!(
+                        "spec bindings in {kind} must have the form `?x == value` at the top level"
+                    ));
+                }
+                residual.push(expr);
+            }
+            _ => {
+                if typed_expr_contains_bind(&conjunct) {
+                    return Err(format!(
+                        "spec bindings in {kind} must have the form `?x == value` at the top level"
+                    ));
+                }
+                residual.push(conjunct);
+            }
+        }
+    }
+    Ok(NormalizedPredicate {
+        bindings,
+        condition: join_top_level_conjuncts(residual),
+    })
+}
+
+fn ensure_bind_free_predicate(expr: TypedExpr, kind: &str) -> Result<TypedExpr, String> {
+    if typed_expr_contains_bind(&expr) {
+        return Err(format!("new spec bindings are not allowed in {kind}"));
+    }
+    Ok(expr)
 }
 
 struct ExprResolutionContext<'a> {
@@ -3742,26 +3866,34 @@ fn compute_directives<'tcx>(
     let typed_req = match req_directive {
         Some(directive) => {
             let mut scope = SpecScope::default();
+            let typed = typed_runtime_contract_expr(
+                &directive.expr,
+                pure_fns,
+                enum_defs,
+                &mut scope,
+                &param_tys,
+                false,
+                &result_ty,
+                &mut inferred,
+            )
+            .map_err(|message| LoopPrepassError {
+                span: directive.span,
+                display_span: Some(directive.span_text.clone()),
+                message,
+            })?;
             Some(
-                typed_runtime_contract_expr(
-                    &directive.expr,
-                    pure_fns,
-                    enum_defs,
-                    &mut scope,
-                    &param_tys,
-                    false,
-                    &result_ty,
-                    &mut inferred,
-                )
-                .map_err(|message| LoopPrepassError {
-                    span: directive.span,
-                    display_span: Some(directive.span_text.clone()),
-                    message,
+                normalize_assert_like_predicate(typed, "//@ req").map_err(|message| {
+                    LoopPrepassError {
+                        span: directive.span,
+                        display_span: Some(directive.span_text.clone()),
+                        message,
+                    }
                 })?,
             )
         }
         None => None,
     };
+    let mut typed_body_assertions = HashMap::new();
     let mut typed_body_exprs = HashMap::new();
     let mut body_type_scope = if req_directive.is_some() {
         let mut scope = SpecScope::default();
@@ -3838,6 +3970,34 @@ fn compute_directives<'tcx>(
                     display_span: Some(directive.span_text.clone()),
                     message,
                 })?;
+                let typed =
+                    match directive.kind {
+                        DirectiveKind::Assert => {
+                            let predicate = normalize_assert_like_predicate(typed, "//@ assert")
+                                .map_err(|message| LoopPrepassError {
+                                    span: directive.span,
+                                    display_span: Some(directive.span_text.clone()),
+                                    message,
+                                })?;
+                            typed_body_assertions.insert(directive.span_text.clone(), predicate);
+                            continue;
+                        }
+                        DirectiveKind::Assume => ensure_bind_free_predicate(typed, "//@ assume")
+                            .map_err(|message| LoopPrepassError {
+                                span: directive.span,
+                                display_span: Some(directive.span_text.clone()),
+                                message,
+                            })?,
+                        DirectiveKind::Inv => ensure_bind_free_predicate(typed, "//@ inv")
+                            .map_err(|message| LoopPrepassError {
+                                span: directive.span,
+                                display_span: Some(directive.span_text.clone()),
+                                message,
+                            })?,
+                        DirectiveKind::Req | DirectiveKind::Ens | DirectiveKind::LemmaCall => {
+                            unreachable!("filtered above")
+                        }
+                    };
                 typed_body_exprs.insert(directive.span_text.clone(), typed);
             }
         }
@@ -3862,21 +4022,28 @@ fn compute_directives<'tcx>(
                     message,
                 })?;
             }
+            let typed = typed_runtime_contract_expr(
+                &directive.expr,
+                pure_fns,
+                enum_defs,
+                &mut scope,
+                &param_tys,
+                true,
+                &result_ty,
+                &mut inferred,
+            )
+            .map_err(|message| LoopPrepassError {
+                span: directive.span,
+                display_span: Some(directive.span_text.clone()),
+                message,
+            })?;
             Some(
-                typed_runtime_contract_expr(
-                    &directive.expr,
-                    pure_fns,
-                    enum_defs,
-                    &mut scope,
-                    &param_tys,
-                    true,
-                    &result_ty,
-                    &mut inferred,
-                )
-                .map_err(|message| LoopPrepassError {
-                    span: directive.span,
-                    display_span: Some(directive.span_text.clone()),
-                    message,
+                ensure_bind_free_predicate(typed, "//@ ens").map_err(|message| {
+                    LoopPrepassError {
+                        span: directive.span,
+                        display_span: Some(directive.span_text.clone()),
+                        message,
+                    }
                 })?,
             )
         }
@@ -3885,17 +4052,13 @@ fn compute_directives<'tcx>(
     let function_contract = match (req_directive, ens_directive) {
         (None, None) => Some(FunctionContract {
             params: params.clone(),
-            req: TypedExpr {
-                ty: SpecTy::Bool,
-                kind: TypedExprKind::Bool(true),
+            req: NormalizedPredicate {
+                bindings: Vec::new(),
+                condition: typed_bool_expr(true),
             },
             req_span: def_span.clone(),
-            ens: TypedExpr {
-                ty: SpecTy::Bool,
-                kind: TypedExprKind::Bool(true),
-            },
+            ens: typed_bool_expr(true),
             ens_span: def_span,
-            spec_vars: Vec::new(),
             result,
         }),
         (Some(req), Some(ens)) => Some(FunctionContract {
@@ -3904,13 +4067,6 @@ fn compute_directives<'tcx>(
             req_span: req.span_text.clone(),
             ens: typed_ens.expect("typed ens"),
             ens_span: ens.span_text.clone(),
-            spec_vars: contract_scope
-                .typed_ordered(&mut inferred)
-                .map_err(|message| LoopPrepassError {
-                    span: tcx.def_span(def_id.to_def_id()),
-                    display_span: None,
-                    message,
-                })?,
             result,
         }),
         _ => {
@@ -3950,7 +4106,7 @@ fn compute_directives<'tcx>(
                     .entry(control)
                     .or_default()
                     .push(ControlPointDirective::Assert(AssertionContract {
-                        assertion: typed_body_exprs
+                        assertion: typed_body_assertions
                             .get(&directive.span_text)
                             .cloned()
                             .expect("typed assertion expression"),
@@ -4021,13 +4177,6 @@ fn compute_directives<'tcx>(
         loop_contracts,
         control_point_directives,
         function_contract,
-        spec_vars: body_scope
-            .typed_ordered_with(&contract_scope, &mut inferred)
-            .map_err(|message| LoopPrepassError {
-                span: tcx.def_span(def_id.to_def_id()),
-                display_span: None,
-                message,
-            })?,
     })
 }
 
@@ -4706,13 +4855,21 @@ fn typed_lemma_stmts(
     for stmt in stmts {
         match stmt {
             crate::spec::GhostStmt::Assert(expr) => {
-                typed.push(TypedGhostStmt::Assert(typed_contract_expr(
+                let typed_expr = typed_contract_expr(
                     expr, pure_fns, enum_defs, spec_scope, local_tys, false, result_ty, inferred,
+                )?;
+                typed.push(TypedGhostStmt::Assert(normalize_assert_like_predicate(
+                    typed_expr,
+                    "ghost assert",
                 )?))
             }
             crate::spec::GhostStmt::Assume(expr) => {
-                typed.push(TypedGhostStmt::Assume(typed_contract_expr(
+                let typed_expr = typed_contract_expr(
                     expr, pure_fns, enum_defs, spec_scope, local_tys, false, result_ty, inferred,
+                )?;
+                typed.push(TypedGhostStmt::Assume(ensure_bind_free_predicate(
+                    typed_expr,
+                    "ghost assume",
                 )?))
             }
             crate::spec::GhostStmt::Call {
@@ -5137,6 +5294,13 @@ fn type_lemmas(
             span,
             display_span: None,
             message: format!("lemma `{}` req: {message}", lemma.name),
+        })
+        .and_then(|expr| {
+            normalize_assert_like_predicate(expr, "lemma req").map_err(|message| LoopPrepassError {
+                span,
+                display_span: None,
+                message: format!("lemma `{}` req: {message}", lemma.name),
+            })
         })?;
         let body = typed_lemma_stmts(
             &lemma.body,
@@ -5169,22 +5333,20 @@ fn type_lemmas(
             span,
             display_span: None,
             message: format!("lemma `{}` ens: {message}", lemma.name),
+        })
+        .and_then(|expr| {
+            ensure_bind_free_predicate(expr, "lemma ens").map_err(|message| LoopPrepassError {
+                span,
+                display_span: None,
+                message: format!("lemma `{}` ens: {message}", lemma.name),
+            })
         })?;
-        let spec_vars =
-            type_scope
-                .typed_ordered(&mut inferred)
-                .map_err(|message| LoopPrepassError {
-                    span,
-                    display_span: None,
-                    message: format!("lemma `{}`: {message}", lemma.name),
-                })?;
         let typed_def = TypedLemmaDef {
             name: lemma.name.clone(),
             params,
             req,
             ens,
             body,
-            spec_vars,
         };
         validate_recursive_lemma(&typed_def).map_err(|message| LoopPrepassError {
             span,
