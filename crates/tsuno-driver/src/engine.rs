@@ -80,9 +80,12 @@ pub struct State {
     ctrl: ControlPoint,
 }
 
-struct BuiltinSeqDecls {
+struct BuiltinNatDecls {
     nat_to_int: RecFuncDecl,
     int_to_nat: RecFuncDecl,
+}
+
+struct BuiltinSeqDecls {
     _seq_rev_prefix: RecFuncDecl,
     seq_rev: RecFuncDecl,
 }
@@ -114,6 +117,7 @@ pub struct Verifier<'tcx> {
     pure_fns: HashMap<String, TypedPureFnDef>,
     pure_fn_decls: HashMap<String, RecFuncDecl>,
     lemmas: HashMap<String, TypedLemmaDef>,
+    builtin_nat_decls: RefCell<Option<Rc<BuiltinNatDecls>>>,
     builtin_seq_decls: RefCell<Option<Rc<BuiltinSeqDecls>>>,
     next_sym: Cell<usize>,
     value_encoder: ValueEncoder,
@@ -205,6 +209,7 @@ impl<'tcx> Verifier<'tcx> {
             pure_fns: HashMap::new(),
             pure_fn_decls: HashMap::new(),
             lemmas: HashMap::new(),
+            builtin_nat_decls: RefCell::new(None),
             builtin_seq_decls: RefCell::new(None),
             next_sym: Cell::new(0),
             value_encoder: ValueEncoder::new(tcx.data_layout.pointer_size().bits()),
@@ -643,7 +648,7 @@ impl<'tcx> Verifier<'tcx> {
                 .get(&def_id)
                 .ok_or_else(|| self.missing_local_contract_result(def_id, span))?;
             let spec = self.instantiate_contract_spec_vars(contract);
-            let env = self.call_env(&state, args, contract, span, spec.clone())?;
+            let env = self.call_env(&state, args, contract, span, spec)?;
             self.assert_contract_expr_constraint(
                 &mut state,
                 &contract.req,
@@ -657,7 +662,7 @@ impl<'tcx> Verifier<'tcx> {
             let result_value = self.fresh_for_rust_ty(result_ty, "call_result")?;
             self.write_place(&mut state, destination, result_value.clone(), span)?;
             self.abstract_call_mut_args(&mut state, args, span)?;
-            let mut env = self.call_env(&state, args, contract, span, spec)?;
+            let mut env = self.call_env(&state, args, contract, span, env.spec)?;
             self.consume_call_move_args(&mut state, args, span)?;
             env.current.insert("result".to_owned(), result_value);
             let ens = self.contract_ens_to_z3(contract, &env, span)?;
@@ -3114,8 +3119,8 @@ impl<'tcx> Verifier<'tcx> {
         self.decode_composite_field(&encoding, value, 1, span)
     }
 
-    fn builtin_seq_decls(&self, span: Span) -> Result<Rc<BuiltinSeqDecls>, VerificationResult> {
-        if let Some(decls) = self.builtin_seq_decls.borrow().as_ref().cloned() {
+    fn builtin_nat_decls(&self, span: Span) -> Result<Rc<BuiltinNatDecls>, VerificationResult> {
+        if let Some(decls) = self.builtin_nat_decls.borrow().as_ref().cloned() {
             return Ok(decls);
         }
         let decls = with_solver(|solver| {
@@ -3147,16 +3152,6 @@ impl<'tcx> Verifier<'tcx> {
                 &[&Sort::int()],
                 self.value_encoder.value_sort(),
             );
-            let seq_rev_prefix = RecFuncDecl::new(
-                "builtin_seq_rev_prefix",
-                &[self.value_encoder.seq_value_sort(), &Sort::int()],
-                self.value_encoder.seq_value_sort(),
-            );
-            let seq_rev = RecFuncDecl::new(
-                "builtin_seq_rev",
-                &[self.value_encoder.seq_value_sort()],
-                self.value_encoder.seq_value_sort(),
-            );
 
             let int_arg = Int::new_const(self.fresh_name("builtin_int_to_nat_arg"));
             let zero_value = zero_ctor.symbol.apply(&[]);
@@ -3187,6 +3182,32 @@ impl<'tcx> Verifier<'tcx> {
             let nat_to_int_body = zero_case.ite(&Int::from_i64(0), &(Int::from_i64(1) + succ_int));
             nat_to_int.add_def(&[&nat_arg], &nat_to_int_body);
 
+            Ok(Rc::new(BuiltinNatDecls {
+                nat_to_int,
+                int_to_nat,
+            }))
+        })
+        .map_err(|err: String| self.unsupported_result(span, err))?;
+        self.builtin_nat_decls.replace(Some(decls.clone()));
+        Ok(decls)
+    }
+
+    fn builtin_seq_decls(&self, span: Span) -> Result<Rc<BuiltinSeqDecls>, VerificationResult> {
+        if let Some(decls) = self.builtin_seq_decls.borrow().as_ref().cloned() {
+            return Ok(decls);
+        }
+        let decls = with_solver(|_solver| {
+            let seq_rev_prefix = RecFuncDecl::new(
+                "builtin_seq_rev_prefix",
+                &[self.value_encoder.seq_value_sort(), &Sort::int()],
+                self.value_encoder.seq_value_sort(),
+            );
+            let seq_rev = RecFuncDecl::new(
+                "builtin_seq_rev",
+                &[self.value_encoder.seq_value_sort()],
+                self.value_encoder.seq_value_sort(),
+            );
+
             let seq_arg = Z3Seq::new_const(
                 self.fresh_name("builtin_seq_rev_arg"),
                 self.value_encoder.value_sort(),
@@ -3216,8 +3237,6 @@ impl<'tcx> Verifier<'tcx> {
             seq_rev.add_def(&[&seq_input], &seq_rev_body);
 
             Ok(Rc::new(BuiltinSeqDecls {
-                nat_to_int,
-                int_to_nat,
                 _seq_rev_prefix: seq_rev_prefix,
                 seq_rev,
             }))
@@ -3231,7 +3250,7 @@ impl<'tcx> Verifier<'tcx> {
         if let Some(n) = self.try_concrete_nat_usize(value, span)? {
             return Ok(Int::from_u64(n));
         }
-        let decls = self.builtin_seq_decls(span)?;
+        let decls = self.builtin_nat_decls(span)?;
         decls
             .nat_to_int
             .apply(&[value.ast()])
@@ -3242,7 +3261,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn int_to_nat_value(&self, value: &Int, span: Span) -> Result<SymValue, VerificationResult> {
-        let decls = self.builtin_seq_decls(span)?;
+        let decls = self.builtin_nat_decls(span)?;
         Ok(SymValue::new(decls.int_to_nat.apply(&[value])))
     }
 

@@ -34,8 +34,20 @@ fn reverse(mut xs: Vec<i32>) -> Vec<i32>
 //@ req ?Input == {xs}
 //@ ens {result} == seq_rev(Input)
 {
-    //@ assume false;
-    xs
+    let mut acc = vec_new();
+    //@ assert seq_rev(Input) == {acc} ++ seq_rev({xs});
+    while !vec_is_empty(&xs)
+    //@ inv seq_rev(Input) == {acc} ++ seq_rev({xs})
+    {
+        let x = vec_pop(&mut xs);
+        //@ assert seq_rev(Input) == {acc} ++ ([{x}] ++ seq_rev({xs}));
+        //@ seq_concat_assoc({acc}, [{x}], seq_rev({xs}));
+        vec_push(&mut acc, x);
+        //@ assert seq_rev(Input) == {acc} ++ seq_rev({xs});
+    }
+    //@ seq_rev_empty({xs});
+    //@ seq_concat_empty_right({acc});
+    acc
 }
 
 fn main() {}
