@@ -4,6 +4,7 @@ pub enum Expr {
     Int(IntLiteral),
     Var(String),
     Bind(String),
+    Interpolated(String),
     SeqLit(Vec<Expr>),
     Match {
         scrutinee: Box<Expr>,
@@ -73,6 +74,7 @@ pub enum TypedExprKind {
     Bool(bool),
     Int(IntLiteral),
     Var(String),
+    RustVar(String),
     Bind(String),
     SeqLit(Vec<TypedExpr>),
     Match {
@@ -363,10 +365,7 @@ fn parse_source_expr_with_type_params(
     text: &str,
     type_params: &[String],
 ) -> Result<Expr, ParseError> {
-    if let Some(decoded) = decode_legacy_string_literal(text)? {
-        return parse_templated_expr_with_type_params(kind, &decoded, type_params);
-    }
-    parse_templated_expr_with_type_params(kind, text.trim(), type_params)
+    parse_raw_expr_with_type_params(kind, text.trim(), type_params)
 }
 
 pub fn parse_statement_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
@@ -377,15 +376,6 @@ pub fn parse_statement_expr(kind: &str, text: &str) -> Result<Expr, ParseError> 
         )));
     };
     parse_source_expr(kind, text.trim_end())
-}
-
-fn parse_templated_expr_with_type_params(
-    kind: &str,
-    text: &str,
-    type_params: &[String],
-) -> Result<Expr, ParseError> {
-    let expanded = expand_template(kind, text)?;
-    parse_raw_expr_with_type_params(kind, &expanded, type_params)
 }
 
 pub fn parse_raw_expr(_kind: &str, text: &str) -> Result<Expr, ParseError> {
@@ -422,101 +412,6 @@ fn parse_raw_match_pattern(text: &str) -> Result<MatchPattern, ParseError> {
         .ok_or_else(|| ParseError::new("expected match arm pattern"))?;
     parser.expect_end()?;
     Ok(pattern)
-}
-
-fn decode_legacy_string_literal(text: &str) -> Result<Option<String>, ParseError> {
-    let Some(inner) = text
-        .trim()
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-    else {
-        return Ok(None);
-    };
-
-    let mut out = String::new();
-    let mut chars = inner.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            out.push(ch);
-            continue;
-        }
-        let Some(esc) = chars.next() else {
-            return Err(ParseError::new(
-                "failed to parse spec expression: trailing escape in string literal".to_string(),
-            ));
-        };
-        match esc {
-            '\\' => out.push('\\'),
-            '"' => out.push('"'),
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            't' => out.push('\t'),
-            '0' => out.push('\0'),
-            _ => {
-                return Err(ParseError::new(format!(
-                    "failed to parse spec expression: unsupported escape `\\{esc}`"
-                )));
-            }
-        }
-    }
-
-    Ok(Some(out))
-}
-
-fn expand_template(kind: &str, raw: &str) -> Result<String, ParseError> {
-    let mut out = String::new();
-    let mut chars = raw.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '{' => {
-                if chars.peek() == Some(&'{') {
-                    chars.next();
-                    out.push('{');
-                    continue;
-                }
-                let mut inner = String::new();
-                let mut closed = false;
-                while let Some(next) = chars.next() {
-                    if next == '}' {
-                        if chars.peek() == Some(&'}') {
-                            chars.next();
-                            inner.push('}');
-                            continue;
-                        }
-                        closed = true;
-                        break;
-                    }
-                    inner.push(next);
-                }
-                if !closed {
-                    return Err(ParseError::new(format!(
-                        "unclosed `{{` in //@ {kind} template"
-                    )));
-                }
-                let inner = inner.trim();
-                if inner.is_empty() {
-                    return Err(ParseError::new(format!(
-                        "empty interpolation in //@ {kind} template"
-                    )));
-                }
-                out.push('(');
-                out.push_str(inner);
-                out.push(')');
-            }
-            '}' => {
-                if chars.peek() == Some(&'}') {
-                    chars.next();
-                    out.push('}');
-                } else {
-                    return Err(ParseError::new(format!(
-                        "unmatched `}}` in //@ {kind} template"
-                    )));
-                }
-            }
-            _ => out.push(ch),
-        }
-    }
-    Ok(out)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1179,6 +1074,23 @@ impl Parser {
                 self.expect(&Token::RParen)?;
                 Ok(expr)
             }
+            Some(Token::LBrace) => {
+                let name = match self.next().cloned() {
+                    Some(Token::Ident(name)) => name,
+                    _ => {
+                        return Err(ParseError::new(
+                            "expected a Rust binding name inside `{...}`",
+                        ));
+                    }
+                };
+                if self.tokens.get(self.cursor) != Some(&Token::RBrace) {
+                    return Err(ParseError::new(
+                        "expected `}` after Rust binding name in `{...}`",
+                    ));
+                }
+                self.expect(&Token::RBrace)?;
+                Ok(Expr::Interpolated(name))
+            }
             Some(Token::LBracket) => self.parse_seq_literal(),
             _ => Err(ParseError::new("expected a spec expression")),
         }
@@ -1798,10 +1710,10 @@ mod tests {
             Expr::Binary {
                 op: BinaryOp::Eq,
                 lhs: Box::new(Expr::Deref {
-                    base: Box::new(Expr::Var("x".to_owned())),
+                    base: Box::new(Expr::Interpolated("x".to_owned())),
                 }),
                 rhs: Box::new(Expr::Field {
-                    base: Box::new(Expr::Var("y".to_owned())),
+                    base: Box::new(Expr::Interpolated("y".to_owned())),
                     name: "fin".to_owned(),
                 }),
             }
@@ -1816,7 +1728,7 @@ mod tests {
             Expr::Binary {
                 op: BinaryOp::Eq,
                 lhs: Box::new(Expr::TupleField {
-                    base: Box::new(Expr::Var("x".to_owned())),
+                    base: Box::new(Expr::Interpolated("x".to_owned())),
                     index: 0,
                 }),
                 rhs: Box::new(Expr::Int(IntLiteral {
@@ -1839,6 +1751,22 @@ mod tests {
                     digits: "3".to_owned(),
                     suffix: None,
                 })),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_negated_call_with_bind_argument() {
+        let expr = parse_expr("assert", r#"!P(?x)"#).expect("expr");
+        assert_eq!(
+            expr,
+            Expr::Unary {
+                op: UnaryOp::Not,
+                arg: Box::new(Expr::Call {
+                    func: "P".to_owned(),
+                    type_args: vec![],
+                    args: vec![Expr::Bind("x".to_owned())],
+                }),
             }
         );
     }
@@ -1891,7 +1819,7 @@ mod tests {
             Expr::Binary {
                 op: BinaryOp::Eq,
                 lhs: Box::new(Expr::Field {
-                    base: Box::new(Expr::Var("x".to_owned())),
+                    base: Box::new(Expr::Interpolated("x".to_owned())),
                     name: "left".to_owned(),
                 }),
                 rhs: Box::new(Expr::Int(IntLiteral {
@@ -1931,9 +1859,9 @@ mod tests {
                 lhs: Box::new(Expr::Call {
                     func: "seq_rev".to_owned(),
                     type_args: vec![],
-                    args: vec![Expr::Var("xs".to_owned())],
+                    args: vec![Expr::Interpolated("xs".to_owned())],
                 }),
-                rhs: Box::new(Expr::Var("ys".to_owned())),
+                rhs: Box::new(Expr::Interpolated("ys".to_owned())),
             }
         );
     }
@@ -2084,12 +2012,47 @@ mod tests {
             expr,
             Expr::Binary {
                 op: BinaryOp::Eq,
-                lhs: Box::new(Expr::Var("x".to_owned())),
+                lhs: Box::new(Expr::Interpolated("x".to_owned())),
                 rhs: Box::new(Expr::Int(IntLiteral {
                     digits: "1".to_owned(),
                     suffix: Some(IntSuffix::I32),
                 })),
             }
+        );
+    }
+
+    #[test]
+    fn keeps_bare_and_interpolated_names_distinct() {
+        let expr = parse_expr("assert", r#"x == {x}"#).expect("expr");
+        assert_eq!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                lhs: Box::new(Expr::Var("x".to_owned())),
+                rhs: Box::new(Expr::Interpolated("x".to_owned())),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_non_binding_interpolation() {
+        let err = parse_expr("assert", r#"{x + 1i32} == 2i32"#).expect_err("parse should fail");
+        assert_eq!(
+            err.message,
+            "expected `}` after Rust binding name in `{...}`"
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_string_literal_statement_expression() {
+        let err = super::parse_statement_expr("assert", r#""{x} == 1i32";"#)
+            .expect_err("legacy string literal form should be rejected");
+        assert!(
+            err.to_string().contains("expected a spec expression")
+                || err
+                    .to_string()
+                    .contains("unexpected character `\"` in spec expression"),
+            "{err}"
         );
     }
 

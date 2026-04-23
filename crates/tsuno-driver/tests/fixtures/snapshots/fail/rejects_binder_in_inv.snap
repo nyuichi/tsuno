@@ -5,10 +5,8 @@ expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
-FAIL solver_returns_unknown
-  solver returned unknown while checking an assertion
-  src/main.rs:10:6: 10:6
-PASS main
-  all assertions discharged
+UNSUPPORTED rejects_binder_in_inv
+  new spec bindings are not allowed in //@ inv
+  src/main.rs:3:5: 3:26
 
 stderr:

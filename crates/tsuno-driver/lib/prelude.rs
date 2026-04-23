@@ -125,11 +125,4 @@ fn seq_concat_empty_right<T>(xs: Seq<T>)
 {
     assert xs ++ [] == xs;
 }
-
-fn seq_rev_empty<T>(xs: Seq<T>)
-  req xs == []
-  ens seq_rev(xs) == []
-{
-    assert seq_rev(xs) == [];
-}
 */

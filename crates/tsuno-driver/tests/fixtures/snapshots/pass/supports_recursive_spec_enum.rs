@@ -10,7 +10,7 @@ fn singleton(x: i32) -> IntList {
 */
 
 fn builds_recursive_spec_enum(x: i32) {
-    //@ assert singleton(x) == IntList::Cons(x, IntList::Nil);
+    //@ assert singleton({x}) == IntList::Cons({x}, IntList::Nil);
 }
 
 fn main() {}

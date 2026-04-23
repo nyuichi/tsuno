@@ -1,6 +1,6 @@
 fn id(x: i32) -> i32
 //@ req true
-//@ ens ?R == result && result == x
+//@ ens ?R == {result} && {result} == {x}
 {
     x
 }

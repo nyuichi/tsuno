@@ -1,6 +1,6 @@
 fn rejects_ens_spec_var_use_in_body() -> i32
 //@ req true
-//@ ens ?X == result
+//@ ens ?X == {result}
 {
     //@ assert X == 0;
     let out = 0;

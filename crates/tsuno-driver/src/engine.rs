@@ -38,9 +38,9 @@ use z3::{Config, Context, RecFuncDecl, SatResult, Solver, Sort, SortKind};
 
 use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
-    FunctionContract, LemmaCallContract, LoopContract, LoopContracts, ProgramPrepass,
-    ResolvedExprEnv, SpecVarBinding, TypedGhostMatchArm, TypedGhostStmt, TypedLemmaDef,
-    TypedPureFnDef, spec_ty_for_rust_ty,
+    FunctionContract, LemmaCallContract, LoopContract, LoopContracts, NormalizedBinding,
+    NormalizedPredicate, ProgramPrepass, ResolvedExprEnv, TypedGhostMatchArm, TypedGhostStmt,
+    TypedLemmaDef, TypedPureFnDef, spec_ty_for_rust_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{BinaryOp, SpecTy, TypedExpr, TypedExprKind, TypedMatchBinding, UnaryOp};
@@ -77,27 +77,19 @@ pub struct ControlPoint {
 pub struct State {
     pc: Bool,
     model: BTreeMap<Local, SymValue>,
+    spec_env: HashMap<String, SymValue>,
     ctrl: ControlPoint,
 }
 
-struct BuiltinSeqDecls {
+struct BuiltinNatDecls {
     nat_to_int: RecFuncDecl,
     int_to_nat: RecFuncDecl,
-    _seq_rev_prefix: RecFuncDecl,
-    seq_rev: RecFuncDecl,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AssertionKind {
-    Universal,
-    Existential,
 }
 
 struct FunctionContext<'tcx> {
     def_id: LocalDefId,
     body: Body<'tcx>,
     contract: FunctionContract,
-    function_spec_vars: HashMap<String, SymValue>,
     loop_contracts: LoopContracts,
     control_point_directives: ControlPointDirectives,
 }
@@ -114,7 +106,7 @@ pub struct Verifier<'tcx> {
     pure_fns: HashMap<String, TypedPureFnDef>,
     pure_fn_decls: HashMap<String, RecFuncDecl>,
     lemmas: HashMap<String, TypedLemmaDef>,
-    builtin_seq_decls: RefCell<Option<Rc<BuiltinSeqDecls>>>,
+    builtin_nat_decls: RefCell<Option<Rc<BuiltinNatDecls>>>,
     next_sym: Cell<usize>,
     value_encoder: ValueEncoder,
 }
@@ -205,7 +197,7 @@ impl<'tcx> Verifier<'tcx> {
             pure_fns: HashMap::new(),
             pure_fn_decls: HashMap::new(),
             lemmas: HashMap::new(),
-            builtin_seq_decls: RefCell::new(None),
+            builtin_nat_decls: RefCell::new(None),
             next_sym: Cell::new(0),
             value_encoder: ValueEncoder::new(tcx.data_layout.pointer_size().bits()),
         }
@@ -224,10 +216,6 @@ impl<'tcx> Verifier<'tcx> {
 
     fn current_contract(&self) -> &FunctionContract {
         &self.function_context().contract
-    }
-
-    fn function_spec_vars(&self) -> &HashMap<String, SymValue> {
-        &self.function_context().function_spec_vars
     }
 
     fn loop_contracts(&self) -> &LoopContracts {
@@ -300,7 +288,6 @@ impl<'tcx> Verifier<'tcx> {
             loop_contracts,
             control_point_directives,
             function_contract,
-            spec_vars,
         } = prepass;
         let contract = function_contract.expect("successful function prepass must yield contract");
         self.contracts.insert(def_id, contract.clone());
@@ -308,7 +295,6 @@ impl<'tcx> Verifier<'tcx> {
             def_id,
             body,
             contract,
-            function_spec_vars: self.instantiate_spec_vars(&spec_vars),
             loop_contracts,
             control_point_directives,
         });
@@ -342,7 +328,7 @@ impl<'tcx> Verifier<'tcx> {
                 for directive in directives {
                     match directive {
                         ControlPointDirective::Assert(assertion) => {
-                            if let Err(err) = self.assert_spec_expr_constraint(
+                            if let Err(err) = self.assert_spec_predicate_constraint(
                                 &mut state,
                                 &assertion.assertion,
                                 &assertion.resolution,
@@ -419,6 +405,7 @@ impl<'tcx> Verifier<'tcx> {
         let mut state = State {
             pc: Bool::from_bool(true),
             model: BTreeMap::new(),
+            spec_env: HashMap::new(),
             ctrl: ControlPoint {
                 basic_block: BasicBlock::from_usize(0),
                 statement_index: 0,
@@ -436,9 +423,11 @@ impl<'tcx> Verifier<'tcx> {
         }
         {
             let contract = self.current_contract();
-            let env =
-                CallEnv::for_function(self, &state, contract, self.function_spec_vars().clone())?;
-            let req = self.contract_req_to_z3(contract, &env, self.report_span())?;
+            let env = CallEnv::for_function(self, &state, contract)?;
+            state.spec_env =
+                self.bind_contract_spec_values(&env.current, &env.spec, &contract.req.bindings)?;
+            let env = CallEnv::for_function(self, &state, contract)?;
+            let req = self.contract_req_formula(contract, &env, self.report_span())?;
             if !self.assume_path_condition(&mut state, req) {
                 return Ok(None);
             }
@@ -498,17 +487,11 @@ impl<'tcx> Verifier<'tcx> {
             TerminatorKind::Return => {
                 {
                     let contract = self.current_contract();
-                    let env = CallEnv::for_function(
-                        self,
-                        &state,
-                        contract,
-                        self.function_spec_vars().clone(),
-                    )?;
-                    self.assert_contract_expr_constraint(
+                    let env = CallEnv::for_function(self, &state, contract)?;
+                    let ens = self.contract_ens_formula(contract, &env, term.source_info.span)?;
+                    self.assert_predicate_constraint(
                         &mut state,
-                        &contract.ens,
-                        &env.current,
-                        &env.spec,
+                        ens,
                         term.source_info.span,
                         contract.ens_span.clone(),
                         "postcondition failed".to_owned(),
@@ -580,7 +563,6 @@ impl<'tcx> Verifier<'tcx> {
                 self.assert_constraint(
                     &mut state,
                     formula,
-                    AssertionKind::Universal,
                     term.source_info.span,
                     span_text(self.tcx, term.source_info.span),
                     format!("assertion failed: {msg:?}"),
@@ -642,13 +624,17 @@ impl<'tcx> Verifier<'tcx> {
                 .contracts
                 .get(&def_id)
                 .ok_or_else(|| self.missing_local_contract_result(def_id, span))?;
-            let spec = self.instantiate_contract_spec_vars(contract);
-            let env = self.call_env(&state, args, contract, span, spec.clone())?;
-            self.assert_contract_expr_constraint(
+            let env = self.call_env(&state, args, contract, span, HashMap::new())?;
+            let spec =
+                self.bind_contract_spec_values(&env.current, &env.spec, &contract.req.bindings)?;
+            let req_env = CallEnv {
+                current: env.current.clone(),
+                spec: spec.clone(),
+            };
+            let req = self.contract_req_formula(contract, &req_env, span)?;
+            self.assert_predicate_constraint(
                 &mut state,
-                &contract.req,
-                &env.current,
-                &env.spec,
+                req,
                 span,
                 contract.req_span.clone(),
                 "precondition failed".to_owned(),
@@ -660,7 +646,7 @@ impl<'tcx> Verifier<'tcx> {
             let mut env = self.call_env(&state, args, contract, span, spec)?;
             self.consume_call_move_args(&mut state, args, span)?;
             env.current.insert("result".to_owned(), result_value);
-            let ens = self.contract_ens_to_z3(contract, &env, span)?;
+            let ens = self.contract_ens_formula(contract, &env, span)?;
             if !self.assume_path_condition(&mut state, ens) {
                 return Ok(Vec::new());
             }
@@ -703,10 +689,14 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Option<State>, VerificationResult> {
         if let Some(loop_contract) = self.loop_contracts().contract_by_header(target) {
-            self.assert_spec_expr_constraint(
-                &mut state,
+            let invariant = self.spec_expr_to_bool(
+                &state,
                 &loop_contract.invariant,
                 &loop_contract.resolution,
+            )?;
+            self.assert_predicate_constraint(
+                &mut state,
+                invariant.clone(),
                 span,
                 loop_contract.invariant_span.clone(),
                 "loop invariant does not hold".to_owned(),
@@ -781,6 +771,7 @@ impl<'tcx> Verifier<'tcx> {
         let mut merged = State {
             pc: Bool::from_bool(false),
             model: BTreeMap::new(),
+            spec_env: HashMap::new(),
             ctrl,
         };
         let pcs = states
@@ -825,12 +816,33 @@ impl<'tcx> Verifier<'tcx> {
             merged.model.insert(local, merged_value);
         }
 
-        merged.pc = merged.pc.simplify();
-        match self.check_sat(std::slice::from_ref(&merged.pc)) {
-            SatResult::Sat => Ok(Some(merged)),
-            SatResult::Unsat => Ok(None),
-            SatResult::Unknown => Ok(Some(merged)),
+        let shared_spec_names: BTreeSet<_> = states
+            .iter()
+            .map(|state| state.spec_env.keys().cloned().collect::<BTreeSet<_>>())
+            .reduce(|acc, keys| acc.intersection(&keys).cloned().collect())
+            .unwrap_or_default();
+        for name in shared_spec_names {
+            let mut incoming = states
+                .iter()
+                .map(|state| {
+                    state
+                        .spec_env
+                        .get(&name)
+                        .cloned()
+                        .expect("shared spec binding present")
+                })
+                .collect::<Vec<_>>();
+            let first = incoming
+                .first()
+                .cloned()
+                .expect("shared spec binding present");
+            if incoming.drain(..).all(|value| value == first) {
+                merged.spec_env.insert(name, first);
+            }
         }
+
+        merged.pc = merged.pc.simplify();
+        Ok(Some(merged))
     }
 
     fn enqueue_state(
@@ -898,19 +910,22 @@ impl<'tcx> Verifier<'tcx> {
                 self.fresh_for_spec_ty(&param.ty, &format!("lemma_{}_{}", lemma.name, param.name))?;
             current.insert(param.name.clone(), value);
         }
-        let spec = self.instantiate_spec_vars(&lemma.spec_vars);
         let mut state = State {
             pc: Bool::from_bool(true),
             model: BTreeMap::new(),
+            spec_env: HashMap::new(),
             ctrl: ControlPoint {
                 basic_block: BasicBlock::from_usize(0),
                 statement_index: 0,
             },
         };
-        let req = self.contract_expr_to_bool(&current, &spec, &lemma.req)?;
-        if !self.assume_path_condition(&mut state, req) {
+        let state_spec = state.spec_env.clone();
+        let Some(spec) =
+            self.assume_contract_predicate(&mut state, &lemma.req, &current, &state_spec)?
+        else {
             return Ok(());
-        }
+        };
+        state.spec_env = spec;
         for param in &lemma.params {
             let value = current.get(&param.name).expect("lemma parameter value");
             if let Some(formula) = self.spec_ty_formula(&param.ty, value, self.report_span())?
@@ -919,14 +934,14 @@ impl<'tcx> Verifier<'tcx> {
                 return Ok(());
             }
         }
-        let final_states = self.execute_lemma_stmts(lemma, &current, &spec, state, &lemma.body)?;
+        let final_states = self.execute_lemma_stmts(lemma, &current, state, &lemma.body)?;
         for final_exec in final_states {
             let mut final_state = final_exec.state;
-            self.assert_contract_expr_constraint(
+            let ens =
+                self.contract_expr_to_bool(&final_exec.current, &final_state.spec_env, &lemma.ens)?;
+            self.assert_predicate_constraint(
                 &mut final_state,
-                &lemma.ens,
-                &final_exec.current,
-                &spec,
+                ens,
                 self.report_span(),
                 format!("lemma `{}`", lemma.name),
                 format!("lemma `{}` postcondition failed", lemma.name),
@@ -939,7 +954,6 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         lemma: &TypedLemmaDef,
         current: &HashMap<String, SymValue>,
-        spec: &HashMap<String, SymValue>,
         mut state: State,
         stmts: &[TypedGhostStmt],
     ) -> Result<Vec<LemmaExecState>, VerificationResult> {
@@ -951,23 +965,25 @@ impl<'tcx> Verifier<'tcx> {
         };
         match stmt {
             TypedGhostStmt::Assert(expr) => {
-                self.assert_contract_expr_constraint(
+                let state_spec = state.spec_env.clone();
+                let spec = self.assert_contract_predicate_constraint(
                     &mut state,
                     expr,
                     current,
-                    spec,
+                    &state_spec,
                     self.report_span(),
                     format!("lemma `{}`", lemma.name),
                     format!("lemma `{}` assertion failed", lemma.name),
                 )?;
-                self.execute_lemma_stmts(lemma, current, spec, state, rest)
+                state.spec_env = spec;
+                self.execute_lemma_stmts(lemma, current, state, rest)
             }
             TypedGhostStmt::Assume(expr) => {
-                let formula = self.contract_expr_to_bool(current, spec, expr)?;
+                let formula = self.contract_expr_to_bool(current, &state.spec_env, expr)?;
                 if !self.assume_path_condition(&mut state, formula) {
                     return Ok(Vec::new());
                 }
-                self.execute_lemma_stmts(lemma, current, spec, state, rest)
+                self.execute_lemma_stmts(lemma, current, state, rest)
             }
             TypedGhostStmt::Call { lemma_name, args } => {
                 let callee = self.lemmas.get(lemma_name).ok_or_else(|| {
@@ -976,8 +992,9 @@ impl<'tcx> Verifier<'tcx> {
                         format!("unknown lemma `{lemma_name}`"),
                     )
                 })?;
-                let env = self.lemma_env_from_contract_args(args, current, spec, callee)?;
-                self.assert_contract_expr_constraint(
+                let env =
+                    self.lemma_env_from_contract_args(args, current, &state.spec_env, callee)?;
+                let spec = self.assert_contract_predicate_constraint(
                     &mut state,
                     &callee.req,
                     &env.current,
@@ -986,11 +1003,11 @@ impl<'tcx> Verifier<'tcx> {
                     format!("lemma `{}`", lemma.name),
                     format!("lemma `{}` precondition failed", callee.name),
                 )?;
-                let ens = self.contract_expr_to_bool(&env.current, &env.spec, &callee.ens)?;
+                let ens = self.contract_expr_to_bool(&env.current, &spec, &callee.ens)?;
                 if !self.assume_path_condition(&mut state, ens) {
                     return Ok(Vec::new());
                 }
-                self.execute_lemma_stmts(lemma, current, spec, state, rest)
+                self.execute_lemma_stmts(lemma, current, state, rest)
             }
             TypedGhostStmt::Match {
                 scrutinee,
@@ -999,7 +1016,6 @@ impl<'tcx> Verifier<'tcx> {
             } => self.execute_lemma_match(
                 lemma,
                 current,
-                spec,
                 state,
                 scrutinee,
                 arms,
@@ -1014,14 +1030,13 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         lemma: &TypedLemmaDef,
         current: &HashMap<String, SymValue>,
-        spec: &HashMap<String, SymValue>,
         state: State,
         scrutinee: &TypedExpr,
         arms: &[TypedGhostMatchArm],
         default: Option<&[TypedGhostStmt]>,
         rest: &[TypedGhostStmt],
     ) -> Result<Vec<LemmaExecState>, VerificationResult> {
-        let scrutinee_value = self.contract_expr_to_value(current, spec, scrutinee)?;
+        let scrutinee_value = self.contract_expr_to_value(current, &state.spec_env, scrutinee)?;
         let composite = self.composite_encoding(&scrutinee.ty)?;
         let mut guard_formulas = Vec::with_capacity(arms.len());
         let mut final_states = Vec::new();
@@ -1069,12 +1084,11 @@ impl<'tcx> Verifier<'tcx> {
                 continue;
             }
             let branch_end_states =
-                self.execute_lemma_stmts(lemma, &branch_current, spec, branch_state, &arm.body)?;
+                self.execute_lemma_stmts(lemma, &branch_current, branch_state, &arm.body)?;
             for branch_end_state in branch_end_states {
                 final_states.extend(self.execute_lemma_stmts(
                     lemma,
                     &branch_end_state.current,
-                    spec,
                     branch_end_state.state,
                     rest,
                 )?);
@@ -1085,12 +1099,11 @@ impl<'tcx> Verifier<'tcx> {
             let default_guard = bool_and(guard_formulas.into_iter().map(bool_not).collect());
             if self.assume_path_condition(&mut default_state, default_guard) {
                 let default_end_states =
-                    self.execute_lemma_stmts(lemma, current, spec, default_state, default)?;
+                    self.execute_lemma_stmts(lemma, current, default_state, default)?;
                 for default_end_state in default_end_states {
                     final_states.extend(self.execute_lemma_stmts(
                         lemma,
                         &default_end_state.current,
-                        spec,
                         default_end_state.state,
                         rest,
                     )?);
@@ -1110,7 +1123,7 @@ impl<'tcx> Verifier<'tcx> {
             self.unsupported_result(span, format!("unknown lemma `{}`", call.lemma_name))
         })?;
         let env = self.lemma_env_from_state_exprs(state, &call.args, &call.resolution, lemma)?;
-        self.assert_contract_expr_constraint(
+        let spec = self.assert_contract_predicate_constraint(
             state,
             &lemma.req,
             &env.current,
@@ -1119,7 +1132,7 @@ impl<'tcx> Verifier<'tcx> {
             call.span_text.clone(),
             format!("lemma `{}` precondition failed", lemma.name),
         )?;
-        let ens = self.contract_expr_to_bool(&env.current, &env.spec, &lemma.ens)?;
+        let ens = self.contract_expr_to_bool(&env.current, &spec, &lemma.ens)?;
         Ok(self.assume_path_condition(state, ens))
     }
 
@@ -1148,7 +1161,7 @@ impl<'tcx> Verifier<'tcx> {
         }
         Ok(CallEnv {
             current,
-            spec: self.instantiate_spec_vars(&lemma.spec_vars),
+            spec: state.spec_env.clone(),
         })
     }
 
@@ -1177,7 +1190,7 @@ impl<'tcx> Verifier<'tcx> {
         }
         Ok(CallEnv {
             current: call_current,
-            spec: self.instantiate_spec_vars(&lemma.spec_vars),
+            spec: spec.clone(),
         })
     }
 
@@ -1217,7 +1230,6 @@ impl<'tcx> Verifier<'tcx> {
         self.assert_constraint(
             state,
             formula,
-            AssertionKind::Universal,
             span,
             span_text(self.tcx, span),
             "mutable reference close failed".to_owned(),
@@ -1931,15 +1943,13 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(self.seq_literal_value(&values))
             }
-            TypedExprKind::Var(name) if resolved.spec_vars.contains(name) => {
-                self.function_spec_vars().get(name).cloned().ok_or_else(|| {
-                    self.unsupported_result(
-                        self.control_span(state.ctrl),
-                        format!("missing spec binding `{name}`"),
-                    )
-                })
-            }
-            TypedExprKind::Var(name) => {
+            TypedExprKind::Var(name) => state.spec_env.get(name).cloned().ok_or_else(|| {
+                self.unsupported_result(
+                    self.control_span(state.ctrl),
+                    format!("missing spec binding `{name}`"),
+                )
+            }),
+            TypedExprKind::RustVar(name) => {
                 let Some(local) = resolved.locals.get(name) else {
                     return Err(self.unsupported_result(
                         self.control_span(state.ctrl),
@@ -1953,14 +1963,12 @@ impl<'tcx> Verifier<'tcx> {
                     )
                 })
             }
-            TypedExprKind::Bind(name) => {
-                self.function_spec_vars().get(name).cloned().ok_or_else(|| {
-                    self.unsupported_result(
-                        self.control_span(state.ctrl),
-                        format!("missing spec binding `{name}`"),
-                    )
-                })
-            }
+            TypedExprKind::Bind(name) => state.spec_env.get(name).cloned().ok_or_else(|| {
+                self.unsupported_result(
+                    self.control_span(state.ctrl),
+                    format!("missing spec binding `{name}`"),
+                )
+            }),
             TypedExprKind::Match { .. } => Err(self.unsupported_result(
                 self.control_span(state.ctrl),
                 "match expressions are only supported in pure function bodies".to_owned(),
@@ -2128,18 +2136,21 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(self.seq_literal_value(&values))
             }
-            TypedExprKind::Var(name) if spec.contains_key(name) => {
-                spec.get(name).cloned().ok_or_else(|| {
+            TypedExprKind::Var(name) => {
+                if let Some(value) = spec.get(name).cloned() {
+                    return Ok(value);
+                }
+                current.get(name).cloned().ok_or_else(|| {
                     self.unsupported_result(
                         self.report_span(),
                         format!("missing spec binding `{name}`"),
                     )
                 })
             }
-            TypedExprKind::Var(name) => current.get(name).cloned().ok_or_else(|| {
+            TypedExprKind::RustVar(name) => current.get(name).cloned().ok_or_else(|| {
                 self.unsupported_result(
                     self.report_span(),
-                    format!("missing contract binding `{name}`"),
+                    format!("missing Rust binding `{name}`"),
                 )
             }),
             TypedExprKind::Bind(name) => spec.get(name).cloned().ok_or_else(|| {
@@ -2326,8 +2337,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(Some(self.int_to_nat_value(&length, span)?))
             }
-            ("seq_rev", [value]) => Ok(Some(self.seq_rev_value(value, span)?)),
-            ("seq_len" | "seq_rev", _) => Err(self.unsupported_result(
+            ("seq_len", _) => Err(self.unsupported_result(
                 span,
                 format!("builtin pure function `{func}` expects 1 argument"),
             )),
@@ -2354,7 +2364,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Some(self.seq_literal_value(&values))
             }
-            TypedExprKind::Var(name) => env.get(name).cloned(),
+            TypedExprKind::Var(name) | TypedExprKind::RustVar(name) => env.get(name).cloned(),
             TypedExprKind::Bind(_) => None,
             TypedExprKind::CtorCall {
                 ctor_index, args, ..
@@ -2505,304 +2515,121 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         state: &mut State,
         constraint: Bool,
-        kind: AssertionKind,
         span: Span,
         diagnostic_span: String,
         message: String,
     ) -> Result<(), VerificationResult> {
         let constraint = constraint.simplify();
         if let Some(value) = constraint.as_bool() {
-            return match (kind, value) {
-                (AssertionKind::Universal, true) | (AssertionKind::Existential, true) => {
+            return match value {
+                true => {
                     self.add_path_condition(state, constraint);
                     Ok(())
                 }
-                (AssertionKind::Universal, false) | (AssertionKind::Existential, false) => {
-                    Err(VerificationResult {
-                        function: self.report_function(),
-                        status: VerificationStatus::Fail,
-                        span: diagnostic_span,
-                        message,
-                    })
-                }
-            };
-        }
-        match kind {
-            AssertionKind::Universal => match self.check_sat(&[state.pc.clone(), constraint.not()])
-            {
-                SatResult::Sat => Err(VerificationResult {
+                false => Err(VerificationResult {
                     function: self.report_function(),
                     status: VerificationStatus::Fail,
                     span: diagnostic_span,
                     message,
                 }),
-                SatResult::Unsat => {
-                    self.add_path_condition(state, constraint);
-                    Ok(())
-                }
-                SatResult::Unknown => {
-                    Err(self.unknown_solver_result(span, "checking a universal assertion"))
-                }
-            },
-            AssertionKind::Existential => {
-                match self.check_sat(&[state.pc.clone(), constraint.clone()]) {
-                    SatResult::Sat => {
-                        self.add_path_condition(state, constraint);
-                        Ok(())
-                    }
-                    SatResult::Unsat => Err(VerificationResult {
-                        function: self.report_function(),
-                        status: VerificationStatus::Fail,
-                        span: diagnostic_span,
-                        message,
-                    }),
-                    SatResult::Unknown => {
-                        Err(self.unknown_solver_result(span, "checking an existential assertion"))
-                    }
-                }
+            };
+        }
+        match self.check_sat(&[state.pc.clone(), constraint.not()]) {
+            SatResult::Sat => Err(VerificationResult {
+                function: self.report_function(),
+                status: VerificationStatus::Fail,
+                span: diagnostic_span,
+                message,
+            }),
+            SatResult::Unsat => {
+                self.add_path_condition(state, constraint);
+                Ok(())
             }
+            SatResult::Unknown => Err(self.unknown_solver_result(span, "checking an assertion")),
         }
     }
 
-    fn assert_expr_constraint(
+    fn bind_state_spec_values(
         &self,
         state: &mut State,
-        expr: &TypedExpr,
+        bindings: &[NormalizedBinding],
+        resolved: &ResolvedExprEnv,
+    ) -> Result<(), VerificationResult> {
+        for binding in bindings {
+            let value = self.spec_expr_to_value(state, &binding.value, resolved)?;
+            state.spec_env.insert(binding.name.clone(), value);
+        }
+        Ok(())
+    }
+
+    fn bind_contract_spec_values(
+        &self,
+        current: &HashMap<String, SymValue>,
+        spec: &HashMap<String, SymValue>,
+        bindings: &[NormalizedBinding],
+    ) -> Result<HashMap<String, SymValue>, VerificationResult> {
+        let mut bound = spec.clone();
+        for binding in bindings {
+            let value = self.contract_expr_to_value(current, &bound, &binding.value)?;
+            bound.insert(binding.name.clone(), value);
+        }
+        Ok(bound)
+    }
+
+    fn assert_predicate_constraint(
+        &self,
+        state: &mut State,
         constraint: Bool,
         span: Span,
         diagnostic_span: String,
         message: String,
     ) -> Result<(), VerificationResult> {
-        self.assert_constraint(
-            state,
-            constraint,
-            Self::assertion_kind_for_expr(expr),
-            span,
-            diagnostic_span,
-            message,
-        )
+        self.assert_constraint(state, constraint, span, diagnostic_span, message)
     }
 
-    fn assert_spec_expr_constraint(
+    fn assert_spec_predicate_constraint(
         &self,
         state: &mut State,
-        expr: &TypedExpr,
+        predicate: &NormalizedPredicate,
         resolved: &ResolvedExprEnv,
         span: Span,
         diagnostic_span: String,
         message: String,
     ) -> Result<(), VerificationResult> {
-        if self.try_assert_spec_bind_witnesses(
-            state,
-            expr,
-            resolved,
-            span,
-            diagnostic_span.clone(),
-            message.clone(),
-        )? {
-            return Ok(());
-        }
-        let constraint = self.spec_expr_to_bool(state, expr, resolved)?;
-        self.assert_expr_constraint(state, expr, constraint, span, diagnostic_span, message)
+        self.bind_state_spec_values(state, &predicate.bindings, resolved)?;
+        let constraint = self.spec_expr_to_bool(state, &predicate.condition, resolved)?;
+        self.assert_predicate_constraint(state, constraint, span, diagnostic_span, message)
     }
 
-    fn assert_contract_expr_constraint(
+    fn assert_contract_predicate_constraint(
         &self,
         state: &mut State,
-        expr: &TypedExpr,
+        predicate: &NormalizedPredicate,
         current: &HashMap<String, SymValue>,
         spec: &HashMap<String, SymValue>,
         span: Span,
         diagnostic_span: String,
         message: String,
-    ) -> Result<(), VerificationResult> {
-        if self.try_assert_contract_bind_witnesses(
-            state,
-            expr,
-            current,
-            spec,
-            span,
-            diagnostic_span.clone(),
-            message.clone(),
-        )? {
-            return Ok(());
-        }
-        let constraint = self.contract_expr_to_bool(current, spec, expr)?;
-        self.assert_expr_constraint(state, expr, constraint, span, diagnostic_span, message)
+    ) -> Result<HashMap<String, SymValue>, VerificationResult> {
+        let spec = self.bind_contract_spec_values(current, spec, &predicate.bindings)?;
+        let constraint = self.contract_expr_to_bool(current, &spec, &predicate.condition)?;
+        self.assert_predicate_constraint(state, constraint, span, diagnostic_span, message)?;
+        Ok(spec)
     }
 
-    fn try_assert_spec_bind_witnesses(
+    fn assume_contract_predicate(
         &self,
         state: &mut State,
-        expr: &TypedExpr,
-        resolved: &ResolvedExprEnv,
-        span: Span,
-        diagnostic_span: String,
-        message: String,
-    ) -> Result<bool, VerificationResult> {
-        let (witnesses, residuals) = Self::split_bind_witness_conjuncts(expr);
-        if witnesses.is_empty() {
-            return Ok(false);
-        }
-        for (bind_expr, witness_expr) in witnesses {
-            let bind_value = self.spec_expr_to_value(state, bind_expr, resolved)?;
-            let witness_value = self.spec_expr_to_value(state, witness_expr, resolved)?;
-            let equality = self.eq_for_spec_ty(&bind_expr.ty, &bind_value, &witness_value, span)?;
-            self.add_path_condition(state, equality);
-        }
-        if residuals.is_empty() {
-            return Ok(true);
-        }
-        let residual_formulas = residuals
-            .iter()
-            .map(|residual| self.spec_expr_to_bool(state, residual, resolved))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.assert_constraint(
-            state,
-            bool_and(residual_formulas),
-            Self::conjunct_assertion_kind(&residuals),
-            span,
-            diagnostic_span,
-            message,
-        )?;
-        Ok(true)
-    }
-
-    fn try_assert_contract_bind_witnesses(
-        &self,
-        state: &mut State,
-        expr: &TypedExpr,
+        predicate: &NormalizedPredicate,
         current: &HashMap<String, SymValue>,
         spec: &HashMap<String, SymValue>,
-        span: Span,
-        diagnostic_span: String,
-        message: String,
-    ) -> Result<bool, VerificationResult> {
-        let (witnesses, residuals) = Self::split_bind_witness_conjuncts(expr);
-        if witnesses.is_empty() {
-            return Ok(false);
-        }
-        for (bind_expr, witness_expr) in witnesses {
-            let bind_value = self.contract_expr_to_value(current, spec, bind_expr)?;
-            let witness_value = self.contract_expr_to_value(current, spec, witness_expr)?;
-            let equality = self.eq_for_spec_ty(&bind_expr.ty, &bind_value, &witness_value, span)?;
-            self.add_path_condition(state, equality);
-        }
-        if residuals.is_empty() {
-            return Ok(true);
-        }
-        let residual_formulas = residuals
-            .iter()
-            .map(|residual| self.contract_expr_to_bool(current, spec, residual))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.assert_constraint(
-            state,
-            bool_and(residual_formulas),
-            Self::conjunct_assertion_kind(&residuals),
-            span,
-            diagnostic_span,
-            message,
-        )?;
-        Ok(true)
-    }
-
-    fn split_bind_witness_conjuncts<'a>(
-        expr: &'a TypedExpr,
-    ) -> (Vec<(&'a TypedExpr, &'a TypedExpr)>, Vec<&'a TypedExpr>) {
-        let mut witnesses = Vec::new();
-        let mut residuals = Vec::new();
-        Self::collect_bind_witness_conjuncts(expr, &mut witnesses, &mut residuals);
-        (witnesses, residuals)
-    }
-
-    fn collect_bind_witness_conjuncts<'a>(
-        expr: &'a TypedExpr,
-        witnesses: &mut Vec<(&'a TypedExpr, &'a TypedExpr)>,
-        residuals: &mut Vec<&'a TypedExpr>,
-    ) {
-        match &expr.kind {
-            TypedExprKind::Binary {
-                op: BinaryOp::And,
-                lhs,
-                rhs,
-            } => {
-                Self::collect_bind_witness_conjuncts(lhs, witnesses, residuals);
-                Self::collect_bind_witness_conjuncts(rhs, witnesses, residuals);
-            }
-            TypedExprKind::Binary {
-                op: BinaryOp::Eq,
-                lhs,
-                rhs,
-            } => {
-                if let Some(witness) = Self::bind_witness_from_equality(lhs, rhs) {
-                    witnesses.push(witness);
-                } else {
-                    residuals.push(expr);
-                }
-            }
-            _ => residuals.push(expr),
-        }
-    }
-
-    fn bind_witness_from_equality<'a>(
-        lhs: &'a TypedExpr,
-        rhs: &'a TypedExpr,
-    ) -> Option<(&'a TypedExpr, &'a TypedExpr)> {
-        match (&lhs.kind, &rhs.kind) {
-            (TypedExprKind::Bind(name), _) if !Self::typed_expr_mentions_bind(rhs, name) => {
-                Some((lhs, rhs))
-            }
-            (_, TypedExprKind::Bind(name)) if !Self::typed_expr_mentions_bind(lhs, name) => {
-                Some((rhs, lhs))
-            }
-            _ => None,
-        }
-    }
-
-    fn typed_expr_mentions_bind(expr: &TypedExpr, name: &str) -> bool {
-        match &expr.kind {
-            TypedExprKind::Bind(other) => other == name,
-            TypedExprKind::Bool(_) | TypedExprKind::Int(_) | TypedExprKind::Var(_) => false,
-            TypedExprKind::SeqLit(items) => items
-                .iter()
-                .any(|item| Self::typed_expr_mentions_bind(item, name)),
-            TypedExprKind::Match {
-                scrutinee,
-                arms,
-                default,
-            } => {
-                Self::typed_expr_mentions_bind(scrutinee, name)
-                    || arms
-                        .iter()
-                        .any(|arm| Self::typed_expr_mentions_bind(&arm.body, name))
-                    || default
-                        .as_deref()
-                        .is_some_and(|body| Self::typed_expr_mentions_bind(body, name))
-            }
-            TypedExprKind::PureCall { args, .. } | TypedExprKind::CtorCall { args, .. } => args
-                .iter()
-                .any(|arg| Self::typed_expr_mentions_bind(arg, name)),
-            TypedExprKind::Field { base, .. }
-            | TypedExprKind::TupleField { base, .. }
-            | TypedExprKind::Deref { base }
-            | TypedExprKind::Fin { base }
-            | TypedExprKind::Unary { arg: base, .. } => Self::typed_expr_mentions_bind(base, name),
-            TypedExprKind::Index { base, index } => {
-                Self::typed_expr_mentions_bind(base, name)
-                    || Self::typed_expr_mentions_bind(index, name)
-            }
-            TypedExprKind::Binary { lhs, rhs, .. } => {
-                Self::typed_expr_mentions_bind(lhs, name)
-                    || Self::typed_expr_mentions_bind(rhs, name)
-            }
-        }
-    }
-
-    fn conjunct_assertion_kind(exprs: &[&TypedExpr]) -> AssertionKind {
-        if exprs.iter().any(|expr| Self::expr_has_bind(expr)) {
-            AssertionKind::Existential
+    ) -> Result<Option<HashMap<String, SymValue>>, VerificationResult> {
+        let spec = self.bind_contract_spec_values(current, spec, &predicate.bindings)?;
+        let constraint = self.contract_expr_to_bool(current, &spec, &predicate.condition)?;
+        if self.assume_path_condition(state, constraint) {
+            Ok(Some(spec))
         } else {
-            AssertionKind::Universal
+            Ok(None)
         }
     }
 
@@ -2906,44 +2733,6 @@ impl<'tcx> Verifier<'tcx> {
     fn check_sat(&self, assumptions: &[Bool]) -> SatResult {
         let assumptions = assumptions.iter().map(Bool::simplify).collect::<Vec<_>>();
         with_solver(|solver| solver.check_assumptions(&assumptions))
-    }
-
-    fn expr_has_bind(expr: &TypedExpr) -> bool {
-        match &expr.kind {
-            TypedExprKind::Bind(_) => true,
-            TypedExprKind::Bool(_) | TypedExprKind::Int(_) | TypedExprKind::Var(_) => false,
-            TypedExprKind::SeqLit(items) => items.iter().any(Self::expr_has_bind),
-            TypedExprKind::Match {
-                scrutinee,
-                arms,
-                default,
-            } => {
-                Self::expr_has_bind(scrutinee)
-                    || arms.iter().any(|arm| Self::expr_has_bind(&arm.body))
-                    || default.as_deref().is_some_and(Self::expr_has_bind)
-            }
-            TypedExprKind::PureCall { args, .. } => args.iter().any(Self::expr_has_bind),
-            TypedExprKind::CtorCall { args, .. } => args.iter().any(Self::expr_has_bind),
-            TypedExprKind::Field { base, .. }
-            | TypedExprKind::TupleField { base, .. }
-            | TypedExprKind::Deref { base }
-            | TypedExprKind::Fin { base }
-            | TypedExprKind::Unary { arg: base, .. } => Self::expr_has_bind(base),
-            TypedExprKind::Index { base, index } => {
-                Self::expr_has_bind(base) || Self::expr_has_bind(index)
-            }
-            TypedExprKind::Binary { lhs, rhs, .. } => {
-                Self::expr_has_bind(lhs) || Self::expr_has_bind(rhs)
-            }
-        }
-    }
-
-    fn assertion_kind_for_expr(expr: &TypedExpr) -> AssertionKind {
-        if Self::expr_has_bind(expr) {
-            AssertionKind::Existential
-        } else {
-            AssertionKind::Universal
-        }
     }
 
     fn abstract_call_mut_args(
@@ -3298,8 +3087,8 @@ impl<'tcx> Verifier<'tcx> {
         self.decode_composite_field(&encoding, value, 1, span)
     }
 
-    fn builtin_seq_decls(&self, span: Span) -> Result<Rc<BuiltinSeqDecls>, VerificationResult> {
-        if let Some(decls) = self.builtin_seq_decls.borrow().as_ref().cloned() {
+    fn builtin_nat_decls(&self, span: Span) -> Result<Rc<BuiltinNatDecls>, VerificationResult> {
+        if let Some(decls) = self.builtin_nat_decls.borrow().as_ref().cloned() {
             return Ok(decls);
         }
         let decls = with_solver(|solver| {
@@ -3331,16 +3120,6 @@ impl<'tcx> Verifier<'tcx> {
                 &[&Sort::int()],
                 self.value_encoder.value_sort(),
             );
-            let seq_rev_prefix = RecFuncDecl::new(
-                "builtin_seq_rev_prefix",
-                &[self.value_encoder.seq_value_sort(), &Sort::int()],
-                self.value_encoder.seq_value_sort(),
-            );
-            let seq_rev = RecFuncDecl::new(
-                "builtin_seq_rev",
-                &[self.value_encoder.seq_value_sort()],
-                self.value_encoder.seq_value_sort(),
-            );
 
             let int_arg = Int::new_const(self.fresh_name("builtin_int_to_nat_arg"));
             let zero_value = zero_ctor.symbol.apply(&[]);
@@ -3371,43 +3150,13 @@ impl<'tcx> Verifier<'tcx> {
             let nat_to_int_body = zero_case.ite(&Int::from_i64(0), &(Int::from_i64(1) + succ_int));
             nat_to_int.add_def(&[&nat_arg], &nat_to_int_body);
 
-            let seq_arg = Z3Seq::new_const(
-                self.fresh_name("builtin_seq_rev_arg"),
-                self.value_encoder.value_sort(),
-            );
-            let len_arg = Int::new_const(self.fresh_name("builtin_seq_rev_len"));
-            let empty_seq = Z3Seq::empty(self.value_encoder.value_sort());
-            let last_index = len_arg.clone() - Int::from_i64(1);
-            let last_item = seq_arg.nth(last_index.clone());
-            let rev_rest = seq_rev_prefix
-                .apply(&[&seq_arg, &(len_arg.clone() - Int::from_i64(1))])
-                .as_seq()
-                .ok_or_else(|| "builtin_seq_rev_prefix must return Seq".to_owned())?;
-            let seq_rev_prefix_body = len_arg.le(0).ite(
-                &empty_seq,
-                &Z3Seq::concat(&[&Z3Seq::unit(&last_item), &rev_rest]),
-            );
-            seq_rev_prefix.add_def(&[&seq_arg, &len_arg], &seq_rev_prefix_body);
-
-            let seq_input = Z3Seq::new_const(
-                self.fresh_name("builtin_seq_rev_input"),
-                self.value_encoder.value_sort(),
-            );
-            let seq_rev_body = seq_rev_prefix
-                .apply(&[&seq_input, &seq_input.length()])
-                .as_seq()
-                .ok_or_else(|| "builtin_seq_rev must return Seq".to_owned())?;
-            seq_rev.add_def(&[&seq_input], &seq_rev_body);
-
-            Ok(Rc::new(BuiltinSeqDecls {
+            Ok(Rc::new(BuiltinNatDecls {
                 nat_to_int,
                 int_to_nat,
-                _seq_rev_prefix: seq_rev_prefix,
-                seq_rev,
             }))
         })
         .map_err(|err: String| self.unsupported_result(span, err))?;
-        self.builtin_seq_decls.replace(Some(decls.clone()));
+        self.builtin_nat_decls.replace(Some(decls.clone()));
         Ok(decls)
     }
 
@@ -3415,7 +3164,7 @@ impl<'tcx> Verifier<'tcx> {
         if let Some(n) = self.try_concrete_nat_usize(value, span)? {
             return Ok(Int::from_u64(n));
         }
-        let decls = self.builtin_seq_decls(span)?;
+        let decls = self.builtin_nat_decls(span)?;
         decls
             .nat_to_int
             .apply(&[value.ast()])
@@ -3426,13 +3175,8 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn int_to_nat_value(&self, value: &Int, span: Span) -> Result<SymValue, VerificationResult> {
-        let decls = self.builtin_seq_decls(span)?;
+        let decls = self.builtin_nat_decls(span)?;
         Ok(SymValue::new(decls.int_to_nat.apply(&[value])))
-    }
-
-    fn seq_rev_value(&self, value: &SymValue, span: Span) -> Result<SymValue, VerificationResult> {
-        let decls = self.builtin_seq_decls(span)?;
-        Ok(SymValue::new(decls.seq_rev.apply(&[value.ast()])))
     }
 
     fn nat_spec_ty() -> SpecTy {
@@ -3874,14 +3618,7 @@ impl<'tcx> Verifier<'tcx> {
         let Some(formula) = self.spec_ty_formula(&spec_ty, value, span)? else {
             return Ok(());
         };
-        self.assert_constraint(
-            state,
-            formula,
-            AssertionKind::Universal,
-            span,
-            span_text(self.tcx, span),
-            message,
-        )
+        self.assert_constraint(state, formula, span, span_text(self.tcx, span), message)
     }
 
     fn require_int_invariant(
@@ -3898,7 +3635,6 @@ impl<'tcx> Verifier<'tcx> {
         self.assert_constraint(
             state,
             bool_and(vec![value.ge(lower), value.le(upper)]),
-            AssertionKind::Universal,
             span,
             span_text(self.tcx, span),
             message,
@@ -3949,60 +3685,6 @@ impl<'tcx> Verifier<'tcx> {
         Ok(CallEnv { current, spec })
     }
 
-    fn instantiate_contract_spec_vars(
-        &self,
-        contract: &FunctionContract,
-    ) -> HashMap<String, SymValue> {
-        self.instantiate_spec_vars(&contract.spec_vars)
-    }
-
-    fn instantiate_spec_vars(&self, spec_vars: &[SpecVarBinding]) -> HashMap<String, SymValue> {
-        let mut spec = HashMap::new();
-        for binding in spec_vars {
-            let symbol = format!("spec_{}", self.fresh_name(&binding.name));
-            let value = self
-                .fresh_for_spec_ty(&binding.ty, &symbol)
-                .expect("spec variable instantiation must succeed");
-            spec.insert(binding.name.clone(), value);
-        }
-        spec
-    }
-
-    fn contract_req_to_z3(
-        &self,
-        contract: &FunctionContract,
-        env: &CallEnv,
-        span: Span,
-    ) -> Result<Bool, VerificationResult> {
-        self.contract_side_to_z3(contract, env, span, false)
-    }
-
-    fn contract_ens_to_z3(
-        &self,
-        contract: &FunctionContract,
-        env: &CallEnv,
-        span: Span,
-    ) -> Result<Bool, VerificationResult> {
-        self.contract_side_to_z3(contract, env, span, true)
-    }
-
-    fn contract_side_to_z3(
-        &self,
-        contract: &FunctionContract,
-        env: &CallEnv,
-        span: Span,
-        is_post: bool,
-    ) -> Result<Bool, VerificationResult> {
-        let manual = if is_post {
-            self.contract_expr_to_bool(&env.current, &env.spec, &contract.ens)?
-        } else {
-            self.contract_expr_to_bool(&env.current, &env.spec, &contract.req)?
-        };
-        let mut formulas = vec![manual];
-        formulas.extend(self.auto_contract_formulas(contract, env, span, is_post)?);
-        Ok(bool_and(formulas))
-    }
-
     fn auto_contract_formulas(
         &self,
         contract: &FunctionContract,
@@ -4030,6 +3712,30 @@ impl<'tcx> Verifier<'tcx> {
         }
         Ok(formulas)
     }
+
+    fn contract_req_formula(
+        &self,
+        contract: &FunctionContract,
+        env: &CallEnv,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        let mut formulas =
+            vec![self.contract_expr_to_bool(&env.current, &env.spec, &contract.req.condition)?];
+        formulas.extend(self.auto_contract_formulas(contract, env, span, false)?);
+        Ok(bool_and(formulas))
+    }
+
+    fn contract_ens_formula(
+        &self,
+        contract: &FunctionContract,
+        env: &CallEnv,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        let mut formulas =
+            vec![self.contract_expr_to_bool(&env.current, &env.spec, &contract.ens)?];
+        formulas.extend(self.auto_contract_formulas(contract, env, span, true)?);
+        Ok(bool_and(formulas))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4055,9 +3761,9 @@ impl CallEnv {
         verifier: &Verifier<'tcx>,
         state: &State,
         contract: &FunctionContract,
-        spec: HashMap<String, SymValue>,
     ) -> Result<Self, VerificationResult> {
         let mut current = HashMap::new();
+        let mut spec = state.spec_env.clone();
         for (param, local) in contract
             .params
             .iter()
@@ -4072,7 +3778,8 @@ impl CallEnv {
             current.insert(param.name.clone(), value);
         }
         if let Some(result) = state.model.get(&Local::from_usize(0)).cloned() {
-            current.insert("result".to_owned(), result);
+            current.insert("result".to_owned(), result.clone());
+            spec.insert("result".to_owned(), result);
         }
         Ok(Self { current, spec })
     }
@@ -4121,7 +3828,7 @@ fn collect_directive_prepass_pure_fn_refs(
     out: &mut BTreeSet<String>,
 ) {
     if let Some(contract) = &prepass.function_contract {
-        collect_typed_expr_pure_fn_refs(&contract.req, out);
+        collect_normalized_predicate_pure_fn_refs(&contract.req, out);
         collect_typed_expr_pure_fn_refs(&contract.ens, out);
     }
     for loop_contract in prepass.loop_contracts.by_header.values() {
@@ -4132,7 +3839,7 @@ fn collect_directive_prepass_pure_fn_refs(
         for directive in directives {
             match directive {
                 ControlPointDirective::Assert(assertion) => {
-                    collect_typed_expr_pure_fn_refs(&assertion.assertion, out);
+                    collect_normalized_predicate_pure_fn_refs(&assertion.assertion, out);
                 }
                 ControlPointDirective::Assume(assumption) => {
                     collect_typed_expr_pure_fn_refs(&assumption.assumption, out);
@@ -4154,9 +3861,19 @@ fn collect_directive_prepass_pure_fn_refs(
         let Some(lemma) = lemmas.get(&lemma_name) else {
             continue;
         };
-        collect_typed_expr_pure_fn_refs(&lemma.req, out);
+        collect_normalized_predicate_pure_fn_refs(&lemma.req, out);
         collect_typed_expr_pure_fn_refs(&lemma.ens, out);
     }
+}
+
+fn collect_normalized_predicate_pure_fn_refs(
+    predicate: &NormalizedPredicate,
+    out: &mut BTreeSet<String>,
+) {
+    for binding in &predicate.bindings {
+        collect_typed_expr_pure_fn_refs(&binding.value, out);
+    }
+    collect_typed_expr_pure_fn_refs(&predicate.condition, out);
 }
 
 fn collect_typed_expr_pure_fn_refs(expr: &TypedExpr, out: &mut BTreeSet<String>) {
@@ -4164,6 +3881,7 @@ fn collect_typed_expr_pure_fn_refs(expr: &TypedExpr, out: &mut BTreeSet<String>)
         TypedExprKind::Bool(_)
         | TypedExprKind::Int(_)
         | TypedExprKind::Var(_)
+        | TypedExprKind::RustVar(_)
         | TypedExprKind::Bind(_) => {}
         TypedExprKind::SeqLit(items) => {
             for item in items {
@@ -4306,7 +4024,7 @@ mod tests {
     use super::{collect_needed_pure_fns, rebuild_solver, with_solver};
     use crate::prepass::{
         AssertionContract, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
-        FunctionContract, LoopContracts, ResolvedExprEnv, TypedPureFnDef,
+        FunctionContract, LoopContracts, NormalizedPredicate, ResolvedExprEnv, TypedPureFnDef,
     };
     use crate::spec::{SpecTy, TypedExpr, TypedExprKind};
     use z3::ast::Int;
@@ -4387,7 +4105,10 @@ mod tests {
                 by_control_point: std::collections::HashMap::from([(
                     (rustc_middle::mir::BasicBlock::from_usize(0), 0usize),
                     vec![ControlPointDirective::Assert(AssertionContract {
-                        assertion: id_call,
+                        assertion: NormalizedPredicate {
+                            bindings: Vec::new(),
+                            condition: id_call,
+                        },
                         resolution: ResolvedExprEnv::default(),
                         assertion_span: "fixture.rs:1:1".to_owned(),
                     })],
@@ -4395,14 +4116,15 @@ mod tests {
             },
             function_contract: Some(FunctionContract {
                 params: Vec::new(),
-                req: bool_true.clone(),
+                req: NormalizedPredicate {
+                    bindings: Vec::new(),
+                    condition: bool_true.clone(),
+                },
                 req_span: "fixture.rs:1:1".to_owned(),
                 ens: bool_true,
                 ens_span: "fixture.rs:1:1".to_owned(),
-                spec_vars: Vec::new(),
                 result: SpecTy::Bool,
             }),
-            spec_vars: Vec::new(),
         };
         let pure_fns = vec![
             TypedPureFnDef {
