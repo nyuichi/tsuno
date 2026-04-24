@@ -1,0 +1,12 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+expression: snapshot_output(output)
+---
+status: Some(0)
+stdout:
+PASS let_directive_has_block_scope
+  all assertions discharged
+PASS main
+  all assertions discharged
+
+stderr:

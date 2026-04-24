@@ -1,12 +1,11 @@
 ---
 source: crates/tsuno-driver/tests/snapshot_tests.rs
-assertion_line: 85
 expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
 UNSUPPORTED rejects_ens_spec_var_use_in_body
-  unresolved binding `X` in //@ assert
-  src/main.rs:6:5: 6:17
+  expected a //@ ens predicate
+  src/main.rs:1:1: 8:2
 
 stderr:

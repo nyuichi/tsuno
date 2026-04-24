@@ -15,7 +15,8 @@ fn vec_is_empty(xs: &Vec<i32>) -> bool
 }
 
 fn vec_push(xs: &mut Vec<i32>, x: i32)
-//@ req ?Old == *{xs}
+//@ let Old = *{xs};
+//@ req true
 //@ ens {xs}.fin == Old ++ [{x}]
 {
     //@ assume false;
@@ -23,7 +24,8 @@ fn vec_push(xs: &mut Vec<i32>, x: i32)
 }
 
 fn vec_pop(xs: &mut Vec<i32>) -> i32
-//@ req ?Old == *{xs} && !(Old == [])
+//@ let Old = *{xs};
+//@ req !(Old == [])
 //@ ens {xs}.fin ++ [{result}] == Old && seq_rev(Old) == [{result}] ++ seq_rev({xs}.fin)
 {
     //@ assume false;
@@ -31,7 +33,8 @@ fn vec_pop(xs: &mut Vec<i32>) -> i32
 }
 
 fn reverse(mut xs: Vec<i32>) -> Vec<i32>
-//@ req ?Input == {xs}
+//@ let Input = {xs};
+//@ req true
 //@ ens {result} == seq_rev(Input)
 {
     let mut acc = vec_new();

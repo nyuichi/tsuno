@@ -327,6 +327,15 @@ impl<'tcx> Verifier<'tcx> {
                 let mut pruned = false;
                 for directive in directives {
                     match directive {
+                        ControlPointDirective::Let(binding) => {
+                            if let Err(err) = self.bind_state_spec_values(
+                                &mut state,
+                                std::slice::from_ref(&binding.binding),
+                                &binding.resolution,
+                            ) {
+                                return err;
+                            }
+                        }
                         ControlPointDirective::Assert(assertion) => {
                             if let Err(err) = self.assert_spec_predicate_constraint(
                                 &mut state,
@@ -1963,12 +1972,6 @@ impl<'tcx> Verifier<'tcx> {
                     )
                 })
             }
-            TypedExprKind::Bind(name) => state.spec_env.get(name).cloned().ok_or_else(|| {
-                self.unsupported_result(
-                    self.control_span(state.ctrl),
-                    format!("missing spec binding `{name}`"),
-                )
-            }),
             TypedExprKind::Match { .. } => Err(self.unsupported_result(
                 self.control_span(state.ctrl),
                 "match expressions are only supported in pure function bodies".to_owned(),
@@ -2151,12 +2154,6 @@ impl<'tcx> Verifier<'tcx> {
                 self.unsupported_result(
                     self.report_span(),
                     format!("missing Rust binding `{name}`"),
-                )
-            }),
-            TypedExprKind::Bind(name) => spec.get(name).cloned().ok_or_else(|| {
-                self.unsupported_result(
-                    self.report_span(),
-                    format!("missing spec binding `{name}`"),
                 )
             }),
             TypedExprKind::Match {
@@ -2365,7 +2362,6 @@ impl<'tcx> Verifier<'tcx> {
                 Some(self.seq_literal_value(&values))
             }
             TypedExprKind::Var(name) | TypedExprKind::RustVar(name) => env.get(name).cloned(),
-            TypedExprKind::Bind(_) => None,
             TypedExprKind::CtorCall {
                 ctor_index, args, ..
             } => {
@@ -3838,6 +3834,9 @@ fn collect_directive_prepass_pure_fn_refs(
     for directives in prepass.control_point_directives.by_control_point.values() {
         for directive in directives {
             match directive {
+                ControlPointDirective::Let(binding) => {
+                    collect_typed_expr_pure_fn_refs(&binding.binding.value, out);
+                }
                 ControlPointDirective::Assert(assertion) => {
                     collect_normalized_predicate_pure_fn_refs(&assertion.assertion, out);
                 }
@@ -3881,8 +3880,7 @@ fn collect_typed_expr_pure_fn_refs(expr: &TypedExpr, out: &mut BTreeSet<String>)
         TypedExprKind::Bool(_)
         | TypedExprKind::Int(_)
         | TypedExprKind::Var(_)
-        | TypedExprKind::RustVar(_)
-        | TypedExprKind::Bind(_) => {}
+        | TypedExprKind::RustVar(_) => {}
         TypedExprKind::SeqLit(items) => {
             for item in items {
                 collect_typed_expr_pure_fn_refs(item, out);

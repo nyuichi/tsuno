@@ -1,5 +1,6 @@
 fn req_binder_is_visible_in_body(x: i32)
-//@ req ?V == {x}
+//@ let V = {x};
+//@ req V == {x}
 //@ ens true
 {
     //@ assert V == {x};

@@ -4,8 +4,8 @@ expression: snapshot_output(output)
 ---
 status: Some(1)
 stdout:
-UNSUPPORTED main
-  expected a //@ assert predicate
-  src/main.rs:3:2: 3:2
+UNSUPPORTED rejects_let_directive_out_of_scope
+  unresolved binding `y` in //@ assert
+  src/main.rs:7:2: 7:2
 
 stderr:

@@ -3,7 +3,6 @@ pub enum Expr {
     Bool(bool),
     Int(IntLiteral),
     Var(String),
-    Bind(String),
     Interpolated(String),
     SeqLit(Vec<Expr>),
     Match {
@@ -75,7 +74,6 @@ pub enum TypedExprKind {
     Int(IntLiteral),
     Var(String),
     RustVar(String),
-    Bind(String),
     SeqLit(Vec<TypedExpr>),
     Match {
         scrutinee: Box<TypedExpr>,
@@ -1035,12 +1033,6 @@ impl Parser {
         match self.next().cloned() {
             Some(Token::Bool(value)) => Ok(Expr::Bool(value)),
             Some(Token::Int(value)) => Ok(Expr::Int(value)),
-            Some(Token::Question) => {
-                let Some(Token::Ident(ident)) = self.next().cloned() else {
-                    return Err(ParseError::new("expected identifier after `?`"));
-                };
-                Ok(Expr::Bind(ident))
-            }
             Some(Token::Ident(ident)) if ident == "match" => self.parse_match_expr(),
             Some(Token::Ident(ident)) => {
                 let type_args = self.try_parse_call_type_args()?.unwrap_or_default();
@@ -1743,35 +1735,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_bind_expression() {
-        let expr = parse_expr("assert", r#"?x == 3"#).expect("expr");
-        assert_eq!(
-            expr,
-            Expr::Binary {
-                op: BinaryOp::Eq,
-                lhs: Box::new(Expr::Bind("x".to_owned())),
-                rhs: Box::new(Expr::Int(IntLiteral {
-                    digits: "3".to_owned(),
-                    suffix: None,
-                })),
-            }
-        );
-    }
-
-    #[test]
-    fn parses_negated_call_with_bind_argument() {
-        let expr = parse_expr("assert", r#"!P(?x)"#).expect("expr");
-        assert_eq!(
-            expr,
-            Expr::Unary {
-                op: UnaryOp::Not,
-                arg: Box::new(Expr::Call {
-                    func: "P".to_owned(),
-                    type_args: vec![],
-                    args: vec![Expr::Bind("x".to_owned())],
-                }),
-            }
-        );
+    fn rejects_question_binding_syntax() {
+        let expr = parse_expr("assert", r#"?x == 3"#);
+        assert!(expr.is_err(), "{expr:?}");
     }
 
     #[test]

@@ -81,7 +81,7 @@ fn reports_multiple_function_prepass_errors_before_verification() {
         "unexpected stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("duplicate spec binding `?X` in //@ assert"),
+        stdout.contains("duplicate spec binding `X` in //@ let"),
         "unexpected stdout:\n{stdout}"
     );
     assert!(
@@ -167,11 +167,11 @@ fn rejects_unknown_existential_lemma_assertion_during_prepass() {
     assert!(!output.status.success(), "fixture unexpectedly passed");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("FAIL prepass"),
+        stdout.contains("UNSUPPORTED prepass"),
         "unexpected stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("solver returned unknown") || stdout.contains("solver timed out"),
+        stdout.contains("expected a spec expression"),
         "unexpected stdout:\n{stdout}"
     );
 }

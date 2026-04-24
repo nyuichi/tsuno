@@ -64,6 +64,12 @@ pub struct AssumptionContract {
 }
 
 #[derive(Debug, Clone)]
+pub struct LetBindingContract {
+    pub binding: NormalizedBinding,
+    pub resolution: ResolvedExprEnv,
+}
+
+#[derive(Debug, Clone)]
 pub struct NormalizedBinding {
     pub name: String,
     pub value: TypedExpr,
@@ -85,6 +91,7 @@ pub struct LemmaCallContract {
 
 #[derive(Debug, Clone)]
 pub enum ControlPointDirective {
+    Let(LetBindingContract),
     Assert(AssertionContract),
     Assume(AssumptionContract),
     LemmaCall(LemmaCallContract),
@@ -448,27 +455,50 @@ struct SpecScope {
     visible: HashSet<String>,
     bound: HashSet<String>,
     ordered: Vec<String>,
+    scoped: HashMap<String, Span>,
 }
 
 impl SpecScope {
-    fn bind(
+    fn bind_let(
         &mut self,
         name: &str,
         span: Span,
         display_span: Option<String>,
-        kind: &str,
+        scope_span: Option<Span>,
     ) -> Result<(), LoopPrepassError> {
         if self.bound.contains(name) {
             return Err(LoopPrepassError {
                 span,
                 display_span,
-                message: format!("duplicate spec binding `?{name}` in //@ {kind}"),
+                message: format!("duplicate spec binding `{name}` in //@ let"),
             });
         }
         self.bound.insert(name.to_owned());
         self.visible.insert(name.to_owned());
         self.ordered.push(name.to_owned());
+        if let Some(scope_span) = scope_span {
+            self.scoped.insert(name.to_owned(), scope_span);
+        }
         Ok(())
+    }
+
+    fn prune_expired(&mut self, anchor_span: Span) {
+        let expired: Vec<_> = self
+            .scoped
+            .iter()
+            .filter_map(|(name, scope_span)| {
+                if scope_contains(*scope_span, anchor_span) {
+                    None
+                } else {
+                    Some(name.clone())
+                }
+            })
+            .collect();
+        for name in expired {
+            self.scoped.remove(&name);
+            self.visible.remove(&name);
+            self.bound.remove(&name);
+        }
     }
 
     fn typed_ordered(
@@ -479,9 +509,12 @@ impl SpecScope {
     }
 }
 
+fn scope_contains(scope_span: Span, anchor_span: Span) -> bool {
+    scope_span.lo() <= anchor_span.lo() && anchor_span.hi() <= scope_span.hi()
+}
+
 fn typed_expr_contains_bind(expr: &TypedExpr) -> bool {
     match &expr.kind {
-        TypedExprKind::Bind(_) => true,
         TypedExprKind::Bool(_)
         | TypedExprKind::Int(_)
         | TypedExprKind::Var(_)
@@ -520,89 +553,13 @@ fn typed_bool_expr(value: bool) -> TypedExpr {
     }
 }
 
-fn split_top_level_conjuncts(expr: TypedExpr, out: &mut Vec<TypedExpr>) {
-    match expr.kind {
-        TypedExprKind::Binary {
-            op: crate::spec::BinaryOp::And,
-            lhs,
-            rhs,
-        } => {
-            split_top_level_conjuncts(*lhs, out);
-            split_top_level_conjuncts(*rhs, out);
-        }
-        _ => out.push(expr),
-    }
-}
-
-fn join_top_level_conjuncts(exprs: Vec<TypedExpr>) -> TypedExpr {
-    exprs
-        .into_iter()
-        .reduce(|lhs, rhs| TypedExpr {
-            ty: SpecTy::Bool,
-            kind: TypedExprKind::Binary {
-                op: crate::spec::BinaryOp::And,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            },
-        })
-        .unwrap_or_else(|| typed_bool_expr(true))
-}
-
 fn normalize_assert_like_predicate(
     expr: TypedExpr,
     kind: &str,
 ) -> Result<NormalizedPredicate, String> {
-    let mut conjuncts = Vec::new();
-    split_top_level_conjuncts(expr, &mut conjuncts);
-    let mut bindings = Vec::new();
-    let mut residual = Vec::new();
-    for conjunct in conjuncts {
-        match conjunct.kind {
-            TypedExprKind::Binary {
-                op: crate::spec::BinaryOp::Eq,
-                lhs,
-                rhs,
-            } => {
-                if let TypedExprKind::Bind(name) = &lhs.kind {
-                    if typed_expr_contains_bind(&rhs) {
-                        return Err(format!(
-                            "spec bindings in {kind} must have the form `?x == value` at the top level"
-                        ));
-                    }
-                    bindings.push(NormalizedBinding {
-                        name: name.clone(),
-                        value: *rhs,
-                    });
-                    continue;
-                }
-                let expr = TypedExpr {
-                    ty: SpecTy::Bool,
-                    kind: TypedExprKind::Binary {
-                        op: crate::spec::BinaryOp::Eq,
-                        lhs,
-                        rhs,
-                    },
-                };
-                if typed_expr_contains_bind(&expr) {
-                    return Err(format!(
-                        "spec bindings in {kind} must have the form `?x == value` at the top level"
-                    ));
-                }
-                residual.push(expr);
-            }
-            _ => {
-                if typed_expr_contains_bind(&conjunct) {
-                    return Err(format!(
-                        "spec bindings in {kind} must have the form `?x == value` at the top level"
-                    ));
-                }
-                residual.push(conjunct);
-            }
-        }
-    }
     Ok(NormalizedPredicate {
-        bindings,
-        condition: join_top_level_conjuncts(residual),
+        bindings: Vec::new(),
+        condition: ensure_bind_free_predicate(expr, kind)?,
     })
 }
 
@@ -611,6 +568,17 @@ fn ensure_bind_free_predicate(expr: TypedExpr, kind: &str) -> Result<TypedExpr, 
         return Err(format!("new spec bindings are not allowed in {kind}"));
     }
     Ok(expr)
+}
+
+fn bind_free_normalized_predicate(
+    bindings: Vec<NormalizedBinding>,
+    expr: TypedExpr,
+    kind: &str,
+) -> Result<NormalizedPredicate, String> {
+    Ok(NormalizedPredicate {
+        bindings,
+        condition: ensure_bind_free_predicate(expr, kind)?,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -704,6 +672,19 @@ impl SpecTypeInference {
     fn resolved_ty(&mut self, name: &str) -> Option<SpecTy> {
         let root = self.find(name);
         self.concrete.get(&root).cloned()
+    }
+}
+
+fn constrain_let_binding_ty(
+    name: &str,
+    inferred_ty: InferredExprTy,
+    inferred: &mut SpecTypeInference,
+) -> Result<(), String> {
+    inferred.ensure_var(name);
+    match inferred_ty {
+        InferredExprTy::Known(ty) => inferred.constrain(name, &ty),
+        InferredExprTy::SpecVar(other) => inferred.union(name, &other),
+        InferredExprTy::Unknown => Ok(()),
     }
 }
 
@@ -2425,7 +2406,7 @@ fn infer_common_expr_types_with_expected(
                 }
             }))
         }
-        Expr::Var(_) | Expr::Interpolated(_) | Expr::Match { .. } | Expr::Bind(_) => Ok(None),
+        Expr::Var(_) | Expr::Interpolated(_) | Expr::Match { .. } => Ok(None),
     }
 }
 
@@ -2548,24 +2529,6 @@ fn infer_contract_expr_types_with_expected(
             allow_bare_names,
             expected,
         ),
-        Expr::Bind(name) => {
-            if allow_result && name == "result" {
-                return Err("duplicate spec binding `?result` in //@ ens".to_owned());
-            }
-            spec_scope
-                .bind(
-                    name,
-                    Span::default(),
-                    None,
-                    if allow_result { "ens" } else { "req" },
-                )
-                .map_err(|err| err.message)?;
-            inferred.ensure_var(name);
-            if let Some(expected) = expected {
-                inferred.constrain(name, expected)?;
-            }
-            Ok(InferredExprTy::SpecVar(name.clone()))
-        }
         _ => infer_common_expr_types_with_expected(
             expr,
             SpecCallContext {
@@ -2686,16 +2649,6 @@ fn infer_body_expr_types_with_expected(
             .map(InferredExprTy::Known)
             .ok_or_else(|| format!("unresolved binding `{name}` in //@ {}", kind.keyword())),
         Expr::Match { .. } => Err(unsupported_match_expr_message()),
-        Expr::Bind(name) => {
-            spec_scope
-                .bind(name, Span::default(), None, kind.keyword())
-                .map_err(|err| err.message)?;
-            inferred.ensure_var(name);
-            if let Some(expected) = expected {
-                inferred.constrain(name, expected)?;
-            }
-            Ok(InferredExprTy::SpecVar(name.clone()))
-        }
         _ => infer_common_expr_types_with_expected(
             expr,
             SpecCallContext {
@@ -2954,24 +2907,6 @@ fn typed_contract_expr_with_expected(
             allow_bare_names,
             expected,
         ),
-        Expr::Bind(name) => {
-            if allow_result && name == "result" {
-                return Err("duplicate spec binding `?result` in //@ ens".to_owned());
-            }
-            spec_scope
-                .bind(
-                    name,
-                    Span::default(),
-                    None,
-                    if allow_result { "ens" } else { "req" },
-                )
-                .map_err(|err| err.message)?;
-            let ty = inferred_spec_var_ty(inferred, name)?;
-            Ok(TypedExpr {
-                ty,
-                kind: TypedExprKind::Bind(name.clone()),
-            })
-        }
         Expr::Call {
             func,
             type_args,
@@ -3310,16 +3245,6 @@ fn typed_body_expr_with_expected(
             )
         }),
         Expr::Match { .. } => Err(unsupported_match_expr_message()),
-        Expr::Bind(name) => {
-            spec_scope
-                .bind(name, Span::default(), None, kind.keyword())
-                .map_err(|err| err.message)?;
-            let ty = inferred_spec_var_ty(inferred, name)?;
-            Ok(TypedExpr {
-                ty,
-                kind: TypedExprKind::Bind(name.clone()),
-            })
-        }
         Expr::Call {
             func,
             type_args,
@@ -3705,8 +3630,12 @@ fn compute_directives<'tcx>(
     let mut contract_scope = SpecScope::default();
     let mut req_directive = None;
     let mut ens_directive = None;
+    let mut contract_lets = Vec::new();
     for directive in &directives.directives {
         match directive.kind {
+            DirectiveKind::Let if matches!(directive.attach, DirectiveAttach::Function) => {
+                contract_lets.push(directive);
+            }
             DirectiveKind::Req => {
                 if req_directive.replace(directive).is_some() {
                     return Err(LoopPrepassError {
@@ -3728,15 +3657,29 @@ fn compute_directives<'tcx>(
             _ => {}
         }
     }
-    let param_names = if req_directive.is_some() || ens_directive.is_some() {
-        function_param_names(tcx, def_id).map_err(|err| LoopPrepassError {
-            span: tcx.def_span(def_id.to_def_id()),
-            display_span: None,
-            message: err.message,
-        })?
-    } else {
-        function_param_names_relaxed(tcx, def_id)
-    };
+    if let Some(req) = req_directive {
+        for directive in &contract_lets {
+            if directive.line_no > req.line_no {
+                return Err(LoopPrepassError {
+                    span: directive.span,
+                    display_span: Some(directive.span_text.clone()),
+                    message:
+                        "//@ let directives in function contracts must be placed before //@ req"
+                            .to_owned(),
+                });
+            }
+        }
+    }
+    let param_names =
+        if req_directive.is_some() || ens_directive.is_some() || !contract_lets.is_empty() {
+            function_param_names(tcx, def_id).map_err(|err| LoopPrepassError {
+                span: tcx.def_span(def_id.to_def_id()),
+                display_span: None,
+                message: err.message,
+            })?
+        } else {
+            function_param_names_relaxed(tcx, def_id)
+        };
     let (params, result) = function_contract_signature_with_names(tcx, def_id, param_names.clone())
         .map_err(|err| LoopPrepassError {
             span: tcx.def_span(def_id.to_def_id()),
@@ -3748,11 +3691,31 @@ fn compute_directives<'tcx>(
         .map(|param| (param.name.clone(), param.ty.clone()))
         .collect();
     let result_ty = result.clone();
+    for directive in &contract_lets {
+        let (name, value) = directive.let_binding().expect("let directive payload");
+        validate_function_contract_expr_prepass(
+            directive.span,
+            &directive.span_text,
+            value,
+            pure_fns,
+            enum_defs,
+            &directive_type_param_scope,
+            &param_names,
+            false,
+            &mut contract_scope,
+        )?;
+        contract_scope.bind_let(
+            name,
+            directive.span,
+            Some(directive.span_text.clone()),
+            None,
+        )?;
+    }
     if let Some(directive) = req_directive {
         validate_function_contract_expr_prepass(
             directive.span,
             &directive.span_text,
-            &directive.expr,
+            directive.expr(),
             pure_fns,
             enum_defs,
             &directive_type_param_scope,
@@ -3766,15 +3729,22 @@ fn compute_directives<'tcx>(
     for directive in directives.directives.iter().filter(|directive| {
         matches!(
             directive.kind,
-            DirectiveKind::Assert
+            DirectiveKind::Let
+                | DirectiveKind::Assert
                 | DirectiveKind::Assume
                 | DirectiveKind::Inv
                 | DirectiveKind::LemmaCall
         )
     }) {
+        if directive.kind == DirectiveKind::Let
+            && matches!(directive.attach, DirectiveAttach::Function)
+        {
+            continue;
+        }
+        body_scope.prune_expired(directive_anchor_span(&directive.attach));
         let resolution = match directive.kind {
             DirectiveKind::LemmaCall => resolve_lemma_call_expr_env(
-                &directive.expr,
+                directive.expr(),
                 pure_fns,
                 enum_defs,
                 &directive_type_param_scope,
@@ -3785,8 +3755,29 @@ fn compute_directives<'tcx>(
                 lemma_defs,
                 &mut body_scope,
             )?,
+            DirectiveKind::Let => {
+                let (name, value) = directive.let_binding().expect("let directive payload");
+                let resolution = resolve_expr_env(
+                    value,
+                    pure_fns,
+                    enum_defs,
+                    &binding_info,
+                    &hir_locals,
+                    directive.span,
+                    directive_anchor_span(&directive.attach),
+                    directive.kind,
+                    &mut body_scope,
+                )?;
+                body_scope.bind_let(
+                    name,
+                    directive.span,
+                    Some(directive.span_text.clone()),
+                    directive.scope_span,
+                )?;
+                resolution
+            }
             _ => resolve_expr_env(
-                &directive.expr,
+                directive.expr(),
                 pure_fns,
                 enum_defs,
                 &binding_info,
@@ -3803,7 +3794,7 @@ fn compute_directives<'tcx>(
         validate_function_contract_expr_prepass(
             directive.span,
             &directive.span_text,
-            &directive.expr,
+            directive.expr(),
             pure_fns,
             enum_defs,
             &directive_type_param_scope,
@@ -3814,9 +3805,40 @@ fn compute_directives<'tcx>(
     }
     let mut inferred = SpecTypeInference::default();
     let mut contract_infer_scope = SpecScope::default();
+    for directive in &contract_lets {
+        let (name, value) = directive.let_binding().expect("let directive payload");
+        let inferred_ty = infer_runtime_contract_expr_types(
+            value,
+            pure_fns,
+            enum_defs,
+            &mut contract_infer_scope,
+            &param_tys,
+            false,
+            &result_ty,
+            &mut inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span: directive.span,
+            display_span: Some(directive.span_text.clone()),
+            message,
+        })?;
+        contract_infer_scope.bind_let(
+            name,
+            directive.span,
+            Some(directive.span_text.clone()),
+            None,
+        )?;
+        constrain_let_binding_ty(name, inferred_ty, &mut inferred).map_err(|message| {
+            LoopPrepassError {
+                span: directive.span,
+                display_span: Some(directive.span_text.clone()),
+                message,
+            }
+        })?;
+    }
     if let Some(directive) = req_directive {
         infer_runtime_contract_expr_types(
-            &directive.expr,
+            directive.expr(),
             pure_fns,
             enum_defs,
             &mut contract_infer_scope,
@@ -3836,12 +3858,19 @@ fn compute_directives<'tcx>(
     for directive in directives.directives.iter().filter(|directive| {
         matches!(
             directive.kind,
-            DirectiveKind::Assert
+            DirectiveKind::Let
+                | DirectiveKind::Assert
                 | DirectiveKind::Assume
                 | DirectiveKind::Inv
                 | DirectiveKind::LemmaCall
         )
     }) {
+        if directive.kind == DirectiveKind::Let
+            && matches!(directive.attach, DirectiveAttach::Function)
+        {
+            continue;
+        }
+        body_infer_scope.prune_expired(directive_anchor_span(&directive.attach));
         let resolution = resolved_exprs
             .get(&directive.span_text)
             .expect("resolved body expression");
@@ -3854,7 +3883,7 @@ fn compute_directives<'tcx>(
         match directive.kind {
             DirectiveKind::LemmaCall => {
                 infer_lemma_call(
-                    &directive.expr,
+                    directive.expr(),
                     lemma_defs,
                     SpecCallContext {
                         pure_fns,
@@ -3871,9 +3900,39 @@ fn compute_directives<'tcx>(
                     message,
                 })?;
             }
+            DirectiveKind::Let => {
+                let (name, value) = directive.let_binding().expect("let directive payload");
+                let inferred_ty = infer_body_expr_types(
+                    value,
+                    pure_fns,
+                    enum_defs,
+                    directive.kind,
+                    &mut body_infer_scope,
+                    &local_tys,
+                    &mut inferred,
+                )
+                .map_err(|message| LoopPrepassError {
+                    span: directive.span,
+                    display_span: Some(directive.span_text.clone()),
+                    message,
+                })?;
+                body_infer_scope.bind_let(
+                    name,
+                    directive.span,
+                    Some(directive.span_text.clone()),
+                    directive.scope_span,
+                )?;
+                constrain_let_binding_ty(name, inferred_ty, &mut inferred).map_err(|message| {
+                    LoopPrepassError {
+                        span: directive.span,
+                        display_span: Some(directive.span_text.clone()),
+                        message,
+                    }
+                })?;
+            }
             _ => {
                 infer_body_expr_types(
-                    &directive.expr,
+                    directive.expr(),
                     pure_fns,
                     enum_defs,
                     directive.kind,
@@ -3891,7 +3950,7 @@ fn compute_directives<'tcx>(
     }
     if let Some(directive) = ens_directive {
         infer_runtime_contract_expr_types(
-            &directive.expr,
+            directive.expr(),
             pure_fns,
             enum_defs,
             &mut contract_infer_scope,
@@ -3910,11 +3969,41 @@ fn compute_directives<'tcx>(
         .sess
         .source_map()
         .span_to_diagnostic_string(tcx.def_span(def_id.to_def_id()));
+    let mut typed_contract_lets = Vec::new();
+    let mut contract_type_scope = SpecScope::default();
+    for directive in &contract_lets {
+        let (name, value) = directive.let_binding().expect("let directive payload");
+        let typed = typed_runtime_contract_expr(
+            value,
+            pure_fns,
+            enum_defs,
+            &mut contract_type_scope,
+            &param_tys,
+            false,
+            &result_ty,
+            &mut inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span: directive.span,
+            display_span: Some(directive.span_text.clone()),
+            message,
+        })?;
+        contract_type_scope.bind_let(
+            name,
+            directive.span,
+            Some(directive.span_text.clone()),
+            None,
+        )?;
+        typed_contract_lets.push(NormalizedBinding {
+            name: name.to_owned(),
+            value: typed,
+        });
+    }
     let typed_req = match req_directive {
         Some(directive) => {
-            let mut scope = SpecScope::default();
+            let mut scope = contract_type_scope.clone();
             let typed = typed_runtime_contract_expr(
-                &directive.expr,
+                directive.expr(),
                 pure_fns,
                 enum_defs,
                 &mut scope,
@@ -3929,24 +4018,24 @@ fn compute_directives<'tcx>(
                 message,
             })?;
             Some(
-                normalize_assert_like_predicate(typed, "//@ req").map_err(|message| {
-                    LoopPrepassError {
+                bind_free_normalized_predicate(typed_contract_lets.clone(), typed, "//@ req")
+                    .map_err(|message| LoopPrepassError {
                         span: directive.span,
                         display_span: Some(directive.span_text.clone()),
                         message,
-                    }
-                })?,
+                    })?,
             )
         }
         None => None,
     };
     let mut typed_body_assertions = HashMap::new();
     let mut typed_body_exprs = HashMap::new();
+    let mut typed_body_lets = HashMap::new();
     let mut body_type_scope = if req_directive.is_some() {
-        let mut scope = SpecScope::default();
+        let mut scope = contract_type_scope.clone();
         if let Some(directive) = req_directive {
             let _ = typed_runtime_contract_expr(
-                &directive.expr,
+                directive.expr(),
                 pure_fns,
                 enum_defs,
                 &mut scope,
@@ -3968,12 +4057,19 @@ fn compute_directives<'tcx>(
     for directive in directives.directives.iter().filter(|directive| {
         matches!(
             directive.kind,
-            DirectiveKind::Assert
+            DirectiveKind::Let
+                | DirectiveKind::Assert
                 | DirectiveKind::Assume
                 | DirectiveKind::Inv
                 | DirectiveKind::LemmaCall
         )
     }) {
+        if directive.kind == DirectiveKind::Let
+            && matches!(directive.attach, DirectiveAttach::Function)
+        {
+            continue;
+        }
+        body_type_scope.prune_expired(directive_anchor_span(&directive.attach));
         let resolution = resolved_exprs
             .get(&directive.span_text)
             .expect("resolved body expression");
@@ -3986,7 +4082,7 @@ fn compute_directives<'tcx>(
         match directive.kind {
             DirectiveKind::LemmaCall => {
                 let contract = typed_lemma_call(
-                    &directive.expr,
+                    directive.expr(),
                     &directive.span_text,
                     lemma_defs,
                     SpecCallContext {
@@ -4005,9 +4101,39 @@ fn compute_directives<'tcx>(
                 })?;
                 typed_lemma_calls.insert(directive.span_text.clone(), contract);
             }
+            DirectiveKind::Let => {
+                let (name, value) = directive.let_binding().expect("let directive payload");
+                let typed = typed_body_expr(
+                    value,
+                    pure_fns,
+                    enum_defs,
+                    directive.kind,
+                    &mut body_type_scope,
+                    &local_tys,
+                    &mut inferred,
+                )
+                .map_err(|message| LoopPrepassError {
+                    span: directive.span,
+                    display_span: Some(directive.span_text.clone()),
+                    message,
+                })?;
+                body_type_scope.bind_let(
+                    name,
+                    directive.span,
+                    Some(directive.span_text.clone()),
+                    directive.scope_span,
+                )?;
+                typed_body_lets.insert(
+                    directive.span_text.clone(),
+                    NormalizedBinding {
+                        name: name.to_owned(),
+                        value: typed,
+                    },
+                );
+            }
             _ => {
                 let typed = typed_body_expr(
-                    &directive.expr,
+                    directive.expr(),
                     pure_fns,
                     enum_defs,
                     directive.kind,
@@ -4044,7 +4170,10 @@ fn compute_directives<'tcx>(
                                 display_span: Some(directive.span_text.clone()),
                                 message,
                             })?,
-                        DirectiveKind::Req | DirectiveKind::Ens | DirectiveKind::LemmaCall => {
+                        DirectiveKind::Req
+                        | DirectiveKind::Ens
+                        | DirectiveKind::Let
+                        | DirectiveKind::LemmaCall => {
                             unreachable!("filtered above")
                         }
                     };
@@ -4054,10 +4183,10 @@ fn compute_directives<'tcx>(
     }
     let typed_ens = match ens_directive {
         Some(directive) => {
-            let mut scope = SpecScope::default();
+            let mut scope = contract_type_scope.clone();
             if let Some(req) = req_directive {
                 let _ = typed_runtime_contract_expr(
-                    &req.expr,
+                    req.expr(),
                     pure_fns,
                     enum_defs,
                     &mut scope,
@@ -4073,7 +4202,7 @@ fn compute_directives<'tcx>(
                 })?;
             }
             let typed = typed_runtime_contract_expr(
-                &directive.expr,
+                directive.expr(),
                 pure_fns,
                 enum_defs,
                 &mut scope,
@@ -4100,7 +4229,7 @@ fn compute_directives<'tcx>(
         None => None,
     };
     let function_contract = match (req_directive, ens_directive) {
-        (None, None) => Some(FunctionContract {
+        (None, None) if contract_lets.is_empty() => Some(FunctionContract {
             params: params.clone(),
             req: NormalizedPredicate {
                 bindings: Vec::new(),
@@ -4135,6 +4264,35 @@ fn compute_directives<'tcx>(
     for directive in directives.directives {
         match directive.kind {
             DirectiveKind::Req | DirectiveKind::Ens => {}
+            DirectiveKind::Let if matches!(directive.attach, DirectiveAttach::Function) => {}
+            DirectiveKind::Let => {
+                let control = control_point_after(body, directive_anchor_span(&directive.attach))
+                    .ok_or_else(|| LoopPrepassError {
+                    span: directive.span,
+                    display_span: Some(directive.span_text.clone()),
+                    message: format!(
+                        "unable to map //@ let at {} to MIR",
+                        tcx.sess
+                            .source_map()
+                            .span_to_diagnostic_string(directive.span)
+                    ),
+                })?;
+                let resolution = resolved_exprs
+                    .get(&directive.span_text)
+                    .cloned()
+                    .expect("resolved let expression");
+                control_point_directives
+                    .by_control_point
+                    .entry(control)
+                    .or_default()
+                    .push(ControlPointDirective::Let(LetBindingContract {
+                        binding: typed_body_lets
+                            .get(&directive.span_text)
+                            .cloned()
+                            .expect("typed let expression"),
+                        resolution,
+                    }));
+            }
             DirectiveKind::Assert => {
                 let control = control_point_after(body, directive_anchor_span(&directive.attach))
                     .ok_or_else(|| LoopPrepassError {
@@ -4440,8 +4598,7 @@ fn typed_expr_calls_pure_fn(expr: &TypedExpr, name: &str) -> bool {
         TypedExprKind::Bool(_)
         | TypedExprKind::Int(_)
         | TypedExprKind::Var(_)
-        | TypedExprKind::RustVar(_)
-        | TypedExprKind::Bind(_) => false,
+        | TypedExprKind::RustVar(_) => false,
     }
 }
 
@@ -4541,8 +4698,7 @@ fn validate_recursive_pure_expr(
         TypedExprKind::Bool(_)
         | TypedExprKind::Int(_)
         | TypedExprKind::Var(_)
-        | TypedExprKind::RustVar(_)
-        | TypedExprKind::Bind(_) => Ok(()),
+        | TypedExprKind::RustVar(_) => Ok(()),
     }
 }
 
@@ -5833,19 +5989,6 @@ fn validate_contract_expr_core(
             Ok(())
         }
         Expr::Match { .. } => Err(unsupported_match_expr_message()),
-        Expr::Bind(name) => {
-            if allow_result && name == "result" {
-                return Err("duplicate spec binding `?result` in //@ ens".to_owned());
-            }
-            spec_scope
-                .bind(
-                    name,
-                    Span::default(),
-                    None,
-                    if allow_result { "ens" } else { "req" },
-                )
-                .map_err(|err| err.message)
-        }
         Expr::Call {
             func,
             type_args,
@@ -6060,11 +6203,6 @@ fn resolve_expr_env_into(
             display_span: None,
             message: unsupported_match_expr_message(),
         }),
-        Expr::Bind(name) => {
-            ctx.spec_scope
-                .bind(name, ctx.span, None, ctx.kind.keyword())?;
-            Ok(())
-        }
         Expr::Call {
             func,
             type_args,

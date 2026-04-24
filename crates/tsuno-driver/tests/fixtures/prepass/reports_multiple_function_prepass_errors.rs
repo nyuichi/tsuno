@@ -1,7 +1,7 @@
 fn first_bad() {
-    //@ assert ?X == 0;
+    //@ let X = 0;
     let _ = 0;
-    //@ assert ?X == 1;
+    //@ let X = 1;
     let _ = 1;
 }
 

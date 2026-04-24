@@ -1,5 +1,6 @@
 fn echo(x: i32) -> i32
-//@ req ?A == {x}
+//@ let A = {x};
+//@ req true
 //@ ens result == A
 {
     //@ assume false;

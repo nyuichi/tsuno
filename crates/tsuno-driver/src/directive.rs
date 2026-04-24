@@ -12,6 +12,7 @@ use crate::spec;
 pub enum DirectiveKind {
     Req,
     Ens,
+    Let,
     Inv,
     Assert,
     Assume,
@@ -23,6 +24,7 @@ impl DirectiveKind {
         match self {
             Self::Req => "req",
             Self::Ens => "ens",
+            Self::Let => "let",
             Self::Inv => "inv",
             Self::Assert => "assert",
             Self::Assume => "assume",
@@ -52,7 +54,31 @@ pub struct FunctionDirective {
     pub span_text: String,
     pub line_no: usize,
     pub attach: DirectiveAttach,
-    pub expr: spec::Expr,
+    pub payload: DirectivePayload,
+    pub scope_span: Option<Span>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DirectivePayload {
+    Predicate(spec::Expr),
+    Let { name: String, value: spec::Expr },
+    LemmaCall(spec::Expr),
+}
+
+impl FunctionDirective {
+    pub fn expr(&self) -> &spec::Expr {
+        match &self.payload {
+            DirectivePayload::Predicate(expr) | DirectivePayload::LemmaCall(expr) => expr,
+            DirectivePayload::Let { value, .. } => value,
+        }
+    }
+
+    pub fn let_binding(&self) -> Option<(&str, &spec::Expr)> {
+        match &self.payload {
+            DirectivePayload::Let { name, value } => Some((name, value)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -125,34 +151,40 @@ fn collect_contract_directives<'tcx>(
             (DirectiveKind::Req, rest)
         } else if let Some(rest) = line.strip_prefix("//@ ens") {
             (DirectiveKind::Ens, rest)
+        } else if let Some(rest) = line.strip_prefix("//@ let") {
+            (DirectiveKind::Let, rest)
         } else {
             continue;
         };
-        let expr = parse_directive_expr(kind, rest.trim(), item_span)?;
+        let payload = parse_directive_payload(kind, rest.trim(), item_span)?;
         directives.push(FunctionDirective {
             kind,
             span: item_span,
             span_text: display_line_span(&file_name, line_no, raw_line),
             line_no,
             attach: DirectiveAttach::Function,
-            expr,
+            payload,
+            scope_span: None,
         });
     }
     Ok(directives)
 }
 
-fn parse_directive_expr(
+fn parse_directive_payload(
     kind: DirectiveKind,
     text: &str,
     span: Span,
-) -> Result<spec::Expr, DirectiveError> {
+) -> Result<DirectivePayload, DirectiveError> {
     if kind == DirectiveKind::LemmaCall {
-        return spec::parse_statement_expr("lemma call", text.trim()).map_err(|err| {
-            DirectiveError {
+        return spec::parse_statement_expr("lemma call", text.trim())
+            .map_err(|err| DirectiveError {
                 span,
                 message: err.to_string().replace("spec expression", "//@ lemma call"),
-            }
-        });
+            })
+            .map(DirectivePayload::LemmaCall);
+    }
+    if kind == DirectiveKind::Let {
+        return parse_let_directive(text, span);
     }
     let parsed = match kind {
         DirectiveKind::Assert | DirectiveKind::Assume => {
@@ -160,10 +192,51 @@ fn parse_directive_expr(
         }
         _ => spec::parse_source_expr(kind.keyword(), text),
     };
-    parsed.map_err(|err| DirectiveError {
+    parsed
+        .map_err(|err| DirectiveError {
+            span,
+            message: render_parse_error(kind, err),
+        })
+        .map(DirectivePayload::Predicate)
+}
+
+fn parse_let_directive(text: &str, span: Span) -> Result<DirectivePayload, DirectiveError> {
+    let Some(text) = text.strip_suffix(';') else {
+        return Err(DirectiveError {
+            span,
+            message: "//@ let directive must end with `;`".to_owned(),
+        });
+    };
+    let Some((name, value)) = text.split_once('=') else {
+        return Err(DirectiveError {
+            span,
+            message: "//@ let directive must have the form `//@ let name = expr;`".to_owned(),
+        });
+    };
+    let name = name.trim();
+    if !is_ident(name) {
+        return Err(DirectiveError {
+            span,
+            message: "//@ let directive must bind an identifier".to_owned(),
+        });
+    }
+    let value = spec::parse_source_expr("let", value.trim()).map_err(|err| DirectiveError {
         span,
-        message: render_parse_error(kind, err),
+        message: render_parse_error(DirectiveKind::Let, err),
+    })?;
+    Ok(DirectivePayload::Let {
+        name: name.to_owned(),
+        value,
     })
+}
+
+fn is_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 fn render_parse_error(kind: DirectiveKind, err: spec::ParseError) -> String {
@@ -288,7 +361,7 @@ impl<'a> FunctionDirectiveCollector<'a> {
             line_no,
             directive_line_text(prefix_source, directive_pos),
         );
-        let expr = parse_directive_expr(DirectiveKind::Inv, predicate_text, entry_span)?;
+        let payload = parse_directive_payload(DirectiveKind::Inv, predicate_text, entry_span)?;
         self.directives.push(FunctionDirective {
             kind: DirectiveKind::Inv,
             span: entry_span,
@@ -300,7 +373,8 @@ impl<'a> FunctionDirectiveCollector<'a> {
                 body_span: loop_body.span,
                 entry_span,
             },
-            expr,
+            payload,
+            scope_span: None,
         });
         Ok(())
     }
@@ -355,6 +429,7 @@ impl<'a> FunctionDirectiveCollector<'a> {
             line_anchor,
             &file_name,
             true,
+            Some(block.span),
         )?;
         self.directives.append(&mut directives);
         Ok(())
@@ -403,6 +478,7 @@ impl<'a> FunctionDirectiveCollector<'a> {
             line_anchor,
             file_name,
             allow_terminal,
+            Some(block_span),
         )?;
         self.directives.append(&mut directives);
         Ok(anchor_end)
@@ -415,6 +491,7 @@ impl<'a> FunctionDirectiveCollector<'a> {
         line_anchor: usize,
         file_name: &str,
         allow_terminal: bool,
+        scope_span: Option<Span>,
     ) -> Result<Vec<FunctionDirective>, DirectiveError> {
         let body = if allow_terminal {
             trim_terminal_anchor_suffix(source)
@@ -439,7 +516,7 @@ impl<'a> FunctionDirectiveCollector<'a> {
             if matches_reserved_statement_directive(predicate_text)
                 && !matches!(
                     classify_statement_directive(predicate_text),
-                    Some(DirectiveKind::Assert | DirectiveKind::Assume)
+                    Some(DirectiveKind::Assert | DirectiveKind::Assume | DirectiveKind::Let)
                 )
             {
                 return Err(
@@ -457,10 +534,14 @@ impl<'a> FunctionDirectiveCollector<'a> {
                     .strip_prefix("assume")
                     .expect("assume directive")
                     .trim(),
+                DirectiveKind::Let => predicate_text
+                    .strip_prefix("let")
+                    .expect("let directive")
+                    .trim(),
                 DirectiveKind::LemmaCall => predicate_text,
                 _ => unreachable!("unexpected statement directive kind"),
             };
-            let expr = parse_directive_expr(kind, expr_text, anchor_span)?;
+            let payload = parse_directive_payload(kind, expr_text, anchor_span)?;
             let line_no = directive_line_number(line_anchor, source, directive_pos);
             let span_text = display_line_span(file_name, line_no, directive_line);
             found.push(FunctionDirective {
@@ -469,7 +550,8 @@ impl<'a> FunctionDirectiveCollector<'a> {
                 span_text,
                 line_no,
                 attach: DirectiveAttach::Statement { anchor_span },
-                expr,
+                payload,
+                scope_span,
             });
         }
         Ok(found)
@@ -691,6 +773,8 @@ fn classify_statement_directive(text: &str) -> Option<DirectiveKind> {
         Some(DirectiveKind::Assert)
     } else if text.starts_with("assume") {
         Some(DirectiveKind::Assume)
+    } else if text.starts_with("let") {
+        Some(DirectiveKind::Let)
     } else {
         None
     }
@@ -762,6 +846,7 @@ fn matches_reserved_statement_directive(text: &str) -> bool {
         || text.starts_with("inv")
         || text.starts_with("req")
         || text.starts_with("ens")
+        || text.starts_with("let")
 }
 
 #[cfg(test)]

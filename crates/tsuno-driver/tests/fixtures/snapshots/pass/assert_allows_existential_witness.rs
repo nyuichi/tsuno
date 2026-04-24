@@ -1,5 +1,6 @@
 fn foo() {
-    //@ assert ?x == 42usize;
+    //@ let x = 42usize;
+    //@ assert x == 42usize;
     let _ = ();
 }
 
