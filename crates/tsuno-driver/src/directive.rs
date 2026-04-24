@@ -123,10 +123,10 @@ fn collect_contract_directives<'tcx>(
     let Some(source) = loc.file.src.as_deref() else {
         return Ok(Vec::new());
     };
-    if let Some(lines) = function_contract_lines_before_item(source, loc.line)
+    if let Some(lines) = function_contract_comment_lines_before_item(source, loc.line)
         && lines
             .iter()
-            .any(|line| line.starts_with("//@ req") || line.starts_with("//@ ens"))
+            .any(|line| line.text.starts_with("req") || line.text.starts_with("ens"))
     {
         return Err(DirectiveError {
             span: item_span,
@@ -137,31 +137,19 @@ fn collect_contract_directives<'tcx>(
     }
 
     let body_line = tcx.sess.source_map().lookup_char_pos(body_span.lo()).line;
-    let Some(lines) = function_contract_lines_before_body(source, body_line) else {
+    let Some(lines) = function_contract_comment_lines_before_body(source, body_line) else {
         return Ok(Vec::new());
     };
 
     let file_name = loc.file.name.prefer_local().to_string();
-    let block_start_line = body_line - lines.len();
     let mut directives = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        let line_no = block_start_line + index;
-        let raw_line = source.lines().nth(line_no - 1).unwrap_or(line).trim_end();
-        let (kind, rest) = if let Some(rest) = line.strip_prefix("//@ req") {
-            (DirectiveKind::Req, rest)
-        } else if let Some(rest) = line.strip_prefix("//@ ens") {
-            (DirectiveKind::Ens, rest)
-        } else if let Some(rest) = line.strip_prefix("//@ let") {
-            (DirectiveKind::Let, rest)
-        } else {
-            continue;
-        };
-        let payload = parse_directive_payload(kind, rest.trim(), item_span)?;
+    for entry in contract_directive_entries(&lines, item_span)? {
+        let payload = parse_directive_payload(entry.kind, entry.text.trim(), item_span)?;
         directives.push(FunctionDirective {
-            kind,
+            kind: entry.kind,
             span: item_span,
-            span_text: display_line_span(&file_name, line_no, raw_line),
-            line_no,
+            span_text: display_line_span(&file_name, entry.line_no, &entry.line_text),
+            line_no: entry.line_no,
             attach: DirectiveAttach::Function,
             payload,
             scope_span: None,
@@ -252,44 +240,341 @@ fn display_line_span(file_name: &str, line_no: usize, line_text: &str) -> String
     format!("{file_name}:{line_no}:{start_col}: {line_no}:{end_col}")
 }
 
+#[cfg(test)]
 pub(crate) fn function_contract_lines_before_item(
     source: &str,
     item_line: usize,
 ) -> Option<Vec<String>> {
-    function_contract_lines_before_line(source, item_line)
+    function_contract_comment_lines_before_line(source, item_line)
+        .map(|lines| lines.into_iter().map(|line| line.render()).collect())
 }
 
+#[cfg(test)]
 pub(crate) fn function_contract_lines_before_body(
     source: &str,
     body_line: usize,
 ) -> Option<Vec<String>> {
-    function_contract_lines_before_line(source, body_line)
+    function_contract_comment_lines_before_line(source, body_line)
+        .map(|lines| lines.into_iter().map(|line| line.render()).collect())
 }
 
-fn function_contract_lines_before_line(source: &str, line_no: usize) -> Option<Vec<String>> {
+#[derive(Debug, Clone)]
+struct SpecCommentLine {
+    text: String,
+    line_no: usize,
+    line_text: String,
+    start_line: usize,
+    end_line: usize,
+    start_offset: usize,
+}
+
+#[cfg(test)]
+impl SpecCommentLine {
+    fn render(self) -> String {
+        format!("//@ {}", self.text)
+    }
+}
+
+#[derive(Debug)]
+struct DirectiveText {
+    kind: DirectiveKind,
+    text: String,
+    line_no: usize,
+    line_text: String,
+    start_offset: usize,
+}
+
+fn function_contract_comment_lines_before_item(
+    source: &str,
+    item_line: usize,
+) -> Option<Vec<SpecCommentLine>> {
+    function_contract_comment_lines_before_line(source, item_line)
+}
+
+fn function_contract_comment_lines_before_body(
+    source: &str,
+    body_line: usize,
+) -> Option<Vec<SpecCommentLine>> {
+    function_contract_comment_lines_before_line(source, body_line)
+}
+
+fn function_contract_comment_lines_before_line(
+    source: &str,
+    line_no: usize,
+) -> Option<Vec<SpecCommentLine>> {
     if line_no <= 1 {
         return None;
     }
 
-    let lines: Vec<_> = source.lines().collect();
-    let mut idx = line_no.saturating_sub(2);
+    let comments = collect_line_spec_comments(source);
+    let mut idx = comments
+        .iter()
+        .rposition(|comment| comment.end_line < line_no)?;
+    if !physical_lines_between_are_blank(source, comments[idx].end_line + 1, line_no - 1) {
+        return None;
+    }
+
     let mut block = Vec::new();
-    while let Some(line) = lines.get(idx) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            break;
-        }
-        if !trimmed.starts_with("//@") {
-            break;
-        }
-        block.push(trimmed.to_owned());
+    loop {
+        let comment = &comments[idx];
+        block.push(comment.clone());
         if idx == 0 {
+            break;
+        }
+        let previous = &comments[idx - 1];
+        if !physical_lines_between_are_blank(source, previous.end_line + 1, comment.start_line - 1)
+        {
             break;
         }
         idx -= 1;
     }
     block.reverse();
-    if block.is_empty() { None } else { Some(block) }
+    Some(block)
+}
+
+fn physical_lines_between_are_blank(source: &str, start_line: usize, end_line: usize) -> bool {
+    if start_line > end_line {
+        return true;
+    }
+    source
+        .lines()
+        .enumerate()
+        .filter(|(index, _)| {
+            let line_no = index + 1;
+            start_line <= line_no && line_no <= end_line
+        })
+        .all(|(_, line)| line.trim().is_empty())
+}
+
+fn collect_line_spec_comments(source: &str) -> Vec<SpecCommentLine> {
+    let physical_lines: Vec<_> = source.lines().collect();
+    let mut comments = Vec::new();
+    let mut index = 0;
+    let mut line_offset = 0;
+    while index < physical_lines.len() {
+        let line = physical_lines[index];
+        let trimmed = line.trim_start();
+        if let Some(text) = trimmed.strip_prefix("//@") {
+            let start_offset = line_offset + line.find("//@").unwrap_or(0);
+            comments.push(SpecCommentLine {
+                text: text.trim().to_owned(),
+                line_no: index + 1,
+                line_text: line.trim_end().to_owned(),
+                start_line: index + 1,
+                end_line: index + 1,
+                start_offset,
+            });
+            line_offset += line.len() + 1;
+            index += 1;
+            continue;
+        }
+        if let Some(first) = trimmed.strip_prefix("/*@") {
+            let start_line = index + 1;
+            let start_offset = line_offset + line.find("/*@").unwrap_or(0);
+            let mut parts = Vec::new();
+            let mut line_text = line.trim_end().to_owned();
+            let mut rest = first;
+            loop {
+                if let Some(end) = rest.find("*/") {
+                    parts.push(rest[..end].trim().to_owned());
+                    let text = parts.join(" ");
+                    comments.push(SpecCommentLine {
+                        text: text.trim().to_owned(),
+                        line_no: start_line,
+                        line_text,
+                        start_line,
+                        end_line: index + 1,
+                        start_offset,
+                    });
+                    line_offset += physical_lines[index].len() + 1;
+                    index += 1;
+                    break;
+                }
+                parts.push(rest.trim().to_owned());
+                line_offset += physical_lines[index].len() + 1;
+                index += 1;
+                if index >= physical_lines.len() {
+                    break;
+                }
+                rest = physical_lines[index];
+                line_text.push(' ');
+                line_text.push_str(rest.trim_end());
+            }
+            continue;
+        }
+        line_offset += line.len() + 1;
+        index += 1;
+    }
+    comments
+        .into_iter()
+        .filter(|comment| !spec::is_ghost_item_block(&comment.text))
+        .collect()
+}
+
+fn contract_directive_entries(
+    comments: &[SpecCommentLine],
+    span: Span,
+) -> Result<Vec<DirectiveText>, DirectiveError> {
+    let logical = logical_directive_texts(comments, contract_comment_kind);
+    let mut entries = Vec::new();
+    for directive in logical {
+        entries.extend(split_directive_text(
+            directive,
+            contract_comment_kind,
+            span,
+        )?);
+    }
+    Ok(entries)
+}
+
+fn statement_directive_entries(
+    comments: &[SpecCommentLine],
+    position_error: DirectiveError,
+) -> Result<Vec<DirectiveText>, DirectiveError> {
+    let mut entries = Vec::new();
+    for comment in comments {
+        if matches_reserved_statement_directive(&comment.text)
+            && !matches!(
+                classify_statement_directive(&comment.text),
+                Some(DirectiveKind::Assert | DirectiveKind::Assume | DirectiveKind::Let)
+            )
+        {
+            return Err(position_error);
+        }
+
+        if let Some(kind) = classify_statement_directive(&comment.text) {
+            let text = comment.text[kind.keyword().len()..].trim().to_owned();
+            entries.push(DirectiveText {
+                kind,
+                text,
+                line_no: comment.line_no,
+                line_text: comment.line_text.clone(),
+                start_offset: comment.start_offset,
+            });
+        } else if let Some(last) = entries.last_mut()
+            && !last.text.trim_end().ends_with(';')
+        {
+            if !last.text.is_empty() {
+                last.text.push(' ');
+            }
+            last.text.push_str(comment.text.trim());
+            last.line_text.push(' ');
+            last.line_text.push_str(comment.line_text.trim());
+        } else {
+            entries.push(DirectiveText {
+                kind: DirectiveKind::LemmaCall,
+                text: comment.text.trim().to_owned(),
+                line_no: comment.line_no,
+                line_text: comment.line_text.clone(),
+                start_offset: comment.start_offset,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+fn logical_directive_texts(
+    comments: &[SpecCommentLine],
+    classify: fn(&str) -> Option<DirectiveKind>,
+) -> Vec<DirectiveText> {
+    let mut entries: Vec<DirectiveText> = Vec::new();
+    for comment in comments {
+        if let Some(kind) = classify(&comment.text) {
+            let text = comment.text[kind.keyword().len()..].trim().to_owned();
+            entries.push(DirectiveText {
+                kind,
+                text,
+                line_no: comment.line_no,
+                line_text: comment.line_text.clone(),
+                start_offset: comment.start_offset,
+            });
+        } else if let Some(last) = entries.last_mut() {
+            if !last.text.is_empty() {
+                last.text.push(' ');
+            }
+            last.text.push_str(comment.text.trim());
+            last.line_text.push(' ');
+            last.line_text.push_str(comment.line_text.trim());
+        }
+    }
+    entries
+}
+
+fn split_directive_text(
+    directive: DirectiveText,
+    classify: fn(&str) -> Option<DirectiveKind>,
+    span: Span,
+) -> Result<Vec<DirectiveText>, DirectiveError> {
+    let mut entries = Vec::new();
+    let mut kind = directive.kind;
+    let mut text = directive.text.as_str();
+    loop {
+        let Some((next_at, next_kind)) = find_next_directive_keyword(text, classify) else {
+            entries.push(DirectiveText {
+                kind,
+                text: text.trim().to_owned(),
+                line_no: directive.line_no,
+                line_text: directive.line_text.clone(),
+                start_offset: directive.start_offset,
+            });
+            return Ok(entries);
+        };
+        entries.push(DirectiveText {
+            kind,
+            text: text[..next_at].trim().to_owned(),
+            line_no: directive.line_no,
+            line_text: directive.line_text.clone(),
+            start_offset: directive.start_offset,
+        });
+        let next_start = next_at + next_kind.keyword().len();
+        if next_start > text.len() {
+            return Err(DirectiveError {
+                span,
+                message: "empty directive".to_owned(),
+            });
+        }
+        kind = next_kind;
+        text = &text[next_start..];
+    }
+}
+
+fn find_next_directive_keyword(
+    text: &str,
+    classify: fn(&str) -> Option<DirectiveKind>,
+) -> Option<(usize, DirectiveKind)> {
+    let mut depth = 0usize;
+    let mut previous_boundary = true;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth == 0 && previous_boundary {
+            let rest = &text[index..];
+            if let Some(kind) = classify(rest)
+                && index != 0
+            {
+                return Some((index, kind));
+            }
+        }
+        previous_boundary = ch.is_whitespace() || ch == ';';
+    }
+    None
+}
+
+fn contract_comment_kind(text: &str) -> Option<DirectiveKind> {
+    directive_kind_prefix(
+        text,
+        &[DirectiveKind::Req, DirectiveKind::Ens, DirectiveKind::Let],
+    )
+}
+
+fn directive_kind_prefix(text: &str, kinds: &[DirectiveKind]) -> Option<DirectiveKind> {
+    kinds.iter().copied().find(|kind| {
+        text.strip_prefix(kind.keyword())
+            .is_some_and(|rest| rest.chars().next().is_none_or(|ch| ch.is_whitespace()))
+    })
 }
 
 struct FunctionDirectiveCollector<'tcx> {
@@ -498,54 +783,34 @@ impl<'a> FunctionDirectiveCollector<'a> {
         } else {
             source.trim_end_matches(char::is_whitespace)
         };
-        let Some(first_directive) = body.find("//@") else {
+        let Some(first_directive) = first_spec_comment_pos(body) else {
             return Ok(Vec::new());
         };
         let body = &body[first_directive..];
+        if !source_contains_only_spec_comments(body) {
+            return Err(
+                self.statement_directive_position_error(anchor_span, DirectiveKind::LemmaCall)
+            );
+        }
+
+        let comment_lines = collect_line_spec_comments(body);
+        if comment_lines.is_empty() {
+            return Err(
+                self.statement_directive_position_error(anchor_span, DirectiveKind::LemmaCall)
+            );
+        }
 
         let mut found = Vec::new();
-        for (directive_pos, directive_line) in directive_lines(
-            body,
+        for entry in statement_directive_entries(
+            &comment_lines,
             self.statement_directive_position_error(anchor_span, DirectiveKind::LemmaCall),
         )? {
-            let directive_pos = first_directive + directive_pos;
-            let predicate_text = directive_line
-                .strip_prefix("//@")
-                .expect("directive line starts with //@")
-                .trim();
-            if matches_reserved_statement_directive(predicate_text)
-                && !matches!(
-                    classify_statement_directive(predicate_text),
-                    Some(DirectiveKind::Assert | DirectiveKind::Assume | DirectiveKind::Let)
-                )
-            {
-                return Err(
-                    self.statement_directive_position_error(anchor_span, DirectiveKind::LemmaCall)
-                );
-            }
-            let kind =
-                classify_statement_directive(predicate_text).unwrap_or(DirectiveKind::LemmaCall);
-            let expr_text = match kind {
-                DirectiveKind::Assert => predicate_text
-                    .strip_prefix("assert")
-                    .expect("assert directive")
-                    .trim(),
-                DirectiveKind::Assume => predicate_text
-                    .strip_prefix("assume")
-                    .expect("assume directive")
-                    .trim(),
-                DirectiveKind::Let => predicate_text
-                    .strip_prefix("let")
-                    .expect("let directive")
-                    .trim(),
-                DirectiveKind::LemmaCall => predicate_text,
-                _ => unreachable!("unexpected statement directive kind"),
-            };
-            let payload = parse_directive_payload(kind, expr_text, anchor_span)?;
+            let directive_pos = first_directive + entry.start_offset;
+            let payload = parse_directive_payload(entry.kind, entry.text.trim(), anchor_span)?;
             let line_no = directive_line_number(line_anchor, source, directive_pos);
-            let span_text = display_line_span(file_name, line_no, directive_line);
+            let span_text = display_line_span(file_name, line_no, &entry.line_text);
             found.push(FunctionDirective {
-                kind,
+                kind: entry.kind,
                 span: anchor_span,
                 span_text,
                 line_no,
@@ -740,44 +1005,46 @@ fn trim_terminal_anchor_suffix(source: &str) -> &str {
     source.trim_end_matches(|c: char| c.is_whitespace() || c == '}')
 }
 
-fn directive_lines(
-    source: &str,
-    position_error: DirectiveError,
-) -> Result<Vec<(usize, &str)>, DirectiveError> {
-    let mut directives = Vec::new();
-    let mut offset = 0;
-    for line in source.split_inclusive('\n') {
-        let line_end = line.trim_end_matches(['\n', '\r']);
-        let trimmed = line_end.trim();
-        if trimmed.is_empty() {
-            offset += line.len();
+fn first_spec_comment_pos(source: &str) -> Option<usize> {
+    match (source.find("//@"), source.find("/*@")) {
+        (Some(line), Some(block)) => Some(line.min(block)),
+        (Some(line), None) => Some(line),
+        (None, Some(block)) => Some(block),
+        (None, None) => None,
+    }
+}
+
+fn source_contains_only_spec_comments(source: &str) -> bool {
+    let mut in_block = false;
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        if in_block {
+            if trimmed.contains("*/") {
+                in_block = false;
+            }
             continue;
         }
-        let Some(directive_col) = line_end.find("//@") else {
-            return Err(position_error.clone());
-        };
-        if !line_end[..directive_col].trim().is_empty() {
-            return Err(position_error.clone());
+        if trimmed.trim_end().is_empty() || trimmed.starts_with("//@") {
+            continue;
         }
-        directives.push((
-            offset + directive_col,
-            line_end[directive_col..].trim_end_matches([' ', '\t']),
-        ));
-        offset += line.len();
+        if let Some(rest) = trimmed.strip_prefix("/*@") {
+            in_block = !rest.contains("*/");
+            continue;
+        }
+        return false;
     }
-    Ok(directives)
+    true
 }
 
 fn classify_statement_directive(text: &str) -> Option<DirectiveKind> {
-    if text.starts_with("assert") {
-        Some(DirectiveKind::Assert)
-    } else if text.starts_with("assume") {
-        Some(DirectiveKind::Assume)
-    } else if text.starts_with("let") {
-        Some(DirectiveKind::Let)
-    } else {
-        None
-    }
+    directive_kind_prefix(
+        text,
+        &[
+            DirectiveKind::Assert,
+            DirectiveKind::Assume,
+            DirectiveKind::Let,
+        ],
+    )
 }
 
 fn spec_directive_line<'a>(
@@ -841,12 +1108,18 @@ fn spec_directive_line<'a>(
 }
 
 fn matches_reserved_statement_directive(text: &str) -> bool {
-    text.starts_with("assert")
-        || text.starts_with("assume")
-        || text.starts_with("inv")
-        || text.starts_with("req")
-        || text.starts_with("ens")
-        || text.starts_with("let")
+    directive_kind_prefix(
+        text,
+        &[
+            DirectiveKind::Assert,
+            DirectiveKind::Assume,
+            DirectiveKind::Inv,
+            DirectiveKind::Req,
+            DirectiveKind::Ens,
+            DirectiveKind::Let,
+        ],
+    )
+    .is_some()
 }
 
 #[cfg(test)]
@@ -877,5 +1150,30 @@ mod tests {
                 "//@ ens {result} == 3".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn splits_doc_style_function_contract_comments() {
+        let source =
+            "fn callee() -> i32\n//@ req true &&\n/*@ true */\n//@ ens result == 3\n{\n    2\n}\n";
+        let lines = super::function_contract_comment_lines_before_body(source, 5).unwrap();
+        let entries = super::contract_directive_entries(&lines, rustc_span::DUMMY_SP).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kind, super::DirectiveKind::Req);
+        assert_eq!(entries[0].text, "true && true");
+        assert_eq!(entries[1].kind, super::DirectiveKind::Ens);
+        assert_eq!(entries[1].text, "result == 3");
+    }
+
+    #[test]
+    fn splits_inline_req_ens_contract_comment() {
+        let source = "fn callee() -> i32\n//@ req true ens result == 3\n{\n    2\n}\n";
+        let lines = super::function_contract_comment_lines_before_body(source, 3).unwrap();
+        let entries = super::contract_directive_entries(&lines, rustc_span::DUMMY_SP).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kind, super::DirectiveKind::Req);
+        assert_eq!(entries[0].text, "true");
+        assert_eq!(entries[1].kind, super::DirectiveKind::Ens);
+        assert_eq!(entries[1].text, "result == 3");
     }
 }

@@ -350,6 +350,11 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+pub fn is_ghost_item_block(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("fn ") || trimmed.starts_with("enum ")
+}
+
 #[cfg(test)]
 pub fn parse_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
     parse_source_expr(kind, text)

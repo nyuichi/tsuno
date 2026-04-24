@@ -5897,6 +5897,10 @@ fn collect_ghost_items_in_source(
         };
         let end = body_start + end_rel;
         let block = &source[body_start..end];
+        if !crate::spec::is_ghost_item_block(block) {
+            cursor = end + 2;
+            continue;
+        }
         let parsed = parse_ghost_block(block).map_err(|err| LoopPrepassError {
             span: error_span,
             display_span: None,
