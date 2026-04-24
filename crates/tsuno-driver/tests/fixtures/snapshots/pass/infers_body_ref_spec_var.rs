@@ -1,6 +1,6 @@
 fn main() {
     let x = 1;
     let r = &x;
-    //@ assert ?V == *{r};
+    //@ let V = *{r};
     //@ assert V == *{r};
 }

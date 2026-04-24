@@ -4,7 +4,7 @@ This document describes the spec language that is implemented today. It covers o
 
 The language appears in two places:
 
-- line directives such as `//@ req`, `//@ ens`, `//@ assert`, `//@ assume`, `//@ inv`, and `//@ lemma_name(...)`
+- line directives such as `//@ let`, `//@ req`, `//@ ens`, `//@ assert`, `//@ assume`, `//@ inv`, and `//@ lemma_name(...)`
 - ghost blocks written as `/*@ ... */`
 
 ## 1. Where Spec Code Appears
@@ -27,9 +27,10 @@ Rules:
 - both lines must appear immediately before the body
 - `result` is only available bare in `//@ ens`
 
-Assertions, assumptions, and lemma calls appear inside executable Rust code.
+Let bindings, assertions, assumptions, and lemma calls appear inside executable Rust code.
 
 ```rust
+//@ let old = {x};
 //@ assert {x} == 0;
 //@ assume {x} == 0;
 //@ helper_lemma({x});
@@ -37,7 +38,7 @@ Assertions, assumptions, and lemma calls appear inside executable Rust code.
 
 Rules:
 
-- these forms require a trailing `;`
+- `//@ let name = expr;`, `//@ assert`, `//@ assume`, and lemma calls require a trailing `;`
 - the expression is written directly; it is not wrapped in a string literal
 
 Loop invariants appear immediately before the loop body.
@@ -105,7 +106,6 @@ false
 result
 x
 {x}
-?x
 f(x, y)
 Enum::Ctor(x, y)
 Enum::<T>::Ctor(x)
@@ -155,24 +155,19 @@ a ++ b ++ c    == (a ++ b) ++ c
 a && b && c    == (a && b) && c
 ```
 
-This matters for binders as well. For example:
-
-```text
-!P(?x) == !(P(?x))
-```
-
 ## 3. Spec Binders
 
-The form `?x` introduces a spec binder. A binder is not a general existential form. It is a witness-style binding syntax with a restricted shape.
+The directive `//@ let name = expr;` introduces a spec binder. The right-hand side is a spec expression evaluated at that program point.
 
 ```rust
-//@ assert ?V == *{r};
+//@ let V = *{r};
 //@ assert V == *{r};
 ```
 
 ```rust
 fn read_ref(x: &i32) -> i32
-//@ req ?V == *{x}
+//@ let V = *{x};
+//@ req true
 //@ ens V == result
 {
     *x
@@ -187,88 +182,65 @@ If no visible binding exists, the expression is rejected.
 
 ### 3.1 Binder-Introducing Forms
 
-New binders may be introduced only in:
+New binders may be introduced with `//@ let` before a function contract's `//@ req`, or inside executable Rust code.
 
-- `req`
-- `//@ assert`
-- ghost `assert`
-
-In those positions, binder introduction is allowed only through top-level conjunctions whose conjunct has the form:
-
-```text
-?x == expr
+```rust
+fn f(x: usize)
+//@ let y = {x};
+//@ let z = y;
+//@ req z == {x}
+//@ ens result == z
+{
+    z
+}
 ```
 
-Examples:
-
-```text
-assert ?x == 42 && Q(x);   // ok
-assert ?x == 42 && ?y == x && R(x, y);   // ok
-assert Q(x) && ?x == 42;   // rejected
-assert !P(?x);             // rejected
-assert 42 == ?x;           // rejected
+```rust
+fn g(x: i32) {
+    //@ let y = {x};
+    //@ assert y == {x};
+}
 ```
 
-The accepted form is processed left to right. Conceptually:
+The old `?x` binder syntax is not part of the language.
 
-```text
-assert ?x == 42 && ?y == x && R(x, y);
-
-== let x = 42;
-   let y = x;
-   assert R(x, y);
+```rust
+//@ assert ?x == 42usize;
 ```
 
-The surface language does not have `let`. This desugaring describes the implemented behavior.
+The form above is rejected.
 
 ### 3.2 Scope Across `req`, Body Directives, and `ens`
 
-Function-level binder visibility is staged in source order:
+Spec binders follow the corresponding Rust source scope.
 
-1. `req`
-2. body directives such as `assert`, `assume`, `inv`, and lemma calls
-3. `ens`
-
-As a result, binders introduced in `req` are available both in later body directives and in the matching `ens`.
-
-```rust
-fn f(x: &i32) -> i32
-//@ req ?V == *{x}
-//@ ens true
-{
-    //@ assert V == *{x};
-    *x
-}
-```
+Function-level `//@ let` directives before `//@ req` are visible in the function's `req`, body directives, and `ens`.
 
 ```rust
 fn read_ref(x: &i32) -> i32
-//@ req ?V == *{x}
-//@ ens V == result
+//@ let V = *{x};
+//@ req true
+//@ ens result == V
 {
     *x
 }
 ```
 
-Binders introduced in a function body are available later in that body.
+Body `//@ let` directives are available to later directives in the same Rust scope. A binder introduced in an inner block is not visible after that block.
 
 ```rust
 fn main() {
     let x = 1;
     let r = &x;
-    //@ assert ?V == *{r};
-    //@ assert V == *{r};
+    {
+        //@ let V = *{r};
+        //@ assert V == *{r};
+    }
+    //@ assert {x} == {x};
 }
 ```
 
-Binders introduced only in one directive are visible to later directives, not earlier ones.
-
-New binders are rejected in:
-
-- `ens`
-- `//@ assume`
-- `//@ inv`
-- ghost `assume`
+Binders are visible only after their `//@ let` directive; forward references are rejected.
 
 ## 4. Types and Values
 
@@ -317,7 +289,8 @@ Shared references can be dereferenced with `*`.
 Mutable references expose both the current value through `*` and the final value through `.fin`.
 
 ```rust
-//@ req ?Old == *{xs}
+//@ let Old = *{xs};
+//@ req true
 //@ ens {xs}.fin == Old ++ [x]
 ```
 
