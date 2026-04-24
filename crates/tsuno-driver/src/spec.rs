@@ -5,6 +5,10 @@ pub enum Expr {
     Var(String),
     Interpolated(String),
     SeqLit(Vec<Expr>),
+    StructLit {
+        name: String,
+        fields: Vec<StructLitField>,
+    },
     Match {
         scrutinee: Box<Expr>,
         arms: Vec<MatchArm>,
@@ -54,6 +58,12 @@ pub struct MatchArm {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructLitField {
+    pub name: String,
+    pub value: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchPattern {
     Constructor {
         enum_name: String,
@@ -75,6 +85,9 @@ pub enum TypedExprKind {
     Var(String),
     RustVar(String),
     SeqLit(Vec<TypedExpr>),
+    StructLit {
+        fields: Vec<TypedExpr>,
+    },
     Match {
         scrutinee: Box<TypedExpr>,
         arms: Vec<TypedMatchArm>,
@@ -137,6 +150,7 @@ pub enum TypedMatchBinding {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IntSuffix {
+    Nat,
     I8,
     I16,
     I32,
@@ -152,6 +166,10 @@ pub enum IntSuffix {
 impl IntSuffix {
     pub fn spec_ty(self) -> SpecTy {
         match self {
+            Self::Nat => SpecTy::Enum {
+                name: "Nat".to_owned(),
+                args: vec![],
+            },
             Self::I8 => SpecTy::I8,
             Self::I16 => SpecTy::I16,
             Self::I32 => SpecTy::I32,
@@ -204,7 +222,7 @@ pub enum SpecTy {
     Seq(Box<SpecTy>),
     Tuple(Vec<SpecTy>),
     Struct(StructTy),
-    Named { name: String, args: Vec<SpecTy> },
+    Enum { name: String, args: Vec<SpecTy> },
     TypeParam(String),
     Ref(Box<SpecTy>),
     Mut(Box<SpecTy>),
@@ -260,6 +278,7 @@ pub struct LemmaDef {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GhostBlock {
     pub enums: Vec<EnumDef>,
+    pub structs: Vec<StructDef>,
     pub pure_fns: Vec<PureFnDef>,
     pub lemmas: Vec<LemmaDef>,
 }
@@ -284,6 +303,12 @@ impl EnumDef {
 pub struct EnumCtorDef {
     pub name: String,
     pub fields: Vec<SpecTy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StructDef {
+    pub name: String,
+    pub fields: Vec<StructFieldTy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -362,7 +387,7 @@ pub struct SpecComment {
 
 pub fn is_ghost_item_block(text: &str) -> bool {
     let trimmed = text.trim_start();
-    trimmed.starts_with("fn ") || trimmed.starts_with("enum ")
+    trimmed.starts_with("fn ") || trimmed.starts_with("enum ") || trimmed.starts_with("struct ")
 }
 
 pub fn is_complete_ghost_item_comment(text: &str) -> bool {
@@ -539,6 +564,7 @@ enum Token {
     RBracket,
     Comma,
     Dot,
+    Colon,
     ColonColon,
     FatArrow,
     Question,
@@ -647,10 +673,11 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
             }
             ':' => {
                 chars.next();
-                if chars.next() == Some(':') {
+                if chars.peek() == Some(&':') {
+                    chars.next();
                     tokens.push(Token::ColonColon);
                 } else {
-                    return Err(ParseError::new("unexpected `:` in spec expression"));
+                    tokens.push(Token::Colon);
                 }
             }
             '?' => {
@@ -740,6 +767,7 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
 
 fn parse_int_suffix(text: &str) -> Result<IntSuffix, ParseError> {
     match text {
+        "Nat" => Ok(IntSuffix::Nat),
         "i8" => Ok(IntSuffix::I8),
         "i16" => Ok(IntSuffix::I16),
         "i32" => Ok(IntSuffix::I32),
@@ -1089,7 +1117,6 @@ impl Parser {
             Vec::new()
         };
         match ident.as_str() {
-            "bool" if args.is_empty() => Ok(SpecTy::Bool),
             "i8" if args.is_empty() => Ok(SpecTy::I8),
             "i16" if args.is_empty() => Ok(SpecTy::I16),
             "i32" if args.is_empty() => Ok(SpecTy::I32),
@@ -1100,6 +1127,7 @@ impl Parser {
             "u32" if args.is_empty() => Ok(SpecTy::U32),
             "u64" if args.is_empty() => Ok(SpecTy::U64),
             "usize" if args.is_empty() => Ok(SpecTy::Usize),
+            "bool" if args.is_empty() => Ok(SpecTy::Bool),
             "Seq" if args.len() == 1 => Ok(SpecTy::Seq(Box::new(args[0].clone()))),
             "Seq" => Err(ParseError::new(format!(
                 "spec type `Seq` expects 1 type argument, found {}",
@@ -1108,7 +1136,7 @@ impl Parser {
             _ if args.is_empty() && self.type_params.iter().any(|param| param == &ident) => {
                 Ok(SpecTy::TypeParam(ident))
             }
-            _ => Ok(SpecTy::Named { name: ident, args }),
+            _ => Ok(SpecTy::Enum { name: ident, args }),
         }
     }
 
@@ -1148,7 +1176,12 @@ impl Parser {
             Some(Token::Ident(ident)) if ident == "match" => self.parse_match_expr(),
             Some(Token::Ident(ident)) => {
                 let type_args = self.try_parse_call_type_args()?.unwrap_or_default();
-                if self.eat(&Token::ColonColon) {
+                if !ident.starts_with("__")
+                    && type_args.is_empty()
+                    && self.next_tokens_start_struct_literal()
+                {
+                    self.parse_struct_literal(ident)
+                } else if self.eat(&Token::ColonColon) {
                     let Some(Token::Ident(ctor)) = self.next().cloned() else {
                         return Err(ParseError::new("expected constructor name after `::`"));
                     };
@@ -1202,6 +1235,43 @@ impl Parser {
         }
     }
 
+    fn parse_struct_literal(&mut self, name: String) -> Result<Expr, ParseError> {
+        self.expect(&Token::LBrace)?;
+        let mut fields = Vec::new();
+        if self.eat(&Token::RBrace) {
+            return Ok(Expr::StructLit { name, fields });
+        }
+        loop {
+            let Some(Token::Ident(field_name)) = self.next().cloned() else {
+                return Err(ParseError::new("expected a field name in struct literal"));
+            };
+            self.expect(&Token::Colon)?;
+            fields.push(StructLitField {
+                name: field_name,
+                value: self.parse_expr()?,
+            });
+            if self.eat(&Token::RBrace) {
+                return Ok(Expr::StructLit { name, fields });
+            }
+            self.expect(&Token::Comma)?;
+        }
+    }
+
+    fn next_tokens_start_struct_literal(&self) -> bool {
+        matches!(
+            (
+                self.tokens.get(self.cursor),
+                self.tokens.get(self.cursor + 1),
+                self.tokens.get(self.cursor + 2),
+            ),
+            (
+                Some(Token::LBrace),
+                Some(Token::Ident(_)),
+                Some(Token::Colon)
+            ) | (Some(Token::LBrace), Some(Token::RBrace), _)
+        )
+    }
+
     fn parse_seq_literal(&mut self) -> Result<Expr, ParseError> {
         let mut items = Vec::new();
         if self.eat(&Token::RBracket) {
@@ -1253,6 +1323,7 @@ pub fn parse_ghost_block(text: &str) -> Result<GhostBlock, ParseError> {
     while parser.skip_ws() {
         match parser.parse_item()? {
             GhostItem::Enum(def) => block.enums.push(def),
+            GhostItem::Struct(def) => block.structs.push(def),
             GhostItem::PureFn(def) => block.pure_fns.push(def),
             GhostItem::Lemma(def) => block.lemmas.push(def),
         }
@@ -1262,6 +1333,7 @@ pub fn parse_ghost_block(text: &str) -> Result<GhostBlock, ParseError> {
 
 enum GhostItem {
     Enum(EnumDef),
+    Struct(StructDef),
     PureFn(PureFnDef),
     Lemma(LemmaDef),
 }
@@ -1291,6 +1363,10 @@ impl<'a> GhostBlockParser<'a> {
         if self.starts_with_keyword("enum") {
             self.expect_keyword("enum")?;
             return Ok(GhostItem::Enum(self.parse_enum_def()?));
+        }
+        if self.starts_with_keyword("struct") {
+            self.expect_keyword("struct")?;
+            return Ok(GhostItem::Struct(self.parse_struct_def()?));
         }
         self.expect_keyword("fn")?;
         let name = self.parse_ident()?;
@@ -1371,6 +1447,36 @@ impl<'a> GhostBlockParser<'a> {
             type_params,
             ctors,
         })
+    }
+
+    fn parse_struct_def(&mut self) -> Result<StructDef, ParseError> {
+        let name = self.parse_ident()?;
+        let type_params = self.parse_type_params()?;
+        if !type_params.is_empty() {
+            return Err(ParseError::new("generic spec structs are unsupported"));
+        }
+        self.expect_char('{')?;
+        let mut fields = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.eat_char('}') {
+                break;
+            }
+            let field_name = self.parse_ident()?;
+            self.expect_char(':')?;
+            let ty = self.parse_spec_ty_annotation(&type_params, &[',', '}'])?;
+            fields.push(StructFieldTy {
+                name: field_name,
+                ty,
+            });
+            self.skip_ws();
+            if self.eat_char(',') {
+                continue;
+            }
+            self.expect_char('}')?;
+            break;
+        }
+        Ok(StructDef { name, fields })
     }
 
     fn parse_pure_fn_def(
@@ -1804,10 +1910,14 @@ impl<'a> GhostBlockParser<'a> {
 mod tests {
     use super::{
         BinaryOp, EnumCtorDef, EnumDef, Expr, GhostBlock, GhostStmt, IntLiteral, IntSuffix,
-        LemmaDef, MatchArm, MatchBinding, MatchPattern, PureFnDef, PureFnParam, SpecTy, UnaryOp,
-        parse_expr, parse_ghost_block, parse_pure_fn_block, parse_raw_expr,
+        LemmaDef, MatchArm, MatchBinding, MatchPattern, PureFnDef, PureFnParam, SpecTy, StructDef,
+        StructFieldTy, parse_expr, parse_ghost_block, parse_pure_fn_block, parse_raw_expr,
         parse_spec_ty_text_with_params,
     };
+
+    fn true_expr() -> Expr {
+        Expr::Bool(true)
+    }
 
     #[test]
     fn parses_deref_and_fin() {
@@ -1860,7 +1970,7 @@ mod tests {
             Expr::Binary {
                 op: BinaryOp::Or,
                 lhs: Box::new(Expr::Unary {
-                    op: UnaryOp::Not,
+                    op: super::UnaryOp::Not,
                     arg: Box::new(Expr::Bool(false)),
                 }),
                 rhs: Box::new(Expr::Binary {
@@ -2079,7 +2189,7 @@ mod tests {
         let ty = parse_spec_ty_text_with_params("List<i32>", &[]).expect("named generic spec type");
         assert_eq!(
             ty,
-            SpecTy::Named {
+            SpecTy::Enum {
                 name: "List".to_owned(),
                 args: vec![SpecTy::I32],
             }
@@ -2170,7 +2280,7 @@ fn add1(x: i32) -> i32 {
     }
 
     #[test]
-    fn parses_generic_named_types_in_pure_function_block() {
+    fn parses_generic_seq_types_in_pure_function_block() {
         let defs = parse_pure_fn_block(
             r#"
 fn is_rev(x: Seq<i32>) -> bool {
@@ -2178,8 +2288,60 @@ fn is_rev(x: Seq<i32>) -> bool {
 }
 "#,
         )
-        .expect("generic named type should parse");
+        .expect("generic sequence type should parse");
         assert_eq!(defs[0].params[0].ty, SpecTy::Seq(Box::new(SpecTy::I32)));
+        assert_eq!(defs[0].result_ty, SpecTy::Bool);
+    }
+
+    #[test]
+    fn parses_true_false_literals() {
+        assert_eq!(parse_expr("assert", "true").unwrap(), Expr::Bool(true));
+        assert_eq!(parse_expr("assert", "false").unwrap(), Expr::Bool(false));
+    }
+
+    #[test]
+    fn parses_nat_integer_suffix() {
+        let expr = parse_expr("assert", "43Nat").expect("Nat literal");
+        assert_eq!(
+            expr,
+            Expr::Int(IntLiteral {
+                digits: "43".to_owned(),
+                suffix: Some(IntSuffix::Nat),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_struct_defs_and_literals() {
+        let block = parse_ghost_block(
+            r#"
+struct Foo {
+    bar: isize,
+    baz: bool,
+}
+"#,
+        )
+        .expect("struct block");
+        assert_eq!(
+            block.structs,
+            vec![StructDef {
+                name: "Foo".to_owned(),
+                fields: vec![
+                    StructFieldTy {
+                        name: "bar".to_owned(),
+                        ty: SpecTy::Isize,
+                    },
+                    StructFieldTy {
+                        name: "baz".to_owned(),
+                        ty: SpecTy::Bool,
+                    },
+                ],
+            }]
+        );
+
+        let expr = parse_expr("assert", "Foo { bar: 42isize, baz: true }.bar")
+            .expect("struct literal field");
+        assert!(matches!(expr, Expr::Field { .. }));
     }
 
     #[test]
@@ -2226,6 +2388,7 @@ fn add1_done(x: i32)
             block,
             GhostBlock {
                 enums: vec![],
+                structs: vec![],
                 pure_fns: vec![PureFnDef {
                     name: "add1".to_owned(),
                     type_params: vec![],
@@ -2250,7 +2413,7 @@ fn add1_done(x: i32)
                         name: "x".to_owned(),
                         ty: SpecTy::I32,
                     }],
-                    req: Expr::Bool(true),
+                    req: true_expr(),
                     ens: Expr::Binary {
                         op: BinaryOp::Eq,
                         lhs: Box::new(Expr::Call {
@@ -2337,8 +2500,8 @@ fn refl<T>(xs: Seq<T>)
                     name: "xs".to_owned(),
                     ty: SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned()))),
                 }],
-                req: Expr::Bool(true),
-                ens: Expr::Bool(true),
+                req: true_expr(),
+                ens: true_expr(),
                 body: vec![GhostStmt::Call {
                     name: "refl".to_owned(),
                     type_args: vec![SpecTy::TypeParam("T".to_owned())],
@@ -2392,7 +2555,7 @@ fn singleton(x: i32) -> IntList {
                             name: "Cons".to_owned(),
                             fields: vec![
                                 SpecTy::I32,
-                                SpecTy::Named {
+                                SpecTy::Enum {
                                     name: "IntList".to_owned(),
                                     args: vec![],
                                 },
@@ -2400,6 +2563,7 @@ fn singleton(x: i32) -> IntList {
                         },
                     ],
                 }],
+                structs: vec![],
                 pure_fns: vec![PureFnDef {
                     name: "singleton".to_owned(),
                     type_params: vec![],
@@ -2407,7 +2571,7 @@ fn singleton(x: i32) -> IntList {
                         name: "x".to_owned(),
                         ty: SpecTy::I32,
                     }],
-                    result_ty: SpecTy::Named {
+                    result_ty: SpecTy::Enum {
                         name: "IntList".to_owned(),
                         args: vec![],
                     },

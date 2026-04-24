@@ -16,6 +16,14 @@ fn nat_add(x: Nat, y: Nat) -> Nat {
     }
 }
 
+fn nat_bit0(n: Nat) -> Nat {
+    nat_add(n, n)
+}
+
+fn nat_bit1(n: Nat) -> Nat {
+    Nat::Succ(nat_bit0(n))
+}
+
 fn nat_to_i32(n: Nat) -> i32 {
     match n {
         Nat::Zero => 0i32,
