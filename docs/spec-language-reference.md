@@ -80,6 +80,16 @@ while x < n
 }
 ```
 
+The block form is equivalent here too.
+
+```rust
+while x < n
+  /*@ inv 0 <= {x} && {x} <= {n} */
+{
+    x = x + 1;
+}
+```
+
 Rules:
 
 - each supported loop must have exactly one `//@ inv`
@@ -104,6 +114,20 @@ fn add1(x: i32) -> i32 {
     x + 1i32
 }
 */
+```
+
+Ghost item blocks can also be written with line comments, or by mixing line and block comments.
+
+```rust
+//@ fn trivial(n: Nat)
+//@   req true
+//@   ens true
+//@ {}
+
+/*@ fn also_trivial(n: Nat) */
+//@   req true
+/*@   ens true */
+//@ {}
 ```
 
 Interpolation composes with the surrounding spec syntax. The content of `{...}` is a single Rust binding name, not a general Rust expression.

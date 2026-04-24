@@ -350,9 +350,116 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+#[derive(Debug, Clone)]
+pub struct SpecComment {
+    pub text: String,
+    pub line_no: usize,
+    pub line_text: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub start_offset: usize,
+}
+
 pub fn is_ghost_item_block(text: &str) -> bool {
     let trimmed = text.trim_start();
     trimmed.starts_with("fn ") || trimmed.starts_with("enum ")
+}
+
+pub fn is_complete_ghost_item_comment(text: &str) -> bool {
+    let mut depth = 0usize;
+    let mut saw_brace = false;
+    for ch in text.chars() {
+        match ch {
+            '{' => {
+                saw_brace = true;
+                depth += 1;
+            }
+            '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    saw_brace && depth == 0
+}
+
+pub fn collect_spec_comments(source: &str) -> Vec<SpecComment> {
+    let physical_lines: Vec<_> = source.lines().collect();
+    let mut comments = Vec::new();
+    let mut index = 0;
+    let mut line_offset = 0;
+    while index < physical_lines.len() {
+        let line = physical_lines[index];
+        let line_comment = line.find("//@");
+        let block_comment = line.find("/*@");
+        let first_comment = match (line_comment, block_comment) {
+            (Some(line), Some(block)) => Some(line.min(block)),
+            (Some(line), None) => Some(line),
+            (None, Some(block)) => Some(block),
+            (None, None) => None,
+        };
+        let Some(comment_col) = first_comment else {
+            line_offset += line.len() + 1;
+            index += 1;
+            continue;
+        };
+        let comment = &line[comment_col..];
+        if let Some(text) = comment.strip_prefix("//@") {
+            let start_offset = line_offset + comment_col;
+            comments.push(SpecComment {
+                text: text.trim().to_owned(),
+                line_no: index + 1,
+                line_text: line.trim_end().to_owned(),
+                start_line: index + 1,
+                end_line: index + 1,
+                start_offset,
+            });
+            line_offset += line.len() + 1;
+            index += 1;
+            continue;
+        }
+        if let Some(first) = comment.strip_prefix("/*@") {
+            let start_line = index + 1;
+            let start_offset = line_offset + comment_col;
+            let mut parts = Vec::new();
+            let mut line_text = line.trim_end().to_owned();
+            let mut rest = first;
+            loop {
+                if let Some(end) = rest.find("*/") {
+                    parts.push(rest[..end].trim().to_owned());
+                    let text = parts.join("\n");
+                    comments.push(SpecComment {
+                        text: text.trim().to_owned(),
+                        line_no: start_line,
+                        line_text,
+                        start_line,
+                        end_line: index + 1,
+                        start_offset,
+                    });
+                    line_offset += physical_lines[index].len() + 1;
+                    index += 1;
+                    break;
+                }
+                parts.push(rest.trim().to_owned());
+                line_offset += physical_lines[index].len() + 1;
+                index += 1;
+                if index >= physical_lines.len() {
+                    break;
+                }
+                rest = physical_lines[index];
+                line_text.push(' ');
+                line_text.push_str(rest.trim_end());
+            }
+            continue;
+        }
+    }
+    comments
+}
+
+pub fn spec_comment_group_text(group: &[SpecComment]) -> String {
+    group
+        .iter()
+        .map(|comment| comment.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -2357,5 +2464,24 @@ fn len(xs: List<i32>) -> i32 {
 "#,
         );
         assert!(block.is_ok(), "{block:?}");
+    }
+
+    #[test]
+    fn parses_line_comment_style_lemma_items() {
+        let source = r#"
+//@ fn line_comment_lemma(n: Nat)
+//@   req true
+//@   ens true
+//@ {}
+
+/*@ fn mixed_comment_lemma(n: Nat) */
+//@   req true
+/*@   ens true */
+//@ {}
+"#;
+        let comments = super::collect_spec_comments(source);
+        let block = super::spec_comment_group_text(&comments);
+        let parsed = parse_ghost_block(&block);
+        assert!(parsed.is_ok(), "{block}\n{parsed:?}");
     }
 }
