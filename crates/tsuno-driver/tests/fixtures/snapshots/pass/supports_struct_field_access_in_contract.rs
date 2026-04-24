@@ -5,8 +5,8 @@ struct Pair {
 }
 
 fn supports_struct_field_access_in_contract(pair: Pair)
-//@ req {pair}.left == 1i32
-//@ ens {pair}.right == false
+//@ req {pair}.left == 1i32 && !{pair}.right
+//@ ens !{pair}.right
 {}
 
 fn main() {

@@ -155,6 +155,7 @@ true
 false
 0
 1i32
+43Nat
 42usize
 result
 x
@@ -162,6 +163,7 @@ x
 f(x, y)
 Enum::Ctor(x, y)
 Enum::<T>::Ctor(x)
+StructName { field: value }
 (expr)
 [a, b, c]
 xs[i]
@@ -321,13 +323,19 @@ fn len(xs: List<i32>) -> i32 { ... }
 ```
 
 Integer literals may be unsuffixed or use one of the integer suffixes above.
+In a `Nat` context, an unsuffixed integer literal is interpreted as a `Nat`.
+The `Nat` suffix makes this explicit.
 
 ```text
 0
+43Nat
 1i32
 42usize
 18446744073709551615u64
 ```
+
+Boolean literals are written as `true` and `false`. Boolean values can also be
+produced by comparisons, equality, logical operators, and predicate calls.
 
 Equality and inequality require matching spec types. Equality on `Ref<T>` and `Mut<T>` is currently rejected.
 
@@ -351,6 +359,20 @@ Named field access works on structs.
 
 ```rust
 //@ assert {pair}.left == 0i32;
+```
+
+Spec-side structs can be declared in ghost blocks and constructed with named
+fields.
+
+```rust
+/*@
+struct Foo {
+    bar: isize,
+    baz: bool,
+}
+*/
+
+//@ assert (Foo { bar: 42isize, baz: true }).bar == 42isize;
 ```
 
 Numeric projection works on tuples.
@@ -404,6 +426,7 @@ fn append_len(xs: List<i32>, ys: List<i32>)
 Supported items:
 
 - `enum`
+- `struct`
 - pure functions: `fn name<T>(args...) -> Ty { expr }`
 - lemmas: `fn name<T>(args...) req <expr> ens <expr> { stmts }`
 

@@ -47,7 +47,7 @@ Composite values are arranged like constructor families.
 
   We only exploit those equalities syntactically when the term already is a
   visible constructor application.
-- Named spec types (`SpecTy::Named`, i.e. ghost enums such as `List<T>`) reuse
+- Enum spec types (`SpecTy::Enum`, i.e. ghost enums such as `List<T>`) reuse
   one nominal constructor family across all instantiations of the same enum
   declaration. Type arguments are enforced through per-instantiation invariant
   predicates.
@@ -74,7 +74,7 @@ eta-style axiom:
   forall v: value.
     mk_<name>(ctorinv_<name>_0(v), .., ctorinv_<name>_n(v)) = v
 
-Named spec types also get a per-instantiation invariant predicate:
+Enum spec types also get a per-instantiation invariant predicate:
 
   inv_<name<args>> : value -> Bool
 
@@ -509,7 +509,7 @@ impl ValueEncoder {
                 .map(|(lhs, rhs)| lhs == rhs)),
             SpecTy::Tuple(_)
             | SpecTy::Struct(_)
-            | SpecTy::Named { .. }
+            | SpecTy::Enum { .. }
             | SpecTy::Ref(_)
             | SpecTy::Mut(_)
             | SpecTy::TypeParam(_) => Ok(None),
@@ -705,7 +705,7 @@ impl ValueEncoder {
             SpecTy::Seq(_) => (TypeEncodingKind::Seq, self.seq_value_sort.clone()),
             SpecTy::Tuple(_)
             | SpecTy::Struct(_)
-            | SpecTy::Named { .. }
+            | SpecTy::Enum { .. }
             | SpecTy::Ref(_)
             | SpecTy::Mut(_) => (
                 TypeEncodingKind::Composite(self.build_composite_encoding(ty)?),
@@ -717,7 +717,7 @@ impl ValueEncoder {
     }
 
     fn build_composite_encoding(&self, ty: &SpecTy) -> Result<Rc<CompositeEncoding>, String> {
-        if let SpecTy::Named { name, args } = ty {
+        if let SpecTy::Enum { name, args } = ty {
             return self.build_named_composite_encoding(name, args);
         }
 
@@ -778,7 +778,7 @@ impl ValueEncoder {
         let composite = Rc::new(CompositeEncoding {
             tag_function,
             constructors,
-            invariant: matches!(ty, SpecTy::Named { .. }).then(|| {
+            invariant: matches!(ty, SpecTy::Enum { .. }).then(|| {
                 Rc::new(FuncDecl::new(
                     format!("inv_{sort_name}"),
                     &[&self.value_sort],
@@ -916,7 +916,7 @@ impl ValueEncoder {
             | TypeEncodingKind::Opaque
             | TypeEncodingKind::Seq => Ok(()),
             TypeEncodingKind::Composite(composite) => {
-                if matches!(ty, SpecTy::Named { .. }) {
+                if matches!(ty, SpecTy::Enum { .. }) {
                     self.assert_composite_axioms(composite, solver);
                     self.assert_named_invariant_axioms(ty, composite, solver)?;
                 }
@@ -1089,10 +1089,10 @@ impl ValueEncoder {
             })),
             SpecTy::TypeParam(_) => Ok(None),
             SpecTy::Seq(_) => Ok(None),
-            SpecTy::Named { name, args } => {
+            SpecTy::Enum { name, args } => {
                 let invariant = self
                     .named_invariant(
-                        &SpecTy::Named {
+                        &SpecTy::Enum {
                             name: name.clone(),
                             args: args.clone(),
                         },
@@ -1140,7 +1140,7 @@ impl ValueEncoder {
                     .map(|field| (field.name.clone(), field.ty.clone()))
                     .collect(),
             )]),
-            SpecTy::Named { name, args } => self.named_ctor_specs(name, args),
+            SpecTy::Enum { name, args } => self.named_ctor_specs(name, args),
             other => Err(format!(
                 "expected composite-backed spec type, found {other:?}"
             )),
@@ -1228,7 +1228,7 @@ impl ValueEncoder {
                     })
                     .collect::<Result<Vec<_>, String>>()?,
             })),
-            SpecTy::Named { name, args } => Ok(SpecTy::Named {
+            SpecTy::Enum { name, args } => Ok(SpecTy::Enum {
                 name: name.clone(),
                 args: args
                     .iter()
@@ -1282,7 +1282,7 @@ impl ValueEncoder {
                     .join("_")
             ),
             SpecTy::Struct(struct_ty) => format!("struct_{}", sanitize(&struct_ty.name)),
-            SpecTy::Named { name, args } => self.instantiated_named_type_name(name, args),
+            SpecTy::Enum { name, args } => self.instantiated_named_type_name(name, args),
             SpecTy::Seq(inner) => format!("seq_{}", self.type_name(inner)),
             SpecTy::Ref(inner) => format!("ref_{}", self.type_name(inner)),
             SpecTy::Mut(inner) => format!("mut_{}", self.type_name(inner)),

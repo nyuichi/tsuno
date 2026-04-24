@@ -8,7 +8,7 @@ use crate::directive::{
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
     EnumDef, Expr, GhostMatchArm, LemmaDef, MatchBinding, MatchPattern, PureFnDef, SpecTy,
-    StructFieldTy, StructTy, TypedExpr, TypedExprKind, TypedMatchArm, TypedMatchBinding,
+    StructDef, StructFieldTy, StructTy, TypedExpr, TypedExprKind, TypedMatchArm, TypedMatchBinding,
     parse_ghost_block,
 };
 use rustc_hir::intravisit::{self, Visitor};
@@ -317,6 +317,7 @@ fn compute_raw_global_ghost_prepass<'tcx>(
     let sources = collect_global_ghost_sources(tcx, anchor_span);
 
     let mut enum_defs = Vec::new();
+    let mut struct_defs = Vec::new();
     let mut pure_fn_defs = Vec::new();
     let mut lemma_defs = Vec::new();
     for (span, source) in sources {
@@ -324,6 +325,7 @@ fn compute_raw_global_ghost_prepass<'tcx>(
             &source,
             span,
             &mut enum_defs,
+            &mut struct_defs,
             &mut pure_fn_defs,
             &mut lemma_defs,
         )?;
@@ -343,6 +345,20 @@ fn compute_raw_global_ghost_prepass<'tcx>(
         }
     }
     validate_enum_defs(&enums, anchor_span)?;
+
+    let mut structs = HashMap::new();
+    for struct_def in struct_defs {
+        if structs
+            .insert(struct_def.name.clone(), struct_def.clone())
+            .is_some()
+        {
+            return Err(LoopPrepassError {
+                span: anchor_span,
+                display_span: None,
+                message: format!("duplicate struct name `{}`", struct_def.name),
+            });
+        }
+    }
 
     let mut pure_fns = HashMap::new();
     let mut pure_fn_order = Vec::with_capacity(pure_fn_defs.len());
@@ -519,7 +535,9 @@ fn typed_expr_contains_bind(expr: &TypedExpr) -> bool {
         | TypedExprKind::Int(_)
         | TypedExprKind::Var(_)
         | TypedExprKind::RustVar(_) => false,
-        TypedExprKind::SeqLit(items) => items.iter().any(typed_expr_contains_bind),
+        TypedExprKind::SeqLit(items) | TypedExprKind::StructLit { fields: items } => {
+            items.iter().any(typed_expr_contains_bind)
+        }
         TypedExprKind::Match {
             scrutinee,
             arms,
@@ -734,11 +752,11 @@ fn unify_spec_tys(lhs: &SpecTy, rhs: &SpecTy) -> Result<SpecTy, String> {
             }))
         }
         (
-            SpecTy::Named {
+            SpecTy::Enum {
                 name: lhs_name,
                 args: lhs_args,
             },
-            SpecTy::Named {
+            SpecTy::Enum {
                 name: rhs_name,
                 args: rhs_args,
             },
@@ -747,7 +765,7 @@ fn unify_spec_tys(lhs: &SpecTy, rhs: &SpecTy) -> Result<SpecTy, String> {
             for (lhs_arg, rhs_arg) in lhs_args.iter().zip(rhs_args) {
                 args.push(unify_spec_tys(lhs_arg, rhs_arg)?);
             }
-            Ok(SpecTy::Named {
+            Ok(SpecTy::Enum {
                 name: lhs_name.clone(),
                 args,
             })
@@ -789,7 +807,7 @@ fn display_spec_ty(ty: &SpecTy) -> String {
                 .join(", ")
         ),
         SpecTy::Struct(struct_ty) => struct_ty.name.clone(),
-        SpecTy::Named { name, args } => {
+        SpecTy::Enum { name, args } => {
             if args.is_empty() {
                 name.clone()
             } else {
@@ -812,7 +830,7 @@ fn display_spec_field_ty(field: &StructFieldTy) -> String {
 }
 
 fn nat_spec_ty() -> SpecTy {
-    SpecTy::Named {
+    SpecTy::Enum {
         name: "Nat".to_owned(),
         args: vec![],
     }
@@ -821,8 +839,69 @@ fn nat_spec_ty() -> SpecTy {
 fn is_nat_spec_ty(ty: &SpecTy) -> bool {
     matches!(
         ty,
-        SpecTy::Named { name, args } if name == "Nat" && args.is_empty()
+        SpecTy::Enum { name, args } if name == "Nat" && args.is_empty()
     )
+}
+
+fn type_int_expr_as(
+    lit: &crate::spec::IntLiteral,
+    expected: Option<&SpecTy>,
+    enum_defs: &HashMap<String, EnumDef>,
+) -> Result<TypedExpr, String> {
+    let ty = match (lit.suffix, expected) {
+        (None, Some(expected)) if is_nat_spec_ty(expected) => nat_spec_ty(),
+        _ => lit.spec_ty(),
+    };
+    if is_nat_spec_ty(&ty) {
+        return type_nat_literal_expr(&lit.digits, enum_defs);
+    }
+    Ok(TypedExpr {
+        ty,
+        kind: TypedExprKind::Int(lit.clone()),
+    })
+}
+
+fn type_nat_literal_expr(
+    digits: &str,
+    enum_defs: &HashMap<String, EnumDef>,
+) -> Result<TypedExpr, String> {
+    let value = digits
+        .parse::<u128>()
+        .map_err(|_| format!("invalid Nat literal `{digits}`"))?;
+    let nat_def = enum_defs
+        .get("Nat")
+        .ok_or_else(|| "Nat is missing from the prelude".to_owned())?;
+    let (zero_index, _) = nat_def
+        .ctor("Zero")
+        .ok_or_else(|| "Nat is missing `Zero`".to_owned())?;
+    let mut expr = TypedExpr {
+        ty: nat_spec_ty(),
+        kind: TypedExprKind::CtorCall {
+            enum_name: "Nat".to_owned(),
+            ctor_name: "Zero".to_owned(),
+            ctor_index: zero_index,
+            args: vec![],
+        },
+    };
+    if value == 0 {
+        return Ok(expr);
+    }
+    let bit_len = u128::BITS - value.leading_zeros();
+    for bit_index in (0..bit_len).rev() {
+        let func = if (value >> bit_index) & 1 == 0 {
+            "nat_bit0"
+        } else {
+            "nat_bit1"
+        };
+        expr = TypedExpr {
+            ty: nat_spec_ty(),
+            kind: TypedExprKind::PureCall {
+                func: func.to_owned(),
+                args: vec![expr],
+            },
+        };
+    }
+    Ok(expr)
 }
 
 fn is_integer_spec_ty(ty: &SpecTy) -> bool {
@@ -854,7 +933,7 @@ fn is_fully_inferred_spec_ty(ty: &SpecTy) -> bool {
             .fields
             .iter()
             .all(|field| is_fully_inferred_spec_ty(&field.ty)),
-        SpecTy::Named { args, .. } => args.iter().all(is_fully_inferred_spec_ty),
+        SpecTy::Enum { args, .. } => args.iter().all(is_fully_inferred_spec_ty),
         SpecTy::TypeParam(_) => true,
         SpecTy::Ref(inner) | SpecTy::Mut(inner) => is_fully_inferred_spec_ty(inner),
         _ => true,
@@ -1045,7 +1124,7 @@ fn validate_named_spec_ty(
             }
             Ok(())
         }
-        SpecTy::Named { name, args } => {
+        SpecTy::Enum { name, args } => {
             let Some(enum_def) = enum_defs.get(name) else {
                 return Err(format!("unknown spec type `{name}`"));
             };
@@ -1072,7 +1151,7 @@ fn validate_named_spec_ty(
 }
 
 fn enum_result_ty(enum_def: &EnumDef, type_args: Vec<SpecTy>) -> SpecTy {
-    SpecTy::Named {
+    SpecTy::Enum {
         name: enum_def.name.clone(),
         args: type_args,
     }
@@ -1116,11 +1195,11 @@ fn try_instantiate_spec_ty(ty: &SpecTy, bindings: &HashMap<String, SpecTy>) -> O
                     fields,
                 })
             }),
-        SpecTy::Named { name, args } => args
+        SpecTy::Enum { name, args } => args
             .iter()
             .map(|arg| try_instantiate_spec_ty(arg, bindings))
             .collect::<Option<Vec<_>>>()
-            .map(|args| SpecTy::Named {
+            .map(|args| SpecTy::Enum {
                 name: name.clone(),
                 args,
             }),
@@ -1155,8 +1234,8 @@ fn infer_type_param_bindings(
                 Ok(())
             }
         },
-        SpecTy::Named { name, args } => match actual {
-            SpecTy::Named {
+        SpecTy::Enum { name, args } => match actual {
+            SpecTy::Enum {
                 name: actual_name,
                 args: actual_args,
             } if name == actual_name && args.len() == actual_args.len() => {
@@ -1230,7 +1309,7 @@ fn seed_enum_type_param_bindings(
     expected: &SpecTy,
     bindings: &mut HashMap<String, SpecTy>,
 ) -> Result<bool, String> {
-    let SpecTy::Named { name, args } = expected else {
+    let SpecTy::Enum { name, args } = expected else {
         return Ok(false);
     };
     if *name != enum_def.name {
@@ -1370,6 +1449,73 @@ fn type_seq_lit_expr(
     Ok(TypedExpr {
         ty: SpecTy::Seq(Box::new(item_ty)),
         kind: TypedExprKind::SeqLit(typed_items),
+    })
+}
+
+fn type_struct_lit_expr(
+    name: &str,
+    fields: &[crate::spec::StructLitField],
+    expected: Option<&SpecTy>,
+    type_value: &mut impl FnMut(&Expr, Option<&SpecTy>) -> Result<TypedExpr, String>,
+) -> Result<TypedExpr, String> {
+    let expected_struct = match expected {
+        Some(SpecTy::Struct(struct_ty)) if struct_ty.name == name => Some(struct_ty),
+        Some(other) => {
+            return Err(format!(
+                "struct literal `{name}` requires `{name}`, found `{}`",
+                display_spec_ty(other)
+            ));
+        }
+        None => None,
+    };
+    let mut seen = HashSet::new();
+    let mut struct_fields = Vec::with_capacity(fields.len());
+    let mut typed_fields = Vec::with_capacity(fields.len());
+    for field in fields {
+        if !seen.insert(field.name.clone()) {
+            return Err(format!(
+                "struct literal `{name}` contains duplicate field `{}`",
+                field.name
+            ));
+        }
+        let expected_field = expected_struct
+            .and_then(|struct_ty| struct_ty.field(&field.name).map(|(_, field)| &field.ty));
+        let typed = type_value(&field.value, expected_field)?;
+        struct_fields.push(StructFieldTy {
+            name: field.name.clone(),
+            ty: typed.ty.clone(),
+        });
+        typed_fields.push(typed);
+    }
+    if let Some(expected_struct) = expected_struct {
+        for expected_field in &expected_struct.fields {
+            if !seen.contains(&expected_field.name) {
+                return Err(format!(
+                    "struct literal `{name}` is missing field `{}`",
+                    expected_field.name
+                ));
+            }
+        }
+        struct_fields = expected_struct.fields.clone();
+        let mut by_name = fields
+            .iter()
+            .zip(typed_fields)
+            .map(|(field, typed)| (field.name.clone(), typed))
+            .collect::<HashMap<_, _>>();
+        typed_fields = expected_struct
+            .fields
+            .iter()
+            .map(|field| by_name.remove(&field.name).expect("checked field exists"))
+            .collect();
+    }
+    Ok(TypedExpr {
+        ty: SpecTy::Struct(StructTy {
+            name: name.to_owned(),
+            fields: struct_fields,
+        }),
+        kind: TypedExprKind::StructLit {
+            fields: typed_fields,
+        },
     })
 }
 
@@ -1914,7 +2060,7 @@ fn infer_match_expr_types(
         allow_bare_names,
         None,
     )?;
-    let InferredExprTy::Known(SpecTy::Named {
+    let InferredExprTy::Known(SpecTy::Enum {
         name: scrutinee_enum_name,
         args: scrutinee_type_args,
     }) = scrutinee_ty
@@ -2036,7 +2182,7 @@ fn typed_match_expr(
         allow_bare_names,
         None,
     )?;
-    let SpecTy::Named {
+    let SpecTy::Enum {
         name: scrutinee_enum_name,
         args: scrutinee_type_args,
     } = &scrutinee.ty
@@ -2282,12 +2428,35 @@ fn infer_common_expr_types_with_expected(
 ) -> Result<Option<InferredExprTy>, String> {
     match expr {
         Expr::Bool(_) => Ok(Some(InferredExprTy::Known(SpecTy::Bool))),
-        Expr::Int(lit) => Ok(Some(InferredExprTy::Known(lit.spec_ty()))),
+        Expr::Int(lit) => Ok(Some(InferredExprTy::Known(match (lit.suffix, expected) {
+            (None, Some(expected)) if is_nat_spec_ty(expected) => nat_spec_ty(),
+            _ => lit.spec_ty(),
+        }))),
         Expr::SeqLit(items) => Ok(Some(infer_seq_lit_expr_types(
             items,
             expected,
             &mut |item, expected| infer_expr(item, expected, inferred),
         )?)),
+        Expr::StructLit { name, fields } => {
+            let expected_struct = match expected {
+                Some(SpecTy::Struct(struct_ty)) if struct_ty.name == *name => Some(struct_ty),
+                _ => None,
+            };
+            let mut typed_fields = Vec::with_capacity(fields.len());
+            for field in fields {
+                let field_expected = expected_struct
+                    .and_then(|struct_ty| struct_ty.field(&field.name).map(|(_, field)| &field.ty));
+                let field_ty = infer_expr(&field.value, field_expected, inferred)?;
+                typed_fields.push(StructFieldTy {
+                    name: field.name.clone(),
+                    ty: known_spec_ty(&field_ty).unwrap_or(SpecTy::IntLiteral),
+                });
+            }
+            Ok(Some(InferredExprTy::Known(SpecTy::Struct(StructTy {
+                name: name.clone(),
+                fields: typed_fields,
+            }))))
+        }
         Expr::Call {
             func,
             type_args,
@@ -2478,7 +2647,10 @@ fn infer_contract_expr_types_with_expected(
 ) -> Result<InferredExprTy, String> {
     match expr {
         Expr::Bool(_) => Ok(InferredExprTy::Known(SpecTy::Bool)),
-        Expr::Int(lit) => Ok(InferredExprTy::Known(lit.spec_ty())),
+        Expr::Int(lit) => Ok(InferredExprTy::Known(match (lit.suffix, expected) {
+            (None, Some(expected)) if is_nat_spec_ty(expected) => nat_spec_ty(),
+            _ => lit.spec_ty(),
+        })),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
                 inferred.ensure_var(name);
@@ -2620,7 +2792,10 @@ fn infer_body_expr_types_with_expected(
 ) -> Result<InferredExprTy, String> {
     match expr {
         Expr::Bool(_) => Ok(InferredExprTy::Known(SpecTy::Bool)),
-        Expr::Int(lit) => Ok(InferredExprTy::Known(lit.spec_ty())),
+        Expr::Int(lit) => Ok(InferredExprTy::Known(match (lit.suffix, expected) {
+            (None, Some(expected)) if is_nat_spec_ty(expected) => nat_spec_ty(),
+            _ => lit.spec_ty(),
+        })),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
                 inferred.ensure_var(name);
@@ -2826,10 +3001,7 @@ fn typed_contract_expr_with_expected(
             ty: SpecTy::Bool,
             kind: TypedExprKind::Bool(*value),
         }),
-        Expr::Int(lit) => Ok(TypedExpr {
-            ty: lit.spec_ty(),
-            kind: TypedExprKind::Int(lit.clone()),
-        }),
+        Expr::Int(lit) => type_int_expr_as(lit, expected, enum_defs),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
                 let ty = inferred_spec_var_ty(inferred, name)?;
@@ -2888,6 +3060,23 @@ fn typed_contract_expr_with_expected(
                 expected,
             )
         }),
+        Expr::StructLit { name, fields } => {
+            type_struct_lit_expr(name, fields, expected, &mut |value, expected| {
+                typed_contract_expr_with_expected(
+                    value,
+                    pure_fns,
+                    enum_defs,
+                    type_param_scope,
+                    spec_scope,
+                    params,
+                    allow_result,
+                    result_ty,
+                    inferred,
+                    allow_bare_names,
+                    expected,
+                )
+            })
+        }
         Expr::Match {
             scrutinee,
             arms,
@@ -3193,10 +3382,7 @@ fn typed_body_expr_with_expected(
             ty: SpecTy::Bool,
             kind: TypedExprKind::Bool(*value),
         }),
-        Expr::Int(lit) => Ok(TypedExpr {
-            ty: lit.spec_ty(),
-            kind: TypedExprKind::Int(lit.clone()),
-        }),
+        Expr::Int(lit) => type_int_expr_as(lit, expected, enum_defs),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
                 let ty = inferred_spec_var_ty(inferred, name)?;
@@ -3244,6 +3430,22 @@ fn typed_body_expr_with_expected(
                 expected,
             )
         }),
+        Expr::StructLit { name, fields } => {
+            type_struct_lit_expr(name, fields, expected, &mut |value, expected| {
+                typed_body_expr_with_expected(
+                    value,
+                    pure_fns,
+                    enum_defs,
+                    type_param_scope,
+                    kind,
+                    spec_scope,
+                    local_tys,
+                    inferred,
+                    allow_bare_names,
+                    expected,
+                )
+            })
+        }
         Expr::Match { .. } => Err(unsupported_match_expr_message()),
         Expr::Call {
             func,
@@ -4565,7 +4767,7 @@ fn typed_expr_calls_pure_fn(expr: &TypedExpr, name: &str) -> bool {
         TypedExprKind::PureCall { func, args } => {
             func == name || args.iter().any(|arg| typed_expr_calls_pure_fn(arg, name))
         }
-        TypedExprKind::SeqLit(items) => items
+        TypedExprKind::SeqLit(items) | TypedExprKind::StructLit { fields: items } => items
             .iter()
             .any(|item| typed_expr_calls_pure_fn(item, name)),
         TypedExprKind::Match {
@@ -4674,7 +4876,7 @@ fn validate_recursive_pure_expr(
             }
             Ok(())
         }
-        TypedExprKind::SeqLit(items) => {
+        TypedExprKind::SeqLit(items) | TypedExprKind::StructLit { fields: items } => {
             for item in items {
                 validate_recursive_pure_expr(item, ctx, allowed_recursive_vars)?;
             }
@@ -4725,7 +4927,7 @@ fn validate_recursive_pure_fn(def: &TypedPureFnDef) -> Result<(), String> {
         return Err("recursive pure functions must match on one of their parameters".to_owned());
     };
     let recursive_param = &def.params[recursive_param_index];
-    if !matches!(recursive_param.ty, SpecTy::Named { .. }) {
+    if !matches!(recursive_param.ty, SpecTy::Enum { .. }) {
         return Err("recursive pure functions require a named enum parameter".to_owned());
     }
     let ctx = RecursivePureFnContext {
@@ -4993,7 +5195,7 @@ fn infer_lemma_stmts(
                     result_ty,
                     inferred,
                 )?;
-                let InferredExprTy::Known(SpecTy::Named {
+                let InferredExprTy::Known(SpecTy::Enum {
                     name: scrutinee_enum_name,
                     args: scrutinee_type_args,
                 }) = scrutinee_ty
@@ -5206,7 +5408,7 @@ fn typed_lemma_stmts(
                     result_ty,
                     inferred,
                 )?;
-                let SpecTy::Named {
+                let SpecTy::Enum {
                     name: scrutinee_enum_name,
                     args: scrutinee_type_args,
                 } = &scrutinee.ty
@@ -5436,7 +5638,7 @@ fn validate_recursive_lemma(def: &TypedLemmaDef) -> Result<(), String> {
     else {
         return Err("recursive lemmas must match on one of their parameters".to_owned());
     };
-    if !matches!(def.params[induction_param_index].ty, SpecTy::Named { .. }) {
+    if !matches!(def.params[induction_param_index].ty, SpecTy::Enum { .. }) {
         return Err("recursive lemmas require a named enum parameter".to_owned());
     }
     let ctx = RecursiveLemmaContext {
@@ -5881,6 +6083,7 @@ fn collect_ghost_items_in_source(
     source: &str,
     error_span: Span,
     enums: &mut Vec<EnumDef>,
+    structs: &mut Vec<StructDef>,
     pure_fns: &mut Vec<PureFnDef>,
     lemmas: &mut Vec<LemmaDef>,
 ) -> Result<(), LoopPrepassError> {
@@ -5905,6 +6108,7 @@ fn collect_ghost_items_in_source(
             message: err.to_string(),
         })?;
         enums.extend(parsed.enums);
+        structs.extend(parsed.structs);
         pure_fns.extend(parsed.pure_fns);
         lemmas.extend(parsed.lemmas);
         ghost_item.clear();
@@ -5981,6 +6185,19 @@ fn validate_contract_expr_core(
             for item in items {
                 validate_contract_expr_core(
                     item,
+                    call_ctx,
+                    spec_scope,
+                    params,
+                    allow_result,
+                    allow_bare_names,
+                )?;
+            }
+            Ok(())
+        }
+        Expr::StructLit { fields, .. } => {
+            for field in fields {
+                validate_contract_expr_core(
+                    &field.value,
                     call_ctx,
                     spec_scope,
                     params,
@@ -6197,6 +6414,12 @@ fn resolve_expr_env_into(
         Expr::SeqLit(items) => {
             for item in items {
                 resolve_expr_env_into(item, ctx, resolved)?;
+            }
+            Ok(())
+        }
+        Expr::StructLit { fields, .. } => {
+            for field in fields {
+                resolve_expr_env_into(&field.value, ctx, resolved)?;
             }
             Ok(())
         }
@@ -6533,6 +6756,10 @@ mod tests {
         TypedExprKind,
     };
 
+    fn true_expr() -> Expr {
+        Expr::Bool(true)
+    }
+
     #[test]
     fn preserves_user_pure_call_for_engine_encoding() {
         let pure_fns = HashMap::from([(
@@ -6808,7 +7035,7 @@ mod tests {
                         name: "Cons".to_owned(),
                         fields: vec![
                             SpecTy::TypeParam("T".to_owned()),
-                            SpecTy::Named {
+                            SpecTy::Enum {
                                 name: "List".to_owned(),
                                 args: vec![SpecTy::TypeParam("T".to_owned())],
                             },
@@ -6849,7 +7076,7 @@ mod tests {
 
         assert_eq!(
             typed.ty,
-            SpecTy::Named {
+            SpecTy::Enum {
                 name: "List".to_owned(),
                 args: vec![SpecTy::I32],
             }
@@ -6876,8 +7103,8 @@ mod tests {
                     name: "xs".to_owned(),
                     ty: SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned()))),
                 }],
-                req: Expr::Bool(true),
-                ens: Expr::Bool(true),
+                req: true_expr(),
+                ens: true_expr(),
                 body: vec![],
             },
         )]);

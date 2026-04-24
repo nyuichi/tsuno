@@ -1839,7 +1839,7 @@ impl<'tcx> Verifier<'tcx> {
             | SpecTy::U16
             | SpecTy::U32
             | SpecTy::U64
-            | SpecTy::Named { .. }
+            | SpecTy::Enum { .. }
             | SpecTy::Usize
             | SpecTy::TypeParam(_) => Ok(value.clone()),
         }
@@ -1951,6 +1951,13 @@ impl<'tcx> Verifier<'tcx> {
                     values.push(self.spec_expr_to_value(state, item, resolved)?);
                 }
                 Ok(self.seq_literal_value(&values))
+            }
+            TypedExprKind::StructLit { fields } => {
+                let mut values = Vec::with_capacity(fields.len());
+                for field in fields {
+                    values.push(self.spec_expr_to_value(state, field, resolved)?);
+                }
+                self.construct_composite(&expr.ty, &values)
             }
             TypedExprKind::Var(name) => state.spec_env.get(name).cloned().ok_or_else(|| {
                 self.unsupported_result(
@@ -2138,6 +2145,13 @@ impl<'tcx> Verifier<'tcx> {
                     values.push(self.contract_expr_to_value(current, spec, item)?);
                 }
                 Ok(self.seq_literal_value(&values))
+            }
+            TypedExprKind::StructLit { fields } => {
+                let mut values = Vec::with_capacity(fields.len());
+                for field in fields {
+                    values.push(self.contract_expr_to_value(current, spec, field)?);
+                }
+                self.construct_composite(&expr.ty, &values)
             }
             TypedExprKind::Var(name) => {
                 if let Some(value) = spec.get(name).cloned() {
@@ -2360,6 +2374,16 @@ impl<'tcx> Verifier<'tcx> {
                     values.push(value);
                 }
                 Some(self.seq_literal_value(&values))
+            }
+            TypedExprKind::StructLit { fields } => {
+                let mut values = Vec::with_capacity(fields.len());
+                for field in fields {
+                    let Some(value) = self.try_eval_ground_pure_expr(field, env, span)? else {
+                        return Ok(None);
+                    };
+                    values.push(value);
+                }
+                Some(self.construct_composite(&expr.ty, &values)?)
             }
             TypedExprKind::Var(name) | TypedExprKind::RustVar(name) => env.get(name).cloned(),
             TypedExprKind::CtorCall {
@@ -2995,7 +3019,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn fresh_for_spec_ty(&self, ty: &SpecTy, hint: &str) -> Result<SymValue, VerificationResult> {
-        if matches!(ty, SpecTy::Named { .. }) {
+        if matches!(ty, SpecTy::Enum { .. }) {
             return Ok(SymValue::new(Dynamic::new_const(
                 self.fresh_name(hint),
                 self.value_encoder.value_sort(),
@@ -3088,7 +3112,7 @@ impl<'tcx> Verifier<'tcx> {
             return Ok(decls);
         }
         let decls = with_solver(|solver| {
-            let nat_ty = SpecTy::Named {
+            let nat_ty = SpecTy::Enum {
                 name: "Nat".to_owned(),
                 args: vec![],
             };
@@ -3176,7 +3200,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn nat_spec_ty() -> SpecTy {
-        SpecTy::Named {
+        SpecTy::Enum {
             name: "Nat".to_owned(),
             args: vec![],
         }
@@ -3488,7 +3512,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(Some(bool_and(formulas)))
             }
-            SpecTy::Named { .. } => self.named_invariant_formula(ty, value, span).map(Some),
+            SpecTy::Enum { .. } => self.named_invariant_formula(ty, value, span).map(Some),
             SpecTy::TypeParam(_) => Ok(None),
         }
     }
@@ -3553,7 +3577,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(bool_and(formulas))
             }
-            SpecTy::Named { .. } => self.named_invariant_formula(ty, value, span),
+            SpecTy::Enum { .. } => self.named_invariant_formula(ty, value, span),
             SpecTy::TypeParam(_) => Ok(Bool::from_bool(true)),
         }
     }
@@ -3881,7 +3905,7 @@ fn collect_typed_expr_pure_fn_refs(expr: &TypedExpr, out: &mut BTreeSet<String>)
         | TypedExprKind::Int(_)
         | TypedExprKind::Var(_)
         | TypedExprKind::RustVar(_) => {}
-        TypedExprKind::SeqLit(items) => {
+        TypedExprKind::SeqLit(items) | TypedExprKind::StructLit { fields: items } => {
             for item in items {
                 collect_typed_expr_pure_fn_refs(item, out);
             }
