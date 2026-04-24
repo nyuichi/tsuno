@@ -5884,20 +5884,22 @@ fn collect_ghost_items_in_source(
     pure_fns: &mut Vec<PureFnDef>,
     lemmas: &mut Vec<LemmaDef>,
 ) -> Result<(), LoopPrepassError> {
-    let mut cursor = 0usize;
-    while let Some(start) = source[cursor..].find("/*@") {
-        let start = cursor + start;
-        let body_start = start + 3;
-        let Some(end_rel) = source[body_start..].find("*/") else {
-            return Err(LoopPrepassError {
-                span: error_span,
-                display_span: None,
-                message: "unclosed /*@ ghost block".to_owned(),
-            });
-        };
-        let end = body_start + end_rel;
-        let block = &source[body_start..end];
-        let parsed = parse_ghost_block(block).map_err(|err| LoopPrepassError {
+    let mut ghost_item = Vec::new();
+    for comment in crate::spec::collect_spec_comments(source) {
+        if ghost_item.is_empty() {
+            if !crate::spec::is_ghost_item_block(&comment.text) {
+                continue;
+            }
+            ghost_item.push(comment);
+        } else {
+            ghost_item.push(comment);
+        }
+
+        let block = crate::spec::spec_comment_group_text(&ghost_item);
+        if !crate::spec::is_complete_ghost_item_comment(&block) {
+            continue;
+        }
+        let parsed = parse_ghost_block(&block).map_err(|err| LoopPrepassError {
             span: error_span,
             display_span: None,
             message: err.to_string(),
@@ -5905,7 +5907,7 @@ fn collect_ghost_items_in_source(
         enums.extend(parsed.enums);
         pure_fns.extend(parsed.pure_fns);
         lemmas.extend(parsed.lemmas);
-        cursor = end + 2;
+        ghost_item.clear();
     }
     Ok(())
 }

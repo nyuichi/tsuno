@@ -4,8 +4,8 @@ This document describes the spec language that is implemented today. It covers o
 
 The language appears in two places:
 
-- line directives such as `//@ let`, `//@ req`, `//@ ens`, `//@ assert`, `//@ assume`, `//@ inv`, and `//@ lemma_name(...)`
-- ghost blocks written as `/*@ ... */`
+- directives written in spec comments, such as `//@ let`, `//@ req`, `//@ ens`, `//@ assert`, `//@ assume`, `//@ inv`, and `//@ lemma_name(...)`
+- ghost item blocks written as `/*@ ... */` whose contents begin with `fn` or `enum`
 
 ## 1. Where Spec Code Appears
 
@@ -17,6 +17,28 @@ fn add1(x: i32) -> i32
 //@ ens result == {x} + 1
 {
     x + 1
+}
+```
+
+The line form `//@` and the block form `/*@ ... */` are treated like one stream of doc comments. Consecutive comments are joined before parsing, so a predicate may be split across both forms.
+
+```rust
+fn add1(x: i32) -> i32
+//@ req {x} >= 0 &&
+/*@    {x} <= 2147483647 */
+//@ ens result == {x} + 1
+{
+    x + 1
+}
+```
+
+Multiple contract directives may also appear in one spec comment.
+
+```rust
+fn id(x: i32) -> i32
+//@ req true ens result == {x}
+{
+    x
 }
 ```
 
@@ -36,6 +58,13 @@ Let bindings, assertions, assumptions, and lemma calls appear inside executable 
 //@ helper_lemma({x});
 ```
 
+Block comments may be used for statement directives as well.
+
+```rust
+/*@ assert {x} == {x} &&
+    true; */
+```
+
 Rules:
 
 - `//@ let name = expr;`, `//@ assert`, `//@ assume`, and lemma calls require a trailing `;`
@@ -46,6 +75,16 @@ Loop invariants appear immediately before the loop body.
 ```rust
 while x < n
   //@ inv 0 <= {x} && {x} <= {n}
+{
+    x = x + 1;
+}
+```
+
+The block form is equivalent here too.
+
+```rust
+while x < n
+  /*@ inv 0 <= {x} && {x} <= {n} */
 {
     x = x + 1;
 }
@@ -75,6 +114,20 @@ fn add1(x: i32) -> i32 {
     x + 1i32
 }
 */
+```
+
+Ghost item blocks can also be written with line comments, or by mixing line and block comments.
+
+```rust
+//@ fn trivial(n: Nat)
+//@   req true
+//@   ens true
+//@ {}
+
+/*@ fn also_trivial(n: Nat) */
+//@   req true
+/*@   ens true */
+//@ {}
 ```
 
 Interpolation composes with the surrounding spec syntax. The content of `{...}` is a single Rust binding name, not a general Rust expression.
