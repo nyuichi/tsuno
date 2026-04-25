@@ -4233,7 +4233,7 @@ fn compute_directives<'tcx>(
     let mut typed_body_assertions = HashMap::new();
     let mut typed_body_exprs = HashMap::new();
     let mut typed_body_lets = HashMap::new();
-    let mut body_type_scope = if req_directive.is_some() {
+    let mut body_type_scope = if req_directive.is_some() || !contract_lets.is_empty() {
         let mut scope = contract_type_scope.clone();
         if let Some(directive) = req_directive {
             let _ = typed_runtime_contract_expr(
@@ -4431,33 +4431,28 @@ fn compute_directives<'tcx>(
         None => None,
     };
     let function_contract = match (req_directive, ens_directive) {
-        (None, None) if contract_lets.is_empty() => Some(FunctionContract {
-            params: params.clone(),
-            req: NormalizedPredicate {
-                bindings: Vec::new(),
-                condition: typed_bool_expr(true),
-            },
-            req_span: def_span.clone(),
-            ens: typed_bool_expr(true),
-            ens_span: def_span,
-            result,
-        }),
-        (Some(req), Some(ens)) => Some(FunctionContract {
-            params: params.clone(),
-            req: typed_req.expect("typed req"),
-            req_span: req.span_text.clone(),
-            ens: typed_ens.expect("typed ens"),
-            ens_span: ens.span_text.clone(),
-            result,
-        }),
-        _ => {
+        (None, None) if !contract_lets.is_empty() => {
             return Err(LoopPrepassError {
                 span: tcx.def_span(def_id.to_def_id()),
                 display_span: None,
-                message: "function contract requires exactly one //@ req and one //@ ens"
-                    .to_owned(),
+                message: "function contract requires a //@ req or //@ ens predicate".to_owned(),
             });
         }
+        (req, ens) => Some(FunctionContract {
+            params: params.clone(),
+            req: typed_req.unwrap_or_else(|| NormalizedPredicate {
+                bindings: typed_contract_lets,
+                condition: typed_bool_expr(true),
+            }),
+            req_span: req
+                .map(|directive| directive.span_text.clone())
+                .unwrap_or_else(|| def_span.clone()),
+            ens: typed_ens.unwrap_or_else(|| typed_bool_expr(true)),
+            ens_span: ens
+                .map(|directive| directive.span_text.clone())
+                .unwrap_or(def_span),
+            result,
+        }),
     };
     let loop_contracts =
         collect_loop_contracts(tcx, body, &directives, &resolved_exprs, &typed_body_exprs)?;
