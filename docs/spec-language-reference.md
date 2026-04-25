@@ -45,7 +45,9 @@ fn id(x: i32) -> i32
 Rules:
 
 - a function may omit the contract entirely
-- if a contract is present, it must contain exactly one `//@ req` and exactly one `//@ ens`
+- if a contract is present, it must contain at least one of `//@ req` or `//@ ens`
+- a missing `//@ req` is treated as `//@ req true`, and a missing `//@ ens` is treated as `//@ ens true`
+- a contract may contain at most one `//@ req` and at most one `//@ ens`
 - both lines must appear immediately before the body
 - `result` is only available bare in `//@ ens`
 
