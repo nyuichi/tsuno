@@ -1,4 +1,30 @@
 /*@
+enum Option<T> {
+    None,
+    Some(T),
+}
+
+struct Provenance {
+    alloc_id: Int,
+}
+
+struct Ptr {
+    addr: usize,
+    prov: Option<Provenance>,
+    ty: RustTy,
+}
+
+struct Ref<T> {
+    deref: T,
+    ptr: Ptr,
+}
+
+struct Mut<T> {
+    cur: T,
+    fin: T,
+    ptr: Ptr,
+}
+
 enum Nat {
     Zero,
     Succ(Nat),

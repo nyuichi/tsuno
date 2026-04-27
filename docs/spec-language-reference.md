@@ -99,13 +99,14 @@ Rules:
 
 ## 2. Writing Expressions
 
-Spec expressions are written directly. In runtime specs (`req`, `ens`, `assert`, `assume`, `inv`, and runtime lemma calls), a bare identifier refers only to a visible spec binder. The only built-in bare name is `result` in `ens`. A Rust binding must be written as `{name}`.
+Spec expressions are written directly. In runtime specs (`req`, `ens`, `assert`, `assume`, `inv`, and runtime lemma calls), a bare identifier refers only to a visible spec binder. The only built-in bare name is `result` in `ens`. A Rust binding must be written as `{name}`. A Rust type value is written as `{type T}`.
 
 ```rust
 //@ assert {x} == 1i32;
 //@ assert *{r} == 1i32;
 //@ assert {pair}.left == 1i32;
 //@ assert {pair}.0 == 1i32;
+//@ assert {p}.ty == {type i32};
 ```
 
 Inside ghost blocks, ordinary ghost parameters and local names are written bare.
@@ -132,12 +133,15 @@ Ghost item blocks can also be written with line comments, or by mixing line and 
 //@ {}
 ```
 
-Interpolation composes with the surrounding spec syntax. The content of `{...}` is a single Rust binding name, not a general Rust expression.
+Interpolation composes with the surrounding spec syntax. The content of `{...}` is either a single Rust binding name or `type` followed by a Rust type.
 
 ```text
 {x}
 *{r}
 {pair}.0
+{type i32}
+{type T}
+{type *const T}
 ```
 
 String-literal wrappers are not part of the language.
@@ -305,9 +309,14 @@ The surface type syntax accepts:
 
 ```text
 bool
+RustTy
+Int
 i8   i16   i32   i64   isize
 u8   u16   u32   u64   usize
 Seq<T>
+Ref<T>
+Mut<T>
+Ptr
 Name
 Name<T1, T2, ...>
 T
@@ -324,9 +333,10 @@ enum List<T> {
 fn len(xs: List<i32>) -> i32 { ... }
 ```
 
-Integer literals may be unsuffixed or use one of the integer suffixes above.
-In a `Nat` context, an unsuffixed integer literal is interpreted as a `Nat`.
-The `Nat` suffix makes this explicit.
+`Int` is an unbounded mathematical integer. Integer literals may be unsuffixed
+or use one of the integer suffixes above. In an `Int` context, an unsuffixed
+integer literal is interpreted as an `Int`; in a `Nat` context, it is interpreted
+as a `Nat`. The `Nat` suffix makes this explicit.
 
 ```text
 0
@@ -343,13 +353,91 @@ Equality and inequality require matching spec types. Equality on `Ref<T>` and `M
 
 ## 5. References, Fields, Tuples, and Sequences
 
-Shared references can be dereferenced with `*`.
+The prelude declares the reference and pointer model types used for Rust
+references and raw pointers.
+
+```rust
+enum Option<T> {
+    None,
+    Some(T),
+}
+
+struct Provenance {
+    alloc_id: Int,
+}
+
+struct Ptr {
+    addr: usize,
+    prov: Option<Provenance>,
+    ty: RustTy,
+}
+
+struct Ref<T> {
+    deref: T,
+    ptr: Ptr,
+}
+
+struct Mut<T> {
+    cur: T,
+    fin: T,
+    ptr: Ptr,
+}
+```
+
+`RustTy` is a builtin spec type used to represent Rust types as spec values.
+Each Rust type has a corresponding `RustTy` value, produced with `{type ...}`.
+For example, `{type i32}` denotes the model value for Rust `i32`, and `{type T}`
+denotes the model value for the Rust type parameter `T` in the surrounding
+Rust item. Distinct observed Rust type values are treated as distinct by the
+solver.
+`Provenance` currently records only `alloc_id`; borrow tags for Tree Borrows are
+not part of the model yet. Rust raw pointer types are modeled as `Ptr`.
+`Ref<T>` and `Mut<T>` values require `ptr.prov` to be `Some(_)`; raw `Ptr`
+values may have no provenance because null, dangling, and integer-derived
+pointers are representable.
+
+Pointers created from Rust places carry a stable place-derived identity. Taking
+`&x`, `&raw const x`, or `&raw mut x` gives a pointer whose `prov` is
+`Some(Provenance { alloc_id: ... })`; taking a pointer to a field keeps the same
+allocation id and uses `base_addr + offset`, where field offsets come from
+rustc's type layout query for the Rust type. Repeating a borrow of the same
+place gives the same modeled `addr` and `prov`. Different live locals get
+different allocation ids and non-overlapping address ranges. Layout-dependent
+pointer formation currently supports field projections, including fields below
+a dereferenced reference or raw pointer; DST metadata and non-field projections
+are not modeled yet.
+
+Strict-provenance APIs can be used through ordinary local wrapper contracts.
+For example:
+
+```rust
+fn ptr_eq_u8(lhs: *const u8, rhs: *const u8) -> bool
+//@ req true
+//@ ens result == ({lhs}.addr == {rhs}.addr)
+{
+    //@ assume false;
+    std::ptr::eq(lhs, rhs)
+}
+
+fn null_u8() -> *const u8
+//@ req true
+//@ ens result.addr == 0usize && result.prov == Option::<Provenance>::None && result.ty == {type u8}
+{
+    //@ assume false;
+    std::ptr::null::<u8>()
+}
+```
+
+Shared references can be dereferenced with `*`. After type checking, `*r` for a
+`Ref<T>` is desugared to `r.deref`.
 
 ```rust
 //@ assert *{x} == {y};
 ```
 
-Mutable references expose both the current value through `*` and the final value through `.fin`.
+Mutable references expose the current value through `*` and `.cur`, the final
+value through `.fin`, and the modeled pointer through `.ptr`. After type
+checking, `*r` for a `Mut<T>` is desugared to `r.cur`.
 
 ```rust
 //@ let Old = *{xs};

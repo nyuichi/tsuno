@@ -7,9 +7,9 @@ use crate::directive::{
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
-    EnumDef, Expr, GhostMatchArm, LemmaDef, MatchBinding, MatchPattern, PureFnDef, SpecTy,
-    StructDef, StructFieldTy, StructTy, TypedExpr, TypedExprKind, TypedMatchArm, TypedMatchBinding,
-    parse_ghost_block,
+    EnumDef, Expr, GhostMatchArm, LemmaDef, MatchBinding, MatchPattern, PureFnDef, RustTyKey,
+    RustTypeExpr, SpecTy, StructDef, StructFieldTy, StructTy, TypedExpr, TypedExprKind,
+    TypedMatchArm, TypedMatchBinding, parse_ghost_block, ptr_spec_ty,
 };
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{HirId, Pat, PatKind};
@@ -534,7 +534,8 @@ fn typed_expr_contains_bind(expr: &TypedExpr) -> bool {
         TypedExprKind::Bool(_)
         | TypedExprKind::Int(_)
         | TypedExprKind::Var(_)
-        | TypedExprKind::RustVar(_) => false,
+        | TypedExprKind::RustVar(_)
+        | TypedExprKind::RustType(_) => false,
         TypedExprKind::SeqLit(items) | TypedExprKind::StructLit { fields: items } => {
             items.iter().any(typed_expr_contains_bind)
         }
@@ -552,8 +553,6 @@ fn typed_expr_contains_bind(expr: &TypedExpr) -> bool {
         }
         TypedExprKind::Field { base, .. }
         | TypedExprKind::TupleField { base, .. }
-        | TypedExprKind::Deref { base }
-        | TypedExprKind::Fin { base }
         | TypedExprKind::Unary { arg: base, .. } => typed_expr_contains_bind(base),
         TypedExprKind::Index { base, index } => {
             typed_expr_contains_bind(base) || typed_expr_contains_bind(index)
@@ -568,6 +567,13 @@ fn typed_bool_expr(value: bool) -> TypedExpr {
     TypedExpr {
         ty: SpecTy::Bool,
         kind: TypedExprKind::Bool(value),
+    }
+}
+
+fn typed_rust_type_expr(expr: &RustTypeExpr) -> TypedExpr {
+    TypedExpr {
+        ty: SpecTy::RustTy,
+        kind: TypedExprKind::RustType(RustTyKey::new(expr.text.clone())),
     }
 }
 
@@ -710,6 +716,8 @@ fn unify_spec_tys(lhs: &SpecTy, rhs: &SpecTy) -> Result<SpecTy, String> {
     match (lhs, rhs) {
         (SpecTy::Bool, SpecTy::Bool) => Ok(SpecTy::Bool),
         (SpecTy::IntLiteral, SpecTy::IntLiteral) => Ok(SpecTy::IntLiteral),
+        (SpecTy::Int, rhs) if is_integer_spec_ty(rhs) => Ok(SpecTy::Int),
+        (lhs, SpecTy::Int) if is_integer_spec_ty(lhs) => Ok(SpecTy::Int),
         (SpecTy::IntLiteral, rhs) if is_concrete_integer_spec_ty(rhs) => Ok(rhs.clone()),
         (lhs, SpecTy::IntLiteral) if is_concrete_integer_spec_ty(lhs) => Ok(lhs.clone()),
         (lhs, rhs) if lhs == rhs => Ok(lhs.clone()),
@@ -784,6 +792,8 @@ fn unify_spec_tys(lhs: &SpecTy, rhs: &SpecTy) -> Result<SpecTy, String> {
 fn display_spec_ty(ty: &SpecTy) -> String {
     match ty {
         SpecTy::Bool => "bool".to_owned(),
+        SpecTy::RustTy => "RustTy".to_owned(),
+        SpecTy::Int => "Int".to_owned(),
         SpecTy::IntLiteral => "{integer}".to_owned(),
         SpecTy::I8 => "i8".to_owned(),
         SpecTy::I16 => "i16".to_owned(),
@@ -907,7 +917,8 @@ fn type_nat_literal_expr(
 fn is_integer_spec_ty(ty: &SpecTy) -> bool {
     matches!(
         ty,
-        SpecTy::IntLiteral
+        SpecTy::Int
+            | SpecTy::IntLiteral
             | SpecTy::I8
             | SpecTy::I16
             | SpecTy::I32
@@ -1041,6 +1052,8 @@ pub fn spec_ty_for_rust_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<Spec
             ty::UintTy::Usize => SpecTy::Usize,
             other => return Err(format!("unsupported integer type {other:?}")),
         }),
+        TyKind::RawPtr(_, _) => Ok(ptr_spec_ty()),
+        TyKind::Param(param) => Ok(SpecTy::TypeParam(param.name.to_string())),
         TyKind::Ref(_, inner, mutability) => {
             let inner = spec_ty_for_rust_ty(tcx, *inner)?;
             if mutability.is_mut() {
@@ -1100,6 +1113,8 @@ fn validate_named_spec_ty(
 ) -> Result<(), String> {
     match ty {
         SpecTy::Bool
+        | SpecTy::RustTy
+        | SpecTy::Int
         | SpecTy::IntLiteral
         | SpecTy::I8
         | SpecTy::I16
@@ -1144,8 +1159,8 @@ fn validate_named_spec_ty(
             .contains(name)
             .then_some(())
             .ok_or_else(|| format!("unbound spec type parameter `{name}`")),
-        SpecTy::Ref(_) | SpecTy::Mut(_) => {
-            Err("Ref<T> and Mut<T> are not supported in spec enum definitions".to_owned())
+        SpecTy::Ref(inner) | SpecTy::Mut(inner) => {
+            validate_named_spec_ty(inner, enum_defs, type_params)
         }
     }
 }
@@ -1160,6 +1175,8 @@ fn enum_result_ty(enum_def: &EnumDef, type_args: Vec<SpecTy>) -> SpecTy {
 fn try_instantiate_spec_ty(ty: &SpecTy, bindings: &HashMap<String, SpecTy>) -> Option<SpecTy> {
     match ty {
         SpecTy::Bool => Some(SpecTy::Bool),
+        SpecTy::RustTy => Some(SpecTy::RustTy),
+        SpecTy::Int => Some(SpecTy::Int),
         SpecTy::IntLiteral => Some(SpecTy::IntLiteral),
         SpecTy::I8 => Some(SpecTy::I8),
         SpecTy::I16 => Some(SpecTy::I16),
@@ -2432,6 +2449,7 @@ fn infer_common_expr_types_with_expected(
             (None, Some(expected)) if is_nat_spec_ty(expected) => nat_spec_ty(),
             _ => lit.spec_ty(),
         }))),
+        Expr::RustType(_) => Ok(Some(InferredExprTy::Known(SpecTy::RustTy))),
         Expr::SeqLit(items) => Ok(Some(infer_seq_lit_expr_types(
             items,
             expected,
@@ -2651,6 +2669,7 @@ fn infer_contract_expr_types_with_expected(
             (None, Some(expected)) if is_nat_spec_ty(expected) => nat_spec_ty(),
             _ => lit.spec_ty(),
         })),
+        Expr::RustType(_) => Ok(InferredExprTy::Known(SpecTy::RustTy)),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
                 inferred.ensure_var(name);
@@ -2796,6 +2815,7 @@ fn infer_body_expr_types_with_expected(
             (None, Some(expected)) if is_nat_spec_ty(expected) => nat_spec_ty(),
             _ => lit.spec_ty(),
         })),
+        Expr::RustType(_) => Ok(InferredExprTy::Known(SpecTy::RustTy)),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
                 inferred.ensure_var(name);
@@ -2865,12 +2885,21 @@ fn infer_named_field_expr_type(
             .field(name)
             .map(|(_, field)| InferredExprTy::Known(field.ty.clone()))
             .unwrap_or(InferredExprTy::Unknown)),
-        InferredExprTy::Known(SpecTy::Mut(inner)) if name == "fin" => {
+        InferredExprTy::Known(SpecTy::Ref(inner)) if name == "deref" => {
             Ok(InferredExprTy::Known(*inner))
+        }
+        InferredExprTy::Known(SpecTy::Ref(_)) if name == "ptr" => {
+            Ok(InferredExprTy::Known(ptr_spec_ty()))
+        }
+        InferredExprTy::Known(SpecTy::Mut(inner)) if name == "cur" || name == "fin" => {
+            Ok(InferredExprTy::Known(*inner))
+        }
+        InferredExprTy::Known(SpecTy::Mut(_)) if name == "ptr" => {
+            Ok(InferredExprTy::Known(ptr_spec_ty()))
         }
         InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
         InferredExprTy::Known(other) => Err(format!(
-            "field access requires a struct or Mut<T>. found `{}`",
+            "field access requires a struct, Ref<T>, or Mut<T>. found `{}`",
             display_spec_ty(&other)
         )),
     }
@@ -3002,6 +3031,7 @@ fn typed_contract_expr_with_expected(
             kind: TypedExprKind::Bool(*value),
         }),
         Expr::Int(lit) => type_int_expr_as(lit, expected, enum_defs),
+        Expr::RustType(expr) => Ok(typed_rust_type_expr(expr)),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
                 let ty = inferred_spec_var_ty(inferred, name)?;
@@ -3215,18 +3245,7 @@ fn typed_contract_expr_with_expected(
                 allow_bare_names,
                 None,
             )?;
-            match &base.ty {
-                SpecTy::Ref(inner) | SpecTy::Mut(inner) => Ok(TypedExpr {
-                    ty: (**inner).clone(),
-                    kind: TypedExprKind::Deref {
-                        base: Box::new(base),
-                    },
-                }),
-                other => Err(format!(
-                    "dereference requires Ref<T> or Mut<T>, found `{}`",
-                    display_spec_ty(other)
-                )),
-            }
+            type_deref_expr(base)
         }
         Expr::Unary { op, arg } => {
             let arg = typed_contract_expr_with_expected(
@@ -3383,6 +3402,7 @@ fn typed_body_expr_with_expected(
             kind: TypedExprKind::Bool(*value),
         }),
         Expr::Int(lit) => type_int_expr_as(lit, expected, enum_defs),
+        Expr::RustType(expr) => Ok(typed_rust_type_expr(expr)),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
                 let ty = inferred_spec_var_ty(inferred, name)?;
@@ -3560,18 +3580,7 @@ fn typed_body_expr_with_expected(
                 allow_bare_names,
                 None,
             )?;
-            match &base.ty {
-                SpecTy::Ref(inner) | SpecTy::Mut(inner) => Ok(TypedExpr {
-                    ty: (**inner).clone(),
-                    kind: TypedExprKind::Deref {
-                        base: Box::new(base),
-                    },
-                }),
-                other => Err(format!(
-                    "dereference requires Ref<T> or Mut<T>, found `{}`",
-                    display_spec_ty(other)
-                )),
-            }
+            type_deref_expr(base)
         }
         Expr::Unary { op, arg } => {
             let arg = typed_body_expr_with_expected(
@@ -3760,15 +3769,64 @@ fn type_binary_expr(
 }
 
 fn type_named_field_expr(base: TypedExpr, name: &str) -> Result<TypedExpr, String> {
-    if name == "fin"
-        && let SpecTy::Mut(inner) = &base.ty
-    {
-        return Ok(TypedExpr {
-            ty: (**inner).clone(),
-            kind: TypedExprKind::Fin {
-                base: Box::new(base),
-            },
-        });
+    match (base.ty.clone(), name) {
+        (SpecTy::Ref(inner), "deref") => {
+            return Ok(TypedExpr {
+                ty: *inner,
+                kind: TypedExprKind::Field {
+                    base: Box::new(base),
+                    name: name.to_owned(),
+                    index: 0,
+                },
+            });
+        }
+        (SpecTy::Ref(_), "ptr") => {
+            return Ok(TypedExpr {
+                ty: ptr_spec_ty(),
+                kind: TypedExprKind::Field {
+                    base: Box::new(base),
+                    name: name.to_owned(),
+                    index: 1,
+                },
+            });
+        }
+        (SpecTy::Mut(inner), "cur") => {
+            return Ok(TypedExpr {
+                ty: *inner,
+                kind: TypedExprKind::Field {
+                    base: Box::new(base),
+                    name: name.to_owned(),
+                    index: 0,
+                },
+            });
+        }
+        (SpecTy::Mut(inner), "fin") => {
+            return Ok(TypedExpr {
+                ty: *inner,
+                kind: TypedExprKind::Field {
+                    base: Box::new(base),
+                    name: name.to_owned(),
+                    index: 1,
+                },
+            });
+        }
+        (SpecTy::Mut(_), "ptr") => {
+            return Ok(TypedExpr {
+                ty: ptr_spec_ty(),
+                kind: TypedExprKind::Field {
+                    base: Box::new(base),
+                    name: name.to_owned(),
+                    index: 2,
+                },
+            });
+        }
+        (SpecTy::Ref(_), _) => {
+            return Err(format!("Ref<T> does not have a field named `{name}`"));
+        }
+        (SpecTy::Mut(_), _) => {
+            return Err(format!("Mut<T> does not have a field named `{name}`"));
+        }
+        _ => {}
     }
     let SpecTy::Struct(struct_ty) = &base.ty else {
         return Err(format!(
@@ -3790,6 +3848,31 @@ fn type_named_field_expr(base: TypedExpr, name: &str) -> Result<TypedExpr, Strin
             index,
         },
     })
+}
+
+fn type_deref_expr(base: TypedExpr) -> Result<TypedExpr, String> {
+    match base.ty.clone() {
+        SpecTy::Ref(inner) => Ok(TypedExpr {
+            ty: *inner,
+            kind: TypedExprKind::Field {
+                base: Box::new(base),
+                name: "deref".to_owned(),
+                index: 0,
+            },
+        }),
+        SpecTy::Mut(inner) => Ok(TypedExpr {
+            ty: *inner,
+            kind: TypedExprKind::Field {
+                base: Box::new(base),
+                name: "cur".to_owned(),
+                index: 0,
+            },
+        }),
+        other => Err(format!(
+            "dereference requires Ref<T> or Mut<T>, found `{}`",
+            display_spec_ty(&other)
+        )),
+    }
 }
 
 fn type_tuple_field_expr(base: TypedExpr, index: usize) -> Result<TypedExpr, String> {
@@ -4783,8 +4866,6 @@ fn typed_expr_calls_pure_fn(expr: &TypedExpr, name: &str) -> bool {
         }
         TypedExprKind::Field { base, .. }
         | TypedExprKind::TupleField { base, .. }
-        | TypedExprKind::Deref { base }
-        | TypedExprKind::Fin { base }
         | TypedExprKind::Unary { arg: base, .. } => typed_expr_calls_pure_fn(base, name),
         TypedExprKind::Index { base, index } => {
             typed_expr_calls_pure_fn(base, name) || typed_expr_calls_pure_fn(index, name)
@@ -4795,7 +4876,8 @@ fn typed_expr_calls_pure_fn(expr: &TypedExpr, name: &str) -> bool {
         TypedExprKind::Bool(_)
         | TypedExprKind::Int(_)
         | TypedExprKind::Var(_)
-        | TypedExprKind::RustVar(_) => false,
+        | TypedExprKind::RustVar(_)
+        | TypedExprKind::RustType(_) => false,
     }
 }
 
@@ -4879,8 +4961,6 @@ fn validate_recursive_pure_expr(
         }
         TypedExprKind::Field { base, .. }
         | TypedExprKind::TupleField { base, .. }
-        | TypedExprKind::Deref { base }
-        | TypedExprKind::Fin { base }
         | TypedExprKind::Unary { arg: base, .. } => {
             validate_recursive_pure_expr(base, ctx, allowed_recursive_vars)
         }
@@ -4895,7 +4975,8 @@ fn validate_recursive_pure_expr(
         TypedExprKind::Bool(_)
         | TypedExprKind::Int(_)
         | TypedExprKind::Var(_)
-        | TypedExprKind::RustVar(_) => Ok(()),
+        | TypedExprKind::RustVar(_)
+        | TypedExprKind::RustType(_) => Ok(()),
     }
 }
 
@@ -5534,7 +5615,7 @@ fn recursive_lemma_measure(
         TypedExprKind::Var(name) => size_map
             .get(name)
             .and_then(|(root, depth)| (root == &param.name).then_some(*depth)),
-        TypedExprKind::RustVar(_) => None,
+        TypedExprKind::RustVar(_) | TypedExprKind::RustType(_) => None,
         _ => None,
     }
 }
@@ -5593,7 +5674,7 @@ fn validate_recursive_lemma_stmts(
             } => {
                 let branch_root = match &scrutinee.kind {
                     TypedExprKind::Var(name) => size_map.get(name).cloned(),
-                    TypedExprKind::RustVar(_) => None,
+                    TypedExprKind::RustVar(_) | TypedExprKind::RustType(_) => None,
                     _ => None,
                 };
                 for arm in arms {
@@ -6151,7 +6232,7 @@ fn validate_contract_expr_core(
     allow_bare_names: bool,
 ) -> Result<(), String> {
     match expr {
-        Expr::Bool(_) | Expr::Int(_) => Ok(()),
+        Expr::Bool(_) | Expr::Int(_) | Expr::RustType(_) => Ok(()),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
                 return Ok(());
@@ -6355,7 +6436,7 @@ fn resolve_expr_env_into(
     resolved: &mut ResolvedExprEnv,
 ) -> Result<(), LoopPrepassError> {
     match expr {
-        Expr::Bool(_) | Expr::Int(_) => Ok(()),
+        Expr::Bool(_) | Expr::Int(_) | Expr::RustType(_) => Ok(()),
         Expr::Var(name) => {
             if ctx.spec_scope.visible.contains(name) {
                 return Ok(());

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::str::FromStr;
 
-use crate::spec::{BinaryOp, EnumDef, SpecTy, StructTy, UnaryOp};
+use crate::spec::{BinaryOp, EnumDef, RustTyKey, SpecTy, StructTy, UnaryOp, ptr_spec_ty};
 use z3::ast::{self, Ast, Bool, Dynamic, Int, Seq as Z3Seq};
 use z3::{DeclKind, FuncDecl, Pattern, Solver, Sort, Symbol};
 
@@ -214,6 +214,8 @@ pub(crate) struct ValueEncoder {
     enum_family_encodings: RefCell<BTreeMap<String, Rc<EnumFamilyEncoding>>>,
     type_encodings: RefCell<BTreeMap<SpecTy, Rc<TypeEncoding>>>,
     asserted_type_axioms: RefCell<BTreeSet<SpecTy>>,
+    rust_ty_values: RefCell<BTreeMap<RustTyKey, SymValue>>,
+    asserted_rust_ty_distinct: RefCell<BTreeSet<(RustTyKey, RustTyKey)>>,
 }
 
 impl ValueEncoder {
@@ -242,16 +244,34 @@ impl ValueEncoder {
             enum_family_encodings: RefCell::new(BTreeMap::new()),
             type_encodings: RefCell::new(BTreeMap::new()),
             asserted_type_axioms: RefCell::new(BTreeSet::new()),
+            rust_ty_values: RefCell::new(BTreeMap::new()),
+            asserted_rust_ty_distinct: RefCell::new(BTreeSet::new()),
         }
     }
 
     pub(crate) fn reset_solver_state(&self) {
         self.primitive_axioms_asserted.set(false);
         self.asserted_type_axioms.borrow_mut().clear();
+        self.asserted_rust_ty_distinct.borrow_mut().clear();
     }
 
     pub(crate) fn register_enum_def(&self, def: EnumDef) {
         self.enum_defs.borrow_mut().insert(def.name.clone(), def);
+    }
+
+    pub(crate) fn enum_ctor_index(
+        &self,
+        enum_name: &str,
+        ctor_name: &str,
+    ) -> Result<usize, String> {
+        let enum_defs = self.enum_defs.borrow();
+        let enum_def = enum_defs
+            .get(enum_name)
+            .ok_or_else(|| format!("unknown spec enum `{enum_name}`"))?;
+        enum_def
+            .ctor(ctor_name)
+            .map(|(index, _)| index)
+            .ok_or_else(|| format!("unknown constructor `{enum_name}::{ctor_name}`"))
     }
 
     pub(crate) fn value_sort(&self) -> &Sort {
@@ -264,7 +284,8 @@ impl ValueEncoder {
         solver: &Solver,
     ) -> Result<Rc<TypeEncoding>, String> {
         self.ensure_primitive_axioms(solver);
-        if let Some(encoding) = self.type_encodings.borrow().get(ty).cloned() {
+        let cached = { self.type_encodings.borrow().get(ty).cloned() };
+        if let Some(encoding) = cached {
             if !self.asserted_type_axioms.borrow().contains(ty) {
                 self.asserted_type_axioms.borrow_mut().insert(ty.clone());
                 self.assert_type_axioms(ty, &encoding, solver)?;
@@ -386,6 +407,38 @@ impl ValueEncoder {
         self.wrap_bool(&Bool::from_bool(value))
     }
 
+    pub(crate) fn rust_ty_value(&self, key: &RustTyKey, solver: &Solver) -> SymValue {
+        let value = {
+            let mut values = self.rust_ty_values.borrow_mut();
+            values
+                .entry(key.clone())
+                .or_insert_with(|| {
+                    SymValue::new(Dynamic::new_const(
+                        format!("rust_ty_{}", self.sanitize_name(key.as_str())),
+                        &self.value_sort,
+                    ))
+                })
+                .clone()
+        };
+
+        let values = self.rust_ty_values.borrow();
+        let mut asserted = self.asserted_rust_ty_distinct.borrow_mut();
+        for (other_key, other_value) in values.iter() {
+            if other_key == key {
+                continue;
+            }
+            let pair = if key < other_key {
+                (key.clone(), other_key.clone())
+            } else {
+                (other_key.clone(), key.clone())
+            };
+            if asserted.insert(pair) {
+                solver.assert(value.dynamic().eq(other_value.dynamic()).not());
+            }
+        }
+        value
+    }
+
     pub(crate) fn int_value(&self, value: i64) -> SymValue {
         self.wrap_int(&Int::from_i64(value))
     }
@@ -440,6 +493,9 @@ impl ValueEncoder {
         if let Some(equal) = self.try_ground_eq_for_spec_ty(ty, lhs, rhs)? {
             return Ok(Bool::from_bool(equal));
         }
+        if let Some(equal) = self.try_direct_composite_eq_for_spec_ty(ty, lhs, rhs, solver)? {
+            return Ok(equal);
+        }
         let encoding = self.type_encoding(ty, solver)?;
         Ok(match &encoding.kind {
             TypeEncodingKind::Bool => self.bool_term(lhs).eq(self.bool_term(rhs)),
@@ -492,7 +548,9 @@ impl ValueEncoder {
                 .as_bool()
                 .zip(self.bool_term(rhs).as_bool())
                 .map(|(lhs, rhs)| lhs == rhs)),
-            SpecTy::IntLiteral
+            SpecTy::RustTy => Ok(None),
+            SpecTy::Int
+            | SpecTy::IntLiteral
             | SpecTy::I8
             | SpecTy::I16
             | SpecTy::I32
@@ -511,9 +569,118 @@ impl ValueEncoder {
             | SpecTy::Struct(_)
             | SpecTy::Enum { .. }
             | SpecTy::Ref(_)
-            | SpecTy::Mut(_)
-            | SpecTy::TypeParam(_) => Ok(None),
+            | SpecTy::Mut(_) => self.try_ground_composite_eq_for_spec_ty(ty, lhs, rhs),
+            SpecTy::TypeParam(_) => Ok(None),
         }
+    }
+
+    fn try_ground_composite_eq_for_spec_ty(
+        &self,
+        ty: &SpecTy,
+        lhs: &SymValue,
+        rhs: &SymValue,
+    ) -> Result<Option<bool>, String> {
+        let encoding = self.unasserted_type_encoding(ty)?;
+        let TypeEncodingKind::Composite(composite) = &encoding.kind else {
+            return Ok(None);
+        };
+        let lhs_ctor = composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| lhs.dynamic().decl().name() == ctor.symbol.name());
+        let rhs_ctor = composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| rhs.dynamic().decl().name() == ctor.symbol.name());
+        let (Some((lhs_index, lhs_ctor)), Some((rhs_index, rhs_ctor))) = (lhs_ctor, rhs_ctor)
+        else {
+            return Ok(None);
+        };
+        if lhs_index != rhs_index {
+            return Ok(Some(false));
+        }
+        let lhs_children = lhs.dynamic().children();
+        let rhs_children = rhs.dynamic().children();
+        if lhs_children.len() != lhs_ctor.fields.len()
+            || rhs_children.len() != rhs_ctor.fields.len()
+        {
+            return Ok(None);
+        }
+        for (field, lhs_child, rhs_child) in lhs_ctor
+            .fields
+            .iter()
+            .zip(lhs_children)
+            .zip(rhs_children)
+            .map(|((field, lhs_child), rhs_child)| (field, lhs_child, rhs_child))
+        {
+            let lhs_child = SymValue::new(lhs_child);
+            let rhs_child = SymValue::new(rhs_child);
+            let Some(equal) = self.try_ground_eq_for_spec_ty(&field.ty, &lhs_child, &rhs_child)?
+            else {
+                return Ok(None);
+            };
+            if !equal {
+                return Ok(Some(false));
+            }
+        }
+        Ok(Some(true))
+    }
+
+    fn try_direct_composite_eq_for_spec_ty(
+        &self,
+        ty: &SpecTy,
+        lhs: &SymValue,
+        rhs: &SymValue,
+        solver: &Solver,
+    ) -> Result<Option<Bool>, String> {
+        let encoding = self.unasserted_type_encoding(ty)?;
+        let TypeEncodingKind::Composite(composite) = &encoding.kind else {
+            return Ok(None);
+        };
+        let lhs_ctor = composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| lhs.dynamic().decl().name() == ctor.symbol.name());
+        let rhs_ctor = composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| rhs.dynamic().decl().name() == ctor.symbol.name());
+        let (Some((lhs_index, lhs_ctor)), Some((rhs_index, rhs_ctor))) = (lhs_ctor, rhs_ctor)
+        else {
+            return Ok(None);
+        };
+        if lhs_index != rhs_index {
+            return Ok(Some(Bool::from_bool(false)));
+        }
+
+        let lhs_children = lhs.dynamic().children();
+        let rhs_children = rhs.dynamic().children();
+        if lhs_children.len() != lhs_ctor.fields.len()
+            || rhs_children.len() != rhs_ctor.fields.len()
+        {
+            return Ok(None);
+        }
+
+        let mut fields = Vec::with_capacity(lhs_ctor.fields.len());
+        for (field, lhs_child, rhs_child) in lhs_ctor
+            .fields
+            .iter()
+            .zip(lhs_children)
+            .zip(rhs_children)
+            .map(|((field, lhs_child), rhs_child)| (field, lhs_child, rhs_child))
+        {
+            fields.push(self.eq_for_spec_ty(
+                &field.ty,
+                &SymValue::new(lhs_child),
+                &SymValue::new(rhs_child),
+                solver,
+            )?);
+        }
+        Ok(Some(bool_conjoin(fields)))
     }
 
     pub(crate) fn lower_unary_value(&self, op: UnaryOp, value: &SymValue) -> SymValue {
@@ -572,6 +739,32 @@ impl ValueEncoder {
         solver: &Solver,
     ) -> Result<SymValue, String> {
         let composite = self.composite_encoding(ty, solver)?;
+        let ctor = composite
+            .constructors
+            .get(ctor_index)
+            .ok_or_else(|| format!("constructor index {ctor_index} out of range"))?;
+        if fields.len() != ctor.fields.len() {
+            return Err(format!(
+                "constructor `{}` expects {} fields, found {}",
+                ctor.name,
+                ctor.fields.len(),
+                fields.len()
+            ));
+        }
+        let args = fields.iter().map(SymValue::ast).collect::<Vec<_>>();
+        Ok(SymValue::new(ctor.symbol.apply(&args)))
+    }
+
+    pub(crate) fn construct_composite_ctor_without_axioms(
+        &self,
+        ty: &SpecTy,
+        ctor_index: usize,
+        fields: &[SymValue],
+    ) -> Result<SymValue, String> {
+        let encoding = self.unasserted_type_encoding(ty)?;
+        let TypeEncodingKind::Composite(composite) = &encoding.kind else {
+            return Err(format!("expected composite-backed spec type, found {ty:?}"));
+        };
         let ctor = composite
             .constructors
             .get(ctor_index)
@@ -663,6 +856,7 @@ impl ValueEncoder {
 
     pub(crate) fn int_bounds(&self, ty: &SpecTy) -> Result<Option<(Int, Int)>, String> {
         Ok(Some(match ty {
+            SpecTy::Int => return Ok(None),
             SpecTy::IntLiteral => return Ok(None),
             SpecTy::I8 => (Int::from_i64(i8::MIN.into()), Int::from_i64(i8::MAX.into())),
             SpecTy::I16 => (
@@ -691,7 +885,9 @@ impl ValueEncoder {
     fn build_type_encoding(&self, ty: &SpecTy) -> Result<Rc<TypeEncoding>, String> {
         let (kind, sort) = match ty {
             SpecTy::Bool => (TypeEncodingKind::Bool, self.value_sort.clone()),
-            SpecTy::IntLiteral
+            SpecTy::RustTy => (TypeEncodingKind::Opaque, self.value_sort.clone()),
+            SpecTy::Int
+            | SpecTy::IntLiteral
             | SpecTy::I8
             | SpecTy::I16
             | SpecTy::I32
@@ -714,6 +910,18 @@ impl ValueEncoder {
             SpecTy::TypeParam(_) => (TypeEncodingKind::Opaque, self.value_sort.clone()),
         };
         Ok(Rc::new(TypeEncoding { kind, sort }))
+    }
+
+    fn unasserted_type_encoding(&self, ty: &SpecTy) -> Result<Rc<TypeEncoding>, String> {
+        let cached = { self.type_encodings.borrow().get(ty).cloned() };
+        if let Some(encoding) = cached {
+            return Ok(encoding);
+        }
+        let encoding = self.build_type_encoding(ty)?;
+        self.type_encodings
+            .borrow_mut()
+            .insert(ty.clone(), encoding.clone());
+        Ok(encoding)
     }
 
     fn build_composite_encoding(&self, ty: &SpecTy) -> Result<Rc<CompositeEncoding>, String> {
@@ -917,7 +1125,7 @@ impl ValueEncoder {
             | TypeEncodingKind::Seq => Ok(()),
             TypeEncodingKind::Composite(composite) => {
                 if matches!(ty, SpecTy::Enum { .. }) {
-                    self.assert_composite_axioms(composite, solver);
+                    self.assert_composite_axioms(composite, solver)?;
                     self.assert_named_invariant_axioms(ty, composite, solver)?;
                 }
                 Ok(())
@@ -933,16 +1141,23 @@ impl ValueEncoder {
         self.primitive_axioms_asserted.set(true);
     }
 
-    fn assert_composite_axioms(&self, composite: &CompositeEncoding, solver: &Solver) {
+    fn assert_composite_axioms(
+        &self,
+        composite: &CompositeEncoding,
+        solver: &Solver,
+    ) -> Result<(), String> {
         for ctor in &composite.constructors {
             let args = ctor
                 .fields
                 .iter()
                 .enumerate()
-                .map(|(index, _)| {
-                    Dynamic::new_const(format!("{}_arg_{index}", ctor.name), &self.value_sort)
+                .map(|(index, field)| {
+                    Ok(Dynamic::new_const(
+                        format!("{}_arg_{index}", ctor.name),
+                        &self.sort_for_spec_ty(&field.ty)?,
+                    ))
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, String>>()?;
             let arg_refs = args.iter().map(|arg| arg as &dyn Ast).collect::<Vec<_>>();
             let constructor_app = ctor.symbol.apply(&arg_refs);
             let tag_eq = composite
@@ -977,6 +1192,7 @@ impl ValueEncoder {
             let pattern = Pattern::new(&[&reconstructed]);
             solver.assert(ast::forall_const(&[&value], &[&pattern], &body));
         }
+        Ok(())
     }
 
     fn assert_named_invariant_axioms(
@@ -994,10 +1210,13 @@ impl ValueEncoder {
                 .fields
                 .iter()
                 .enumerate()
-                .map(|(index, _)| {
-                    Dynamic::new_const(format!("{}_inv_arg_{index}", ctor.name), &self.value_sort)
+                .map(|(index, field)| {
+                    Ok(Dynamic::new_const(
+                        format!("{}_inv_arg_{index}", ctor.name),
+                        &self.sort_for_spec_ty(&field.ty)?,
+                    ))
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, String>>()?;
             let arg_refs = args.iter().map(|arg| arg as &dyn Ast).collect::<Vec<_>>();
             let constructor_app = ctor.symbol.apply(&arg_refs);
             let inv_app = invariant
@@ -1071,7 +1290,9 @@ impl ValueEncoder {
     ) -> Result<Option<Bool>, String> {
         match ty {
             SpecTy::Bool => Ok(None),
-            SpecTy::IntLiteral
+            SpecTy::RustTy => Ok(None),
+            SpecTy::Int
+            | SpecTy::IntLiteral
             | SpecTy::I8
             | SpecTy::I16
             | SpecTy::I32
@@ -1089,6 +1310,51 @@ impl ValueEncoder {
             })),
             SpecTy::TypeParam(_) => Ok(None),
             SpecTy::Seq(_) => Ok(None),
+            SpecTy::Ref(inner) => {
+                let composite = self.composite_encoding(ty, solver)?;
+                let deref = self.project_composite_field(&composite, value, 0)?;
+                let mut forms = vec![self.tag_formula(&composite, 0, value)?];
+                if let Some(formula) = self.field_invariant_formula(inner, &deref, solver)? {
+                    forms.push(formula);
+                }
+                Ok(Some(bool_conjoin(forms)))
+            }
+            SpecTy::Mut(inner) => {
+                let composite = self.composite_encoding(ty, solver)?;
+                let current = self.project_composite_field(&composite, value, 0)?;
+                let mut forms = vec![self.tag_formula(&composite, 0, value)?];
+                if let Some(formula) = self.field_invariant_formula(inner, &current, solver)? {
+                    forms.push(formula);
+                }
+                Ok(Some(bool_conjoin(forms)))
+            }
+            SpecTy::Tuple(items) => {
+                let composite = self.composite_encoding(ty, solver)?;
+                let mut forms = vec![self.tag_formula(&composite, 0, value)?];
+                for (index, item_ty) in items.iter().enumerate() {
+                    let field = self.project_composite_field(&composite, value, index)?;
+                    if let Some(formula) = self.field_invariant_formula(item_ty, &field, solver)? {
+                        forms.push(formula);
+                    }
+                }
+                Ok(Some(bool_conjoin(forms)))
+            }
+            SpecTy::Struct(struct_ty) => {
+                let composite = self.composite_encoding(ty, solver)?;
+                if struct_ty.name == "Ptr" {
+                    return Ok(Some(self.tag_formula(&composite, 0, value)?));
+                }
+                let mut forms = vec![self.tag_formula(&composite, 0, value)?];
+                for (index, field_ty) in struct_ty.fields.iter().enumerate() {
+                    let field = self.project_composite_field(&composite, value, index)?;
+                    if let Some(formula) =
+                        self.field_invariant_formula(&field_ty.ty, &field, solver)?
+                    {
+                        forms.push(formula);
+                    }
+                }
+                Ok(Some(bool_conjoin(forms)))
+            }
             SpecTy::Enum { name, args } => {
                 let invariant = self
                     .named_invariant(
@@ -1106,9 +1372,6 @@ impl ValueEncoder {
                         .expect("named invariant predicate"),
                 ))
             }
-            other => Err(format!(
-                "unsupported spec enum field type in invariant encoding: {other:?}"
-            )),
         }
     }
 
@@ -1116,13 +1379,17 @@ impl ValueEncoder {
         match ty {
             SpecTy::Ref(inner) => Ok(vec![(
                 String::new(),
-                vec![("deref".to_owned(), (**inner).clone())],
+                vec![
+                    ("deref".to_owned(), (**inner).clone()),
+                    ("ptr".to_owned(), ptr_spec_ty()),
+                ],
             )]),
             SpecTy::Mut(inner) => Ok(vec![(
                 String::new(),
                 vec![
                     ("cur".to_owned(), (**inner).clone()),
                     ("fin".to_owned(), (**inner).clone()),
+                    ("ptr".to_owned(), ptr_spec_ty()),
                 ],
             )]),
             SpecTy::Tuple(items) => Ok(vec![(
@@ -1195,6 +1462,8 @@ impl ValueEncoder {
     ) -> Result<SpecTy, String> {
         match ty {
             SpecTy::Bool => Ok(SpecTy::Bool),
+            SpecTy::RustTy => Ok(SpecTy::RustTy),
+            SpecTy::Int => Ok(SpecTy::Int),
             SpecTy::IntLiteral => Ok(SpecTy::IntLiteral),
             SpecTy::I8 => Ok(SpecTy::I8),
             SpecTy::I16 => Ok(SpecTy::I16),
@@ -1239,9 +1508,12 @@ impl ValueEncoder {
                 .get(name)
                 .cloned()
                 .ok_or_else(|| format!("unbound spec type parameter `{name}` in enum encoding")),
-            SpecTy::Ref(_) | SpecTy::Mut(_) => Err(format!(
-                "unsupported spec enum field type in value encoding: {ty:?}"
-            )),
+            SpecTy::Ref(inner) => Ok(SpecTy::Ref(Box::new(
+                self.instantiate_named_field_ty(inner, bindings)?,
+            ))),
+            SpecTy::Mut(inner) => Ok(SpecTy::Mut(Box::new(
+                self.instantiate_named_field_ty(inner, bindings)?,
+            ))),
         }
     }
 
@@ -1262,6 +1534,8 @@ impl ValueEncoder {
 
         match ty {
             SpecTy::Bool => "bool".to_owned(),
+            SpecTy::RustTy => "rust_ty".to_owned(),
+            SpecTy::Int => "int".to_owned(),
             SpecTy::IntLiteral => "int_lit".to_owned(),
             SpecTy::I8 => "i8".to_owned(),
             SpecTy::I16 => "i16".to_owned(),

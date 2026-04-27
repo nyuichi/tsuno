@@ -4,6 +4,7 @@ pub enum Expr {
     Int(IntLiteral),
     Var(String),
     Interpolated(String),
+    RustType(RustTypeExpr),
     SeqLit(Vec<Expr>),
     StructLit {
         name: String,
@@ -84,6 +85,7 @@ pub enum TypedExprKind {
     Int(IntLiteral),
     Var(String),
     RustVar(String),
+    RustType(RustTyKey),
     SeqLit(Vec<TypedExpr>),
     StructLit {
         fields: Vec<TypedExpr>,
@@ -115,12 +117,6 @@ pub enum TypedExprKind {
     Index {
         base: Box<TypedExpr>,
         index: Box<TypedExpr>,
-    },
-    Deref {
-        base: Box<TypedExpr>,
-    },
-    Fin {
-        base: Box<TypedExpr>,
     },
     Unary {
         op: UnaryOp,
@@ -206,8 +202,32 @@ impl IntLiteral {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RustTypeExpr {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RustTyKey {
+    canonical: String,
+}
+
+impl RustTyKey {
+    pub fn new(canonical: impl Into<String>) -> Self {
+        Self {
+            canonical: canonical.into(),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.canonical
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SpecTy {
     Bool,
+    RustTy,
+    Int,
     IntLiteral,
     I8,
     I16,
@@ -308,6 +328,7 @@ pub struct EnumCtorDef {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StructDef {
     pub name: String,
+    pub type_params: Vec<String>,
     pub fields: Vec<StructFieldTy>,
 }
 
@@ -330,6 +351,47 @@ impl StructTy {
 pub struct StructFieldTy {
     pub name: String,
     pub ty: SpecTy,
+}
+
+pub fn rust_ty_spec_ty() -> SpecTy {
+    SpecTy::RustTy
+}
+
+pub fn option_spec_ty(inner: SpecTy) -> SpecTy {
+    SpecTy::Enum {
+        name: "Option".to_owned(),
+        args: vec![inner],
+    }
+}
+
+pub fn provenance_spec_ty() -> SpecTy {
+    SpecTy::Struct(StructTy {
+        name: "Provenance".to_owned(),
+        fields: vec![StructFieldTy {
+            name: "alloc_id".to_owned(),
+            ty: SpecTy::Int,
+        }],
+    })
+}
+
+pub fn ptr_spec_ty() -> SpecTy {
+    SpecTy::Struct(StructTy {
+        name: "Ptr".to_owned(),
+        fields: vec![
+            StructFieldTy {
+                name: "addr".to_owned(),
+                ty: SpecTy::Usize,
+            },
+            StructFieldTy {
+                name: "prov".to_owned(),
+                ty: option_spec_ty(provenance_spec_ty()),
+            },
+            StructFieldTy {
+                name: "ty".to_owned(),
+                ty: rust_ty_spec_ty(),
+            },
+        ],
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -573,6 +635,7 @@ enum Token {
     Minus,
     Star,
     Bang,
+    Amp,
     EqEq,
     Ne,
     Gt,
@@ -741,10 +804,11 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
             }
             '&' => {
                 chars.next();
-                if chars.next() == Some('&') {
+                if chars.peek() == Some(&'&') {
+                    chars.next();
                     tokens.push(Token::AndAnd);
                 } else {
-                    return Err(ParseError::new("unexpected `&` in spec expression"));
+                    tokens.push(Token::Amp);
                 }
             }
             '|' => {
@@ -1117,6 +1181,12 @@ impl Parser {
             Vec::new()
         };
         match ident.as_str() {
+            "Int" if args.is_empty() => Ok(SpecTy::Int),
+            "RustTy" if args.is_empty() => Ok(SpecTy::RustTy),
+            "RustTy" => Err(ParseError::new(format!(
+                "spec type `RustTy` expects 0 type arguments, found {}",
+                args.len()
+            ))),
             "i8" if args.is_empty() => Ok(SpecTy::I8),
             "i16" if args.is_empty() => Ok(SpecTy::I16),
             "i32" if args.is_empty() => Ok(SpecTy::I32),
@@ -1131,6 +1201,26 @@ impl Parser {
             "Seq" if args.len() == 1 => Ok(SpecTy::Seq(Box::new(args[0].clone()))),
             "Seq" => Err(ParseError::new(format!(
                 "spec type `Seq` expects 1 type argument, found {}",
+                args.len()
+            ))),
+            "Ref" if args.len() == 1 => Ok(SpecTy::Ref(Box::new(args[0].clone()))),
+            "Ref" => Err(ParseError::new(format!(
+                "spec type `Ref` expects 1 type argument, found {}",
+                args.len()
+            ))),
+            "Mut" if args.len() == 1 => Ok(SpecTy::Mut(Box::new(args[0].clone()))),
+            "Mut" => Err(ParseError::new(format!(
+                "spec type `Mut` expects 1 type argument, found {}",
+                args.len()
+            ))),
+            "Provenance" if args.is_empty() => Ok(provenance_spec_ty()),
+            "Provenance" => Err(ParseError::new(format!(
+                "spec type `Provenance` expects 0 type arguments, found {}",
+                args.len()
+            ))),
+            "Ptr" if args.is_empty() => Ok(ptr_spec_ty()),
+            "Ptr" => Err(ParseError::new(format!(
+                "spec type `Ptr` expects 0 type arguments, found {}",
                 args.len()
             ))),
             _ if args.is_empty() && self.type_params.iter().any(|param| param == &ident) => {
@@ -1222,6 +1312,11 @@ impl Parser {
                         ));
                     }
                 };
+                if name == "type" {
+                    let text = self.parse_rust_type_expr_text()?;
+                    self.expect(&Token::RBrace)?;
+                    return Ok(Expr::RustType(RustTypeExpr { text }));
+                }
                 if self.tokens.get(self.cursor) != Some(&Token::RBrace) {
                     return Err(ParseError::new(
                         "expected `}` after Rust binding name in `{...}`",
@@ -1233,6 +1328,86 @@ impl Parser {
             Some(Token::LBracket) => self.parse_seq_literal(),
             _ => Err(ParseError::new("expected a spec expression")),
         }
+    }
+
+    fn parse_rust_type_expr_text(&mut self) -> Result<String, ParseError> {
+        let ty = self.parse_rust_type_text()?;
+        if self.tokens.get(self.cursor) != Some(&Token::RBrace) {
+            return Err(ParseError::new(
+                "expected `}` after Rust type in `{type ...}`",
+            ));
+        }
+        Ok(ty)
+    }
+
+    fn parse_rust_type_text(&mut self) -> Result<String, ParseError> {
+        if self.eat(&Token::Amp) {
+            let mutability = match self.tokens.get(self.cursor) {
+                Some(Token::Ident(ident)) if ident == "mut" => {
+                    self.cursor += 1;
+                    "mut "
+                }
+                _ => "",
+            };
+            let inner = self.parse_rust_type_text()?;
+            return Ok(format!("&{mutability}{inner}"));
+        }
+        if self.eat(&Token::Star) {
+            let kind = match self.next().cloned() {
+                Some(Token::Ident(kind)) if kind == "const" || kind == "mut" => kind,
+                _ => {
+                    return Err(ParseError::new(
+                        "expected `const` or `mut` after `*` in Rust type",
+                    ));
+                }
+            };
+            let inner = self.parse_rust_type_text()?;
+            return Ok(format!("*{kind} {inner}"));
+        }
+        if self.eat(&Token::LParen) {
+            if self.eat(&Token::RParen) {
+                return Ok("()".to_owned());
+            }
+            let mut items = Vec::new();
+            loop {
+                items.push(self.parse_rust_type_text()?);
+                if self.eat(&Token::RParen) {
+                    break;
+                }
+                self.expect(&Token::Comma)?;
+            }
+            return Ok(format!("({})", items.join(", ")));
+        }
+
+        let mut text = match self.next().cloned() {
+            Some(Token::Ident(ident)) => ident,
+            _ => return Err(ParseError::new("expected Rust type after `{type`")),
+        };
+        while self.eat(&Token::ColonColon) {
+            let Some(Token::Ident(segment)) = self.next().cloned() else {
+                return Err(ParseError::new(
+                    "expected path segment after `::` in Rust type",
+                ));
+            };
+            text.push_str("::");
+            text.push_str(&segment);
+        }
+        if self.eat(&Token::Lt) {
+            let mut args = Vec::new();
+            if !self.eat(&Token::Gt) {
+                loop {
+                    args.push(self.parse_rust_type_text()?);
+                    if self.eat(&Token::Gt) {
+                        break;
+                    }
+                    self.expect(&Token::Comma)?;
+                }
+            }
+            text.push('<');
+            text.push_str(&args.join(", "));
+            text.push('>');
+        }
+        Ok(text)
     }
 
     fn parse_struct_literal(&mut self, name: String) -> Result<Expr, ParseError> {
@@ -1452,9 +1627,6 @@ impl<'a> GhostBlockParser<'a> {
     fn parse_struct_def(&mut self) -> Result<StructDef, ParseError> {
         let name = self.parse_ident()?;
         let type_params = self.parse_type_params()?;
-        if !type_params.is_empty() {
-            return Err(ParseError::new("generic spec structs are unsupported"));
-        }
         self.expect_char('{')?;
         let mut fields = Vec::new();
         loop {
@@ -1476,7 +1648,11 @@ impl<'a> GhostBlockParser<'a> {
             self.expect_char('}')?;
             break;
         }
-        Ok(StructDef { name, fields })
+        Ok(StructDef {
+            name,
+            type_params,
+            fields,
+        })
     }
 
     fn parse_pure_fn_def(
@@ -1910,9 +2086,9 @@ impl<'a> GhostBlockParser<'a> {
 mod tests {
     use super::{
         BinaryOp, EnumCtorDef, EnumDef, Expr, GhostBlock, GhostStmt, IntLiteral, IntSuffix,
-        LemmaDef, MatchArm, MatchBinding, MatchPattern, PureFnDef, PureFnParam, SpecTy, StructDef,
-        StructFieldTy, parse_expr, parse_ghost_block, parse_pure_fn_block, parse_raw_expr,
-        parse_spec_ty_text_with_params,
+        LemmaDef, MatchArm, MatchBinding, MatchPattern, PureFnDef, PureFnParam, RustTypeExpr,
+        SpecTy, StructDef, StructFieldTy, parse_expr, parse_ghost_block, parse_pure_fn_block,
+        parse_raw_expr, parse_spec_ty_text_with_params,
     };
 
     fn true_expr() -> Expr {
@@ -2181,6 +2357,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_rust_type_expression() {
+        let expr = parse_raw_expr("assert", r#"{type *const T}"#).expect("rust type");
+        assert_eq!(
+            expr,
+            Expr::RustType(RustTypeExpr {
+                text: "*const T".to_owned(),
+            })
+        );
+    }
+
+    #[test]
     fn parses_spec_type_text_with_type_params() {
         let ty =
             parse_spec_ty_text_with_params("Seq<T>", &["T".to_owned()]).expect("generic spec type");
@@ -2326,6 +2513,7 @@ struct Foo {
             block.structs,
             vec![StructDef {
                 name: "Foo".to_owned(),
+                type_params: vec![],
                 fields: vec![
                     StructFieldTy {
                         name: "bar".to_owned(),
