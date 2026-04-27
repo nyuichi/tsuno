@@ -7,6 +7,7 @@
 // | `bool`                             | `bool`              | boxed value                 | `true` |
 // | `i8`, `i16`, `i32`, `i64`, `isize` | same as Rust        | boxed value                 | width bounds |
 // | `u8`, `u16`, `u32`, `u64`, `usize` | same as Rust        | boxed value                 | width bounds |
+// | raw pointers                       | `Ptr`               | constructor over values     | pointer tag |
 // | `&T`                               | `Ref<T>`            | constructor over values     | `inv<T>(deref(x))` |
 // | `&mut T`                           | `Mut<T>`            | constructor over values     | `inv<T>(cur(x))` |
 // | `(T0, .., Tn)`                     | `Tuple([T0, .., Tn])` | constructor over values   | conjunction of field invariants |
@@ -14,6 +15,8 @@
 //
 // Notes:
 // - `Mut<T>` additionally requires `cur(x) == fin(x)` when the mutable reference is closed.
+// - `Ref<T>` and `Mut<T>` carry a `ptr: Ptr` field whose provenance must be
+//   present. Raw `Ptr` values may still have no provenance.
 // - Structs with `Drop`, generic structs, and recursive structs are unsupported.
 
 use std::cell::{Cell, RefCell};
@@ -30,6 +33,7 @@ use rustc_middle::mir::{
     AggregateKind, BasicBlock, BinOp, Body, BorrowKind, ConstOperand, Local, MutBorrowKind,
     Operand, Place, PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnOp,
 };
+use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::source_map::Spanned;
 use rustc_span::{DUMMY_SP, Span};
@@ -43,7 +47,10 @@ use crate::prepass::{
     TypedLemmaDef, TypedPureFnDef, spec_ty_for_rust_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
-use crate::spec::{BinaryOp, SpecTy, TypedExpr, TypedExprKind, TypedMatchBinding, UnaryOp};
+use crate::spec::{
+    BinaryOp, RustTyKey, SpecTy, TypedExpr, TypedExprKind, TypedMatchBinding, UnaryOp,
+    option_spec_ty, provenance_spec_ty, ptr_spec_ty,
+};
 use crate::value::{CompositeEncoding, SymValue, TypeEncoding, TypeEncodingKind, ValueEncoder};
 
 const SOLVER_TIMEOUT_MS: u32 = 1_000;
@@ -77,8 +84,16 @@ pub struct ControlPoint {
 pub struct State {
     pc: Bool,
     model: BTreeMap<Local, SymValue>,
+    allocs: BTreeMap<Local, Allocation>,
     spec_env: HashMap<String, SymValue>,
     ctrl: ControlPoint,
+}
+
+#[derive(Debug, Clone)]
+struct Allocation {
+    alloc_id: SymValue,
+    base_addr: SymValue,
+    size: u64,
 }
 
 struct BuiltinNatDecls {
@@ -414,6 +429,7 @@ impl<'tcx> Verifier<'tcx> {
         let mut state = State {
             pc: Bool::from_bool(true),
             model: BTreeMap::new(),
+            allocs: BTreeMap::new(),
             spec_env: HashMap::new(),
             ctrl: ControlPoint {
                 basic_block: BasicBlock::from_usize(0),
@@ -429,6 +445,7 @@ impl<'tcx> Verifier<'tcx> {
             let ty = self.body().local_decls[local].ty;
             let value = self.fresh_for_rust_ty(ty, &format!("arg_{}", local.as_usize()))?;
             state.model.insert(local, value);
+            self.create_allocation(&mut state, local, "arg_alloc", self.report_span())?;
         }
         {
             let contract = self.current_contract();
@@ -454,12 +471,14 @@ impl<'tcx> Verifier<'tcx> {
                 let ty = self.body().local_decls[*local].ty;
                 let value = self.fresh_for_rust_ty(ty, &format!("live_{}", local.as_usize()))?;
                 state.model.insert(*local, value);
+                self.create_allocation(&mut state, *local, "live_alloc", stmt.source_info.span)?;
             }
             StatementKind::StorageDead(local) => {
                 let ty = self.body().local_decls[*local].ty;
                 if self.ty_contains_mut_ref(ty) {
                     self.resolve_and_remove_local(&mut state, *local, stmt.source_info.span)?;
                 }
+                state.allocs.remove(local);
             }
             StatementKind::Assign(assign) => {
                 let (place, rvalue) = &**assign;
@@ -627,12 +646,12 @@ impl<'tcx> Verifier<'tcx> {
         target: Option<BasicBlock>,
         span: Span,
     ) -> Result<Vec<State>, VerificationResult> {
-        let callee = self.called_def_id(func);
-        if let Some(def_id) = callee {
+        let callee = self.called_local_def_id(func);
+        if let Some(local_def_id) = callee {
             let contract = self
                 .contracts
-                .get(&def_id)
-                .ok_or_else(|| self.missing_local_contract_result(def_id, span))?;
+                .get(&local_def_id)
+                .ok_or_else(|| self.missing_local_contract_result(local_def_id, span))?;
             let env = self.call_env(&state, args, contract, span, HashMap::new())?;
             let spec =
                 self.bind_contract_spec_values(&env.current, &env.spec, &contract.req.bindings)?;
@@ -780,6 +799,7 @@ impl<'tcx> Verifier<'tcx> {
         let mut merged = State {
             pc: Bool::from_bool(false),
             model: BTreeMap::new(),
+            allocs: BTreeMap::new(),
             spec_env: HashMap::new(),
             ctrl,
         };
@@ -823,6 +843,50 @@ impl<'tcx> Verifier<'tcx> {
                 self.add_path_condition(&mut merged, state.pc.clone().implies(equality));
             }
             merged.model.insert(local, merged_value);
+        }
+
+        let shared_allocs: BTreeSet<_> = states
+            .iter()
+            .map(|state| state.allocs.keys().copied().collect::<BTreeSet<_>>())
+            .reduce(|acc, keys| acc.intersection(&keys).copied().collect())
+            .unwrap_or_default();
+        for local in shared_allocs {
+            let incoming_allocs = states
+                .iter()
+                .map(|state| {
+                    state
+                        .allocs
+                        .get(&local)
+                        .cloned()
+                        .expect("shared allocation present")
+                })
+                .collect::<Vec<_>>();
+            let first_alloc = incoming_allocs
+                .first()
+                .cloned()
+                .expect("shared allocation present");
+            if incoming_allocs
+                .iter()
+                .all(|alloc| self.allocations_are_identical(alloc, &first_alloc))
+            {
+                merged.allocs.insert(local, first_alloc);
+                continue;
+            }
+
+            self.create_allocation(&mut merged, local, "merge_alloc", self.control_span(ctrl))?;
+            let merged_alloc = merged
+                .allocs
+                .get(&local)
+                .cloned()
+                .expect("merged allocation present");
+            for (state, incoming_alloc) in states.iter().zip(incoming_allocs) {
+                let equality = self.allocation_equality_formula(
+                    &merged_alloc,
+                    &incoming_alloc,
+                    self.control_span(state.ctrl),
+                )?;
+                self.add_path_condition(&mut merged, state.pc.clone().implies(equality));
+            }
         }
 
         let shared_spec_names: BTreeSet<_> = states
@@ -922,6 +986,7 @@ impl<'tcx> Verifier<'tcx> {
         let mut state = State {
             pc: Bool::from_bool(true),
             model: BTreeMap::new(),
+            allocs: BTreeMap::new(),
             spec_env: HashMap::new(),
             ctrl: ControlPoint {
                 basic_block: BasicBlock::from_usize(0),
@@ -1209,6 +1274,7 @@ impl<'tcx> Verifier<'tcx> {
         local: Local,
         span: Span,
     ) -> Result<(), VerificationResult> {
+        state.allocs.remove(&local);
         let Some(value) = state.model.remove(&local) else {
             return Ok(());
         };
@@ -1273,6 +1339,8 @@ impl<'tcx> Verifier<'tcx> {
                 _ => Err(self
                     .unsupported_result(span, format!("unsupported borrow kind {borrow_kind:?}"))),
             },
+            Rvalue::RawPtr(_, place) => self.ptr_for_place(state, *place, span),
+            Rvalue::Cast(_, operand, target_ty) => self.eval_cast(state, operand, *target_ty, span),
             Rvalue::BinaryOp(op, operands) => {
                 self.eval_binary_op(state, *op, &operands.0, &operands.1, span)
             }
@@ -1327,8 +1395,13 @@ impl<'tcx> Verifier<'tcx> {
             self.fresh_for_rust_ty(ty, "prophecy")?
         };
         self.write_place(state, place, final_value.clone(), span)?;
-        let inner_ty = self.spec_ty_for_place_ty(self.place_ty(place), span)?;
-        self.construct_composite(&SpecTy::Mut(Box::new(inner_ty)), &[current, final_value])
+        let place_ty = self.place_ty(place);
+        let inner_ty = self.spec_ty_for_place_ty(place_ty, span)?;
+        let ptr = self.ptr_for_place(state, place, span)?;
+        self.construct_composite(
+            &SpecTy::Mut(Box::new(inner_ty)),
+            &[current, final_value, ptr],
+        )
     }
 
     fn create_shared_borrow(
@@ -1338,8 +1411,50 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
         let value = self.read_place(state, place, ReadMode::Current, span)?;
-        let inner_ty = self.spec_ty_for_place_ty(self.place_ty(place), span)?;
-        self.construct_composite(&SpecTy::Ref(Box::new(inner_ty)), &[value])
+        let place_ty = self.place_ty(place);
+        let inner_ty = self.spec_ty_for_place_ty(place_ty, span)?;
+        let ptr = self.ptr_for_place(state, place, span)?;
+        self.construct_composite(&SpecTy::Ref(Box::new(inner_ty)), &[value, ptr])
+    }
+
+    fn eval_cast(
+        &self,
+        state: &mut State,
+        operand: &Operand<'tcx>,
+        target_ty: Ty<'tcx>,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let value = self.eval_operand(state, operand, span)?;
+        match target_ty.kind() {
+            TyKind::RawPtr(target_pointee, _) => {
+                let operand_ty = operand.ty(&self.body().local_decls, self.tcx);
+                let ptr = match operand_ty.kind() {
+                    TyKind::RawPtr(_, _) => value,
+                    TyKind::Ref(_, inner, mutability) => {
+                        let inner_spec_ty = spec_ty_for_rust_ty(self.tcx, *inner)
+                            .map_err(|err| self.unsupported_result(span, err))?;
+                        if mutability.is_mut() {
+                            self.mut_ptr(&value, &inner_spec_ty, span)?
+                        } else {
+                            self.ref_ptr(&value, &inner_spec_ty, span)?
+                        }
+                    }
+                    TyKind::Uint(_) | TyKind::Int(_) => {
+                        return self.ptr_without_provenance(*target_pointee, value);
+                    }
+                    _ => {
+                        return Err(self.unsupported_result(
+                            span,
+                            format!(
+                                "unsupported pointer cast from {operand_ty:?} to {target_ty:?}"
+                            ),
+                        ));
+                    }
+                };
+                self.ptr_with_ty(&ptr, *target_pointee, span)
+            }
+            _ => Err(self.unsupported_result(span, format!("unsupported cast to {target_ty:?}"))),
+        }
     }
 
     fn eval_binary_op(
@@ -1748,7 +1863,8 @@ impl<'tcx> Verifier<'tcx> {
                     span,
                 )?;
                 let fin = self.mut_fin(&value, inner_ty, span)?;
-                self.construct_composite(spec_ty, &[current, fin])
+                let ptr = self.mut_ptr(&value, inner_ty, span)?;
+                self.construct_composite(spec_ty, &[current, fin, ptr])
             }
             PlaceElem::Field(field, _) => {
                 let index = field.index();
@@ -1824,11 +1940,14 @@ impl<'tcx> Verifier<'tcx> {
             SpecTy::Mut(inner) => {
                 let fresh = self.fresh_for_spec_ty(inner, "dangle")?;
                 let fin = self.mut_fin(value, inner, span)?;
-                self.construct_composite(spec_ty, &[fresh, fin])
+                let ptr = self.mut_ptr(value, inner, span)?;
+                self.construct_composite(spec_ty, &[fresh, fin, ptr])
             }
             SpecTy::Ref(_)
             | SpecTy::Seq(_)
             | SpecTy::Bool
+            | SpecTy::RustTy
+            | SpecTy::Int
             | SpecTy::IntLiteral
             | SpecTy::I8
             | SpecTy::I16
@@ -1945,6 +2064,7 @@ impl<'tcx> Verifier<'tcx> {
             TypedExprKind::Int(value) => {
                 self.value_decimal_int(&value.digits, self.control_span(state.ctrl))
             }
+            TypedExprKind::RustType(key) => Ok(self.rust_ty_value(key)),
             TypedExprKind::SeqLit(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
@@ -2013,25 +2133,6 @@ impl<'tcx> Verifier<'tcx> {
                 let index_int =
                     self.nat_to_int_term(&index_value, self.control_span(state.ctrl))?;
                 self.seq_nth_value(&value, &index_int, self.control_span(state.ctrl))
-            }
-            TypedExprKind::Deref { base } => {
-                let value = self.spec_expr_to_value(state, base, resolved)?;
-                match &base.ty {
-                    crate::spec::SpecTy::Ref(inner) => {
-                        self.ref_deref(&value, inner, self.control_span(state.ctrl))
-                    }
-                    crate::spec::SpecTy::Mut(inner) => {
-                        self.mut_cur(&value, inner, self.control_span(state.ctrl))
-                    }
-                    _ => unreachable!("typed deref base"),
-                }
-            }
-            TypedExprKind::Fin { base } => {
-                let value = self.spec_expr_to_value(state, base, resolved)?;
-                let SpecTy::Mut(inner) = &base.ty else {
-                    unreachable!("typed fin base");
-                };
-                self.mut_fin(&value, inner, self.control_span(state.ctrl))
             }
             TypedExprKind::Unary { op, arg } => {
                 let value = self.spec_expr_to_value(state, arg, resolved)?;
@@ -2139,6 +2240,7 @@ impl<'tcx> Verifier<'tcx> {
         match &expr.kind {
             TypedExprKind::Bool(value) => Ok(self.value_bool(*value)),
             TypedExprKind::Int(value) => self.value_decimal_int(&value.digits, self.report_span()),
+            TypedExprKind::RustType(key) => Ok(self.rust_ty_value(key)),
             TypedExprKind::SeqLit(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
@@ -2204,25 +2306,6 @@ impl<'tcx> Verifier<'tcx> {
                 let index_value = self.contract_expr_to_value(current, spec, index)?;
                 let index_int = self.nat_to_int_term(&index_value, self.report_span())?;
                 self.seq_nth_value(&value, &index_int, self.report_span())
-            }
-            TypedExprKind::Deref { base } => {
-                let value = self.contract_expr_to_value(current, spec, base)?;
-                match &base.ty {
-                    crate::spec::SpecTy::Ref(inner) => {
-                        self.ref_deref(&value, inner, self.report_span())
-                    }
-                    crate::spec::SpecTy::Mut(inner) => {
-                        self.mut_cur(&value, inner, self.report_span())
-                    }
-                    _ => unreachable!("typed deref base"),
-                }
-            }
-            TypedExprKind::Fin { base } => {
-                let value = self.contract_expr_to_value(current, spec, base)?;
-                let SpecTy::Mut(inner) = &base.ty else {
-                    unreachable!("typed fin base");
-                };
-                self.mut_fin(&value, inner, self.report_span())
             }
             TypedExprKind::Unary { op, arg } => {
                 let value = self.contract_expr_to_value(current, spec, arg)?;
@@ -2365,6 +2448,7 @@ impl<'tcx> Verifier<'tcx> {
         Ok(match &expr.kind {
             TypedExprKind::Bool(value) => Some(self.value_bool(*value)),
             TypedExprKind::Int(value) => Some(self.value_decimal_int(&value.digits, span)?),
+            TypedExprKind::RustType(key) => Some(self.rust_ty_value(key)),
             TypedExprKind::SeqLit(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
@@ -2476,25 +2560,6 @@ impl<'tcx> Verifier<'tcx> {
                 };
                 let index_int = self.nat_to_int_term(&index_value, span)?;
                 Some(self.seq_nth_value(&value, &index_int, span)?)
-            }
-            TypedExprKind::Deref { base } => {
-                let Some(value) = self.try_eval_ground_pure_expr(base, env, span)? else {
-                    return Ok(None);
-                };
-                Some(match &base.ty {
-                    SpecTy::Ref(inner) => self.ref_deref(&value, inner, span)?,
-                    SpecTy::Mut(inner) => self.mut_cur(&value, inner, span)?,
-                    _ => return Ok(None),
-                })
-            }
-            TypedExprKind::Fin { base } => {
-                let Some(value) = self.try_eval_ground_pure_expr(base, env, span)? else {
-                    return Ok(None);
-                };
-                let SpecTy::Mut(inner) = &base.ty else {
-                    return Ok(None);
-                };
-                Some(self.mut_fin(&value, inner, span)?)
             }
             TypedExprKind::Unary { op, arg } => {
                 let Some(value) = self.try_eval_ground_pure_expr(arg, env, span)? else {
@@ -2796,12 +2861,16 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         value: &SymValue,
         inner_ty: Ty<'tcx>,
-        _span: Span,
+        span: Span,
     ) -> Result<SymValue, VerificationResult> {
         let inner_spec_ty = self.spec_ty_for_place_ty(inner_ty, self.report_span())?;
         let final_value = self.mut_fin(value, &inner_spec_ty, self.report_span())?;
         let fresh = self.fresh_for_rust_ty(inner_ty, "opaque_cur")?;
-        self.construct_composite(&SpecTy::Mut(Box::new(inner_spec_ty)), &[fresh, final_value])
+        let ptr = self.mut_ptr(value, &inner_spec_ty, span)?;
+        self.construct_composite(
+            &SpecTy::Mut(Box::new(inner_spec_ty)),
+            &[fresh, final_value, ptr],
+        )
     }
 
     fn havoc_loop_written_locals(
@@ -2852,7 +2921,7 @@ impl<'tcx> Verifier<'tcx> {
         })
     }
 
-    fn called_def_id(&self, func: &Operand<'tcx>) -> Option<LocalDefId> {
+    fn called_local_def_id(&self, func: &Operand<'tcx>) -> Option<LocalDefId> {
         let Operand::Constant(constant) = func else {
             return None;
         };
@@ -2903,6 +2972,10 @@ impl<'tcx> Verifier<'tcx> {
 
     fn value_bool(&self, value: bool) -> SymValue {
         self.value_encoder.bool_value(value)
+    }
+
+    fn rust_ty_value(&self, key: &RustTyKey) -> SymValue {
+        with_solver(|solver| self.value_encoder.rust_ty_value(key, solver))
     }
 
     fn value_is_true(&self, value: &SymValue) -> Bool {
@@ -2996,7 +3069,40 @@ impl<'tcx> Verifier<'tcx> {
         .map_err(|err| self.unsupported_result(self.report_span(), err))
     }
 
+    fn construct_composite_ctor_without_axioms(
+        &self,
+        ty: &SpecTy,
+        ctor_index: usize,
+        fields: &[SymValue],
+    ) -> Result<SymValue, VerificationResult> {
+        self.value_encoder
+            .construct_composite_ctor_without_axioms(ty, ctor_index, fields)
+            .map_err(|err| self.unsupported_result(self.report_span(), err))
+    }
+
     fn fresh_for_rust_ty(&self, ty: Ty<'tcx>, hint: &str) -> Result<SymValue, VerificationResult> {
+        match ty.kind() {
+            TyKind::RawPtr(pointee, _) => {
+                return self.fresh_raw_ptr_for_pointee_ty(*pointee, hint);
+            }
+            TyKind::Ref(_, inner, mutability) => {
+                let inner_spec_ty = spec_ty_for_rust_ty(self.tcx, *inner)
+                    .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+                let ptr = self.fresh_ref_ptr_for_pointee_ty(*inner, hint)?;
+                if mutability.is_mut() {
+                    let current = self.fresh_for_rust_ty(*inner, &format!("{hint}_cur"))?;
+                    let final_value = self.fresh_for_rust_ty(*inner, &format!("{hint}_fin"))?;
+                    return self.construct_composite(
+                        &SpecTy::Mut(Box::new(inner_spec_ty)),
+                        &[current, final_value, ptr],
+                    );
+                }
+                let value = self.fresh_for_rust_ty(*inner, &format!("{hint}_deref"))?;
+                return self
+                    .construct_composite(&SpecTy::Ref(Box::new(inner_spec_ty)), &[value, ptr]);
+            }
+            _ => {}
+        }
         let spec_ty = spec_ty_for_rust_ty(self.tcx, ty)
             .map_err(|err| self.unsupported_result(self.report_span(), err))?;
         if let TyKind::Adt(adt_def, args) = ty.kind() {
@@ -3018,7 +3124,398 @@ impl<'tcx> Verifier<'tcx> {
         self.fresh_for_spec_ty(&spec_ty, hint)
     }
 
+    fn fresh_raw_ptr_for_pointee_ty(
+        &self,
+        pointee_ty: Ty<'tcx>,
+        hint: &str,
+    ) -> Result<SymValue, VerificationResult> {
+        let addr = self.fresh_for_spec_ty(&SpecTy::Usize, &format!("{hint}_addr"))?;
+        let prov = self.construct_option_none(provenance_spec_ty())?;
+        let ty = self.rust_ty_model_value(pointee_ty);
+        self.construct_composite(&ptr_spec_ty(), &[addr, prov, ty])
+    }
+
+    fn fresh_ref_ptr_for_pointee_ty(
+        &self,
+        pointee_ty: Ty<'tcx>,
+        hint: &str,
+    ) -> Result<SymValue, VerificationResult> {
+        self.fresh_ref_ptr_with_ty_value(hint, self.rust_ty_model_value(pointee_ty))
+    }
+
+    fn fresh_ref_ptr_with_ty_value(
+        &self,
+        hint: &str,
+        ty: SymValue,
+    ) -> Result<SymValue, VerificationResult> {
+        let addr = self.fresh_for_spec_ty(&SpecTy::Usize, &format!("{hint}_addr"))?;
+        let alloc_id = self.fresh_for_spec_ty(&SpecTy::Int, &format!("{hint}_alloc_id"))?;
+        let provenance = self.construct_provenance(alloc_id)?;
+        let prov = self.construct_option_some(provenance_spec_ty(), provenance)?;
+        self.construct_composite(&ptr_spec_ty(), &[addr, prov, ty])
+    }
+
+    fn create_allocation(
+        &self,
+        state: &mut State,
+        local: Local,
+        hint: &str,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        state.allocs.remove(&local);
+        let ty = self.body().local_decls[local].ty;
+        let size = self.layout_size_bytes(ty, span)?;
+        let alloc_id =
+            self.fresh_for_spec_ty(&SpecTy::Int, &format!("{hint}_{}_id", local.as_usize()))?;
+        let base_addr =
+            self.fresh_for_spec_ty(&SpecTy::Usize, &format!("{hint}_{}_base", local.as_usize()))?;
+        let alloc = Allocation {
+            alloc_id,
+            base_addr,
+            size,
+        };
+
+        self.add_path_condition(state, self.allocation_bounds_formula(&alloc, span)?);
+        let other_allocs = state.allocs.values().cloned().collect::<Vec<_>>();
+        for other in &other_allocs {
+            self.add_path_condition(
+                state,
+                self.allocation_distinct_formula(&alloc, other, span)?,
+            );
+            if alloc.size != 0 && other.size != 0 {
+                self.add_path_condition(
+                    state,
+                    self.allocation_non_overlapping_formula(&alloc, other),
+                );
+            }
+        }
+        state.allocs.insert(local, alloc);
+        Ok(())
+    }
+
+    fn allocations_are_identical(&self, lhs: &Allocation, rhs: &Allocation) -> bool {
+        lhs.size == rhs.size && lhs.alloc_id == rhs.alloc_id && lhs.base_addr == rhs.base_addr
+    }
+
+    fn allocation_equality_formula(
+        &self,
+        lhs: &Allocation,
+        rhs: &Allocation,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        if lhs.size != rhs.size {
+            return Ok(Bool::from_bool(false));
+        }
+        Ok(bool_and(vec![
+            self.eq_for_spec_ty(&SpecTy::Int, &lhs.alloc_id, &rhs.alloc_id, span)?,
+            self.eq_for_spec_ty(&SpecTy::Usize, &lhs.base_addr, &rhs.base_addr, span)?,
+        ]))
+    }
+
+    fn allocation_distinct_formula(
+        &self,
+        lhs: &Allocation,
+        rhs: &Allocation,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        Ok(self
+            .eq_for_spec_ty(&SpecTy::Int, &lhs.alloc_id, &rhs.alloc_id, span)?
+            .not())
+    }
+
+    fn allocation_bounds_formula(
+        &self,
+        alloc: &Allocation,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        let mut formulas = Vec::new();
+        if let Some(base_in_range) = self.spec_ty_formula(&SpecTy::Usize, &alloc.base_addr, span)? {
+            formulas.push(base_in_range);
+        }
+        let (_, usize_max) = self.pointer_sized_int_bounds(false)?;
+        let end = self.value_int_data(&alloc.base_addr) + Int::from_u64(alloc.size);
+        formulas.push(end.le(usize_max));
+        Ok(bool_and(formulas))
+    }
+
+    fn allocation_non_overlapping_formula(&self, alloc: &Allocation, other: &Allocation) -> Bool {
+        let alloc_base = self.value_int_data(&alloc.base_addr);
+        let alloc_end = alloc_base.clone() + Int::from_u64(alloc.size);
+        let other_base = self.value_int_data(&other.base_addr);
+        let other_end = other_base.clone() + Int::from_u64(other.size);
+        Bool::or(&[&alloc_end.le(&other_base), &other_end.le(alloc_base)])
+    }
+
+    fn ptr_for_place(
+        &self,
+        state: &State,
+        place: Place<'tcx>,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let projection = place.as_ref().projection;
+        let final_ty = self.place_ty(place);
+        if matches!(projection.first(), Some(PlaceElem::Deref)) {
+            let Some(root) = state.model.get(&place.local).cloned() else {
+                return Err(self.unsupported_result(
+                    span,
+                    format!("missing local {}", place.local.as_usize()),
+                ));
+            };
+            let root_ty = self.body().local_decls[place.local].ty;
+            let root_spec_ty = self.spec_ty_for_place_ty(root_ty, span)?;
+            let base_ptr = self.ptr_for_deref_base(&root, &root_spec_ty, span)?;
+            let pointee_ty = self.deref_pointee_ty(root_ty, span)?;
+            return self.ptr_for_base_projection(
+                &base_ptr,
+                pointee_ty,
+                &projection[1..],
+                final_ty,
+                span,
+            );
+        }
+
+        let alloc = state.allocs.get(&place.local).ok_or_else(|| {
+            self.unsupported_result(
+                span,
+                format!("missing allocation for local {}", place.local.as_usize()),
+            )
+        })?;
+        let root_ty = self.body().local_decls[place.local].ty;
+        let offset = self.place_projection_offset(root_ty, projection, span)?;
+        let addr = self.add_addr_offset(alloc.base_addr.clone(), offset);
+        let provenance = self.construct_provenance(alloc.alloc_id.clone())?;
+        let prov = self.construct_option_some(provenance_spec_ty(), provenance)?;
+        let ty = self.rust_ty_model_value(final_ty);
+        self.construct_ptr(addr, prov, ty)
+    }
+
+    fn ptr_for_deref_base(
+        &self,
+        value: &SymValue,
+        spec_ty: &SpecTy,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        match spec_ty {
+            SpecTy::Ref(inner) => self.ref_ptr(value, inner, span),
+            SpecTy::Mut(inner) => self.mut_ptr(value, inner, span),
+            SpecTy::Struct(struct_ty) if struct_ty.name == "Ptr" => Ok(value.clone()),
+            _ => Err(self.unsupported_result(
+                span,
+                format!("raw pointer requested through non-pointer place `{spec_ty:?}`"),
+            )),
+        }
+    }
+
+    fn ptr_for_base_projection(
+        &self,
+        base_ptr: &SymValue,
+        base_ty: Ty<'tcx>,
+        projection: &[PlaceElem<'tcx>],
+        final_ty: Ty<'tcx>,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let offset = self.place_projection_offset(base_ty, projection, span)?;
+        let addr = self.add_addr_offset(self.ptr_addr(base_ptr, span)?, offset);
+        let prov = self.ptr_prov(base_ptr, span)?;
+        let ty = self.rust_ty_model_value(final_ty);
+        self.construct_ptr(addr, prov, ty)
+    }
+
+    fn deref_pointee_ty(&self, ty: Ty<'tcx>, span: Span) -> Result<Ty<'tcx>, VerificationResult> {
+        match ty.kind() {
+            TyKind::Ref(_, inner, _) | TyKind::RawPtr(inner, _) => Ok(*inner),
+            other => Err(self.unsupported_result(
+                span,
+                format!("raw pointer requested through non-pointer type `{other:?}`"),
+            )),
+        }
+    }
+
+    fn place_projection_offset(
+        &self,
+        root_ty: Ty<'tcx>,
+        projection: &[PlaceElem<'tcx>],
+        span: Span,
+    ) -> Result<u64, VerificationResult> {
+        let mut ty = root_ty;
+        let mut offset = 0;
+        for elem in projection {
+            match elem {
+                PlaceElem::Field(field, field_ty) => {
+                    let layout = self.layout_for_ty(ty, span)?;
+                    offset += layout.layout.fields().offset(field.index()).bytes();
+                    ty = *field_ty;
+                }
+                other => {
+                    return Err(self.unsupported_result(
+                        span,
+                        format!("unsupported layout-dependent place projection {other:?}"),
+                    ));
+                }
+            }
+        }
+        Ok(offset)
+    }
+
+    fn add_addr_offset(&self, base: SymValue, offset: u64) -> SymValue {
+        if offset == 0 {
+            return base;
+        }
+        self.value_encoder
+            .wrap_int(&(self.value_int_data(&base) + Int::from_u64(offset)))
+    }
+
+    fn layout_for_ty(
+        &self,
+        ty: Ty<'tcx>,
+        span: Span,
+    ) -> Result<TyAndLayout<'tcx>, VerificationResult> {
+        self.tcx
+            .layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(ty))
+            .map_err(|err| {
+                self.unsupported_result(span, format!("unsupported layout for `{ty}`: {err:?}"))
+            })
+    }
+
+    fn layout_size_bytes(&self, ty: Ty<'tcx>, span: Span) -> Result<u64, VerificationResult> {
+        match self.layout_for_ty(ty, span) {
+            Ok(layout) => Ok(layout.layout.size().bytes()),
+            Err(err) if matches!(ty.kind(), TyKind::RawPtr(_, _) | TyKind::Ref(_, _, _)) => {
+                let _ = err;
+                Ok(self.tcx.data_layout.pointer_size().bytes())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn ptr_without_provenance(
+        &self,
+        pointee_ty: Ty<'tcx>,
+        addr: SymValue,
+    ) -> Result<SymValue, VerificationResult> {
+        let prov = self.construct_option_none(provenance_spec_ty())?;
+        let ty = self.rust_ty_model_value(pointee_ty);
+        self.construct_ptr(addr, prov, ty)
+    }
+
+    fn construct_ptr(
+        &self,
+        addr: SymValue,
+        prov: SymValue,
+        ty: SymValue,
+    ) -> Result<SymValue, VerificationResult> {
+        self.construct_composite(&ptr_spec_ty(), &[addr, prov, ty])
+    }
+
+    fn construct_provenance(&self, alloc_id: SymValue) -> Result<SymValue, VerificationResult> {
+        self.construct_composite(&provenance_spec_ty(), &[alloc_id])
+    }
+
+    fn construct_option_none(&self, inner: SpecTy) -> Result<SymValue, VerificationResult> {
+        let ctor_index = self
+            .value_encoder
+            .enum_ctor_index("Option", "None")
+            .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+        self.construct_composite_ctor_without_axioms(&option_spec_ty(inner), ctor_index, &[])
+    }
+
+    fn construct_option_some(
+        &self,
+        inner: SpecTy,
+        value: SymValue,
+    ) -> Result<SymValue, VerificationResult> {
+        let ctor_index = self
+            .value_encoder
+            .enum_ctor_index("Option", "Some")
+            .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+        self.construct_composite_ctor_without_axioms(&option_spec_ty(inner), ctor_index, &[value])
+    }
+
+    fn rust_ty_model_value(&self, ty: Ty<'tcx>) -> SymValue {
+        self.rust_ty_value(&self.rust_ty_key_for_rust_ty(ty))
+    }
+
+    fn rust_ty_key_for_rust_ty(&self, ty: Ty<'tcx>) -> RustTyKey {
+        RustTyKey::new(self.rust_ty_key_text_for_rust_ty(ty))
+    }
+
+    fn rust_ty_key_text_for_rust_ty(&self, ty: Ty<'tcx>) -> String {
+        match ty.kind() {
+            TyKind::Bool => "bool".to_owned(),
+            TyKind::Int(kind) => match kind {
+                ty::IntTy::I8 => "i8".to_owned(),
+                ty::IntTy::I16 => "i16".to_owned(),
+                ty::IntTy::I32 => "i32".to_owned(),
+                ty::IntTy::I64 => "i64".to_owned(),
+                ty::IntTy::I128 => "i128".to_owned(),
+                ty::IntTy::Isize => "isize".to_owned(),
+            },
+            TyKind::Uint(kind) => match kind {
+                ty::UintTy::U8 => "u8".to_owned(),
+                ty::UintTy::U16 => "u16".to_owned(),
+                ty::UintTy::U32 => "u32".to_owned(),
+                ty::UintTy::U64 => "u64".to_owned(),
+                ty::UintTy::U128 => "u128".to_owned(),
+                ty::UintTy::Usize => "usize".to_owned(),
+            },
+            TyKind::RawPtr(pointee, mutability) => {
+                let kind = if mutability.is_mut() { "mut" } else { "const" };
+                format!("*{kind} {}", self.rust_ty_key_text_for_rust_ty(*pointee))
+            }
+            TyKind::Ref(_, inner, mutability) => {
+                let inner = self.rust_ty_key_text_for_rust_ty(*inner);
+                if mutability.is_mut() {
+                    format!("&mut {inner}")
+                } else {
+                    format!("&{inner}")
+                }
+            }
+            TyKind::Tuple(fields) => {
+                let fields = fields
+                    .iter()
+                    .map(|field| self.rust_ty_key_text_for_rust_ty(field))
+                    .collect::<Vec<_>>();
+                match fields.as_slice() {
+                    [] => "()".to_owned(),
+                    [field] => format!("({field},)"),
+                    _ => format!("({})", fields.join(", ")),
+                }
+            }
+            TyKind::Adt(adt_def, args) => {
+                let mut text = self.tcx.def_path_str(adt_def.did());
+                let type_args = args
+                    .types()
+                    .map(|arg| self.rust_ty_key_text_for_rust_ty(arg))
+                    .collect::<Vec<_>>();
+                if !type_args.is_empty() {
+                    text.push('<');
+                    text.push_str(&type_args.join(", "));
+                    text.push('>');
+                }
+                text
+            }
+            TyKind::Param(param) => param.name.to_string(),
+            _ => format!("{ty:?}"),
+        }
+    }
+
     fn fresh_for_spec_ty(&self, ty: &SpecTy, hint: &str) -> Result<SymValue, VerificationResult> {
+        match ty {
+            SpecTy::Ref(inner) => {
+                let deref = self.fresh_for_spec_ty(inner, &format!("{hint}_deref"))?;
+                let ptr_ty = self.fresh_for_spec_ty(&SpecTy::RustTy, &format!("{hint}_ptr_ty"))?;
+                let ptr = self.fresh_ref_ptr_with_ty_value(hint, ptr_ty)?;
+                return self.construct_composite(ty, &[deref, ptr]);
+            }
+            SpecTy::Mut(inner) => {
+                let current = self.fresh_for_spec_ty(inner, &format!("{hint}_cur"))?;
+                let final_value = self.fresh_for_spec_ty(inner, &format!("{hint}_fin"))?;
+                let ptr_ty = self.fresh_for_spec_ty(&SpecTy::RustTy, &format!("{hint}_ptr_ty"))?;
+                let ptr = self.fresh_ref_ptr_with_ty_value(hint, ptr_ty)?;
+                return self.construct_composite(ty, &[current, final_value, ptr]);
+            }
+            _ => {}
+        }
         if matches!(ty, SpecTy::Enum { .. }) {
             return Ok(SymValue::new(Dynamic::new_const(
                 self.fresh_name(hint),
@@ -3087,6 +3584,16 @@ impl<'tcx> Verifier<'tcx> {
         self.decode_composite_field(&encoding, value, 0, span)
     }
 
+    fn ref_ptr(
+        &self,
+        value: &SymValue,
+        inner_ty: &SpecTy,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let encoding = self.composite_encoding(&SpecTy::Ref(Box::new(inner_ty.clone())))?;
+        self.decode_composite_field(&encoding, value, 1, span)
+    }
+
     fn mut_cur(
         &self,
         value: &SymValue,
@@ -3105,6 +3612,54 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<SymValue, VerificationResult> {
         let encoding = self.composite_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
         self.decode_composite_field(&encoding, value, 1, span)
+    }
+
+    fn mut_ptr(
+        &self,
+        value: &SymValue,
+        inner_ty: &SpecTy,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let encoding = self.composite_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
+        self.decode_composite_field(&encoding, value, 2, span)
+    }
+
+    fn ptr_addr(&self, value: &SymValue, span: Span) -> Result<SymValue, VerificationResult> {
+        let encoding = self.composite_encoding(&ptr_spec_ty())?;
+        self.decode_composite_field(&encoding, value, 0, span)
+    }
+
+    fn ptr_prov(&self, value: &SymValue, span: Span) -> Result<SymValue, VerificationResult> {
+        let encoding = self.composite_encoding(&ptr_spec_ty())?;
+        self.decode_composite_field(&encoding, value, 1, span)
+    }
+
+    fn reference_ptr_formula(
+        &self,
+        ptr: &SymValue,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        let prov = self.ptr_prov(ptr, span)?;
+        let none = self.construct_option_none(provenance_spec_ty())?;
+        let has_prov = self
+            .eq_for_spec_ty(&option_spec_ty(provenance_spec_ty()), &prov, &none, span)?
+            .not();
+        Ok(bool_and(vec![
+            self.resolve_formula_for_spec_ty(&ptr_spec_ty(), ptr, span)?,
+            has_prov,
+        ]))
+    }
+
+    fn ptr_with_ty(
+        &self,
+        value: &SymValue,
+        pointee_ty: Ty<'tcx>,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let addr = self.ptr_addr(value, span)?;
+        let prov = self.ptr_prov(value, span)?;
+        let ty = self.rust_ty_model_value(pointee_ty);
+        self.construct_ptr(addr, prov, ty)
     }
 
     fn builtin_nat_decls(&self, span: Span) -> Result<Rc<BuiltinNatDecls>, VerificationResult> {
@@ -3450,7 +4005,9 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<Option<Bool>, VerificationResult> {
         match ty {
             SpecTy::Bool => Ok(None),
-            SpecTy::IntLiteral
+            SpecTy::RustTy => Ok(None),
+            SpecTy::Int
+            | SpecTy::IntLiteral
             | SpecTy::I8
             | SpecTy::I16
             | SpecTy::I32
@@ -3470,8 +4027,11 @@ impl<'tcx> Verifier<'tcx> {
             SpecTy::Ref(inner) => {
                 let composite = self.composite_encoding(ty)?;
                 let deref = self.decode_composite_field(&composite, value, 0, span)?;
-                let mut formulas =
-                    vec![self.composite_tag_formula_for_encoding(&composite, value, 0, span)?];
+                let ptr = self.decode_composite_field(&composite, value, 1, span)?;
+                let mut formulas = vec![
+                    self.composite_tag_formula_for_encoding(&composite, value, 0, span)?,
+                    self.reference_ptr_formula(&ptr, span)?,
+                ];
                 if let Some(formula) = self.spec_ty_formula(inner, &deref, span)? {
                     formulas.push(formula);
                 }
@@ -3480,8 +4040,11 @@ impl<'tcx> Verifier<'tcx> {
             SpecTy::Mut(inner) => {
                 let composite = self.composite_encoding(ty)?;
                 let current = self.decode_composite_field(&composite, value, 0, span)?;
-                let mut formulas =
-                    vec![self.composite_tag_formula_for_encoding(&composite, value, 0, span)?];
+                let ptr = self.decode_composite_field(&composite, value, 2, span)?;
+                let mut formulas = vec![
+                    self.composite_tag_formula_for_encoding(&composite, value, 0, span)?,
+                    self.reference_ptr_formula(&ptr, span)?,
+                ];
                 if let Some(formula) = self.spec_ty_formula(inner, &current, span)? {
                     formulas.push(formula);
                 }
@@ -3501,6 +4064,11 @@ impl<'tcx> Verifier<'tcx> {
             }
             SpecTy::Struct(struct_ty) => {
                 let composite = self.composite_encoding(ty)?;
+                if let Some(formula) =
+                    self.direct_struct_invariant_formula(&composite, struct_ty, value, span)?
+                {
+                    return Ok(Some(formula));
+                }
                 let mut formulas =
                     vec![self.composite_tag_formula_for_encoding(&composite, value, 0, span)?];
                 for (index, field) in struct_ty.fields.iter().enumerate() {
@@ -3512,9 +4080,36 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(Some(bool_and(formulas)))
             }
-            SpecTy::Enum { .. } => self.named_invariant_formula(ty, value, span).map(Some),
+            SpecTy::Enum { .. } => self.enum_invariant_formula(ty, value, span).map(Some),
             SpecTy::TypeParam(_) => Ok(None),
         }
+    }
+
+    fn direct_struct_invariant_formula(
+        &self,
+        composite: &CompositeEncoding,
+        struct_ty: &crate::spec::StructTy,
+        value: &SymValue,
+        span: Span,
+    ) -> Result<Option<Bool>, VerificationResult> {
+        let Ok(ctor) = composite.single_constructor() else {
+            return Ok(None);
+        };
+        if value.dynamic().decl().name() != ctor.symbol.name() {
+            return Ok(None);
+        }
+        let children = value.dynamic().children();
+        if children.len() != struct_ty.fields.len() {
+            return Ok(None);
+        }
+        let mut formulas = Vec::new();
+        for (field, child) in struct_ty.fields.iter().zip(children) {
+            let child = SymValue::new(child);
+            if let Some(formula) = self.spec_ty_formula(&field.ty, &child, span)? {
+                formulas.push(formula);
+            }
+        }
+        Ok(Some(bool_and(formulas)))
     }
 
     fn resolve_formula_for_spec_ty(
@@ -3525,6 +4120,8 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<Bool, VerificationResult> {
         match ty {
             SpecTy::Bool
+            | SpecTy::RustTy
+            | SpecTy::Int
             | SpecTy::IntLiteral
             | SpecTy::I8
             | SpecTy::I16
@@ -3539,17 +4136,23 @@ impl<'tcx> Verifier<'tcx> {
             SpecTy::Seq(_) => Ok(Bool::from_bool(true)),
             SpecTy::Ref(_) => {
                 let composite = self.composite_encoding(ty)?;
-                self.composite_tag_formula_for_encoding(&composite, value, 0, span)
+                let ptr = self.decode_composite_field(&composite, value, 1, span)?;
+                Ok(bool_and(vec![
+                    self.composite_tag_formula_for_encoding(&composite, value, 0, span)?,
+                    self.reference_ptr_formula(&ptr, span)?,
+                ]))
             }
             SpecTy::Mut(inner) => {
                 let composite = self.composite_encoding(ty)?;
                 let cur = self.decode_composite_field(&composite, value, 0, span)?;
                 let fin = self.decode_composite_field(&composite, value, 1, span)?;
+                let ptr = self.decode_composite_field(&composite, value, 2, span)?;
                 Ok(bool_and(vec![
                     self.composite_tag_formula_for_encoding(&composite, value, 0, span)?,
                     self.eq_for_spec_ty(inner, &cur, &fin, span)?,
                     self.resolve_formula_for_spec_ty(inner, &cur, span)?,
                     self.resolve_formula_for_spec_ty(inner, &fin, span)?,
+                    self.reference_ptr_formula(&ptr, span)?,
                 ]))
             }
             SpecTy::Tuple(items) => {
@@ -3564,6 +4167,9 @@ impl<'tcx> Verifier<'tcx> {
             }
             SpecTy::Struct(struct_ty) => {
                 let composite = self.composite_encoding(ty)?;
+                if struct_ty.name == "Ptr" {
+                    return self.composite_tag_formula_for_encoding(&composite, value, 0, span);
+                }
                 let mut formulas = Vec::with_capacity(struct_ty.fields.len() + 1);
                 formulas.push(self.composite_tag_formula_for_encoding(&composite, value, 0, span)?);
                 for (index, field) in struct_ty.fields.iter().enumerate() {
@@ -3577,9 +4183,42 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(bool_and(formulas))
             }
-            SpecTy::Enum { .. } => self.named_invariant_formula(ty, value, span),
+            SpecTy::Enum { .. } => self.enum_invariant_formula(ty, value, span),
             SpecTy::TypeParam(_) => Ok(Bool::from_bool(true)),
         }
+    }
+
+    fn enum_invariant_formula(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        let composite = self.composite_encoding(ty)?;
+        let decl_name = value.dynamic().decl().name();
+        if let Some((ctor_index, ctor)) = composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| decl_name == ctor.symbol.name())
+        {
+            let mut formulas =
+                vec![self.composite_tag_formula_for_encoding(&composite, value, ctor_index, span)?];
+            for (field_index, field) in ctor.fields.iter().enumerate() {
+                let field_value = self.decode_composite_ctor_field(
+                    &composite,
+                    ctor_index,
+                    value,
+                    field_index,
+                    span,
+                )?;
+                if let Some(formula) = self.spec_ty_formula(&field.ty, &field_value, span)? {
+                    formulas.push(formula);
+                }
+            }
+            return Ok(bool_and(formulas));
+        }
+        self.named_invariant_formula(ty, value, span)
     }
 
     fn named_invariant_formula(
@@ -3610,6 +4249,19 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<SymValue, VerificationResult> {
         self.value_encoder
             .project_composite_field(encoding, value, index)
+            .map_err(|err| self.unsupported_result(span, err))
+    }
+
+    fn decode_composite_ctor_field(
+        &self,
+        encoding: &CompositeEncoding,
+        ctor_index: usize,
+        value: &SymValue,
+        index: usize,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        self.value_encoder
+            .project_composite_ctor_field(encoding, ctor_index, value, index)
             .map_err(|err| self.unsupported_result(span, err))
     }
 
@@ -3904,7 +4556,8 @@ fn collect_typed_expr_pure_fn_refs(expr: &TypedExpr, out: &mut BTreeSet<String>)
         TypedExprKind::Bool(_)
         | TypedExprKind::Int(_)
         | TypedExprKind::Var(_)
-        | TypedExprKind::RustVar(_) => {}
+        | TypedExprKind::RustVar(_)
+        | TypedExprKind::RustType(_) => {}
         TypedExprKind::SeqLit(items) | TypedExprKind::StructLit { fields: items } => {
             for item in items {
                 collect_typed_expr_pure_fn_refs(item, out);
@@ -3936,8 +4589,6 @@ fn collect_typed_expr_pure_fn_refs(expr: &TypedExpr, out: &mut BTreeSet<String>)
         }
         TypedExprKind::Field { base, .. }
         | TypedExprKind::TupleField { base, .. }
-        | TypedExprKind::Deref { base }
-        | TypedExprKind::Fin { base }
         | TypedExprKind::Unary { arg: base, .. } => collect_typed_expr_pure_fn_refs(base, out),
         TypedExprKind::Index { base, index } => {
             collect_typed_expr_pure_fn_refs(base, out);

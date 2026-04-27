@@ -1,0 +1,31 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+assertion_line: 85
+expression: snapshot_output(output)
+---
+status: Some(0)
+stdout:
+PASS ptr_eq_u8
+  all assertions discharged
+PASS ptr_eq_mut_u8
+  all assertions discharged
+PASS null_u8
+  all assertions discharged
+PASS null_mut_u8
+  all assertions discharged
+PASS dangling_u8
+  all assertions discharged
+PASS addr_u8
+  all assertions discharged
+PASS with_addr_u8
+  all assertions discharged
+PASS pointer_identity_and_raw_borrows
+  all assertions discharged
+PASS strict_provenance_and_ptr_apis
+  all assertions discharged
+PASS integer_to_pointer_casts
+  all assertions discharged
+PASS main
+  all assertions discharged
+
+stderr:
