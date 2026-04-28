@@ -94,6 +94,7 @@ struct Allocation {
     alloc_id: SymValue,
     base_addr: SymValue,
     size: u64,
+    align: u64,
 }
 
 struct BuiltinNatDecls {
@@ -3164,7 +3165,7 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<(), VerificationResult> {
         state.allocs.remove(&local);
         let ty = self.body().local_decls[local].ty;
-        let size = self.layout_size_bytes(ty, span)?;
+        let (size, align) = self.layout_size_align_bytes(ty, span)?;
         let alloc_id =
             self.fresh_for_spec_ty(&SpecTy::Int, &format!("{hint}_{}_id", local.as_usize()))?;
         let base_addr =
@@ -3173,6 +3174,7 @@ impl<'tcx> Verifier<'tcx> {
             alloc_id,
             base_addr,
             size,
+            align,
         };
 
         self.add_path_condition(state, self.allocation_bounds_formula(&alloc, span)?);
@@ -3194,7 +3196,10 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn allocations_are_identical(&self, lhs: &Allocation, rhs: &Allocation) -> bool {
-        lhs.size == rhs.size && lhs.alloc_id == rhs.alloc_id && lhs.base_addr == rhs.base_addr
+        lhs.size == rhs.size
+            && lhs.align == rhs.align
+            && lhs.alloc_id == rhs.alloc_id
+            && lhs.base_addr == rhs.base_addr
     }
 
     fn allocation_equality_formula(
@@ -3203,7 +3208,7 @@ impl<'tcx> Verifier<'tcx> {
         rhs: &Allocation,
         span: Span,
     ) -> Result<Bool, VerificationResult> {
-        if lhs.size != rhs.size {
+        if lhs.size != rhs.size || lhs.align != rhs.align {
             return Ok(Bool::from_bool(false));
         }
         Ok(bool_and(vec![
@@ -3235,6 +3240,10 @@ impl<'tcx> Verifier<'tcx> {
         let (_, usize_max) = self.pointer_sized_int_bounds(false)?;
         let end = self.value_int_data(&alloc.base_addr) + Int::from_u64(alloc.size);
         formulas.push(end.le(usize_max));
+        if alloc.align > 1 {
+            let base = self.value_int_data(&alloc.base_addr);
+            formulas.push(base.modulo(Int::from_u64(alloc.align)).eq(0));
+        }
         Ok(bool_and(formulas))
     }
 
@@ -3377,12 +3386,22 @@ impl<'tcx> Verifier<'tcx> {
             })
     }
 
-    fn layout_size_bytes(&self, ty: Ty<'tcx>, span: Span) -> Result<u64, VerificationResult> {
+    fn layout_size_align_bytes(
+        &self,
+        ty: Ty<'tcx>,
+        span: Span,
+    ) -> Result<(u64, u64), VerificationResult> {
         match self.layout_for_ty(ty, span) {
-            Ok(layout) => Ok(layout.layout.size().bytes()),
+            Ok(layout) => Ok((
+                layout.layout.size().bytes(),
+                layout.layout.align().abi.bytes(),
+            )),
             Err(err) if matches!(ty.kind(), TyKind::RawPtr(_, _) | TyKind::Ref(_, _, _)) => {
                 let _ = err;
-                Ok(self.tcx.data_layout.pointer_size().bytes())
+                Ok((
+                    self.tcx.data_layout.pointer_size().bytes(),
+                    self.tcx.data_layout.pointer_align().abi.bytes(),
+                ))
             }
             Err(err) => Err(err),
         }

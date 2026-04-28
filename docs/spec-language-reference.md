@@ -402,10 +402,11 @@ Pointers created from Rust places carry a stable place-derived identity. Taking
 allocation id and uses `base_addr + offset`, where field offsets come from
 rustc's type layout query for the Rust type. Repeating a borrow of the same
 place gives the same modeled `addr` and `prov`. Different live locals get
-different allocation ids and non-overlapping address ranges. Layout-dependent
-pointer formation currently supports field projections, including fields below
-a dereferenced reference or raw pointer; DST metadata and non-field projections
-are not modeled yet.
+different allocation ids and non-overlapping address ranges. Allocation base
+addresses are constrained to satisfy the Rust type's ABI alignment from rustc's
+layout query. Layout-dependent pointer formation currently supports field
+projections, including fields below a dereferenced reference or raw pointer; DST
+metadata and non-field projections are not modeled yet.
 
 Strict-provenance APIs can be used through ordinary local wrapper contracts.
 For example:
