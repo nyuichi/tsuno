@@ -548,9 +548,7 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<(), VerificationResult> {
         match &stmt.kind {
             StatementKind::StorageLive(local) => {
-                let ty = self.body().local_decls[*local].ty;
-                let value = self.fresh_for_rust_ty(ty, &format!("live_{}", local.as_usize()))?;
-                state.store.insert(*local, value.clone());
+                state.store.remove(local);
                 self.create_unsafe_allocation(
                     state,
                     bridge,
@@ -558,7 +556,6 @@ impl<'tcx> Verifier<'tcx> {
                     "live_alloc",
                     stmt.source_info.span,
                 )?;
-                self.write_local_points_to(state, bridge, *local, value, stmt.source_info.span)?;
             }
             StatementKind::StorageDead(local) => {
                 state.store.remove(local);
@@ -1186,7 +1183,7 @@ impl<'tcx> Verifier<'tcx> {
             }
 
             let merged_value =
-                self.fresh_for_rust_ty(ty, &format!("unsafe_merge_{}", local.as_usize()))?;
+                self.fresh_for_unsafe_merge_ty(ty, &format!("unsafe_merge_{}", local.as_usize()))?;
             for (state, incoming) in states.iter().zip(incoming_values.drain(..)) {
                 let equality = self.eq_for_spec_ty(
                     &spec_ty,
@@ -1954,23 +1951,9 @@ impl<'tcx> Verifier<'tcx> {
         ty: Ty<'tcx>,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        self.assert_raw_pointer_deref_preconditions(state, ptr, ty, span)?;
+        self.assert_raw_pointer_deref_preconditions(state, ptr, ty, true, span)?;
         let addr = self.ptr_addr(ptr, span)?;
-        let index = self
-            .points_to_index(state, &addr, ty)
-            .ok_or_else(|| self.missing_points_to_result(span))?;
-        let value = match &state.heap[index] {
-            Resource::PointsTo {
-                value: Some(value), ..
-            } => value.clone(),
-            Resource::PointsTo { value: None, .. } => {
-                return Err(self.fail_result(
-                    span,
-                    "raw pointer read requires initialized memory".to_owned(),
-                ));
-            }
-            Resource::Alloc { .. } => unreachable!("points_to_index returned an allocation"),
-        };
+        let value = self.read_matching_points_to(state, &addr, ty, span)?;
         self.require_unsafe_type_invariant(
             state,
             ty,
@@ -1990,7 +1973,7 @@ impl<'tcx> Verifier<'tcx> {
         value: SymValue,
         span: Span,
     ) -> Result<(), VerificationResult> {
-        self.assert_raw_pointer_deref_preconditions(state, ptr, ty, span)?;
+        self.assert_raw_pointer_deref_preconditions(state, ptr, ty, false, span)?;
         self.require_unsafe_type_invariant(
             state,
             ty,
@@ -1999,19 +1982,7 @@ impl<'tcx> Verifier<'tcx> {
             "raw pointer write requires a valid typed value".to_owned(),
         )?;
         let addr = self.ptr_addr(ptr, span)?;
-        let index = self
-            .points_to_index(state, &addr, ty)
-            .ok_or_else(|| self.missing_points_to_result(span))?;
-        if let Resource::PointsTo {
-            value: slot, ty, ..
-        } = &mut state.heap[index]
-        {
-            *slot = Some(value.clone());
-            if let Some(local) = self.bridge_local_for_points_to(bridge, &addr, ty) {
-                state.store.insert(local, value);
-            }
-        }
-        Ok(())
+        self.write_matching_points_to(state, bridge, &addr, ty, value, span)
     }
 
     fn unsafe_deinit_raw_pointer(
@@ -2022,18 +1993,9 @@ impl<'tcx> Verifier<'tcx> {
         ty: Ty<'tcx>,
         span: Span,
     ) -> Result<(), VerificationResult> {
-        self.assert_raw_pointer_deref_preconditions(state, ptr, ty, span)?;
+        self.assert_raw_pointer_deref_preconditions(state, ptr, ty, false, span)?;
         let addr = self.ptr_addr(ptr, span)?;
-        let index = self
-            .points_to_index(state, &addr, ty)
-            .ok_or_else(|| self.missing_points_to_result(span))?;
-        if let Resource::PointsTo { value, ty, .. } = &mut state.heap[index] {
-            *value = None;
-            if let Some(local) = self.bridge_local_for_points_to(bridge, &addr, ty) {
-                state.store.remove(&local);
-            }
-        }
-        Ok(())
+        self.deinit_matching_points_to(state, bridge, &addr, ty, span)
     }
 
     fn assert_raw_pointer_deref_preconditions(
@@ -2041,6 +2003,7 @@ impl<'tcx> Verifier<'tcx> {
         state: &mut UnsafeState,
         ptr: &SymValue,
         ty: Ty<'tcx>,
+        require_initialized_points_to: bool,
         span: Span,
     ) -> Result<(), VerificationResult> {
         let addr = self.ptr_addr(ptr, span)?;
@@ -2079,23 +2042,33 @@ impl<'tcx> Verifier<'tcx> {
                 "raw pointer type does not match the dereferenced type".to_owned(),
             ));
         }
-        if self.points_to_index(state, &addr, ty).is_none() {
-            return Err(self.missing_points_to_result(span));
-        }
-        self.unsafe_assert_constraint(
+        let points_to_exists = self.points_to_coverage_formula(
+            state,
+            &addr,
+            &expected_ty,
+            require_initialized_points_to,
+            span,
+        )?;
+        self.unsafe_assert_memory_precondition(
+            state,
+            points_to_exists,
+            span,
+            "raw pointer dereference requires an initialized PointsTo resource".to_owned(),
+        )?;
+        self.unsafe_assert_memory_precondition(
             state,
             ptr_ty_matches,
             span,
             "raw pointer type does not match the dereferenced type".to_owned(),
         )?;
-        self.unsafe_assert_constraint(
+        self.unsafe_assert_memory_precondition(
             state,
             non_null,
             span,
             "raw pointer dereference requires a non-null address".to_owned(),
         )?;
         if align > 1 {
-            self.unsafe_assert_constraint(
+            self.unsafe_assert_memory_precondition(
                 state,
                 aligned.expect("computed above"),
                 span,
@@ -2103,7 +2076,7 @@ impl<'tcx> Verifier<'tcx> {
             )?;
         }
         let live_range = self.unsafe_live_allocation_formula(state, ptr, &addr, ty, span)?;
-        self.unsafe_assert_constraint(
+        self.unsafe_assert_memory_precondition(
             state,
             live_range,
             span,
@@ -2157,9 +2130,241 @@ impl<'tcx> Verifier<'tcx> {
         Ok(bool_or(candidates))
     }
 
-    fn points_to_index(&self, state: &UnsafeState, addr: &SymValue, ty: Ty<'tcx>) -> Option<usize> {
+    fn points_to_coverage_formula(
+        &self,
+        state: &UnsafeState,
+        addr: &SymValue,
+        ty: &SymValue,
+        require_initialized: bool,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        Ok(bool_or(
+            self.points_to_match_conditions_for_ty_value(
+                state,
+                addr,
+                ty,
+                require_initialized,
+                span,
+            )?
+            .into_iter()
+            .map(|(_, condition)| condition)
+            .collect(),
+        ))
+    }
+
+    fn points_to_match_conditions(
+        &self,
+        state: &UnsafeState,
+        addr: &SymValue,
+        ty: Ty<'tcx>,
+        require_initialized: bool,
+        span: Span,
+    ) -> Result<Vec<(usize, Bool)>, VerificationResult> {
         let ty = self.rust_ty_model_value(ty);
-        self.points_to_index_for_ty_value(state, addr, &ty)
+        self.points_to_match_conditions_for_ty_value(state, addr, &ty, require_initialized, span)
+    }
+
+    fn points_to_match_conditions_for_ty_value(
+        &self,
+        state: &UnsafeState,
+        addr: &SymValue,
+        ty: &SymValue,
+        require_initialized: bool,
+        span: Span,
+    ) -> Result<Vec<(usize, Bool)>, VerificationResult> {
+        let mut candidates = Vec::new();
+        for (index, resource) in state.heap.iter().enumerate() {
+            let Resource::PointsTo {
+                addr: resource_addr,
+                ty: resource_ty,
+                value,
+            } = resource
+            else {
+                continue;
+            };
+            if require_initialized && value.is_none() {
+                continue;
+            }
+            if resource_ty != ty {
+                continue;
+            }
+            let addr_matches = self.eq_for_spec_ty(&SpecTy::Usize, addr, resource_addr, span)?;
+            let condition = addr_matches.simplify();
+            if matches!(condition.as_bool(), Some(false)) {
+                continue;
+            }
+            if !matches!(
+                self.check_sat(&[state.pc.clone(), condition.clone()]),
+                SatResult::Unsat
+            ) {
+                candidates.push((index, condition));
+            }
+        }
+        Ok(candidates)
+    }
+
+    fn read_matching_points_to(
+        &self,
+        state: &mut UnsafeState,
+        addr: &SymValue,
+        ty: Ty<'tcx>,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let candidates = self.points_to_match_conditions(state, addr, ty, true, span)?;
+        if candidates.is_empty() {
+            return Err(self.missing_points_to_result(span));
+        }
+        if candidates.len() == 1
+            && matches!(candidates[0].1.simplify().as_bool(), Some(true))
+            && let Resource::PointsTo {
+                value: Some(value), ..
+            } = &state.heap[candidates[0].0]
+        {
+            return Ok(value.clone());
+        }
+
+        let value = self.fresh_for_rust_ty(ty, "unsafe_read")?;
+        let spec_ty = self.spec_ty_for_place_ty(ty, span)?;
+        for (index, condition) in candidates {
+            let Resource::PointsTo {
+                value: Some(resource_value),
+                ..
+            } = &state.heap[index]
+            else {
+                continue;
+            };
+            let equality = self.eq_for_spec_ty(&spec_ty, &value, resource_value, span)?;
+            self.add_unsafe_path_condition(state, condition.implies(equality));
+        }
+        Ok(value)
+    }
+
+    fn write_matching_points_to(
+        &self,
+        state: &mut UnsafeState,
+        bridge: &UnsafeBridge,
+        addr: &SymValue,
+        ty: Ty<'tcx>,
+        value: SymValue,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        let candidates = self.points_to_match_conditions(state, addr, ty, false, span)?;
+        if candidates.is_empty() {
+            return Err(self.missing_points_to_result(span));
+        }
+        let mut updates = Vec::new();
+        for (index, condition) in candidates {
+            let Resource::PointsTo {
+                addr: resource_addr,
+                ty: resource_ty,
+                value: old_value,
+            } = &state.heap[index]
+            else {
+                unreachable!("points-to candidate must be PointsTo");
+            };
+            let local = self.bridge_local_for_points_to(bridge, resource_addr, resource_ty);
+            updates.push((index, condition, old_value.clone(), local));
+        }
+
+        for (index, condition, old_value, local) in updates {
+            let replacement =
+                self.conditional_points_to_value(state, condition, old_value, &value, ty, span)?;
+            if let Resource::PointsTo { value: slot, .. } = &mut state.heap[index] {
+                *slot = replacement.clone();
+            }
+            if let Some(local) = local {
+                match replacement {
+                    Some(value) => {
+                        state.store.insert(local, value);
+                    }
+                    None => {
+                        state.store.remove(&local);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn deinit_matching_points_to(
+        &self,
+        state: &mut UnsafeState,
+        bridge: &UnsafeBridge,
+        addr: &SymValue,
+        ty: Ty<'tcx>,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        let candidates = self.points_to_match_conditions(state, addr, ty, false, span)?;
+        if candidates.is_empty() {
+            return Err(self.missing_points_to_result(span));
+        }
+        let mut updates = Vec::new();
+        for (index, condition) in candidates {
+            let Resource::PointsTo {
+                addr: resource_addr,
+                ty: resource_ty,
+                ..
+            } = &state.heap[index]
+            else {
+                unreachable!("points-to candidate must be PointsTo");
+            };
+            let local = self.bridge_local_for_points_to(bridge, resource_addr, resource_ty);
+            updates.push((index, condition, local));
+        }
+
+        for (index, condition, local) in updates {
+            if !self.unsafe_path_implies(state, &condition) {
+                return Err(self.unsupported_result(
+                    span,
+                    "conditional deinitialization through a raw pointer is unsupported".to_owned(),
+                ));
+            }
+            if let Resource::PointsTo { value, .. } = &mut state.heap[index] {
+                *value = None;
+            }
+            if let Some(local) = local {
+                state.store.remove(&local);
+            }
+        }
+        Ok(())
+    }
+
+    fn conditional_points_to_value(
+        &self,
+        state: &mut UnsafeState,
+        condition: Bool,
+        old_value: Option<SymValue>,
+        value: &SymValue,
+        ty: Ty<'tcx>,
+        span: Span,
+    ) -> Result<Option<SymValue>, VerificationResult> {
+        let condition = condition.simplify();
+        if matches!(condition.as_bool(), Some(false)) {
+            return Ok(old_value);
+        }
+        if self.unsafe_path_implies(state, &condition) {
+            return Ok(Some(value.clone()));
+        }
+        let Some(old_value) = old_value else {
+            return Err(self.unsupported_result(
+                span,
+                "conditional initialization through a raw pointer is unsupported".to_owned(),
+            ));
+        };
+        let result = self.fresh_for_rust_ty(ty, "unsafe_write")?;
+        let spec_ty = self.spec_ty_for_place_ty(ty, span)?;
+        let new_equality = self.eq_for_spec_ty(&spec_ty, &result, value, span)?;
+        self.add_unsafe_path_condition(state, condition.clone().implies(new_equality));
+        let old_equality = self.eq_for_spec_ty(&spec_ty, &result, &old_value, span)?;
+        self.add_unsafe_path_condition(state, condition.not().implies(old_equality));
+        Ok(Some(result))
+    }
+
+    fn unsafe_path_implies(&self, state: &UnsafeState, condition: &Bool) -> bool {
+        matches!(
+            self.check_sat(&[state.pc.clone(), condition.not()]),
+            SatResult::Unsat
+        )
     }
 
     fn points_to_index_for_ty_value(
@@ -2224,6 +2429,32 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(())
             }
             SatResult::Unknown => Err(self.unknown_solver_result(span, "checking unsafe code")),
+        }
+    }
+
+    fn unsafe_assert_memory_precondition(
+        &self,
+        state: &mut UnsafeState,
+        constraint: Bool,
+        span: Span,
+        message: String,
+    ) -> Result<(), VerificationResult> {
+        let constraint = constraint.simplify();
+        if let Some(value) = constraint.as_bool() {
+            return match value {
+                true => {
+                    self.add_unsafe_path_condition(state, constraint);
+                    Ok(())
+                }
+                false => Err(self.fail_result(span, message)),
+            };
+        }
+        match self.check_sat(&[state.pc.clone(), constraint.not()]) {
+            SatResult::Sat | SatResult::Unknown => Err(self.fail_result(span, message)),
+            SatResult::Unsat => {
+                self.add_unsafe_path_condition(state, constraint);
+                Ok(())
+            }
         }
     }
 
@@ -4507,6 +4738,23 @@ impl<'tcx> Verifier<'tcx> {
         let addr = self.fresh_for_spec_ty(&SpecTy::Usize, &format!("{hint}_addr"))?;
         let prov = self.construct_option_none(provenance_spec_ty())?;
         let ty = self.rust_ty_model_value(pointee_ty);
+        self.construct_composite(&ptr_spec_ty(), &[addr, prov, ty])
+    }
+
+    fn fresh_for_unsafe_merge_ty(
+        &self,
+        ty: Ty<'tcx>,
+        hint: &str,
+    ) -> Result<SymValue, VerificationResult> {
+        let TyKind::RawPtr(pointee, _) = ty.kind() else {
+            return self.fresh_for_rust_ty(ty, hint);
+        };
+        let addr = self.fresh_for_spec_ty(&SpecTy::Usize, &format!("{hint}_addr"))?;
+        let prov = self.fresh_for_spec_ty(
+            &option_spec_ty(provenance_spec_ty()),
+            &format!("{hint}_prov"),
+        )?;
+        let ty = self.rust_ty_model_value(*pointee);
         self.construct_composite(&ptr_spec_ty(), &[addr, prov, ty])
     }
 
