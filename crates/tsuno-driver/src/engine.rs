@@ -129,19 +129,18 @@ pub struct Verifier<'tcx> {
 }
 
 #[derive(Debug, Clone)]
-struct UnsafeState<'tcx> {
+struct UnsafeState {
     pc: Bool,
     store: BTreeMap<Local, SymValue>,
-    heap: Vec<Resource<'tcx>>,
+    heap: Vec<Resource>,
 }
 
 #[derive(Debug, Clone)]
-enum Resource<'tcx> {
+enum Resource {
     PointsTo {
         addr: SymValue,
-        ty: Ty<'tcx>,
+        ty: SymValue,
         value: Option<SymValue>,
-        local: Option<Local>,
     },
     Alloc {
         alloc_id: SymValue,
@@ -149,6 +148,25 @@ enum Resource<'tcx> {
         size: u64,
         alignment: u64,
     },
+}
+
+#[derive(Debug, Clone)]
+struct UnsafeFrame {
+    state: UnsafeState,
+    bridge: UnsafeBridge,
+    spec_env: HashMap<String, SymValue>,
+    ctrl: ControlPoint,
+}
+
+#[derive(Debug, Clone, Default)]
+struct UnsafeBridge {
+    locals: BTreeMap<Local, LocalBridge>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalBridge {
+    alloc: Allocation,
+    ty: SymValue,
 }
 
 pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<VerificationResult> {
@@ -348,9 +366,7 @@ impl<'tcx> Verifier<'tcx> {
         };
         let mut pending: BTreeMap<ControlPoint, Vec<State>> = BTreeMap::new();
         let mut worklist = VecDeque::new();
-        if let Some(err) = self.enqueue_state(&mut pending, &mut worklist, initial_state) {
-            return err;
-        }
+        self.enqueue_state(&mut pending, &mut worklist, initial_state);
 
         while let Some(ctrl) = worklist.pop_front() {
             let Some(bucket) = pending.remove(&ctrl) else {
@@ -425,6 +441,15 @@ impl<'tcx> Verifier<'tcx> {
                     continue;
                 }
             }
+            if let Some(unsafe_span) = self.unsafe_block_containing_span(self.control_span(ctrl)) {
+                let next = match self.step_unsafe_region(state, unsafe_span) {
+                    Ok(next) => next,
+                    Err(err) => return err,
+                };
+                self.enqueue_state(&mut pending, &mut worklist, next);
+                continue;
+            }
+
             let data = &self.body().basic_blocks[ctrl.basic_block];
             if ctrl.statement_index < data.statements.len() {
                 let stmt = &data.statements[ctrl.statement_index];
@@ -432,9 +457,7 @@ impl<'tcx> Verifier<'tcx> {
                     Ok(next) => next,
                     Err(err) => return err,
                 };
-                if let Some(err) = self.enqueue_state(&mut pending, &mut worklist, next) {
-                    return err;
-                }
+                self.enqueue_state(&mut pending, &mut worklist, next);
                 continue;
             }
 
@@ -443,9 +466,7 @@ impl<'tcx> Verifier<'tcx> {
                 Err(err) => return err,
             };
             for next in next_states {
-                if let Some(err) = self.enqueue_state(&mut pending, &mut worklist, next) {
-                    return err;
-                }
+                self.enqueue_state(&mut pending, &mut worklist, next);
             }
         }
 
@@ -509,19 +530,8 @@ impl<'tcx> Verifier<'tcx> {
             }
             StatementKind::Assign(assign) => {
                 let (place, rvalue) = &**assign;
-                if self.assign_uses_raw_pointer_deref(*place, rvalue) {
-                    let mut unsafe_state = self.enter_unsafe(&state, stmt.source_info.span)?;
-                    self.step_unsafe_assign(
-                        &mut unsafe_state,
-                        *place,
-                        rvalue,
-                        stmt.source_info.span,
-                    )?;
-                    state = self.exit_unsafe(state, unsafe_state);
-                } else {
-                    let value = self.eval_rvalue(&mut state, rvalue, stmt.source_info.span)?;
-                    self.write_place(&mut state, *place, value, stmt.source_info.span)?;
-                }
+                let value = self.eval_rvalue(&mut state, rvalue, stmt.source_info.span)?;
+                self.write_place(&mut state, *place, value, stmt.source_info.span)?;
             }
             StatementKind::Nop
             | StatementKind::Coverage(..)
@@ -539,6 +549,45 @@ impl<'tcx> Verifier<'tcx> {
         }
         state.ctrl.statement_index += 1;
         Ok(state)
+    }
+
+    fn step_unsafe_statement(
+        &self,
+        frame: &mut UnsafeFrame,
+        stmt: &Statement<'tcx>,
+    ) -> Result<(), VerificationResult> {
+        match &stmt.kind {
+            StatementKind::StorageLive(local) => {
+                let ty = self.body().local_decls[*local].ty;
+                let value = self.fresh_for_rust_ty(ty, &format!("live_{}", local.as_usize()))?;
+                frame.state.store.insert(*local, value.clone());
+                self.create_unsafe_allocation(frame, *local, "live_alloc", stmt.source_info.span)?;
+                self.write_local_points_to(frame, *local, value, stmt.source_info.span)?;
+            }
+            StatementKind::StorageDead(local) => {
+                frame.state.store.remove(local);
+                self.remove_unsafe_local_allocation(frame, *local);
+            }
+            StatementKind::Assign(assign) => {
+                let (place, rvalue) = &**assign;
+                self.step_unsafe_assign(frame, *place, rvalue, stmt.source_info.span)?;
+            }
+            StatementKind::Nop
+            | StatementKind::Coverage(..)
+            | StatementKind::FakeRead(..)
+            | StatementKind::AscribeUserType(..)
+            | StatementKind::BackwardIncompatibleDropHint { .. }
+            | StatementKind::ConstEvalCounter
+            | StatementKind::PlaceMention(..) => {}
+            other => {
+                return Err(self.unsupported_result(
+                    stmt.source_info.span,
+                    format!("unsupported MIR statement in unsafe block {other:?}"),
+                ));
+            }
+        }
+        frame.ctrl.statement_index += 1;
+        Ok(())
     }
 
     fn step_terminator(
@@ -660,25 +709,67 @@ impl<'tcx> Verifier<'tcx> {
                 destination,
                 target,
                 ..
-            } => {
-                if self.is_inside_unsafe_block(term.source_info.span) {
-                    return Err(self.unsupported_result(
-                        term.source_info.span,
-                        "function calls inside unsafe blocks are unsupported".to_owned(),
-                    ));
-                }
-                self.step_call(
-                    state,
-                    func,
-                    args,
-                    *destination,
-                    *target,
-                    term.source_info.span,
-                )
-            }
+            } => self.step_call(
+                state,
+                func,
+                args,
+                *destination,
+                *target,
+                term.source_info.span,
+            ),
             other => Err(self.unsupported_result(
                 term.source_info.span,
                 format!("unsupported MIR terminator {other:?}"),
+            )),
+        }
+    }
+
+    fn step_unsafe_terminator(
+        &self,
+        frame: &mut UnsafeFrame,
+        term: &Terminator<'tcx>,
+    ) -> Result<(), VerificationResult> {
+        match &term.kind {
+            TerminatorKind::Goto { target } => {
+                self.unsafe_goto_target(frame, *target);
+                Ok(())
+            }
+            TerminatorKind::Assert {
+                cond,
+                expected,
+                target,
+                msg,
+                ..
+            } => {
+                let cond_value = self.unsafe_eval_operand(frame, cond, term.source_info.span)?;
+                let mut formula = self.value_is_true(&cond_value);
+                if !*expected {
+                    formula = formula.not();
+                }
+                self.unsafe_assert_constraint(
+                    &mut frame.state,
+                    formula,
+                    term.source_info.span,
+                    format!("assertion failed: {msg:?}"),
+                )?;
+                self.unsafe_goto_target(frame, *target);
+                Ok(())
+            }
+            TerminatorKind::Call { .. } => Err(self.unsupported_result(
+                term.source_info.span,
+                "function calls inside unsafe blocks are unsupported".to_owned(),
+            )),
+            TerminatorKind::SwitchInt { .. } => Err(self.unsupported_result(
+                term.source_info.span,
+                "branches inside unsafe blocks are unsupported".to_owned(),
+            )),
+            TerminatorKind::Return => Err(self.unsupported_result(
+                term.source_info.span,
+                "return inside unsafe blocks is unsupported".to_owned(),
+            )),
+            other => Err(self.unsupported_result(
+                term.source_info.span,
+                format!("unsupported MIR terminator in unsafe block {other:?}"),
             )),
         }
     }
@@ -754,6 +845,13 @@ impl<'tcx> Verifier<'tcx> {
             Some(state) => vec![state],
             None => Vec::new(),
         })
+    }
+
+    fn unsafe_goto_target(&self, frame: &mut UnsafeFrame, target: BasicBlock) {
+        frame.ctrl = ControlPoint {
+            basic_block: target,
+            statement_index: 0,
+        };
     }
 
     fn transition_to_block(
@@ -969,111 +1067,271 @@ impl<'tcx> Verifier<'tcx> {
         pending: &mut BTreeMap<ControlPoint, Vec<State>>,
         worklist: &mut VecDeque<ControlPoint>,
         state: State,
-    ) -> Option<VerificationResult> {
+    ) {
         let ctrl = state.ctrl;
         let bucket = pending.entry(ctrl).or_default();
         if bucket.is_empty() {
             worklist.push_back(ctrl);
         }
         bucket.push(state);
-        None
     }
 
-    fn enter_unsafe(
+    fn step_unsafe_region(
         &self,
-        state: &State,
-        span: Span,
-    ) -> Result<UnsafeState<'tcx>, VerificationResult> {
-        let mut unsafe_state = UnsafeState {
-            pc: state.pc.clone(),
-            store: state.model.clone(),
-            heap: Vec::new(),
+        state: State,
+        unsafe_span: Span,
+    ) -> Result<State, VerificationResult> {
+        let mut frame = self.enter_unsafe(state, unsafe_span)?;
+        while span_contains(unsafe_span, self.control_span(frame.ctrl)) {
+            let data = &self.body().basic_blocks[frame.ctrl.basic_block];
+            if frame.ctrl.statement_index < data.statements.len() {
+                let statement_index = frame.ctrl.statement_index;
+                self.step_unsafe_statement(&mut frame, &data.statements[statement_index])?;
+            } else {
+                self.step_unsafe_terminator(&mut frame, data.terminator())?;
+            }
+        }
+        Ok(self.exit_unsafe(frame))
+    }
+
+    fn enter_unsafe(&self, state: State, span: Span) -> Result<UnsafeFrame, VerificationResult> {
+        let State {
+            pc,
+            model,
+            allocs,
+            spec_env,
+            ctrl,
+        } = state;
+        let mut frame = UnsafeFrame {
+            state: UnsafeState {
+                pc,
+                store: model,
+                heap: Vec::new(),
+            },
+            bridge: UnsafeBridge::default(),
+            spec_env,
+            ctrl,
         };
 
-        for (local, alloc) in &state.allocs {
-            let base_int = self.value_int_data(&alloc.base_addr);
-            self.add_unsafe_path_condition(&mut unsafe_state, base_int.eq(Int::from_i64(0)).not());
-            if alloc.align > 1 {
-                self.add_unsafe_path_condition(
-                    &mut unsafe_state,
-                    base_int.modulo(Int::from_u64(alloc.align)).eq(0),
-                );
-            }
-            unsafe_state.heap.push(Resource::Alloc {
-                alloc_id: alloc.alloc_id.clone(),
-                base: alloc.base_addr.clone(),
-                size: alloc.size,
-                alignment: alloc.align,
-            });
-            if let Some(value) = state.model.get(local).cloned() {
-                let ty = self.body().local_decls[*local].ty;
-                let addr = alloc.base_addr.clone();
-                unsafe_state.heap.push(Resource::PointsTo {
-                    addr: addr.clone(),
-                    ty,
-                    value: Some(value.clone()),
-                    local: Some(*local),
-                });
-                let addr_int = self.value_int_data(&addr);
-                self.add_unsafe_path_condition(
-                    &mut unsafe_state,
-                    addr_int.eq(Int::from_i64(0)).not(),
-                );
-                let (_, align) = self.layout_size_align_bytes(ty, span)?;
-                if align > 1 {
-                    self.add_unsafe_path_condition(
-                        &mut unsafe_state,
-                        addr_int.modulo(Int::from_u64(align)).eq(0),
-                    );
-                }
-                let spec_ty = self.spec_ty_for_place_ty(ty, span)?;
-                if let Some(formula) = self.spec_ty_formula(&spec_ty, &value, span)? {
-                    self.add_unsafe_path_condition(&mut unsafe_state, formula);
-                }
+        for (local, alloc) in allocs {
+            let ty = self.rust_ty_model_value(self.body().local_decls[local].ty);
+            self.add_unsafe_alloc_resource(&mut frame.state, &alloc, span)?;
+            frame.bridge.locals.insert(local, LocalBridge { alloc, ty });
+            if let Some(value) = frame.state.store.get(&local).cloned() {
+                self.write_local_points_to(&mut frame, local, value, span)?;
             }
         }
 
-        Ok(unsafe_state)
+        Ok(frame)
     }
 
-    fn exit_unsafe(&self, mut state: State, unsafe_state: UnsafeState<'tcx>) -> State {
-        state.pc = unsafe_state.pc;
-        state.model = unsafe_state.store;
-        state
+    fn exit_unsafe(&self, mut frame: UnsafeFrame) -> State {
+        for (local, bridge) in &frame.bridge.locals {
+            let index = self.points_to_index_for_ty_value(
+                &frame.state,
+                &bridge.alloc.base_addr,
+                &bridge.ty,
+            );
+            match index.map(|index| &frame.state.heap[index]) {
+                Some(Resource::PointsTo {
+                    value: Some(value), ..
+                }) => {
+                    frame.state.store.insert(*local, value.clone());
+                }
+                Some(Resource::PointsTo { value: None, .. }) | None => {
+                    frame.state.store.remove(local);
+                }
+                Some(Resource::Alloc { .. }) => {
+                    unreachable!("points_to_index returned an allocation")
+                }
+            }
+        }
+        let allocs = frame
+            .bridge
+            .locals
+            .into_iter()
+            .map(|(local, bridge)| (local, bridge.alloc))
+            .collect();
+        State {
+            pc: frame.state.pc,
+            model: frame.state.store,
+            allocs,
+            spec_env: frame.spec_env,
+            ctrl: frame.ctrl,
+        }
+    }
+
+    fn create_unsafe_allocation(
+        &self,
+        frame: &mut UnsafeFrame,
+        local: Local,
+        hint: &str,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        self.remove_unsafe_local_allocation(frame, local);
+        let ty = self.body().local_decls[local].ty;
+        let (size, align) = self.layout_size_align_bytes(ty, span)?;
+        let alloc_id =
+            self.fresh_for_spec_ty(&SpecTy::Int, &format!("{hint}_{}_id", local.as_usize()))?;
+        let base_addr =
+            self.fresh_for_spec_ty(&SpecTy::Usize, &format!("{hint}_{}_base", local.as_usize()))?;
+        let alloc = Allocation {
+            alloc_id,
+            base_addr,
+            size,
+            align,
+        };
+
+        let other_allocs = frame
+            .bridge
+            .locals
+            .values()
+            .map(|bridge| bridge.alloc.clone())
+            .collect::<Vec<_>>();
+        for other in &other_allocs {
+            self.add_unsafe_path_condition(
+                &mut frame.state,
+                self.allocation_distinct_formula(&alloc, other, span)?,
+            );
+            if alloc.size != 0 && other.size != 0 {
+                self.add_unsafe_path_condition(
+                    &mut frame.state,
+                    self.allocation_non_overlapping_formula(&alloc, other),
+                );
+            }
+        }
+        self.add_unsafe_alloc_resource(&mut frame.state, &alloc, span)?;
+        frame.bridge.locals.insert(
+            local,
+            LocalBridge {
+                alloc,
+                ty: self.rust_ty_model_value(ty),
+            },
+        );
+        Ok(())
+    }
+
+    fn add_unsafe_alloc_resource(
+        &self,
+        state: &mut UnsafeState,
+        alloc: &Allocation,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        self.add_unsafe_path_condition(state, self.allocation_bounds_formula(alloc, span)?);
+        state.heap.push(Resource::Alloc {
+            alloc_id: alloc.alloc_id.clone(),
+            base: alloc.base_addr.clone(),
+            size: alloc.size,
+            alignment: alloc.align,
+        });
+        Ok(())
+    }
+
+    fn remove_unsafe_local_allocation(&self, frame: &mut UnsafeFrame, local: Local) {
+        let bridge = frame.bridge.locals.remove(&local);
+        frame.state.heap.retain(|resource| match resource {
+            Resource::PointsTo { addr, ty, .. } => bridge
+                .as_ref()
+                .is_none_or(|bridge| *addr != bridge.alloc.base_addr || *ty != bridge.ty),
+            Resource::Alloc { alloc_id, .. } => bridge
+                .as_ref()
+                .is_none_or(|bridge| *alloc_id != bridge.alloc.alloc_id),
+        });
+    }
+
+    fn write_local_points_to(
+        &self,
+        frame: &mut UnsafeFrame,
+        local: Local,
+        value: SymValue,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        let bridge = frame.bridge.locals.get(&local).cloned().ok_or_else(|| {
+            self.unsupported_result(
+                span,
+                format!("missing allocation for local {}", local.as_usize()),
+            )
+        })?;
+        if let Some(index) =
+            self.points_to_index_for_ty_value(&frame.state, &bridge.alloc.base_addr, &bridge.ty)
+        {
+            if let Resource::PointsTo { value: slot, .. } = &mut frame.state.heap[index] {
+                *slot = Some(value);
+            }
+            return Ok(());
+        }
+
+        let addr = bridge.alloc.base_addr;
+        frame.state.heap.push(Resource::PointsTo {
+            addr: addr.clone(),
+            ty: bridge.ty,
+            value: Some(value.clone()),
+        });
+        let addr_int = self.value_int_data(&addr);
+        self.add_unsafe_path_condition(&mut frame.state, addr_int.eq(Int::from_i64(0)).not());
+        let ty = self.body().local_decls[local].ty;
+        let (_, align) = self.layout_size_align_bytes(ty, span)?;
+        if align > 1 {
+            self.add_unsafe_path_condition(
+                &mut frame.state,
+                addr_int.modulo(Int::from_u64(align)).eq(0),
+            );
+        }
+        let spec_ty = self.spec_ty_for_place_ty(ty, span)?;
+        if let Some(formula) = self.spec_ty_formula(&spec_ty, &value, span)? {
+            self.add_unsafe_path_condition(&mut frame.state, formula);
+        }
+        Ok(())
+    }
+
+    fn bridge_local_for_points_to(
+        &self,
+        bridge: &UnsafeBridge,
+        addr: &SymValue,
+        ty: &SymValue,
+    ) -> Option<Local> {
+        bridge.locals.iter().find_map(|(local, bridge)| {
+            if bridge.alloc.base_addr == *addr && bridge.ty == *ty {
+                Some(*local)
+            } else {
+                None
+            }
+        })
     }
 
     fn step_unsafe_assign(
         &self,
-        state: &mut UnsafeState<'tcx>,
+        frame: &mut UnsafeFrame,
         place: Place<'tcx>,
         rvalue: &Rvalue<'tcx>,
         span: Span,
     ) -> Result<(), VerificationResult> {
-        let value = self.unsafe_eval_rvalue(state, rvalue, span)?;
-        self.unsafe_write_place(state, place, value, span)
+        let value = self.unsafe_eval_rvalue(frame, rvalue, span)?;
+        self.unsafe_write_place(frame, place, value, span)
     }
 
     fn unsafe_eval_rvalue(
         &self,
-        state: &mut UnsafeState<'tcx>,
+        frame: &mut UnsafeFrame,
         rvalue: &Rvalue<'tcx>,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
         match rvalue {
-            Rvalue::Use(operand) => self.unsafe_eval_operand(state, operand, span),
+            Rvalue::Use(operand) => self.unsafe_eval_operand(frame, operand, span),
+            Rvalue::RawPtr(_, place) => self.unsafe_ptr_for_place(frame, *place, span),
             Rvalue::Cast(_, operand, target_ty) => {
-                self.unsafe_eval_cast(state, operand, *target_ty, span)
+                self.unsafe_eval_cast(frame, operand, *target_ty, span)
             }
             Rvalue::BinaryOp(op, operands) => {
-                let lhs = self.unsafe_eval_operand(state, &operands.0, span)?;
-                let rhs = self.unsafe_eval_operand(state, &operands.1, span)?;
+                let lhs = self.unsafe_eval_operand(frame, &operands.0, span)?;
+                let rhs = self.unsafe_eval_operand(frame, &operands.1, span)?;
                 let lhs_ty = operands.0.ty(&self.body().local_decls, self.tcx);
-                self.lower_unsafe_binary_value(state, *op, lhs_ty, &lhs, &rhs, span)
+                self.lower_unsafe_binary_value(&mut frame.state, *op, lhs_ty, &lhs, &rhs, span)
             }
             Rvalue::UnaryOp(op, operand) => {
-                let value = self.unsafe_eval_operand(state, operand, span)?;
+                let value = self.unsafe_eval_operand(frame, operand, span)?;
                 let operand_ty = operand.ty(&self.body().local_decls, self.tcx);
-                self.lower_unsafe_unary_value(state, *op, operand_ty, &value, span)
+                self.lower_unsafe_unary_value(&mut frame.state, *op, operand_ty, &value, span)
             }
             Rvalue::Aggregate(kind, operands) => match **kind {
                 AggregateKind::Tuple => {
@@ -1083,7 +1341,7 @@ impl<'tcx> Verifier<'tcx> {
                     )?;
                     let mut values = Vec::with_capacity(operands.len());
                     for operand in operands {
-                        values.push(self.unsafe_eval_operand(state, operand, span)?);
+                        values.push(self.unsafe_eval_operand(frame, operand, span)?);
                     }
                     self.construct_composite(&result_ty, &values)
                 }
@@ -1095,7 +1353,7 @@ impl<'tcx> Verifier<'tcx> {
                     }
                     let mut values = Vec::with_capacity(operands.len());
                     for operand in operands {
-                        values.push(self.unsafe_eval_operand(state, operand, span)?);
+                        values.push(self.unsafe_eval_operand(frame, operand, span)?);
                     }
                     let result_ty = spec_ty_for_rust_ty(
                         self.tcx,
@@ -1114,19 +1372,19 @@ impl<'tcx> Verifier<'tcx> {
 
     fn unsafe_eval_operand(
         &self,
-        state: &mut UnsafeState<'tcx>,
+        frame: &mut UnsafeFrame,
         operand: &Operand<'tcx>,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
         let value = match operand {
             Operand::Copy(place) | Operand::Move(place) => {
-                self.unsafe_read_place(state, *place, span)?
+                self.unsafe_read_place(frame, *place, span)?
             }
             Operand::Constant(constant) => self.eval_const_operand(constant, span)?,
         };
         if let Operand::Constant(constant) = operand {
             self.require_unsafe_type_invariant(
-                state,
+                &mut frame.state,
                 constant.const_.ty(),
                 &value,
                 span,
@@ -1134,19 +1392,19 @@ impl<'tcx> Verifier<'tcx> {
             )?;
         }
         if matches!(operand, Operand::Move(_)) {
-            self.unsafe_consume_operand(state, operand, span)?;
+            self.unsafe_consume_operand(frame, operand, span)?;
         }
         Ok(value)
     }
 
     fn unsafe_eval_cast(
         &self,
-        state: &mut UnsafeState<'tcx>,
+        frame: &mut UnsafeFrame,
         operand: &Operand<'tcx>,
         target_ty: Ty<'tcx>,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let value = self.unsafe_eval_operand(state, operand, span)?;
+        let value = self.unsafe_eval_operand(frame, operand, span)?;
         match target_ty.kind() {
             TyKind::RawPtr(target_pointee, _) => {
                 let operand_ty = operand.ty(&self.body().local_decls, self.tcx);
@@ -1181,7 +1439,7 @@ impl<'tcx> Verifier<'tcx> {
 
     fn lower_unsafe_binary_value(
         &self,
-        state: &mut UnsafeState<'tcx>,
+        state: &mut UnsafeState,
         op: BinOp,
         lhs_ty: Ty<'tcx>,
         lhs: &SymValue,
@@ -1252,7 +1510,7 @@ impl<'tcx> Verifier<'tcx> {
 
     fn lower_unsafe_unary_value(
         &self,
-        state: &mut UnsafeState<'tcx>,
+        state: &mut UnsafeState,
         op: UnOp,
         operand_ty: Ty<'tcx>,
         value: &SymValue,
@@ -1279,15 +1537,58 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
+    fn unsafe_ptr_for_place(
+        &self,
+        frame: &mut UnsafeFrame,
+        place: Place<'tcx>,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let projection = place.as_ref().projection;
+        let final_ty = self.place_ty(place);
+        if matches!(projection.first(), Some(PlaceElem::Deref)) {
+            let Some(root) = frame.state.store.get(&place.local).cloned() else {
+                return Err(self.unsupported_result(
+                    span,
+                    format!("missing local {}", place.local.as_usize()),
+                ));
+            };
+            let root_ty = self.body().local_decls[place.local].ty;
+            let root_spec_ty = self.spec_ty_for_place_ty(root_ty, span)?;
+            let base_ptr = self.ptr_for_deref_base(&root, &root_spec_ty, span)?;
+            let pointee_ty = self.deref_pointee_ty(root_ty, span)?;
+            return self.ptr_for_base_projection(
+                &base_ptr,
+                pointee_ty,
+                &projection[1..],
+                final_ty,
+                span,
+            );
+        }
+
+        let bridge = frame.bridge.locals.get(&place.local).ok_or_else(|| {
+            self.unsupported_result(
+                span,
+                format!("missing allocation for local {}", place.local.as_usize()),
+            )
+        })?;
+        let root_ty = self.body().local_decls[place.local].ty;
+        let offset = self.place_projection_offset(root_ty, projection, span)?;
+        let addr = self.add_addr_offset(bridge.alloc.base_addr.clone(), offset);
+        let provenance = self.construct_provenance(bridge.alloc.alloc_id.clone())?;
+        let prov = self.construct_option_some(provenance_spec_ty(), provenance)?;
+        let ty = self.rust_ty_model_value(final_ty);
+        self.construct_ptr(addr, prov, ty)
+    }
+
     fn unsafe_read_place(
         &self,
-        state: &mut UnsafeState<'tcx>,
+        frame: &mut UnsafeFrame,
         place: Place<'tcx>,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
         let projection = place.as_ref().projection;
         let root_ty = self.body().local_decls[place.local].ty;
-        let Some(root) = state.store.get(&place.local).cloned() else {
+        let Some(root) = frame.state.store.get(&place.local).cloned() else {
             return Err(
                 self.unsupported_result(span, format!("missing local {}", place.local.as_usize()))
             );
@@ -1296,7 +1597,7 @@ impl<'tcx> Verifier<'tcx> {
             && matches!(root_ty.kind(), TyKind::RawPtr(_, _))
         {
             let pointee_ty = self.deref_pointee_ty(root_ty, span)?;
-            let value = self.unsafe_read_raw_pointer(state, &root, pointee_ty, span)?;
+            let value = self.unsafe_read_raw_pointer(frame, &root, pointee_ty, span)?;
             let pointee_spec_ty = self.spec_ty_for_place_ty(pointee_ty, span)?;
             return self.read_projection(
                 value,
@@ -1313,7 +1614,7 @@ impl<'tcx> Verifier<'tcx> {
 
     fn unsafe_write_place(
         &self,
-        state: &mut UnsafeState<'tcx>,
+        frame: &mut UnsafeFrame,
         place: Place<'tcx>,
         value: SymValue,
         span: Span,
@@ -1323,34 +1624,44 @@ impl<'tcx> Verifier<'tcx> {
         if matches!(projection.first(), Some(PlaceElem::Deref))
             && matches!(root_ty.kind(), TyKind::RawPtr(_, _))
         {
-            let ptr = state.store.get(&place.local).cloned().ok_or_else(|| {
-                self.unsupported_result(span, format!("missing local {}", place.local.as_usize()))
-            })?;
+            let ptr = frame
+                .state
+                .store
+                .get(&place.local)
+                .cloned()
+                .ok_or_else(|| {
+                    self.unsupported_result(
+                        span,
+                        format!("missing local {}", place.local.as_usize()),
+                    )
+                })?;
             let pointee_ty = self.deref_pointee_ty(root_ty, span)?;
             let replacement = if projection.len() == 1 {
                 value
             } else {
-                let current = self.unsafe_read_raw_pointer(state, &ptr, pointee_ty, span)?;
+                let current = self.unsafe_read_raw_pointer(frame, &ptr, pointee_ty, span)?;
                 let pointee_spec_ty = self.spec_ty_for_place_ty(pointee_ty, span)?;
                 self.write_projection(current, &pointee_spec_ty, &projection[1..], value, span)?
             };
-            return self.unsafe_write_raw_pointer(state, &ptr, pointee_ty, replacement, span);
+            return self.unsafe_write_raw_pointer(frame, &ptr, pointee_ty, replacement, span);
         }
 
-        let root = state
+        let root = frame
+            .state
             .store
             .get(&place.local)
             .cloned()
             .unwrap_or_else(|| value.clone());
         let root_spec_ty = self.spec_ty_for_place_ty(root_ty, span)?;
         let updated = self.write_projection(root, &root_spec_ty, projection, value, span)?;
-        state.store.insert(place.local, updated);
+        frame.state.store.insert(place.local, updated.clone());
+        self.write_local_points_to(frame, place.local, updated, span)?;
         Ok(())
     }
 
     fn unsafe_consume_operand(
         &self,
-        state: &mut UnsafeState<'tcx>,
+        frame: &mut UnsafeFrame,
         operand: &Operand<'tcx>,
         span: Span,
     ) -> Result<(), VerificationResult> {
@@ -1358,24 +1669,29 @@ impl<'tcx> Verifier<'tcx> {
             Operand::Copy(_) | Operand::Constant(_) => Ok(()),
             Operand::Move(place) => {
                 if self.place_starts_with_raw_pointer_deref(*place) {
-                    let root = state.store.get(&place.local).cloned().ok_or_else(|| {
-                        self.unsupported_result(
-                            span,
-                            format!("missing local {}", place.local.as_usize()),
-                        )
-                    })?;
+                    let root = frame
+                        .state
+                        .store
+                        .get(&place.local)
+                        .cloned()
+                        .ok_or_else(|| {
+                            self.unsupported_result(
+                                span,
+                                format!("missing local {}", place.local.as_usize()),
+                            )
+                        })?;
                     let root_ty = self.body().local_decls[place.local].ty;
                     let pointee_ty = self.deref_pointee_ty(root_ty, span)?;
-                    self.unsafe_deinit_raw_pointer(state, &root, pointee_ty, span)
+                    self.unsafe_deinit_raw_pointer(frame, &root, pointee_ty, span)
                 } else if place.projection.is_empty() {
-                    state.store.remove(&place.local);
-                    self.deinit_local_points_to(state, place.local);
+                    frame.state.store.remove(&place.local);
+                    self.deinit_local_points_to(frame, place.local);
                     Ok(())
                 } else {
-                    let value = self.unsafe_read_place(state, *place, span)?;
+                    let value = self.unsafe_read_place(frame, *place, span)?;
                     let place_ty = self.spec_ty_for_place_ty(self.place_ty(*place), span)?;
                     let updated = self.dangle_value(&place_ty, &value, span)?;
-                    self.unsafe_write_place(state, *place, updated, span)
+                    self.unsafe_write_place(frame, *place, updated, span)
                 }
             }
         }
@@ -1383,17 +1699,17 @@ impl<'tcx> Verifier<'tcx> {
 
     fn unsafe_read_raw_pointer(
         &self,
-        state: &mut UnsafeState<'tcx>,
+        frame: &mut UnsafeFrame,
         ptr: &SymValue,
         ty: Ty<'tcx>,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        self.assert_raw_pointer_deref_preconditions(state, ptr, ty, span)?;
+        self.assert_raw_pointer_deref_preconditions(&mut frame.state, ptr, ty, span)?;
         let addr = self.ptr_addr(ptr, span)?;
         let index = self
-            .points_to_index(state, &addr, ty)
+            .points_to_index(&frame.state, &addr, ty)
             .ok_or_else(|| self.missing_points_to_result(span))?;
-        let value = match &state.heap[index] {
+        let value = match &frame.state.heap[index] {
             Resource::PointsTo {
                 value: Some(value), ..
             } => value.clone(),
@@ -1406,7 +1722,7 @@ impl<'tcx> Verifier<'tcx> {
             Resource::Alloc { .. } => unreachable!("points_to_index returned an allocation"),
         };
         self.require_unsafe_type_invariant(
-            state,
+            &mut frame.state,
             ty,
             &value,
             span,
@@ -1417,15 +1733,15 @@ impl<'tcx> Verifier<'tcx> {
 
     fn unsafe_write_raw_pointer(
         &self,
-        state: &mut UnsafeState<'tcx>,
+        frame: &mut UnsafeFrame,
         ptr: &SymValue,
         ty: Ty<'tcx>,
         value: SymValue,
         span: Span,
     ) -> Result<(), VerificationResult> {
-        self.assert_raw_pointer_deref_preconditions(state, ptr, ty, span)?;
+        self.assert_raw_pointer_deref_preconditions(&mut frame.state, ptr, ty, span)?;
         self.require_unsafe_type_invariant(
-            state,
+            &mut frame.state,
             ty,
             &value,
             span,
@@ -1433,39 +1749,36 @@ impl<'tcx> Verifier<'tcx> {
         )?;
         let addr = self.ptr_addr(ptr, span)?;
         let index = self
-            .points_to_index(state, &addr, ty)
+            .points_to_index(&frame.state, &addr, ty)
             .ok_or_else(|| self.missing_points_to_result(span))?;
-        let local = match &mut state.heap[index] {
-            Resource::PointsTo {
-                value: slot, local, ..
-            } => {
-                *slot = Some(value.clone());
-                *local
+        if let Resource::PointsTo {
+            value: slot, ty, ..
+        } = &mut frame.state.heap[index]
+        {
+            *slot = Some(value.clone());
+            if let Some(local) = self.bridge_local_for_points_to(&frame.bridge, &addr, ty) {
+                frame.state.store.insert(local, value);
             }
-            Resource::Alloc { .. } => unreachable!("points_to_index returned an allocation"),
-        };
-        if let Some(local) = local {
-            state.store.insert(local, value);
         }
         Ok(())
     }
 
     fn unsafe_deinit_raw_pointer(
         &self,
-        state: &mut UnsafeState<'tcx>,
+        frame: &mut UnsafeFrame,
         ptr: &SymValue,
         ty: Ty<'tcx>,
         span: Span,
     ) -> Result<(), VerificationResult> {
-        self.assert_raw_pointer_deref_preconditions(state, ptr, ty, span)?;
+        self.assert_raw_pointer_deref_preconditions(&mut frame.state, ptr, ty, span)?;
         let addr = self.ptr_addr(ptr, span)?;
         let index = self
-            .points_to_index(state, &addr, ty)
+            .points_to_index(&frame.state, &addr, ty)
             .ok_or_else(|| self.missing_points_to_result(span))?;
-        if let Resource::PointsTo { value, local, .. } = &mut state.heap[index] {
+        if let Resource::PointsTo { value, ty, .. } = &mut frame.state.heap[index] {
             *value = None;
-            if let Some(local) = local {
-                state.store.remove(local);
+            if let Some(local) = self.bridge_local_for_points_to(&frame.bridge, &addr, ty) {
+                frame.state.store.remove(&local);
             }
         }
         Ok(())
@@ -1473,7 +1786,7 @@ impl<'tcx> Verifier<'tcx> {
 
     fn assert_raw_pointer_deref_preconditions(
         &self,
-        state: &mut UnsafeState<'tcx>,
+        state: &mut UnsafeState,
         ptr: &SymValue,
         ty: Ty<'tcx>,
         span: Span,
@@ -1483,30 +1796,59 @@ impl<'tcx> Verifier<'tcx> {
         let expected_ty = self.rust_ty_model_value(ty);
         let ptr_ty_matches =
             self.eq_for_spec_ty(&SpecTy::RustTy, &actual_ty, &expected_ty, span)?;
+        let addr_int = self.value_int_data(&addr);
+        let non_null = addr_int.eq(Int::from_i64(0)).not();
+        if matches!(non_null.simplify().as_bool(), Some(false)) {
+            return Err(self.fail_result(
+                span,
+                "raw pointer dereference requires a non-null address".to_owned(),
+            ));
+        }
+        let (_, align) = self.layout_size_align_bytes(ty, span)?;
+        let aligned = if align > 1 {
+            Some(addr_int.modulo(Int::from_u64(align)).eq(0))
+        } else {
+            None
+        };
+        if matches!(
+            aligned
+                .as_ref()
+                .and_then(|formula| formula.simplify().as_bool()),
+            Some(false)
+        ) {
+            return Err(self.fail_result(
+                span,
+                "raw pointer dereference requires proper alignment".to_owned(),
+            ));
+        }
+        if matches!(ptr_ty_matches.simplify().as_bool(), Some(false)) {
+            return Err(self.fail_result(
+                span,
+                "raw pointer type does not match the dereferenced type".to_owned(),
+            ));
+        }
+        if self.points_to_index(state, &addr, ty).is_none() {
+            return Err(self.missing_points_to_result(span));
+        }
         self.unsafe_assert_constraint(
             state,
             ptr_ty_matches,
             span,
             "raw pointer type does not match the dereferenced type".to_owned(),
         )?;
-        let addr_int = self.value_int_data(&addr);
         self.unsafe_assert_constraint(
             state,
-            addr_int.eq(Int::from_i64(0)).not(),
+            non_null,
             span,
             "raw pointer dereference requires a non-null address".to_owned(),
         )?;
-        let (_, align) = self.layout_size_align_bytes(ty, span)?;
         if align > 1 {
             self.unsafe_assert_constraint(
                 state,
-                addr_int.modulo(Int::from_u64(align)).eq(0),
+                aligned.expect("computed above"),
                 span,
                 "raw pointer dereference requires proper alignment".to_owned(),
             )?;
-        }
-        if self.points_to_index(state, &addr, ty).is_none() {
-            return Err(self.missing_points_to_result(span));
         }
         let live_range = self.unsafe_live_allocation_formula(state, ptr, &addr, ty, span)?;
         self.unsafe_assert_constraint(
@@ -1519,7 +1861,7 @@ impl<'tcx> Verifier<'tcx> {
 
     fn unsafe_live_allocation_formula(
         &self,
-        state: &UnsafeState<'tcx>,
+        state: &UnsafeState,
         ptr: &SymValue,
         addr: &SymValue,
         ty: Ty<'tcx>,
@@ -1563,11 +1905,16 @@ impl<'tcx> Verifier<'tcx> {
         Ok(bool_or(candidates))
     }
 
-    fn points_to_index(
+    fn points_to_index(&self, state: &UnsafeState, addr: &SymValue, ty: Ty<'tcx>) -> Option<usize> {
+        let ty = self.rust_ty_model_value(ty);
+        self.points_to_index_for_ty_value(state, addr, &ty)
+    }
+
+    fn points_to_index_for_ty_value(
         &self,
-        state: &UnsafeState<'tcx>,
+        state: &UnsafeState,
         addr: &SymValue,
-        ty: Ty<'tcx>,
+        ty: &SymValue,
     ) -> Option<usize> {
         state.heap.iter().position(|resource| {
             matches!(
@@ -1576,52 +1923,20 @@ impl<'tcx> Verifier<'tcx> {
                     addr: resource_addr,
                     ty: resource_ty,
                     ..
-                } if resource_addr == addr && *resource_ty == ty
+                } if resource_addr == addr && resource_ty == ty
             )
         })
     }
 
-    fn deinit_local_points_to(&self, state: &mut UnsafeState<'tcx>, local: Local) {
-        for resource in &mut state.heap {
-            if let Resource::PointsTo {
-                value,
-                local: Some(resource_local),
-                ..
-            } = resource
-                && *resource_local == local
-            {
-                *value = None;
-            }
-        }
-    }
-
-    fn assign_uses_raw_pointer_deref(&self, place: Place<'tcx>, rvalue: &Rvalue<'tcx>) -> bool {
-        self.place_starts_with_raw_pointer_deref(place)
-            || self.rvalue_uses_raw_pointer_deref(rvalue)
-    }
-
-    fn rvalue_uses_raw_pointer_deref(&self, rvalue: &Rvalue<'tcx>) -> bool {
-        match rvalue {
-            Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) | Rvalue::UnaryOp(_, operand) => {
-                self.operand_uses_raw_pointer_deref(operand)
-            }
-            Rvalue::BinaryOp(_, operands) => {
-                self.operand_uses_raw_pointer_deref(&operands.0)
-                    || self.operand_uses_raw_pointer_deref(&operands.1)
-            }
-            Rvalue::Aggregate(_, operands) => operands
-                .iter()
-                .any(|operand| self.operand_uses_raw_pointer_deref(operand)),
-            _ => false,
-        }
-    }
-
-    fn operand_uses_raw_pointer_deref(&self, operand: &Operand<'tcx>) -> bool {
-        match operand {
-            Operand::Copy(place) | Operand::Move(place) => {
-                self.place_starts_with_raw_pointer_deref(*place)
-            }
-            Operand::Constant(_) => false,
+    fn deinit_local_points_to(&self, frame: &mut UnsafeFrame, local: Local) {
+        let Some(bridge) = frame.bridge.locals.get(&local) else {
+            return;
+        };
+        if let Some(index) =
+            self.points_to_index_for_ty_value(&frame.state, &bridge.alloc.base_addr, &bridge.ty)
+            && let Resource::PointsTo { value, .. } = &mut frame.state.heap[index]
+        {
+            *value = None;
         }
     }
 
@@ -1635,7 +1950,7 @@ impl<'tcx> Verifier<'tcx> {
 
     fn unsafe_assert_constraint(
         &self,
-        state: &mut UnsafeState<'tcx>,
+        state: &mut UnsafeState,
         constraint: Bool,
         span: Span,
         message: String,
@@ -1660,13 +1975,13 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn add_unsafe_path_condition(&self, state: &mut UnsafeState<'tcx>, constraint: Bool) {
+    fn add_unsafe_path_condition(&self, state: &mut UnsafeState, constraint: Bool) {
         state.pc = bool_and(vec![state.pc.clone(), constraint]).simplify();
     }
 
     fn require_unsafe_type_invariant(
         &self,
-        state: &mut UnsafeState<'tcx>,
+        state: &mut UnsafeState,
         ty: Ty<'tcx>,
         value: &SymValue,
         span: Span,
@@ -1682,7 +1997,7 @@ impl<'tcx> Verifier<'tcx> {
 
     fn require_unsafe_int_invariant(
         &self,
-        state: &mut UnsafeState<'tcx>,
+        state: &mut UnsafeState,
         ty: Ty<'tcx>,
         value: &Int,
         span: Span,
@@ -3733,11 +4048,12 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn is_inside_unsafe_block(&self, span: Span) -> bool {
+    fn unsafe_block_containing_span(&self, span: Span) -> Option<Span> {
         self.function_context()
             .unsafe_blocks
             .iter()
-            .any(|unsafe_span| span_contains(*unsafe_span, span))
+            .copied()
+            .find(|unsafe_span| span_contains(*unsafe_span, span))
     }
 
     fn value_int(&self, value: i64) -> SymValue {
