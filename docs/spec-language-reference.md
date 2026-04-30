@@ -457,10 +457,11 @@ resource is produced for that local. On exit, writes to `PointsTo` resources
 that came from safe locals are reflected back into the corresponding safe local
 model values.
 
-Currently supported unsafe code is straight-line, single-threaded Rust for raw
-pointer reads and writes. Calls inside unsafe blocks are rejected. Loop contracts
-and function contracts inside unsafe code are not supported yet; existing loop
-prepass restrictions still apply before unsafe execution. Aliasing,
+Currently supported unsafe code is single-threaded Rust for raw pointer reads
+and writes, including ordinary branches inside unsafe blocks. Calls inside unsafe
+blocks are rejected. Loop contracts and function contracts inside unsafe code are
+not supported yet; existing loop prepass restrictions still apply before unsafe
+execution. Aliasing,
 permissions, fractional permissions, and user-defined heap predicates are not
 part of this initial unsafe model.
 
