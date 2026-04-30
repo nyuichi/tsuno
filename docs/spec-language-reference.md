@@ -390,8 +390,9 @@ For example, `{type i32}` denotes the model value for Rust `i32`, and `{type T}`
 denotes the model value for the Rust type parameter `T` in the surrounding
 Rust item. Distinct observed Rust type values are treated as distinct by the
 solver.
-`Provenance` currently records only the allocation base address; borrow tags for Tree Borrows are
-not part of the model yet. Rust raw pointer types are modeled as `Ptr`.
+`Provenance` currently records only the allocation base address; borrow tags for
+Tree Borrows are not part of the model yet. Rust raw pointer types are modeled
+as `Ptr`.
 `Ref<T>` and `Mut<T>` values require `ptr.prov` to be `Some(_)`; raw `Ptr`
 values may have no provenance because null, dangling, and integer-derived
 pointers are representable.
@@ -402,11 +403,15 @@ Pointers created from Rust places carry a stable place-derived identity. Taking
 provenance base and uses `base + offset`, where field offsets come from
 rustc's type layout query for the Rust type. Repeating a borrow of the same
 place gives the same modeled `addr` and `prov`. Different live locals get
-different allocation base addresses and non-overlapping address ranges. Allocation base
-addresses are constrained to satisfy the Rust type's ABI alignment from rustc's
-layout query. Layout-dependent pointer formation currently supports field
-projections, including fields below a dereferenced reference or raw pointer; DST
-metadata and non-field projections are not modeled yet.
+different allocation base addresses and non-overlapping address ranges.
+Every live allocation has a distinct non-null base address, including
+zero-sized allocations. This keeps allocation identity available for strict
+provenance and pointer-identity reasoning even when the allocation has no
+non-empty byte range. Allocation base addresses are constrained to satisfy the
+Rust type's ABI alignment from rustc's layout query. Layout-dependent pointer
+formation currently supports field projections, including fields below a
+dereferenced reference or raw pointer; DST metadata and non-field projections
+are not modeled yet.
 
 Strict-provenance APIs can be used through ordinary local wrapper contracts.
 For example:
@@ -442,20 +447,49 @@ Alloc(base: usize, size: usize, alignment: usize)
 PointsTo(addr: usize, ty: RustTy, value: Option<T>)
 ```
 
-`PointsTo(addr, ty, Some(v))` means that `addr` is non-null, aligned for `ty`,
-and contains an initialized value valid for the spec model type corresponding to
-`ty`. Raw pointer reads and writes require a matching `PointsTo` resource and a
-live `Alloc` resource covering the accessed Rust layout footprint. A raw pointer
-dereference also checks the pointer's modeled `RustTy`, non-nullness,
-alignment, and initializedness.
+`Alloc(base, size, alignment)` is keyed by `base`; there is no separate
+allocation identifier. `Provenance { base }` identifies the allocation that a
+pointer is derived from, while `Ptr.addr` is the byte address accessed by the
+pointer. `Alloc` records the live allocation range and alignment for that base.
 
-On entry, each live local allocation is converted to an `Alloc` resource using
-rustc's layout size and ABI alignment. If the local currently has a safe model
-value, the entry conversion also creates `PointsTo(base, {type local_ty},
-Some(value))`; if the local has been moved out, no initialized `PointsTo`
-resource is produced for that local. On exit, writes to `PointsTo` resources
-that came from safe locals are reflected back into the corresponding safe local
-model values.
+`PointsTo` is a typed-cell resource. `PointsTo(addr, ty, Some(v))` means that
+`addr` is non-null, aligned for `ty`, and contains one initialized value valid
+for the spec model type corresponding to `ty`. `PointsTo(addr, ty, None)` means
+that the typed cell exists but is not initialized. The initial model does not
+represent byte-level ownership separately from typed cells.
+
+Unsafe states must be resource-well-formed: if two `PointsTo` resources are
+simultaneously present, their Rust layout footprints must not overlap. The
+footprint of `PointsTo(addr, ty, _)` is the byte range
+`addr..addr + layout(ty).size`, using rustc's layout for `ty`.
+
+A raw pointer dereference of type `T` requires all of the following:
+
+- `Ptr.ty == {type T}`.
+- `Ptr.prov == Some(Provenance { base })`.
+- `Alloc(base, size, alignment)` exists.
+- `Ptr.addr..Ptr.addr + layout(T).size` is within `base..base + size`.
+- `Ptr.addr` is non-null and aligned for `T`.
+- `PointsTo(Ptr.addr, {type T}, Some(v))` exists for reads, and
+  `PointsTo(Ptr.addr, {type T}, _)` exists for writes.
+
+The safe-to-unsafe bridge is explicit. `enter_unsafe` converts each live safe
+local allocation to `Alloc(base, size, alignment)` using rustc's layout size and
+ABI alignment. If the local currently has a safe model value, it also creates
+`PointsTo(base, {type local_ty}, Some(value))`; if the local has been moved out
+or otherwise has no safe model value, it creates no initialized typed cell for
+that local. `exit_unsafe` converts bridged local resources back to the safe
+state: `PointsTo(base, {type local_ty}, Some(value))` becomes the local's safe
+model value, while a missing `PointsTo` or `PointsTo(..., None)` leaves the safe
+local without an initialized model value.
+
+Branching inside an unsafe block keeps separate unsafe states for the feasible
+paths. Unsafe heap resources are not merged at unsafe control-flow joins.
+Instead, each unsafe exit state is converted back to a safe state with
+`exit_unsafe`, and the ordinary safe-state engine may merge those safe states at
+the following safe control point. This makes path splitting inside unsafe blocks
+visible: deeply nested unsafe branches can create multiple unsafe states before
+control returns to safe code.
 
 Currently supported unsafe code is single-threaded Rust for raw pointer reads
 and writes, including ordinary branches inside unsafe blocks. Calls inside unsafe

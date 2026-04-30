@@ -1126,164 +1126,6 @@ impl<'tcx> Verifier<'tcx> {
         bucket.push((state, bridge));
     }
 
-    fn merge_unsafe_bucket(
-        &self,
-        mut states: Vec<(UnsafeState, UnsafeBridge)>,
-        span: Span,
-    ) -> Result<Option<(UnsafeState, UnsafeBridge)>, VerificationResult> {
-        if states.is_empty() {
-            return Ok(None);
-        }
-        if states.len() == 1 {
-            return Ok(states.pop());
-        }
-
-        let (states, bridges): (Vec<_>, Vec<_>) = states.into_iter().unzip();
-        let shared: BTreeSet<_> = states
-            .iter()
-            .map(|state| state.store.keys().copied().collect::<BTreeSet<_>>())
-            .reduce(|acc, keys| acc.intersection(&keys).copied().collect())
-            .unwrap_or_default();
-
-        let ctrl = states[0].ctrl;
-        let mut merged = UnsafeState {
-            pc: Bool::from_bool(false),
-            store: BTreeMap::new(),
-            heap: Vec::new(),
-            ctrl,
-        };
-        let pcs = states
-            .iter()
-            .map(|state| state.pc.clone())
-            .collect::<Vec<_>>();
-        merged.pc = Bool::or(&pcs);
-
-        for local in shared {
-            let ty = self.body().local_decls[local].ty;
-            let spec_ty = self.spec_ty_for_place_ty(ty, self.control_span(ctrl))?;
-            let mut incoming_values = states
-                .iter()
-                .map(|state| {
-                    state
-                        .store
-                        .get(&local)
-                        .cloned()
-                        .expect("shared local present")
-                })
-                .collect::<Vec<_>>();
-            let first_value = incoming_values
-                .first()
-                .cloned()
-                .expect("shared local present");
-            if incoming_values.iter().all(|value| *value == first_value) {
-                merged.store.insert(local, first_value);
-                continue;
-            }
-
-            let merged_value =
-                self.fresh_for_unsafe_merge_ty(ty, &format!("unsafe_merge_{}", local.as_usize()))?;
-            for (state, incoming) in states.iter().zip(incoming_values.drain(..)) {
-                let equality = self.eq_for_spec_ty(
-                    &spec_ty,
-                    &merged_value,
-                    &incoming,
-                    self.control_span(state.ctrl),
-                )?;
-                self.add_unsafe_path_condition(&mut merged, state.pc.clone().implies(equality));
-            }
-            merged.store.insert(local, merged_value);
-        }
-
-        merged.pc = merged.pc.simplify();
-        let bridge = self.merge_unsafe_bridge(&states, &bridges, &mut merged, span)?;
-        self.rebuild_unsafe_heap_from_bridge(&mut merged, &bridge);
-        Ok(Some((merged, bridge)))
-    }
-
-    fn merge_unsafe_bridge(
-        &self,
-        states: &[UnsafeState],
-        bridges: &[UnsafeBridge],
-        merged: &mut UnsafeState,
-        span: Span,
-    ) -> Result<UnsafeBridge, VerificationResult> {
-        let shared: BTreeSet<_> = bridges
-            .iter()
-            .map(|bridge| bridge.allocs.keys().copied().collect::<BTreeSet<_>>())
-            .reduce(|acc, keys| acc.intersection(&keys).copied().collect())
-            .unwrap_or_default();
-        let mut merged_bridge = UnsafeBridge::default();
-        for local in shared {
-            let incoming = bridges
-                .iter()
-                .map(|bridge| {
-                    bridge
-                        .allocs
-                        .get(&local)
-                        .cloned()
-                        .expect("shared bridge allocation present")
-                })
-                .collect::<Vec<_>>();
-            let first = incoming
-                .first()
-                .cloned()
-                .expect("shared bridge allocation present");
-            if incoming
-                .iter()
-                .all(|alloc| self.allocations_are_identical(alloc, &first))
-            {
-                merged_bridge.allocs.insert(local, first);
-                continue;
-            }
-
-            if incoming
-                .iter()
-                .any(|alloc| alloc.size != first.size || alloc.align != first.align)
-            {
-                return Err(self.unsupported_result(
-                    span,
-                    "merging incompatible unsafe local allocations is unsupported".to_owned(),
-                ));
-            }
-
-            let base_addr = self.fresh_for_spec_ty(
-                &SpecTy::Usize,
-                &format!("unsafe_merge_alloc_{}_base", local.as_usize()),
-            )?;
-            let alloc = Allocation {
-                base_addr,
-                size: first.size,
-                align: first.align,
-            };
-            for (state, incoming_alloc) in states.iter().zip(incoming.iter()) {
-                let equality = self.allocation_equality_formula(
-                    &alloc,
-                    incoming_alloc,
-                    self.control_span(state.ctrl),
-                )?;
-                self.add_unsafe_path_condition(merged, state.pc.clone().implies(equality));
-            }
-            merged_bridge.allocs.insert(local, alloc);
-        }
-        Ok(merged_bridge)
-    }
-
-    fn rebuild_unsafe_heap_from_bridge(&self, state: &mut UnsafeState, bridge: &UnsafeBridge) {
-        state.heap.clear();
-        for (local, alloc) in &bridge.allocs {
-            state.heap.push(Resource::Alloc {
-                base: alloc.base_addr.clone(),
-                size: alloc.size,
-                alignment: alloc.align,
-            });
-            state.heap.push(Resource::PointsTo {
-                addr: alloc.base_addr.clone(),
-                ty: self.local_rust_ty_model_value(*local),
-                value: state.store.get(local).cloned(),
-            });
-        }
-    }
-
     fn step_unsafe_region(
         &self,
         mut state: State,
@@ -1300,40 +1142,42 @@ impl<'tcx> Verifier<'tcx> {
             let Some(bucket) = pending.remove(&ctrl) else {
                 continue;
             };
-            let Some((mut unsafe_state, mut bridge)) =
-                self.merge_unsafe_bucket(bucket, unsafe_span)?
-            else {
-                continue;
-            };
-            if !span_contains(unsafe_span, self.control_span(unsafe_state.ctrl)) {
-                exits
-                    .entry(unsafe_state.ctrl)
-                    .or_default()
-                    .push((unsafe_state, bridge));
-                continue;
-            }
+            for (mut unsafe_state, mut bridge) in bucket {
+                if !span_contains(unsafe_span, self.control_span(unsafe_state.ctrl)) {
+                    exits
+                        .entry(unsafe_state.ctrl)
+                        .or_default()
+                        .push((unsafe_state, bridge));
+                    continue;
+                }
 
-            let data = &self.body().basic_blocks[unsafe_state.ctrl.basic_block];
-            if unsafe_state.ctrl.statement_index < data.statements.len() {
-                let statement_index = unsafe_state.ctrl.statement_index;
-                self.step_unsafe_statement(
-                    &mut unsafe_state,
-                    &mut bridge,
-                    &data.statements[statement_index],
-                )?;
-                self.enqueue_unsafe_state(&mut pending, &mut worklist, unsafe_state, bridge);
-            } else {
-                for (next_state, next_bridge) in
-                    self.step_unsafe_terminator(unsafe_state, bridge, data.terminator())?
-                {
-                    self.enqueue_unsafe_state(&mut pending, &mut worklist, next_state, next_bridge);
+                let data = &self.body().basic_blocks[unsafe_state.ctrl.basic_block];
+                if unsafe_state.ctrl.statement_index < data.statements.len() {
+                    let statement_index = unsafe_state.ctrl.statement_index;
+                    self.step_unsafe_statement(
+                        &mut unsafe_state,
+                        &mut bridge,
+                        &data.statements[statement_index],
+                    )?;
+                    self.enqueue_unsafe_state(&mut pending, &mut worklist, unsafe_state, bridge);
+                } else {
+                    for (next_state, next_bridge) in
+                        self.step_unsafe_terminator(unsafe_state, bridge, data.terminator())?
+                    {
+                        self.enqueue_unsafe_state(
+                            &mut pending,
+                            &mut worklist,
+                            next_state,
+                            next_bridge,
+                        );
+                    }
                 }
             }
         }
 
         let mut next_states = Vec::new();
         for bucket in exits.into_values() {
-            if let Some((unsafe_state, bridge)) = self.merge_unsafe_bucket(bucket, unsafe_span)? {
+            for (unsafe_state, bridge) in bucket {
                 next_states.push(self.exit_unsafe(unsafe_state, bridge, spec_env.clone()));
             }
         }
@@ -4725,23 +4569,6 @@ impl<'tcx> Verifier<'tcx> {
         let addr = self.fresh_for_spec_ty(&SpecTy::Usize, &format!("{hint}_addr"))?;
         let prov = self.construct_option_none(provenance_spec_ty())?;
         let ty = self.rust_ty_model_value(pointee_ty);
-        self.construct_composite(&ptr_spec_ty(), &[addr, prov, ty])
-    }
-
-    fn fresh_for_unsafe_merge_ty(
-        &self,
-        ty: Ty<'tcx>,
-        hint: &str,
-    ) -> Result<SymValue, VerificationResult> {
-        let TyKind::RawPtr(pointee, _) = ty.kind() else {
-            return self.fresh_for_rust_ty(ty, hint);
-        };
-        let addr = self.fresh_for_spec_ty(&SpecTy::Usize, &format!("{hint}_addr"))?;
-        let prov = self.fresh_for_spec_ty(
-            &option_spec_ty(provenance_spec_ty()),
-            &format!("{hint}_prov"),
-        )?;
-        let ty = self.rust_ty_model_value(*pointee);
         self.construct_composite(&ptr_spec_ty(), &[addr, prov, ty])
     }
 
