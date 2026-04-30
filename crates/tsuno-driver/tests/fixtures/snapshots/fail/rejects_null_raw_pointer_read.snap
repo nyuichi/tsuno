@@ -1,0 +1,14 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+assertion_line: 85
+expression: snapshot_output(output)
+---
+status: Some(1)
+stdout:
+FAIL rejects_null_raw_pointer_read
+  raw pointer dereference requires a non-null address
+  src/main.rs:5:18: 5:20
+PASS main
+  all assertions discharged
+
+stderr:

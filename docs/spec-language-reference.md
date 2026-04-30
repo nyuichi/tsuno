@@ -429,6 +429,45 @@ fn null_u8() -> *const u8
 }
 ```
 
+## 6. Unsafe Blocks
+
+Unsafe blocks use an address-based heap model. Entering an unsafe block converts
+the currently visible safe Rust state into unsafe heap resources, and leaving
+the unsafe block converts the updated resources back into safe Rust state.
+
+The initial unsafe heap model is address-based and has only two resource forms:
+
+```text
+Alloc(alloc_id: Int, base: usize, size: usize, alignment: usize)
+PointsTo(addr: usize, ty: RustTy, value: Option<T>)
+```
+
+`PointsTo(addr, ty, Some(v))` means that `addr` is non-null, aligned for `ty`,
+and contains an initialized value valid for the spec model type corresponding to
+`ty`. Raw pointer reads and writes require a matching `PointsTo` resource and a
+live `Alloc` resource covering the accessed Rust layout footprint. A raw pointer
+dereference also checks the pointer's modeled `RustTy`, non-nullness,
+alignment, and initializedness.
+
+On entry, each live local allocation is converted to an `Alloc` resource using
+rustc's layout size and ABI alignment. If the local currently has a safe model
+value, the entry conversion also creates `PointsTo(base, {type local_ty},
+Some(value))`; if the local has been moved out, no initialized `PointsTo`
+resource is produced for that local. On exit, writes to `PointsTo` resources
+that came from safe locals are reflected back into the corresponding safe local
+model values.
+
+Currently supported unsafe code is straight-line, single-threaded Rust for raw
+pointer reads and writes. Calls inside unsafe blocks are rejected. Loop contracts
+and function contracts inside unsafe code are not supported yet; existing loop
+prepass restrictions still apply before unsafe execution. Aliasing,
+permissions, fractional permissions, and user-defined heap predicates are not
+part of this initial unsafe model.
+
+Ordinary spec directives such as `//@ assert`, `//@ assume`, `//@ let`, and
+`//@ lemma` are not supported inside unsafe blocks. Future separation-logic
+directives for unsafe heap resources will be added separately.
+
 Shared references can be dereferenced with `*`. After type checking, `*r` for a
 `Ref<T>` is desugared to `r.deref`.
 

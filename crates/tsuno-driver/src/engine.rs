@@ -108,6 +108,7 @@ struct FunctionContext<'tcx> {
     contract: FunctionContract,
     loop_contracts: LoopContracts,
     control_point_directives: ControlPointDirectives,
+    unsafe_blocks: Vec<Span>,
 }
 
 enum VerifierContext<'tcx> {
@@ -125,6 +126,29 @@ pub struct Verifier<'tcx> {
     builtin_nat_decls: RefCell<Option<Rc<BuiltinNatDecls>>>,
     next_sym: Cell<usize>,
     value_encoder: ValueEncoder,
+}
+
+#[derive(Debug, Clone)]
+struct UnsafeState<'tcx> {
+    pc: Bool,
+    store: BTreeMap<Local, SymValue>,
+    heap: Vec<Resource<'tcx>>,
+}
+
+#[derive(Debug, Clone)]
+enum Resource<'tcx> {
+    PointsTo {
+        addr: SymValue,
+        ty: Ty<'tcx>,
+        value: Option<SymValue>,
+        local: Option<Local>,
+    },
+    Alloc {
+        alloc_id: SymValue,
+        base: SymValue,
+        size: u64,
+        alignment: u64,
+    },
 }
 
 pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<VerificationResult> {
@@ -304,6 +328,7 @@ impl<'tcx> Verifier<'tcx> {
             loop_contracts,
             control_point_directives,
             function_contract,
+            unsafe_blocks,
         } = prepass;
         let contract = function_contract.expect("successful function prepass must yield contract");
         self.contracts.insert(def_id, contract.clone());
@@ -313,6 +338,7 @@ impl<'tcx> Verifier<'tcx> {
             contract,
             loop_contracts,
             control_point_directives,
+            unsafe_blocks,
         });
 
         let initial_state = match self.initial_state() {
@@ -483,8 +509,19 @@ impl<'tcx> Verifier<'tcx> {
             }
             StatementKind::Assign(assign) => {
                 let (place, rvalue) = &**assign;
-                let value = self.eval_rvalue(&mut state, rvalue, stmt.source_info.span)?;
-                self.write_place(&mut state, *place, value, stmt.source_info.span)?;
+                if self.assign_uses_raw_pointer_deref(*place, rvalue) {
+                    let mut unsafe_state = self.enter_unsafe(&state, stmt.source_info.span)?;
+                    self.step_unsafe_assign(
+                        &mut unsafe_state,
+                        *place,
+                        rvalue,
+                        stmt.source_info.span,
+                    )?;
+                    state = self.exit_unsafe(state, unsafe_state);
+                } else {
+                    let value = self.eval_rvalue(&mut state, rvalue, stmt.source_info.span)?;
+                    self.write_place(&mut state, *place, value, stmt.source_info.span)?;
+                }
             }
             StatementKind::Nop
             | StatementKind::Coverage(..)
@@ -623,14 +660,22 @@ impl<'tcx> Verifier<'tcx> {
                 destination,
                 target,
                 ..
-            } => self.step_call(
-                state,
-                func,
-                args,
-                *destination,
-                *target,
-                term.source_info.span,
-            ),
+            } => {
+                if self.is_inside_unsafe_block(term.source_info.span) {
+                    return Err(self.unsupported_result(
+                        term.source_info.span,
+                        "function calls inside unsafe blocks are unsupported".to_owned(),
+                    ));
+                }
+                self.step_call(
+                    state,
+                    func,
+                    args,
+                    *destination,
+                    *target,
+                    term.source_info.span,
+                )
+            }
             other => Err(self.unsupported_result(
                 term.source_info.span,
                 format!("unsupported MIR terminator {other:?}"),
@@ -932,6 +977,733 @@ impl<'tcx> Verifier<'tcx> {
         }
         bucket.push(state);
         None
+    }
+
+    fn enter_unsafe(
+        &self,
+        state: &State,
+        span: Span,
+    ) -> Result<UnsafeState<'tcx>, VerificationResult> {
+        let mut unsafe_state = UnsafeState {
+            pc: state.pc.clone(),
+            store: state.model.clone(),
+            heap: Vec::new(),
+        };
+
+        for (local, alloc) in &state.allocs {
+            let base_int = self.value_int_data(&alloc.base_addr);
+            self.add_unsafe_path_condition(&mut unsafe_state, base_int.eq(Int::from_i64(0)).not());
+            if alloc.align > 1 {
+                self.add_unsafe_path_condition(
+                    &mut unsafe_state,
+                    base_int.modulo(Int::from_u64(alloc.align)).eq(0),
+                );
+            }
+            unsafe_state.heap.push(Resource::Alloc {
+                alloc_id: alloc.alloc_id.clone(),
+                base: alloc.base_addr.clone(),
+                size: alloc.size,
+                alignment: alloc.align,
+            });
+            if let Some(value) = state.model.get(local).cloned() {
+                let ty = self.body().local_decls[*local].ty;
+                let addr = alloc.base_addr.clone();
+                unsafe_state.heap.push(Resource::PointsTo {
+                    addr: addr.clone(),
+                    ty,
+                    value: Some(value.clone()),
+                    local: Some(*local),
+                });
+                let addr_int = self.value_int_data(&addr);
+                self.add_unsafe_path_condition(
+                    &mut unsafe_state,
+                    addr_int.eq(Int::from_i64(0)).not(),
+                );
+                let (_, align) = self.layout_size_align_bytes(ty, span)?;
+                if align > 1 {
+                    self.add_unsafe_path_condition(
+                        &mut unsafe_state,
+                        addr_int.modulo(Int::from_u64(align)).eq(0),
+                    );
+                }
+                let spec_ty = self.spec_ty_for_place_ty(ty, span)?;
+                if let Some(formula) = self.spec_ty_formula(&spec_ty, &value, span)? {
+                    self.add_unsafe_path_condition(&mut unsafe_state, formula);
+                }
+            }
+        }
+
+        Ok(unsafe_state)
+    }
+
+    fn exit_unsafe(&self, mut state: State, unsafe_state: UnsafeState<'tcx>) -> State {
+        state.pc = unsafe_state.pc;
+        state.model = unsafe_state.store;
+        state
+    }
+
+    fn step_unsafe_assign(
+        &self,
+        state: &mut UnsafeState<'tcx>,
+        place: Place<'tcx>,
+        rvalue: &Rvalue<'tcx>,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        let value = self.unsafe_eval_rvalue(state, rvalue, span)?;
+        self.unsafe_write_place(state, place, value, span)
+    }
+
+    fn unsafe_eval_rvalue(
+        &self,
+        state: &mut UnsafeState<'tcx>,
+        rvalue: &Rvalue<'tcx>,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        match rvalue {
+            Rvalue::Use(operand) => self.unsafe_eval_operand(state, operand, span),
+            Rvalue::Cast(_, operand, target_ty) => {
+                self.unsafe_eval_cast(state, operand, *target_ty, span)
+            }
+            Rvalue::BinaryOp(op, operands) => {
+                let lhs = self.unsafe_eval_operand(state, &operands.0, span)?;
+                let rhs = self.unsafe_eval_operand(state, &operands.1, span)?;
+                let lhs_ty = operands.0.ty(&self.body().local_decls, self.tcx);
+                self.lower_unsafe_binary_value(state, *op, lhs_ty, &lhs, &rhs, span)
+            }
+            Rvalue::UnaryOp(op, operand) => {
+                let value = self.unsafe_eval_operand(state, operand, span)?;
+                let operand_ty = operand.ty(&self.body().local_decls, self.tcx);
+                self.lower_unsafe_unary_value(state, *op, operand_ty, &value, span)
+            }
+            Rvalue::Aggregate(kind, operands) => match **kind {
+                AggregateKind::Tuple => {
+                    let result_ty = self.spec_ty_for_place_ty(
+                        rvalue.ty(&self.body().local_decls, self.tcx),
+                        span,
+                    )?;
+                    let mut values = Vec::with_capacity(operands.len());
+                    for operand in operands {
+                        values.push(self.unsafe_eval_operand(state, operand, span)?);
+                    }
+                    self.construct_composite(&result_ty, &values)
+                }
+                AggregateKind::Adt(def_id, variant_idx, _, _, _) => {
+                    let adt_def = self.tcx.adt_def(def_id);
+                    if !adt_def.is_struct() || variant_idx.as_usize() != 0 {
+                        return Err(self
+                            .unsupported_result(span, format!("unsupported aggregate {kind:?}")));
+                    }
+                    let mut values = Vec::with_capacity(operands.len());
+                    for operand in operands {
+                        values.push(self.unsafe_eval_operand(state, operand, span)?);
+                    }
+                    let result_ty = spec_ty_for_rust_ty(
+                        self.tcx,
+                        rvalue.ty(&self.body().local_decls, self.tcx),
+                    )
+                    .map_err(|err| self.unsupported_result(span, err))?;
+                    self.construct_composite(&result_ty, &values)
+                }
+                _ => Err(self.unsupported_result(span, format!("unsupported aggregate {kind:?}"))),
+            },
+            other => {
+                Err(self.unsupported_result(span, format!("unsupported unsafe rvalue {other:?}")))
+            }
+        }
+    }
+
+    fn unsafe_eval_operand(
+        &self,
+        state: &mut UnsafeState<'tcx>,
+        operand: &Operand<'tcx>,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let value = match operand {
+            Operand::Copy(place) | Operand::Move(place) => {
+                self.unsafe_read_place(state, *place, span)?
+            }
+            Operand::Constant(constant) => self.eval_const_operand(constant, span)?,
+        };
+        if let Operand::Constant(constant) = operand {
+            self.require_unsafe_type_invariant(
+                state,
+                constant.const_.ty(),
+                &value,
+                span,
+                "type invariant does not hold".to_owned(),
+            )?;
+        }
+        if matches!(operand, Operand::Move(_)) {
+            self.unsafe_consume_operand(state, operand, span)?;
+        }
+        Ok(value)
+    }
+
+    fn unsafe_eval_cast(
+        &self,
+        state: &mut UnsafeState<'tcx>,
+        operand: &Operand<'tcx>,
+        target_ty: Ty<'tcx>,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let value = self.unsafe_eval_operand(state, operand, span)?;
+        match target_ty.kind() {
+            TyKind::RawPtr(target_pointee, _) => {
+                let operand_ty = operand.ty(&self.body().local_decls, self.tcx);
+                let ptr = match operand_ty.kind() {
+                    TyKind::RawPtr(_, _) => value,
+                    TyKind::Ref(_, inner, mutability) => {
+                        let inner_spec_ty = spec_ty_for_rust_ty(self.tcx, *inner)
+                            .map_err(|err| self.unsupported_result(span, err))?;
+                        if mutability.is_mut() {
+                            self.mut_ptr(&value, &inner_spec_ty, span)?
+                        } else {
+                            self.ref_ptr(&value, &inner_spec_ty, span)?
+                        }
+                    }
+                    TyKind::Uint(_) | TyKind::Int(_) => {
+                        return self.ptr_without_provenance(*target_pointee, value);
+                    }
+                    _ => {
+                        return Err(self.unsupported_result(
+                            span,
+                            format!(
+                                "unsupported pointer cast from {operand_ty:?} to {target_ty:?}"
+                            ),
+                        ));
+                    }
+                };
+                self.ptr_with_ty(&ptr, *target_pointee, span)
+            }
+            _ => Err(self.unsupported_result(span, format!("unsupported cast to {target_ty:?}"))),
+        }
+    }
+
+    fn lower_unsafe_binary_value(
+        &self,
+        state: &mut UnsafeState<'tcx>,
+        op: BinOp,
+        lhs_ty: Ty<'tcx>,
+        lhs: &SymValue,
+        rhs: &SymValue,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let lhs_spec_ty = self.spec_ty_for_place_ty(lhs_ty, span)?;
+        match op {
+            BinOp::Add => {
+                let value = self.value_int_data(lhs) + self.value_int_data(rhs);
+                self.require_unsafe_int_invariant(
+                    state,
+                    lhs_ty,
+                    &value,
+                    span,
+                    "type invariant does not hold".to_owned(),
+                )?;
+                Ok(self.value_encoder.wrap_int(&value))
+            }
+            BinOp::Sub => {
+                let value = self.value_int_data(lhs) - self.value_int_data(rhs);
+                self.require_unsafe_int_invariant(
+                    state,
+                    lhs_ty,
+                    &value,
+                    span,
+                    "type invariant does not hold".to_owned(),
+                )?;
+                Ok(self.value_encoder.wrap_int(&value))
+            }
+            BinOp::Mul => {
+                let value = self.value_int_data(lhs) * self.value_int_data(rhs);
+                self.require_unsafe_int_invariant(
+                    state,
+                    lhs_ty,
+                    &value,
+                    span,
+                    "type invariant does not hold".to_owned(),
+                )?;
+                Ok(self.value_encoder.wrap_int(&value))
+            }
+            BinOp::Eq => Ok(self.value_encoder.wrap_bool(&self.eq_for_spec_ty(
+                &lhs_spec_ty,
+                lhs,
+                rhs,
+                span,
+            )?)),
+            BinOp::Ne => Ok(self
+                .value_encoder
+                .wrap_bool(&self.eq_for_spec_ty(&lhs_spec_ty, lhs, rhs, span)?.not())),
+            BinOp::Lt => Ok(self
+                .value_encoder
+                .wrap_bool(&self.value_int_data(lhs).lt(self.value_int_data(rhs)))),
+            BinOp::Le => Ok(self
+                .value_encoder
+                .wrap_bool(&self.value_int_data(lhs).le(self.value_int_data(rhs)))),
+            BinOp::Gt => Ok(self
+                .value_encoder
+                .wrap_bool(&self.value_int_data(lhs).gt(self.value_int_data(rhs)))),
+            BinOp::Ge => Ok(self
+                .value_encoder
+                .wrap_bool(&self.value_int_data(lhs).ge(self.value_int_data(rhs)))),
+            other => {
+                Err(self.unsupported_result(span, format!("unsupported binary operator {other:?}")))
+            }
+        }
+    }
+
+    fn lower_unsafe_unary_value(
+        &self,
+        state: &mut UnsafeState<'tcx>,
+        op: UnOp,
+        operand_ty: Ty<'tcx>,
+        value: &SymValue,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        match op {
+            UnOp::Not => Ok(self
+                .value_encoder
+                .wrap_bool(&self.value_is_true(value).not())),
+            UnOp::Neg => {
+                let int_value = Int::from_i64(0) - self.value_int_data(value);
+                self.require_unsafe_int_invariant(
+                    state,
+                    operand_ty,
+                    &int_value,
+                    span,
+                    "type invariant does not hold".to_owned(),
+                )?;
+                Ok(self.value_encoder.wrap_int(&int_value))
+            }
+            other => {
+                Err(self.unsupported_result(span, format!("unsupported unary operator {other:?}")))
+            }
+        }
+    }
+
+    fn unsafe_read_place(
+        &self,
+        state: &mut UnsafeState<'tcx>,
+        place: Place<'tcx>,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let projection = place.as_ref().projection;
+        let root_ty = self.body().local_decls[place.local].ty;
+        let Some(root) = state.store.get(&place.local).cloned() else {
+            return Err(
+                self.unsupported_result(span, format!("missing local {}", place.local.as_usize()))
+            );
+        };
+        if matches!(projection.first(), Some(PlaceElem::Deref))
+            && matches!(root_ty.kind(), TyKind::RawPtr(_, _))
+        {
+            let pointee_ty = self.deref_pointee_ty(root_ty, span)?;
+            let value = self.unsafe_read_raw_pointer(state, &root, pointee_ty, span)?;
+            let pointee_spec_ty = self.spec_ty_for_place_ty(pointee_ty, span)?;
+            return self.read_projection(
+                value,
+                &pointee_spec_ty,
+                &projection[1..],
+                ReadMode::Current,
+                span,
+            );
+        }
+
+        let root_spec_ty = self.spec_ty_for_place_ty(root_ty, span)?;
+        self.read_projection(root, &root_spec_ty, projection, ReadMode::Current, span)
+    }
+
+    fn unsafe_write_place(
+        &self,
+        state: &mut UnsafeState<'tcx>,
+        place: Place<'tcx>,
+        value: SymValue,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        let projection = place.as_ref().projection;
+        let root_ty = self.body().local_decls[place.local].ty;
+        if matches!(projection.first(), Some(PlaceElem::Deref))
+            && matches!(root_ty.kind(), TyKind::RawPtr(_, _))
+        {
+            let ptr = state.store.get(&place.local).cloned().ok_or_else(|| {
+                self.unsupported_result(span, format!("missing local {}", place.local.as_usize()))
+            })?;
+            let pointee_ty = self.deref_pointee_ty(root_ty, span)?;
+            let replacement = if projection.len() == 1 {
+                value
+            } else {
+                let current = self.unsafe_read_raw_pointer(state, &ptr, pointee_ty, span)?;
+                let pointee_spec_ty = self.spec_ty_for_place_ty(pointee_ty, span)?;
+                self.write_projection(current, &pointee_spec_ty, &projection[1..], value, span)?
+            };
+            return self.unsafe_write_raw_pointer(state, &ptr, pointee_ty, replacement, span);
+        }
+
+        let root = state
+            .store
+            .get(&place.local)
+            .cloned()
+            .unwrap_or_else(|| value.clone());
+        let root_spec_ty = self.spec_ty_for_place_ty(root_ty, span)?;
+        let updated = self.write_projection(root, &root_spec_ty, projection, value, span)?;
+        state.store.insert(place.local, updated);
+        Ok(())
+    }
+
+    fn unsafe_consume_operand(
+        &self,
+        state: &mut UnsafeState<'tcx>,
+        operand: &Operand<'tcx>,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        match operand {
+            Operand::Copy(_) | Operand::Constant(_) => Ok(()),
+            Operand::Move(place) => {
+                if self.place_starts_with_raw_pointer_deref(*place) {
+                    let root = state.store.get(&place.local).cloned().ok_or_else(|| {
+                        self.unsupported_result(
+                            span,
+                            format!("missing local {}", place.local.as_usize()),
+                        )
+                    })?;
+                    let root_ty = self.body().local_decls[place.local].ty;
+                    let pointee_ty = self.deref_pointee_ty(root_ty, span)?;
+                    self.unsafe_deinit_raw_pointer(state, &root, pointee_ty, span)
+                } else if place.projection.is_empty() {
+                    state.store.remove(&place.local);
+                    self.deinit_local_points_to(state, place.local);
+                    Ok(())
+                } else {
+                    let value = self.unsafe_read_place(state, *place, span)?;
+                    let place_ty = self.spec_ty_for_place_ty(self.place_ty(*place), span)?;
+                    let updated = self.dangle_value(&place_ty, &value, span)?;
+                    self.unsafe_write_place(state, *place, updated, span)
+                }
+            }
+        }
+    }
+
+    fn unsafe_read_raw_pointer(
+        &self,
+        state: &mut UnsafeState<'tcx>,
+        ptr: &SymValue,
+        ty: Ty<'tcx>,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        self.assert_raw_pointer_deref_preconditions(state, ptr, ty, span)?;
+        let addr = self.ptr_addr(ptr, span)?;
+        let index = self
+            .points_to_index(state, &addr, ty)
+            .ok_or_else(|| self.missing_points_to_result(span))?;
+        let value = match &state.heap[index] {
+            Resource::PointsTo {
+                value: Some(value), ..
+            } => value.clone(),
+            Resource::PointsTo { value: None, .. } => {
+                return Err(self.fail_result(
+                    span,
+                    "raw pointer read requires initialized memory".to_owned(),
+                ));
+            }
+            Resource::Alloc { .. } => unreachable!("points_to_index returned an allocation"),
+        };
+        self.require_unsafe_type_invariant(
+            state,
+            ty,
+            &value,
+            span,
+            "raw pointer read produced an invalid typed value".to_owned(),
+        )?;
+        Ok(value)
+    }
+
+    fn unsafe_write_raw_pointer(
+        &self,
+        state: &mut UnsafeState<'tcx>,
+        ptr: &SymValue,
+        ty: Ty<'tcx>,
+        value: SymValue,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        self.assert_raw_pointer_deref_preconditions(state, ptr, ty, span)?;
+        self.require_unsafe_type_invariant(
+            state,
+            ty,
+            &value,
+            span,
+            "raw pointer write requires a valid typed value".to_owned(),
+        )?;
+        let addr = self.ptr_addr(ptr, span)?;
+        let index = self
+            .points_to_index(state, &addr, ty)
+            .ok_or_else(|| self.missing_points_to_result(span))?;
+        let local = match &mut state.heap[index] {
+            Resource::PointsTo {
+                value: slot, local, ..
+            } => {
+                *slot = Some(value.clone());
+                *local
+            }
+            Resource::Alloc { .. } => unreachable!("points_to_index returned an allocation"),
+        };
+        if let Some(local) = local {
+            state.store.insert(local, value);
+        }
+        Ok(())
+    }
+
+    fn unsafe_deinit_raw_pointer(
+        &self,
+        state: &mut UnsafeState<'tcx>,
+        ptr: &SymValue,
+        ty: Ty<'tcx>,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        self.assert_raw_pointer_deref_preconditions(state, ptr, ty, span)?;
+        let addr = self.ptr_addr(ptr, span)?;
+        let index = self
+            .points_to_index(state, &addr, ty)
+            .ok_or_else(|| self.missing_points_to_result(span))?;
+        if let Resource::PointsTo { value, local, .. } = &mut state.heap[index] {
+            *value = None;
+            if let Some(local) = local {
+                state.store.remove(local);
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_raw_pointer_deref_preconditions(
+        &self,
+        state: &mut UnsafeState<'tcx>,
+        ptr: &SymValue,
+        ty: Ty<'tcx>,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        let addr = self.ptr_addr(ptr, span)?;
+        let actual_ty = self.ptr_ty(ptr, span)?;
+        let expected_ty = self.rust_ty_model_value(ty);
+        let ptr_ty_matches =
+            self.eq_for_spec_ty(&SpecTy::RustTy, &actual_ty, &expected_ty, span)?;
+        self.unsafe_assert_constraint(
+            state,
+            ptr_ty_matches,
+            span,
+            "raw pointer type does not match the dereferenced type".to_owned(),
+        )?;
+        let addr_int = self.value_int_data(&addr);
+        self.unsafe_assert_constraint(
+            state,
+            addr_int.eq(Int::from_i64(0)).not(),
+            span,
+            "raw pointer dereference requires a non-null address".to_owned(),
+        )?;
+        let (_, align) = self.layout_size_align_bytes(ty, span)?;
+        if align > 1 {
+            self.unsafe_assert_constraint(
+                state,
+                addr_int.modulo(Int::from_u64(align)).eq(0),
+                span,
+                "raw pointer dereference requires proper alignment".to_owned(),
+            )?;
+        }
+        if self.points_to_index(state, &addr, ty).is_none() {
+            return Err(self.missing_points_to_result(span));
+        }
+        let live_range = self.unsafe_live_allocation_formula(state, ptr, &addr, ty, span)?;
+        self.unsafe_assert_constraint(
+            state,
+            live_range,
+            span,
+            "raw pointer dereference requires a live allocation covering the value".to_owned(),
+        )
+    }
+
+    fn unsafe_live_allocation_formula(
+        &self,
+        state: &UnsafeState<'tcx>,
+        ptr: &SymValue,
+        addr: &SymValue,
+        ty: Ty<'tcx>,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
+        let (size, _) = self.layout_size_align_bytes(ty, span)?;
+        let addr_int = self.value_int_data(addr);
+        let ptr_prov = self.ptr_prov(ptr, span)?;
+        let end = addr_int.clone() + Int::from_u64(size);
+        let mut candidates = Vec::new();
+        for resource in &state.heap {
+            let Resource::Alloc {
+                alloc_id,
+                base,
+                size,
+                alignment,
+            } = resource
+            else {
+                continue;
+            };
+            let base_int = self.value_int_data(base);
+            let alloc_end = base_int.clone() + Int::from_u64(*size);
+            let provenance = self.construct_provenance(alloc_id.clone())?;
+            let expected_prov = self.construct_option_some(provenance_spec_ty(), provenance)?;
+            let prov_matches = self.eq_for_spec_ty(
+                &option_spec_ty(provenance_spec_ty()),
+                &ptr_prov,
+                &expected_prov,
+                span,
+            )?;
+            let mut formulas = vec![
+                prov_matches,
+                addr_int.ge(base_int.clone()),
+                end.le(alloc_end),
+            ];
+            if *alignment > 1 {
+                formulas.push(base_int.modulo(Int::from_u64(*alignment)).eq(0));
+            }
+            candidates.push(bool_and(formulas));
+        }
+        Ok(bool_or(candidates))
+    }
+
+    fn points_to_index(
+        &self,
+        state: &UnsafeState<'tcx>,
+        addr: &SymValue,
+        ty: Ty<'tcx>,
+    ) -> Option<usize> {
+        state.heap.iter().position(|resource| {
+            matches!(
+                resource,
+                Resource::PointsTo {
+                    addr: resource_addr,
+                    ty: resource_ty,
+                    ..
+                } if resource_addr == addr && *resource_ty == ty
+            )
+        })
+    }
+
+    fn deinit_local_points_to(&self, state: &mut UnsafeState<'tcx>, local: Local) {
+        for resource in &mut state.heap {
+            if let Resource::PointsTo {
+                value,
+                local: Some(resource_local),
+                ..
+            } = resource
+                && *resource_local == local
+            {
+                *value = None;
+            }
+        }
+    }
+
+    fn assign_uses_raw_pointer_deref(&self, place: Place<'tcx>, rvalue: &Rvalue<'tcx>) -> bool {
+        self.place_starts_with_raw_pointer_deref(place)
+            || self.rvalue_uses_raw_pointer_deref(rvalue)
+    }
+
+    fn rvalue_uses_raw_pointer_deref(&self, rvalue: &Rvalue<'tcx>) -> bool {
+        match rvalue {
+            Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) | Rvalue::UnaryOp(_, operand) => {
+                self.operand_uses_raw_pointer_deref(operand)
+            }
+            Rvalue::BinaryOp(_, operands) => {
+                self.operand_uses_raw_pointer_deref(&operands.0)
+                    || self.operand_uses_raw_pointer_deref(&operands.1)
+            }
+            Rvalue::Aggregate(_, operands) => operands
+                .iter()
+                .any(|operand| self.operand_uses_raw_pointer_deref(operand)),
+            _ => false,
+        }
+    }
+
+    fn operand_uses_raw_pointer_deref(&self, operand: &Operand<'tcx>) -> bool {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => {
+                self.place_starts_with_raw_pointer_deref(*place)
+            }
+            Operand::Constant(_) => false,
+        }
+    }
+
+    fn place_starts_with_raw_pointer_deref(&self, place: Place<'tcx>) -> bool {
+        matches!(place.as_ref().projection.first(), Some(PlaceElem::Deref))
+            && matches!(
+                self.body().local_decls[place.local].ty.kind(),
+                TyKind::RawPtr(_, _)
+            )
+    }
+
+    fn unsafe_assert_constraint(
+        &self,
+        state: &mut UnsafeState<'tcx>,
+        constraint: Bool,
+        span: Span,
+        message: String,
+    ) -> Result<(), VerificationResult> {
+        let constraint = constraint.simplify();
+        if let Some(value) = constraint.as_bool() {
+            return match value {
+                true => {
+                    self.add_unsafe_path_condition(state, constraint);
+                    Ok(())
+                }
+                false => Err(self.fail_result(span, message)),
+            };
+        }
+        match self.check_sat(&[state.pc.clone(), constraint.not()]) {
+            SatResult::Sat => Err(self.fail_result(span, message)),
+            SatResult::Unsat => {
+                self.add_unsafe_path_condition(state, constraint);
+                Ok(())
+            }
+            SatResult::Unknown => Err(self.unknown_solver_result(span, "checking unsafe code")),
+        }
+    }
+
+    fn add_unsafe_path_condition(&self, state: &mut UnsafeState<'tcx>, constraint: Bool) {
+        state.pc = bool_and(vec![state.pc.clone(), constraint]).simplify();
+    }
+
+    fn require_unsafe_type_invariant(
+        &self,
+        state: &mut UnsafeState<'tcx>,
+        ty: Ty<'tcx>,
+        value: &SymValue,
+        span: Span,
+        message: String,
+    ) -> Result<(), VerificationResult> {
+        let spec_ty =
+            spec_ty_for_rust_ty(self.tcx, ty).map_err(|err| self.unsupported_result(span, err))?;
+        let Some(formula) = self.spec_ty_formula(&spec_ty, value, span)? else {
+            return Ok(());
+        };
+        self.unsafe_assert_constraint(state, formula, span, message)
+    }
+
+    fn require_unsafe_int_invariant(
+        &self,
+        state: &mut UnsafeState<'tcx>,
+        ty: Ty<'tcx>,
+        value: &Int,
+        span: Span,
+        message: String,
+    ) -> Result<(), VerificationResult> {
+        let Some((lower, upper)) = self.int_bounds_for_rust_ty(ty, span)? else {
+            return Ok(());
+        };
+        self.unsafe_assert_constraint(
+            state,
+            bool_and(vec![value.ge(lower), value.le(upper)]),
+            span,
+            message,
+        )
+    }
+
+    fn missing_points_to_result(&self, span: Span) -> VerificationResult {
+        self.fail_result(
+            span,
+            "raw pointer dereference requires an initialized PointsTo resource".to_owned(),
+        )
     }
 
     fn register_pure_fn(&mut self, pure_fn: &TypedPureFnDef) -> Result<(), VerificationResult> {
@@ -2961,6 +3733,13 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
+    fn is_inside_unsafe_block(&self, span: Span) -> bool {
+        self.function_context()
+            .unsafe_blocks
+            .iter()
+            .any(|unsafe_span| span_contains(*unsafe_span, span))
+    }
+
     fn value_int(&self, value: i64) -> SymValue {
         self.value_encoder.int_value(value)
     }
@@ -3653,6 +4432,11 @@ impl<'tcx> Verifier<'tcx> {
         self.decode_composite_field(&encoding, value, 1, span)
     }
 
+    fn ptr_ty(&self, value: &SymValue, span: Span) -> Result<SymValue, VerificationResult> {
+        let encoding = self.composite_encoding(&ptr_spec_ty())?;
+        self.decode_composite_field(&encoding, value, 2, span)
+    }
+
     fn reference_ptr_formula(
         &self,
         ptr: &SymValue,
@@ -4341,6 +5125,15 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
+    fn fail_result(&self, span: Span, message: String) -> VerificationResult {
+        VerificationResult {
+            function: self.report_function(),
+            status: VerificationStatus::Fail,
+            span: span_text(self.tcx, span),
+            message,
+        }
+    }
+
     fn pass_result(&self, message: &str) -> VerificationResult {
         VerificationResult {
             function: self.report_function(),
@@ -4693,6 +5486,10 @@ fn bool_not(expr: Bool) -> Bool {
     expr.not()
 }
 
+fn span_contains(outer: Span, inner: Span) -> bool {
+    outer.lo() <= inner.lo() && inner.hi() <= outer.hi()
+}
+
 fn spec_ty_contains_mut_ref(ty: &SpecTy) -> bool {
     match ty {
         SpecTy::Mut(_) => true,
@@ -4817,6 +5614,7 @@ mod tests {
                 ens_span: "fixture.rs:1:1".to_owned(),
                 result: SpecTy::Bool,
             }),
+            unsafe_blocks: Vec::new(),
         };
         let pure_fns = vec![
             TypedPureFnDef {
