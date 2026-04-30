@@ -83,9 +83,9 @@ pub struct ControlPoint {
 #[derive(Debug, Clone)]
 pub struct State {
     pc: Bool,
-    model: BTreeMap<Local, SymValue>,
+    store: BTreeMap<Local, SymValue>,
     allocs: BTreeMap<Local, Allocation>,
-    spec_env: HashMap<String, SymValue>,
+    env: HashMap<String, SymValue>,
     ctrl: ControlPoint,
 }
 
@@ -464,9 +464,9 @@ impl<'tcx> Verifier<'tcx> {
     fn initial_state(&self) -> Result<Option<State>, VerificationResult> {
         let mut state = State {
             pc: Bool::from_bool(true),
-            model: BTreeMap::new(),
+            store: BTreeMap::new(),
             allocs: BTreeMap::new(),
-            spec_env: HashMap::new(),
+            env: HashMap::new(),
             ctrl: ControlPoint {
                 basic_block: BasicBlock::from_usize(0),
                 statement_index: 0,
@@ -480,13 +480,13 @@ impl<'tcx> Verifier<'tcx> {
         {
             let ty = self.body().local_decls[local].ty;
             let value = self.fresh_for_rust_ty(ty, &format!("arg_{}", local.as_usize()))?;
-            state.model.insert(local, value);
+            state.store.insert(local, value);
             self.create_allocation(&mut state, local, "arg_alloc", self.report_span())?;
         }
         {
             let contract = self.current_contract();
             let env = CallEnv::for_function(self, &state, contract)?;
-            state.spec_env =
+            state.env =
                 self.bind_contract_spec_values(&env.current, &env.spec, &contract.req.bindings)?;
             let env = CallEnv::for_function(self, &state, contract)?;
             let req = self.contract_req_formula(contract, &env, self.report_span())?;
@@ -506,7 +506,7 @@ impl<'tcx> Verifier<'tcx> {
             StatementKind::StorageLive(local) => {
                 let ty = self.body().local_decls[*local].ty;
                 let value = self.fresh_for_rust_ty(ty, &format!("live_{}", local.as_usize()))?;
-                state.model.insert(*local, value);
+                state.store.insert(*local, value);
                 self.create_allocation(&mut state, *local, "live_alloc", stmt.source_info.span)?;
             }
             StatementKind::StorageDead(local) => {
@@ -598,7 +598,7 @@ impl<'tcx> Verifier<'tcx> {
                         "postcondition failed".to_owned(),
                     )?;
                 }
-                let live_locals: Vec<_> = state.model.keys().copied().collect();
+                let live_locals: Vec<_> = state.store.keys().copied().collect();
                 for local in live_locals {
                     if local != Local::from_usize(0) {
                         self.resolve_and_remove_local(&mut state, local, term.source_info.span)?;
@@ -952,12 +952,12 @@ impl<'tcx> Verifier<'tcx> {
 
         let shared: BTreeSet<_> = states
             .iter()
-            .map(|state| state.model.keys().copied().collect::<BTreeSet<_>>())
+            .map(|state| state.store.keys().copied().collect::<BTreeSet<_>>())
             .reduce(|acc, keys| acc.intersection(&keys).copied().collect())
             .unwrap_or_default();
 
         for state in &mut states {
-            let locals: Vec<_> = state.model.keys().copied().collect();
+            let locals: Vec<_> = state.store.keys().copied().collect();
             for local in locals {
                 if !shared.contains(&local) {
                     self.resolve_and_remove_local(state, local, self.control_span(state.ctrl))?;
@@ -968,9 +968,9 @@ impl<'tcx> Verifier<'tcx> {
         let ctrl = states[0].ctrl;
         let mut merged = State {
             pc: Bool::from_bool(false),
-            model: BTreeMap::new(),
+            store: BTreeMap::new(),
             allocs: BTreeMap::new(),
-            spec_env: HashMap::new(),
+            env: HashMap::new(),
             ctrl,
         };
         let pcs = states
@@ -986,7 +986,7 @@ impl<'tcx> Verifier<'tcx> {
                 .iter()
                 .map(|state| {
                     state
-                        .model
+                        .store
                         .get(&local)
                         .cloned()
                         .expect("shared local present")
@@ -997,7 +997,7 @@ impl<'tcx> Verifier<'tcx> {
                 .cloned()
                 .expect("shared local present");
             if incoming_values.iter().all(|value| *value == first_value) {
-                merged.model.insert(local, first_value);
+                merged.store.insert(local, first_value);
                 continue;
             }
 
@@ -1012,7 +1012,7 @@ impl<'tcx> Verifier<'tcx> {
                 )?;
                 self.add_path_condition(&mut merged, state.pc.clone().implies(equality));
             }
-            merged.model.insert(local, merged_value);
+            merged.store.insert(local, merged_value);
         }
 
         let shared_allocs: BTreeSet<_> = states
@@ -1061,7 +1061,7 @@ impl<'tcx> Verifier<'tcx> {
 
         let shared_spec_names: BTreeSet<_> = states
             .iter()
-            .map(|state| state.spec_env.keys().cloned().collect::<BTreeSet<_>>())
+            .map(|state| state.env.keys().cloned().collect::<BTreeSet<_>>())
             .reduce(|acc, keys| acc.intersection(&keys).cloned().collect())
             .unwrap_or_default();
         for name in shared_spec_names {
@@ -1069,7 +1069,7 @@ impl<'tcx> Verifier<'tcx> {
                 .iter()
                 .map(|state| {
                     state
-                        .spec_env
+                        .env
                         .get(&name)
                         .cloned()
                         .expect("shared spec binding present")
@@ -1080,7 +1080,7 @@ impl<'tcx> Verifier<'tcx> {
                 .cloned()
                 .expect("shared spec binding present");
             if incoming.drain(..).all(|value| value == first) {
-                merged.spec_env.insert(name, first);
+                merged.env.insert(name, first);
             }
         }
 
@@ -1121,7 +1121,7 @@ impl<'tcx> Verifier<'tcx> {
         mut state: State,
         unsafe_span: Span,
     ) -> Result<Vec<State>, VerificationResult> {
-        let spec_env = std::mem::take(&mut state.spec_env);
+        let env = std::mem::take(&mut state.env);
         let (unsafe_state, bridge) = self.enter_unsafe(state, unsafe_span)?;
         let mut pending: BTreeMap<ControlPoint, Vec<UnsafeState>> = BTreeMap::new();
         let mut exits: BTreeMap<ControlPoint, Vec<UnsafeState>> = BTreeMap::new();
@@ -1163,7 +1163,7 @@ impl<'tcx> Verifier<'tcx> {
         let mut next_states = Vec::new();
         for bucket in exits.into_values() {
             for unsafe_state in bucket {
-                next_states.push(self.exit_unsafe(unsafe_state, &bridge, spec_env.clone()));
+                next_states.push(self.exit_unsafe(unsafe_state, &bridge, env.clone()));
             }
         }
         Ok(next_states)
@@ -1176,7 +1176,7 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<(UnsafeState, UnsafeBridge), VerificationResult> {
         let State {
             pc,
-            model,
+            store,
             allocs,
             ctrl,
             ..
@@ -1187,7 +1187,7 @@ impl<'tcx> Verifier<'tcx> {
             .collect::<Vec<_>>();
         let mut unsafe_state = UnsafeState {
             pc,
-            store: model,
+            store,
             allocs,
             heap: Vec::new(),
             ctrl,
@@ -1209,7 +1209,7 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         mut unsafe_state: UnsafeState,
         bridge: &UnsafeBridge,
-        spec_env: HashMap<String, SymValue>,
+        env: HashMap<String, SymValue>,
     ) -> State {
         for local in &bridge.locals {
             let ty = self.local_rust_ty_model_value(*local);
@@ -1236,9 +1236,9 @@ impl<'tcx> Verifier<'tcx> {
         }
         State {
             pc: unsafe_state.pc,
-            model: unsafe_state.store,
+            store: unsafe_state.store,
             allocs: unsafe_state.allocs,
-            spec_env,
+            env,
             ctrl: unsafe_state.ctrl,
         }
     }
@@ -2279,21 +2279,21 @@ impl<'tcx> Verifier<'tcx> {
         }
         let mut state = State {
             pc: Bool::from_bool(true),
-            model: BTreeMap::new(),
+            store: BTreeMap::new(),
             allocs: BTreeMap::new(),
-            spec_env: HashMap::new(),
+            env: HashMap::new(),
             ctrl: ControlPoint {
                 basic_block: BasicBlock::from_usize(0),
                 statement_index: 0,
             },
         };
-        let state_spec = state.spec_env.clone();
+        let state_spec = state.env.clone();
         let Some(spec) =
             self.assume_contract_predicate(&mut state, &lemma.req, &current, &state_spec)?
         else {
             return Ok(());
         };
-        state.spec_env = spec;
+        state.env = spec;
         for param in &lemma.params {
             let value = current.get(&param.name).expect("lemma parameter value");
             if let Some(formula) = self.spec_ty_formula(&param.ty, value, self.report_span())?
@@ -2306,7 +2306,7 @@ impl<'tcx> Verifier<'tcx> {
         for final_exec in final_states {
             let mut final_state = final_exec.state;
             let ens =
-                self.contract_expr_to_bool(&final_exec.current, &final_state.spec_env, &lemma.ens)?;
+                self.contract_expr_to_bool(&final_exec.current, &final_state.env, &lemma.ens)?;
             self.assert_predicate_constraint(
                 &mut final_state,
                 ens,
@@ -2333,7 +2333,7 @@ impl<'tcx> Verifier<'tcx> {
         };
         match stmt {
             TypedGhostStmt::Assert(expr) => {
-                let state_spec = state.spec_env.clone();
+                let state_spec = state.env.clone();
                 let spec = self.assert_contract_predicate_constraint(
                     &mut state,
                     expr,
@@ -2343,11 +2343,11 @@ impl<'tcx> Verifier<'tcx> {
                     format!("lemma `{}`", lemma.name),
                     format!("lemma `{}` assertion failed", lemma.name),
                 )?;
-                state.spec_env = spec;
+                state.env = spec;
                 self.execute_lemma_stmts(lemma, current, state, rest)
             }
             TypedGhostStmt::Assume(expr) => {
-                let formula = self.contract_expr_to_bool(current, &state.spec_env, expr)?;
+                let formula = self.contract_expr_to_bool(current, &state.env, expr)?;
                 if !self.assume_path_condition(&mut state, formula) {
                     return Ok(Vec::new());
                 }
@@ -2360,8 +2360,7 @@ impl<'tcx> Verifier<'tcx> {
                         format!("unknown lemma `{lemma_name}`"),
                     )
                 })?;
-                let env =
-                    self.lemma_env_from_contract_args(args, current, &state.spec_env, callee)?;
+                let env = self.lemma_env_from_contract_args(args, current, &state.env, callee)?;
                 let spec = self.assert_contract_predicate_constraint(
                     &mut state,
                     &callee.req,
@@ -2404,7 +2403,7 @@ impl<'tcx> Verifier<'tcx> {
         default: Option<&[TypedGhostStmt]>,
         rest: &[TypedGhostStmt],
     ) -> Result<Vec<LemmaExecState>, VerificationResult> {
-        let scrutinee_value = self.contract_expr_to_value(current, &state.spec_env, scrutinee)?;
+        let scrutinee_value = self.contract_expr_to_value(current, &state.env, scrutinee)?;
         let composite = self.composite_encoding(&scrutinee.ty)?;
         let mut guard_formulas = Vec::with_capacity(arms.len());
         let mut final_states = Vec::new();
@@ -2529,7 +2528,7 @@ impl<'tcx> Verifier<'tcx> {
         }
         Ok(CallEnv {
             current,
-            spec: state.spec_env.clone(),
+            spec: state.env.clone(),
         })
     }
 
@@ -2569,7 +2568,7 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<(), VerificationResult> {
         state.allocs.remove(&local);
-        let Some(value) = state.model.remove(&local) else {
+        let Some(value) = state.store.remove(&local) else {
             return Ok(());
         };
         self.require_resolve_formula(state, local, &value, span)
@@ -2581,7 +2580,7 @@ impl<'tcx> Verifier<'tcx> {
         local: Local,
         span: Span,
     ) -> Result<(), VerificationResult> {
-        let Some(value) = state.model.get(&local).cloned() else {
+        let Some(value) = state.store.get(&local).cloned() else {
             return Ok(());
         };
         self.require_resolve_formula(state, local, &value, span)
@@ -2975,7 +2974,7 @@ impl<'tcx> Verifier<'tcx> {
             Operand::Copy(_) => Ok(()),
             Operand::Move(place) => {
                 if place.projection.is_empty() {
-                    state.model.remove(&place.local);
+                    state.store.remove(&place.local);
                 } else {
                     self.dangle_place(state, *place, span)?;
                 }
@@ -3039,7 +3038,7 @@ impl<'tcx> Verifier<'tcx> {
         mode: ReadMode,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let Some(root) = state.model.get(&place.local).cloned() else {
+        let Some(root) = state.store.get(&place.local).cloned() else {
             return Err(
                 self.unsupported_result(span, format!("missing local {}", place.local.as_usize()))
             );
@@ -3109,7 +3108,7 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<(), VerificationResult> {
         let root = state
-            .model
+            .store
             .get(&place.local)
             .cloned()
             .unwrap_or_else(|| value.clone());
@@ -3117,7 +3116,7 @@ impl<'tcx> Verifier<'tcx> {
         let root_spec_ty = self.spec_ty_for_place_ty(root_ty, span)?;
         let updated =
             self.write_projection(root, &root_spec_ty, place.as_ref().projection, value, span)?;
-        state.model.insert(place.local, updated);
+        state.store.insert(place.local, updated);
         Ok(())
     }
 
@@ -3373,7 +3372,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 self.construct_composite(&expr.ty, &values)
             }
-            TypedExprKind::Var(name) => state.spec_env.get(name).cloned().ok_or_else(|| {
+            TypedExprKind::Var(name) => state.env.get(name).cloned().ok_or_else(|| {
                 self.unsupported_result(
                     self.control_span(state.ctrl),
                     format!("missing spec binding `{name}`"),
@@ -3386,7 +3385,7 @@ impl<'tcx> Verifier<'tcx> {
                         format!("missing local binding `{name}`"),
                     ));
                 };
-                state.model.get(local).cloned().ok_or_else(|| {
+                state.store.get(local).cloned().ok_or_else(|| {
                     self.unsupported_result(
                         self.control_span(state.ctrl),
                         format!("missing local {}", local.as_usize()),
@@ -3936,7 +3935,7 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<(), VerificationResult> {
         for binding in bindings {
             let value = self.spec_expr_to_value(state, &binding.value, resolved)?;
-            state.spec_env.insert(binding.name.clone(), value);
+            state.env.insert(binding.name.clone(), value);
         }
         Ok(())
     }
@@ -4200,12 +4199,12 @@ impl<'tcx> Verifier<'tcx> {
         loop_contract: &LoopContract,
     ) -> Result<(), VerificationResult> {
         for local in &loop_contract.written_locals {
-            if !state.model.contains_key(local) {
+            if !state.store.contains_key(local) {
                 continue;
             }
             let ty = self.body().local_decls[*local].ty;
             let fresh = self.fresh_for_rust_ty(ty, &format!("loop_{}", local.as_usize()))?;
-            state.model.insert(*local, fresh);
+            state.store.insert(*local, fresh);
         }
         Ok(())
     }
@@ -4582,7 +4581,7 @@ impl<'tcx> Verifier<'tcx> {
         let projection = place.as_ref().projection;
         let final_ty = self.place_ty(place);
         if matches!(projection.first(), Some(PlaceElem::Deref)) {
-            let Some(root) = state.model.get(&place.local).cloned() else {
+            let Some(root) = state.store.get(&place.local).cloned() else {
                 return Err(self.unsupported_result(
                     span,
                     format!("missing local {}", place.local.as_usize()),
@@ -5790,13 +5789,13 @@ impl CallEnv {
         contract: &FunctionContract,
     ) -> Result<Self, VerificationResult> {
         let mut current = HashMap::new();
-        let mut spec = state.spec_env.clone();
+        let mut spec = state.env.clone();
         for (param, local) in contract
             .params
             .iter()
             .zip(verifier.body().local_decls.indices().skip(1))
         {
-            let value = state.model.get(&local).cloned().ok_or_else(|| {
+            let value = state.store.get(&local).cloned().ok_or_else(|| {
                 verifier.unsupported_result(
                     verifier.control_span(state.ctrl),
                     format!("missing local {}", local.as_usize()),
@@ -5804,7 +5803,7 @@ impl CallEnv {
             })?;
             current.insert(param.name.clone(), value);
         }
-        if let Some(result) = state.model.get(&Local::from_usize(0)).cloned() {
+        if let Some(result) = state.store.get(&Local::from_usize(0)).cloned() {
             current.insert("result".to_owned(), result.clone());
             spec.insert("result".to_owned(), result);
         }

@@ -454,9 +454,12 @@ pointer. `Alloc` records the live allocation range and alignment for that base.
 
 `PointsTo` is a typed-cell resource. `PointsTo(addr, ty, Some(v))` means that
 `addr` is non-null, aligned for `ty`, and contains one initialized value valid
-for the spec model type corresponding to `ty`. `PointsTo(addr, ty, None)` means
-that the typed cell exists but is not initialized. The initial model does not
-represent byte-level ownership separately from typed cells.
+for the same spec model type that the safe-state engine uses for the Rust type
+represented by `ty`. For example, a raw pointer is modeled as `Ptr`, a shared
+reference as `Ref<T>`, and a mutable reference as `Mut<T>` in both safe and
+unsafe states. `PointsTo(addr, ty, None)` means that the typed cell exists but
+is not initialized. The initial model does not represent byte-level ownership or
+physical pointer-sized layouts separately from typed cells.
 
 Unsafe states must be resource-well-formed: if two `PointsTo` resources are
 simultaneously present, their Rust layout footprints must not overlap. The
