@@ -91,7 +91,6 @@ pub struct State {
 
 #[derive(Debug, Clone)]
 struct Allocation {
-    alloc_id: SymValue,
     base_addr: SymValue,
     size: u64,
     align: u64,
@@ -144,7 +143,6 @@ enum Resource {
         value: Option<SymValue>,
     },
     Alloc {
-        alloc_id: SymValue,
         base: SymValue,
         size: u64,
         alignment: u64,
@@ -1248,16 +1246,11 @@ impl<'tcx> Verifier<'tcx> {
                 ));
             }
 
-            let alloc_id = self.fresh_for_spec_ty(
-                &SpecTy::Int,
-                &format!("unsafe_merge_alloc_{}_id", local.as_usize()),
-            )?;
             let base_addr = self.fresh_for_spec_ty(
                 &SpecTy::Usize,
                 &format!("unsafe_merge_alloc_{}_base", local.as_usize()),
             )?;
             let alloc = Allocation {
-                alloc_id,
                 base_addr,
                 size: first.size,
                 align: first.align,
@@ -1279,7 +1272,6 @@ impl<'tcx> Verifier<'tcx> {
         state.heap.clear();
         for (local, alloc) in &bridge.allocs {
             state.heap.push(Resource::Alloc {
-                alloc_id: alloc.alloc_id.clone(),
                 base: alloc.base_addr.clone(),
                 size: alloc.size,
                 alignment: alloc.align,
@@ -1422,12 +1414,9 @@ impl<'tcx> Verifier<'tcx> {
         self.remove_unsafe_local_allocation(state, bridge, local);
         let ty = self.body().local_decls[local].ty;
         let (size, align) = self.layout_size_align_bytes(ty, span)?;
-        let alloc_id =
-            self.fresh_for_spec_ty(&SpecTy::Int, &format!("{hint}_{}_id", local.as_usize()))?;
         let base_addr =
             self.fresh_for_spec_ty(&SpecTy::Usize, &format!("{hint}_{}_base", local.as_usize()))?;
         let alloc = Allocation {
-            alloc_id,
             base_addr,
             size,
             align,
@@ -1459,7 +1448,6 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<(), VerificationResult> {
         self.add_unsafe_path_condition(state, self.allocation_bounds_formula(alloc, span)?);
         state.heap.push(Resource::Alloc {
-            alloc_id: alloc.alloc_id.clone(),
             base: alloc.base_addr.clone(),
             size: alloc.size,
             alignment: alloc.align,
@@ -1483,9 +1471,9 @@ impl<'tcx> Verifier<'tcx> {
             } => local_alloc
                 .as_ref()
                 .is_none_or(|alloc| *addr != alloc.base_addr || *resource_ty != ty),
-            Resource::Alloc { alloc_id, .. } => local_alloc
+            Resource::Alloc { base, .. } => local_alloc
                 .as_ref()
-                .is_none_or(|alloc| *alloc_id != alloc.alloc_id),
+                .is_none_or(|alloc| *base != alloc.base_addr),
         });
     }
 
@@ -1826,7 +1814,7 @@ impl<'tcx> Verifier<'tcx> {
         let root_ty = self.body().local_decls[place.local].ty;
         let offset = self.place_projection_offset(root_ty, projection, span)?;
         let addr = self.add_addr_offset(alloc.base_addr.clone(), offset);
-        let provenance = self.construct_provenance(alloc.alloc_id.clone())?;
+        let provenance = self.construct_provenance(alloc.base_addr.clone())?;
         let prov = self.construct_option_some(provenance_spec_ty(), provenance)?;
         let ty = self.rust_ty_model_value(final_ty);
         self.construct_ptr(addr, prov, ty)
@@ -2099,7 +2087,6 @@ impl<'tcx> Verifier<'tcx> {
         let mut candidates = Vec::new();
         for resource in &state.heap {
             let Resource::Alloc {
-                alloc_id,
                 base,
                 size,
                 alignment,
@@ -2109,7 +2096,7 @@ impl<'tcx> Verifier<'tcx> {
             };
             let base_int = self.value_int_data(base);
             let alloc_end = base_int.clone() + Int::from_u64(*size);
-            let provenance = self.construct_provenance(alloc_id.clone())?;
+            let provenance = self.construct_provenance(base.clone())?;
             let expected_prov = self.construct_option_some(provenance_spec_ty(), provenance)?;
             let prov_matches = self.eq_for_spec_ty(
                 &option_spec_ty(provenance_spec_ty()),
@@ -4772,8 +4759,7 @@ impl<'tcx> Verifier<'tcx> {
         ty: SymValue,
     ) -> Result<SymValue, VerificationResult> {
         let addr = self.fresh_for_spec_ty(&SpecTy::Usize, &format!("{hint}_addr"))?;
-        let alloc_id = self.fresh_for_spec_ty(&SpecTy::Int, &format!("{hint}_alloc_id"))?;
-        let provenance = self.construct_provenance(alloc_id)?;
+        let provenance = self.construct_provenance(addr.clone())?;
         let prov = self.construct_option_some(provenance_spec_ty(), provenance)?;
         self.construct_composite(&ptr_spec_ty(), &[addr, prov, ty])
     }
@@ -4788,12 +4774,9 @@ impl<'tcx> Verifier<'tcx> {
         state.allocs.remove(&local);
         let ty = self.body().local_decls[local].ty;
         let (size, align) = self.layout_size_align_bytes(ty, span)?;
-        let alloc_id =
-            self.fresh_for_spec_ty(&SpecTy::Int, &format!("{hint}_{}_id", local.as_usize()))?;
         let base_addr =
             self.fresh_for_spec_ty(&SpecTy::Usize, &format!("{hint}_{}_base", local.as_usize()))?;
         let alloc = Allocation {
-            alloc_id,
             base_addr,
             size,
             align,
@@ -4818,10 +4801,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn allocations_are_identical(&self, lhs: &Allocation, rhs: &Allocation) -> bool {
-        lhs.size == rhs.size
-            && lhs.align == rhs.align
-            && lhs.alloc_id == rhs.alloc_id
-            && lhs.base_addr == rhs.base_addr
+        lhs.size == rhs.size && lhs.align == rhs.align && lhs.base_addr == rhs.base_addr
     }
 
     fn allocation_equality_formula(
@@ -4833,10 +4813,7 @@ impl<'tcx> Verifier<'tcx> {
         if lhs.size != rhs.size || lhs.align != rhs.align {
             return Ok(Bool::from_bool(false));
         }
-        Ok(bool_and(vec![
-            self.eq_for_spec_ty(&SpecTy::Int, &lhs.alloc_id, &rhs.alloc_id, span)?,
-            self.eq_for_spec_ty(&SpecTy::Usize, &lhs.base_addr, &rhs.base_addr, span)?,
-        ]))
+        self.eq_for_spec_ty(&SpecTy::Usize, &lhs.base_addr, &rhs.base_addr, span)
     }
 
     fn allocation_distinct_formula(
@@ -4846,7 +4823,7 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Bool, VerificationResult> {
         Ok(self
-            .eq_for_spec_ty(&SpecTy::Int, &lhs.alloc_id, &rhs.alloc_id, span)?
+            .eq_for_spec_ty(&SpecTy::Usize, &lhs.base_addr, &rhs.base_addr, span)?
             .not())
     }
 
@@ -4914,7 +4891,7 @@ impl<'tcx> Verifier<'tcx> {
         let root_ty = self.body().local_decls[place.local].ty;
         let offset = self.place_projection_offset(root_ty, projection, span)?;
         let addr = self.add_addr_offset(alloc.base_addr.clone(), offset);
-        let provenance = self.construct_provenance(alloc.alloc_id.clone())?;
+        let provenance = self.construct_provenance(alloc.base_addr.clone())?;
         let prov = self.construct_option_some(provenance_spec_ty(), provenance)?;
         let ty = self.rust_ty_model_value(final_ty);
         self.construct_ptr(addr, prov, ty)
@@ -5048,8 +5025,8 @@ impl<'tcx> Verifier<'tcx> {
         self.construct_composite(&ptr_spec_ty(), &[addr, prov, ty])
     }
 
-    fn construct_provenance(&self, alloc_id: SymValue) -> Result<SymValue, VerificationResult> {
-        self.construct_composite(&provenance_spec_ty(), &[alloc_id])
+    fn construct_provenance(&self, base: SymValue) -> Result<SymValue, VerificationResult> {
+        self.construct_composite(&provenance_spec_ty(), &[base])
     }
 
     fn construct_option_none(&self, inner: SpecTy) -> Result<SymValue, VerificationResult> {

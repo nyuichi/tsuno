@@ -363,7 +363,7 @@ enum Option<T> {
 }
 
 struct Provenance {
-    alloc_id: Int,
+    base: usize,
 }
 
 struct Ptr {
@@ -390,7 +390,7 @@ For example, `{type i32}` denotes the model value for Rust `i32`, and `{type T}`
 denotes the model value for the Rust type parameter `T` in the surrounding
 Rust item. Distinct observed Rust type values are treated as distinct by the
 solver.
-`Provenance` currently records only `alloc_id`; borrow tags for Tree Borrows are
+`Provenance` currently records only the allocation base address; borrow tags for Tree Borrows are
 not part of the model yet. Rust raw pointer types are modeled as `Ptr`.
 `Ref<T>` and `Mut<T>` values require `ptr.prov` to be `Some(_)`; raw `Ptr`
 values may have no provenance because null, dangling, and integer-derived
@@ -398,11 +398,11 @@ pointers are representable.
 
 Pointers created from Rust places carry a stable place-derived identity. Taking
 `&x`, `&raw const x`, or `&raw mut x` gives a pointer whose `prov` is
-`Some(Provenance { alloc_id: ... })`; taking a pointer to a field keeps the same
-allocation id and uses `base_addr + offset`, where field offsets come from
+`Some(Provenance { base: ... })`; taking a pointer to a field keeps the same
+provenance base and uses `base + offset`, where field offsets come from
 rustc's type layout query for the Rust type. Repeating a borrow of the same
 place gives the same modeled `addr` and `prov`. Different live locals get
-different allocation ids and non-overlapping address ranges. Allocation base
+different allocation base addresses and non-overlapping address ranges. Allocation base
 addresses are constrained to satisfy the Rust type's ABI alignment from rustc's
 layout query. Layout-dependent pointer formation currently supports field
 projections, including fields below a dereferenced reference or raw pointer; DST
@@ -438,7 +438,7 @@ the unsafe block converts the updated resources back into safe Rust state.
 The initial unsafe heap model is address-based and has only two resource forms:
 
 ```text
-Alloc(alloc_id: Int, base: usize, size: usize, alignment: usize)
+Alloc(base: usize, size: usize, alignment: usize)
 PointsTo(addr: usize, ty: RustTy, value: Option<T>)
 ```
 
