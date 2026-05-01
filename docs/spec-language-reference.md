@@ -495,16 +495,25 @@ visible: deeply nested unsafe branches can create multiple unsafe states before
 control returns to safe code.
 
 Currently supported unsafe code is single-threaded Rust for raw pointer reads
-and writes, including ordinary branches inside unsafe blocks. Calls inside unsafe
-blocks are rejected. Loop contracts and function contracts inside unsafe code are
-not supported yet; existing loop prepass restrictions still apply before unsafe
-execution. Aliasing,
-permissions, fractional permissions, and user-defined heap predicates are not
-part of this initial unsafe model.
+and writes, ordinary branches inside unsafe blocks, ordinary reference
+construction, checked integer arithmetic, and calls to ordinary safe Rust
+functions. A safe function call inside an unsafe block uses the same
+contract behavior as safe code: the callee precondition is asserted, the callee
+postcondition is assumed, and opaque calls produce a fresh result satisfying the
+result type invariant. Unsafe function calls inside unsafe blocks are not
+supported. This support is for safe function calls only; unsafe API
+heap/layout/value specifications are separate unsafe resources and are not part
+of this initial model.
 
-Ordinary spec directives such as `//@ assert`, `//@ assume`, `//@ let`, and
-`//@ lemma` are not supported inside unsafe blocks. Future separation-logic
-directives for unsafe heap resources will be added separately.
+Inside unsafe blocks, ordinary `//@ let`, `//@ assert`, `//@ assume`, and
+lemma-call directives are supported when they only affect the symbolic path
+condition or the directive environment, as they do in safe code. Loop invariants
+inside unsafe blocks are not supported. Future separation-logic directives for
+unsafe heap resources will be added separately. Loop contracts and function
+contracts inside unsafe code are not supported yet; existing loop prepass
+restrictions still apply before unsafe execution. Aliasing, permissions,
+fractional permissions, and user-defined heap predicates are not part of this
+initial unsafe model.
 
 Shared references can be dereferenced with `*`. After type checking, `*r` for a
 `Ref<T>` is desugared to `r.deref`.
