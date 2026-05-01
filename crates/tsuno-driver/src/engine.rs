@@ -28,7 +28,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use rustc_hir::def_id::LocalDefId;
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::mir::{
     AggregateKind, BasicBlock, BinOp, Body, BorrowKind, ConstOperand, Local, MutBorrowKind,
     Operand, Place, PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnOp,
@@ -132,6 +132,7 @@ struct UnsafeState {
     pc: Bool,
     store: BTreeMap<Local, SymValue>,
     allocs: BTreeMap<Local, Allocation>,
+    env: HashMap<String, SymValue>,
     heap: Vec<Resource>,
     ctrl: ControlPoint,
 }
@@ -153,6 +154,14 @@ enum Resource {
 #[derive(Debug, Clone, Default)]
 struct UnsafeBridge {
     locals: BTreeSet<Local>,
+}
+
+struct UnsafeCall<'mir, 'tcx> {
+    func: &'mir Operand<'tcx>,
+    args: &'mir [Spanned<Operand<'tcx>>],
+    destination: Place<'tcx>,
+    target: Option<BasicBlock>,
+    span: Span,
 }
 
 pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<VerificationResult> {
@@ -363,70 +372,6 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(None) => continue,
                 Err(err) => return err,
             };
-            let mut state = state;
-            if let Some(directives) = self
-                .control_point_directives()
-                .directives_at(ctrl.basic_block, ctrl.statement_index)
-            {
-                let mut pruned = false;
-                for directive in directives {
-                    match directive {
-                        ControlPointDirective::Let(binding) => {
-                            if let Err(err) = self.bind_state_spec_values(
-                                &mut state,
-                                std::slice::from_ref(&binding.binding),
-                                &binding.resolution,
-                            ) {
-                                return err;
-                            }
-                        }
-                        ControlPointDirective::Assert(assertion) => {
-                            if let Err(err) = self.assert_spec_predicate_constraint(
-                                &mut state,
-                                &assertion.assertion,
-                                &assertion.resolution,
-                                self.control_span(ctrl),
-                                assertion.assertion_span.clone(),
-                                "assertion failed".to_owned(),
-                            ) {
-                                return err;
-                            }
-                        }
-                        ControlPointDirective::Assume(assumption) => {
-                            let formula = match self.spec_expr_to_bool(
-                                &state,
-                                &assumption.assumption,
-                                &assumption.resolution,
-                            ) {
-                                Ok(formula) => formula,
-                                Err(err) => return err,
-                            };
-                            if self.assume_checked_path_condition(&mut state, formula) {
-                            } else {
-                                pruned = true;
-                                break;
-                            }
-                        }
-                        ControlPointDirective::LemmaCall(lemma_call) => {
-                            match self.execute_lemma_call(
-                                &mut state,
-                                lemma_call,
-                                self.control_span(ctrl),
-                            ) {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    pruned = true;
-                                    break;
-                                }
-                                Err(err) => return err,
-                            }
-                        }
-                    }
-                }
-                if pruned {
-                    continue;
-                }
-            }
             if let Some(unsafe_span) = self.unsafe_block_containing_span(self.control_span(ctrl)) {
                 let next_states = match self.step_unsafe_region(state, unsafe_span) {
                     Ok(next_states) => next_states,
@@ -436,6 +381,13 @@ impl<'tcx> Verifier<'tcx> {
                     self.enqueue_state(&mut pending, &mut worklist, next);
                 }
                 continue;
+            }
+
+            let mut state = state;
+            match self.apply_control_point_directives(&mut state, ctrl) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(err) => return err,
             }
 
             let data = &self.body().basic_blocks[ctrl.basic_block];
@@ -459,6 +411,56 @@ impl<'tcx> Verifier<'tcx> {
         }
 
         self.pass_result("all assertions discharged")
+    }
+
+    fn apply_control_point_directives(
+        &self,
+        state: &mut State,
+        ctrl: ControlPoint,
+    ) -> Result<bool, VerificationResult> {
+        let Some(directives) = self
+            .control_point_directives()
+            .directives_at(ctrl.basic_block, ctrl.statement_index)
+        else {
+            return Ok(true);
+        };
+        for directive in directives {
+            match directive {
+                ControlPointDirective::Let(binding) => {
+                    self.bind_state_spec_values(
+                        state,
+                        std::slice::from_ref(&binding.binding),
+                        &binding.resolution,
+                    )?;
+                }
+                ControlPointDirective::Assert(assertion) => {
+                    self.assert_spec_predicate_constraint(
+                        state,
+                        &assertion.assertion,
+                        &assertion.resolution,
+                        self.control_span(ctrl),
+                        assertion.assertion_span.clone(),
+                        "assertion failed".to_owned(),
+                    )?;
+                }
+                ControlPointDirective::Assume(assumption) => {
+                    let formula = self.spec_expr_to_bool(
+                        state,
+                        &assumption.assumption,
+                        &assumption.resolution,
+                    )?;
+                    if !self.assume_checked_path_condition(state, formula) {
+                        return Ok(false);
+                    }
+                }
+                ControlPointDirective::LemmaCall(lemma_call) => {
+                    if !self.execute_lemma_call(state, lemma_call, self.control_span(ctrl))? {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
     }
 
     fn initial_state(&self) -> Result<Option<State>, VerificationResult> {
@@ -743,10 +745,23 @@ impl<'tcx> Verifier<'tcx> {
                 self.unsafe_goto_target(&mut state, *target);
                 Ok(vec![state])
             }
-            TerminatorKind::Call { .. } => Err(self.unsupported_result(
-                term.source_info.span,
-                "function calls inside unsafe blocks are unsupported".to_owned(),
-            )),
+            TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                target,
+                ..
+            } => self.step_unsafe_call(
+                state,
+                bridge,
+                UnsafeCall {
+                    func,
+                    args,
+                    destination: *destination,
+                    target: *target,
+                    span: term.source_info.span,
+                },
+            ),
             TerminatorKind::SwitchInt { discr, targets } => {
                 let discr_value =
                     self.unsafe_eval_operand(&mut state, bridge, discr, term.source_info.span)?;
@@ -859,6 +874,157 @@ impl<'tcx> Verifier<'tcx> {
             return Ok(Vec::new());
         };
         self.goto_target(state, target, span)
+    }
+
+    fn step_unsafe_call(
+        &self,
+        mut state: UnsafeState,
+        bridge: &UnsafeBridge,
+        call: UnsafeCall<'_, 'tcx>,
+    ) -> Result<Vec<UnsafeState>, VerificationResult> {
+        let span = call.span;
+        if let Some(def_id) = self.called_def_id(call.func)
+            && self.fn_def_is_unsafe(def_id)
+        {
+            return Err(self.unsupported_result(
+                span,
+                "unsafe function calls inside unsafe blocks are unsupported".to_owned(),
+            ));
+        }
+        let callee = self.called_local_def_id(call.func);
+        if let Some(local_def_id) = callee {
+            let contract = self
+                .contracts
+                .get(&local_def_id)
+                .ok_or_else(|| self.missing_local_contract_result(local_def_id, span))?;
+            let call_env =
+                self.unsafe_call_env(&mut state, call.args, contract, span, HashMap::new())?;
+            let spec = self.bind_contract_spec_values(
+                &call_env.current,
+                &call_env.spec,
+                &contract.req.bindings,
+            )?;
+            let req_env = CallEnv {
+                current: call_env.current.clone(),
+                spec: spec.clone(),
+            };
+            let req = self.contract_req_formula(contract, &req_env, span)?;
+            self.unsafe_assert_constraint(&mut state, req, span, "precondition failed".to_owned())?;
+            let result_ty = self.place_ty(call.destination);
+            let result_value = self.fresh_for_rust_ty(result_ty, "call_result")?;
+            self.unsafe_write_place(
+                &mut state,
+                bridge,
+                call.destination,
+                result_value.clone(),
+                span,
+            )?;
+            self.unsafe_abstract_call_mut_args(&mut state, bridge, call.args, span)?;
+            let mut call_env = self.unsafe_call_env(&mut state, call.args, contract, span, spec)?;
+            self.unsafe_consume_call_move_args(&mut state, bridge, call.args, span)?;
+            call_env.current.insert("result".to_owned(), result_value);
+            let ens = self.contract_ens_formula(contract, &call_env, span)?;
+            if !self.assume_unsafe_path_condition(&mut state, ens) {
+                return Ok(Vec::new());
+            }
+        } else {
+            let result_ty = self.place_ty(call.destination);
+            let result_value = self.fresh_for_rust_ty(result_ty, "opaque_result")?;
+            self.require_unsafe_type_invariant(
+                &mut state,
+                result_ty,
+                &result_value,
+                span,
+                "type invariant does not hold".to_owned(),
+            )?;
+            self.unsafe_write_place(&mut state, bridge, call.destination, result_value, span)?;
+            self.unsafe_abstract_call_mut_args(&mut state, bridge, call.args, span)?;
+            self.unsafe_consume_call_move_args(&mut state, bridge, call.args, span)?;
+        }
+        let Some(target) = call.target else {
+            return Ok(Vec::new());
+        };
+        self.unsafe_goto_target(&mut state, target);
+        Ok(vec![state])
+    }
+
+    fn unsafe_call_env(
+        &self,
+        state: &mut UnsafeState,
+        args: &[Spanned<Operand<'tcx>>],
+        contract: &FunctionContract,
+        span: Span,
+        spec: HashMap<String, SymValue>,
+    ) -> Result<CallEnv, VerificationResult> {
+        let mut current = HashMap::new();
+        if contract.params.len() != args.len() {
+            return Err(self.unsupported_result(
+                span,
+                format!(
+                    "call contract parameter count mismatch: expected {}, found {}",
+                    contract.params.len(),
+                    args.len()
+                ),
+            ));
+        }
+        for (param, arg) in contract.params.iter().zip(args.iter()) {
+            let value = self.unsafe_read_operand(state, &arg.node, span)?;
+            current.insert(param.name.clone(), value);
+        }
+        Ok(CallEnv { current, spec })
+    }
+
+    fn unsafe_read_operand(
+        &self,
+        state: &mut UnsafeState,
+        operand: &Operand<'tcx>,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => {
+                self.unsafe_read_place(state, *place, span)
+            }
+            Operand::Constant(constant) => self.eval_const_operand(constant, span),
+        }
+    }
+
+    fn unsafe_abstract_call_mut_args(
+        &self,
+        state: &mut UnsafeState,
+        bridge: &UnsafeBridge,
+        args: &[Spanned<Operand<'tcx>>],
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        for arg in args {
+            let place = match arg.node {
+                Operand::Copy(place) | Operand::Move(place) => place,
+                Operand::Constant(_) => continue,
+            };
+            let ty = self.place_ty(place);
+            if matches!(ty.kind(), TyKind::Ref(_, _, mutability) if mutability.is_mut()) {
+                let current = self.unsafe_read_place(state, place, span)?;
+                let inner = match ty.kind() {
+                    TyKind::Ref(_, inner, _) => *inner,
+                    _ => unreachable!(),
+                };
+                let updated = self.abstract_mut_ref(&current, inner, span)?;
+                self.unsafe_write_place(state, bridge, place, updated, span)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn unsafe_consume_call_move_args(
+        &self,
+        state: &mut UnsafeState,
+        bridge: &UnsafeBridge,
+        args: &[Spanned<Operand<'tcx>>],
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        for arg in args {
+            self.unsafe_consume_operand(state, bridge, &arg.node, span)?;
+        }
+        Ok(())
     }
 
     fn goto_target(
@@ -1118,10 +1284,9 @@ impl<'tcx> Verifier<'tcx> {
 
     fn step_unsafe_region(
         &self,
-        mut state: State,
+        state: State,
         unsafe_span: Span,
     ) -> Result<Vec<State>, VerificationResult> {
-        let env = std::mem::take(&mut state.env);
         let (unsafe_state, bridge) = self.enter_unsafe(state, unsafe_span)?;
         let mut pending: BTreeMap<ControlPoint, Vec<UnsafeState>> = BTreeMap::new();
         let mut exits: BTreeMap<ControlPoint, Vec<UnsafeState>> = BTreeMap::new();
@@ -1138,6 +1303,11 @@ impl<'tcx> Verifier<'tcx> {
                         .entry(unsafe_state.ctrl)
                         .or_default()
                         .push(unsafe_state);
+                    continue;
+                }
+
+                let unsafe_ctrl = unsafe_state.ctrl;
+                if !self.apply_unsafe_control_point_directives(&mut unsafe_state, unsafe_ctrl)? {
                     continue;
                 }
 
@@ -1163,10 +1333,74 @@ impl<'tcx> Verifier<'tcx> {
         let mut next_states = Vec::new();
         for bucket in exits.into_values() {
             for unsafe_state in bucket {
-                next_states.push(self.exit_unsafe(unsafe_state, &bridge, env.clone()));
+                next_states.push(self.exit_unsafe(unsafe_state, &bridge));
             }
         }
         Ok(next_states)
+    }
+
+    fn unsafe_state_view(&self, state: &UnsafeState) -> State {
+        State {
+            pc: state.pc.clone(),
+            store: state.store.clone(),
+            allocs: state.allocs.clone(),
+            env: state.env.clone(),
+            ctrl: state.ctrl,
+        }
+    }
+
+    fn apply_unsafe_control_point_directives(
+        &self,
+        state: &mut UnsafeState,
+        ctrl: ControlPoint,
+    ) -> Result<bool, VerificationResult> {
+        let Some(directives) = self
+            .control_point_directives()
+            .directives_at(ctrl.basic_block, ctrl.statement_index)
+        else {
+            return Ok(true);
+        };
+        for directive in directives {
+            let mut view = self.unsafe_state_view(state);
+            let keep_path = match directive {
+                ControlPointDirective::Let(binding) => {
+                    self.bind_state_spec_values(
+                        &mut view,
+                        std::slice::from_ref(&binding.binding),
+                        &binding.resolution,
+                    )?;
+                    true
+                }
+                ControlPointDirective::Assert(assertion) => {
+                    self.assert_spec_predicate_constraint(
+                        &mut view,
+                        &assertion.assertion,
+                        &assertion.resolution,
+                        self.control_span(ctrl),
+                        assertion.assertion_span.clone(),
+                        "assertion failed".to_owned(),
+                    )?;
+                    true
+                }
+                ControlPointDirective::Assume(assumption) => {
+                    let formula = self.spec_expr_to_bool(
+                        &view,
+                        &assumption.assumption,
+                        &assumption.resolution,
+                    )?;
+                    self.assume_checked_path_condition(&mut view, formula)
+                }
+                ControlPointDirective::LemmaCall(lemma_call) => {
+                    self.execute_lemma_call(&mut view, lemma_call, self.control_span(ctrl))?
+                }
+            };
+            state.pc = view.pc;
+            state.env = view.env;
+            if !keep_path {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn enter_unsafe(
@@ -1178,8 +1412,8 @@ impl<'tcx> Verifier<'tcx> {
             pc,
             store,
             allocs,
+            env,
             ctrl,
-            ..
         } = state;
         let reified_allocs = allocs
             .iter()
@@ -1189,6 +1423,7 @@ impl<'tcx> Verifier<'tcx> {
             pc,
             store,
             allocs,
+            env,
             heap: Vec::new(),
             ctrl,
         };
@@ -1205,12 +1440,7 @@ impl<'tcx> Verifier<'tcx> {
         Ok((unsafe_state, bridge))
     }
 
-    fn exit_unsafe(
-        &self,
-        mut unsafe_state: UnsafeState,
-        bridge: &UnsafeBridge,
-        env: HashMap<String, SymValue>,
-    ) -> State {
+    fn exit_unsafe(&self, mut unsafe_state: UnsafeState, bridge: &UnsafeBridge) -> State {
         for local in &bridge.locals {
             let ty = self.local_rust_ty_model_value(*local);
             let points_to = unsafe_state
@@ -1238,7 +1468,7 @@ impl<'tcx> Verifier<'tcx> {
             pc: unsafe_state.pc,
             store: unsafe_state.store,
             allocs: unsafe_state.allocs,
-            env,
+            env: unsafe_state.env,
             ctrl: unsafe_state.ctrl,
         }
     }
@@ -4029,6 +4259,21 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
+    fn assume_unsafe_path_condition(&self, state: &mut UnsafeState, constraint: Bool) -> bool {
+        let constraint = constraint.simplify();
+        match constraint.as_bool() {
+            Some(true) => {
+                self.add_unsafe_path_condition(state, constraint);
+                true
+            }
+            Some(false) => false,
+            None => {
+                self.add_unsafe_path_condition(state, constraint);
+                true
+            }
+        }
+    }
+
     fn assume_checked_path_condition(&self, state: &mut State, constraint: Bool) -> bool {
         let constraint = constraint.simplify();
         if let Some(value) = constraint.as_bool() {
@@ -4242,13 +4487,26 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn called_local_def_id(&self, func: &Operand<'tcx>) -> Option<LocalDefId> {
+        self.called_def_id(func)?.as_local()
+    }
+
+    fn called_def_id(&self, func: &Operand<'tcx>) -> Option<DefId> {
         let Operand::Constant(constant) = func else {
             return None;
         };
         let TyKind::FnDef(def_id, _) = *constant.const_.ty().kind() else {
             return None;
         };
-        def_id.as_local()
+        Some(def_id)
+    }
+
+    fn fn_def_is_unsafe(&self, def_id: DefId) -> bool {
+        self.tcx
+            .fn_sig(def_id)
+            .instantiate_identity()
+            .skip_binder()
+            .safety
+            .is_unsafe()
     }
 
     fn missing_local_contract_result(&self, def_id: LocalDefId, span: Span) -> VerificationResult {

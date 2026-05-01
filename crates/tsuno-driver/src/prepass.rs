@@ -4702,9 +4702,15 @@ fn reject_directives_inside_unsafe_blocks(
     unsafe_blocks: &[Span],
 ) -> Result<(), LoopPrepassError> {
     for directive in &directives.directives {
-        if matches!(directive.kind, DirectiveKind::Req | DirectiveKind::Ens)
-            || matches!(directive.kind, DirectiveKind::Let if matches!(directive.attach, DirectiveAttach::Function))
-        {
+        if matches!(
+            directive.kind,
+            DirectiveKind::Req
+                | DirectiveKind::Ens
+                | DirectiveKind::Let
+                | DirectiveKind::Assert
+                | DirectiveKind::Assume
+                | DirectiveKind::LemmaCall
+        ) {
             continue;
         }
         if unsafe_blocks
