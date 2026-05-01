@@ -5,7 +5,7 @@ enum Option<T> {
 }
 
 struct Provenance {
-    alloc_id: Int,
+    base: usize,
 }
 
 struct Ptr {

@@ -12,7 +12,7 @@ use crate::spec::{
     TypedMatchArm, TypedMatchBinding, parse_ghost_block, ptr_spec_ty,
 };
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::{HirId, Pat, PatKind};
+use rustc_hir::{BlockCheckMode, Expr as HirExpr, ExprKind, HirId, Pat, PatKind, UnsafeSource};
 use rustc_middle::mir::{BasicBlock, Body, Local, PlaceElem, StatementKind, TerminatorKind};
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::def_id::LocalDefId;
@@ -168,6 +168,7 @@ pub struct DirectivePrepass {
     pub loop_contracts: LoopContracts,
     pub control_point_directives: ControlPointDirectives,
     pub function_contract: Option<FunctionContract>,
+    pub unsafe_blocks: Vec<Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -3912,6 +3913,8 @@ fn compute_directives<'tcx>(
     let directive_type_param_scope = HashSet::new();
     let directives =
         collect_function_directives(tcx, def_id, item_span).map_err(directive_error_to_prepass)?;
+    let unsafe_blocks = collect_unsafe_block_spans(tcx, def_id);
+    reject_directives_inside_unsafe_blocks(&directives, &unsafe_blocks)?;
     let mut contract_scope = SpecScope::default();
     let mut req_directive = None;
     let mut ens_directive = None;
@@ -4665,7 +4668,57 @@ fn compute_directives<'tcx>(
         loop_contracts,
         control_point_directives,
         function_contract,
+        unsafe_blocks,
     })
+}
+
+fn collect_unsafe_block_spans<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Vec<Span> {
+    let hir_body = tcx.hir_body_owned_by(def_id);
+    let mut collector = UnsafeBlockCollector { spans: Vec::new() };
+    collector.visit_expr(hir_body.value);
+    collector.spans
+}
+
+struct UnsafeBlockCollector {
+    spans: Vec<Span>,
+}
+
+impl<'v> Visitor<'v> for UnsafeBlockCollector {
+    fn visit_expr(&mut self, expr: &'v HirExpr<'v>) {
+        if let ExprKind::Block(block, _) = expr.kind
+            && matches!(
+                block.rules,
+                BlockCheckMode::UnsafeBlock(UnsafeSource::UserProvided)
+            )
+        {
+            self.spans.push(block.span);
+        }
+        intravisit::walk_expr(self, expr);
+    }
+}
+
+fn reject_directives_inside_unsafe_blocks(
+    directives: &CollectedFunctionDirectives,
+    unsafe_blocks: &[Span],
+) -> Result<(), LoopPrepassError> {
+    for directive in &directives.directives {
+        if matches!(directive.kind, DirectiveKind::Req | DirectiveKind::Ens)
+            || matches!(directive.kind, DirectiveKind::Let if matches!(directive.attach, DirectiveAttach::Function))
+        {
+            continue;
+        }
+        if unsafe_blocks
+            .iter()
+            .any(|unsafe_span| span_contains(*unsafe_span, directive.span))
+        {
+            return Err(LoopPrepassError {
+                span: directive.span,
+                display_span: Some(directive.span_text.clone()),
+                message: "spec directives inside unsafe blocks are unsupported".to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

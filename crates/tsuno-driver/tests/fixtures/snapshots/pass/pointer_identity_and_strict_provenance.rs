@@ -75,16 +75,19 @@ fn pointer_identity_and_raw_borrows() {
     //@ assert {r}.ptr.ty == {type u8};
     //@ assert {p}.addr == {p_again}.addr;
     //@ assert {p}.prov == {p_again}.prov;
+    //@ assert {p}.prov == Option::<Provenance>::Some(Provenance { base: {p}.addr });
     //@ assert {p}.prov != {q}.prov;
     //@ assert {p}.addr != {q}.addr;
     //@ assert {c}.addr == {p}.addr;
     //@ assert {c}.prov == {p}.prov;
 
     let pair = Pair { a: 1u8, b: 2u8 };
+    let ppair = &raw const pair;
     let pa = &raw const pair.a;
     let pb = &raw const pair.b;
     //@ assert {pa}.prov == {pb}.prov;
     //@ assert {pa}.addr != {pb}.addr;
+    //@ assert {pa}.prov == Option::<Provenance>::Some(Provenance { base: {ppair}.addr });
     //@ assert {pa}.ty == {type u8};
 
     let mut z = 11u8;

@@ -368,8 +368,8 @@ pub fn provenance_spec_ty() -> SpecTy {
     SpecTy::Struct(StructTy {
         name: "Provenance".to_owned(),
         fields: vec![StructFieldTy {
-            name: "alloc_id".to_owned(),
-            ty: SpecTy::Int,
+            name: "base".to_owned(),
+            ty: SpecTy::Usize,
         }],
     })
 }
