@@ -495,8 +495,9 @@ visible: deeply nested unsafe branches can create multiple unsafe states before
 control returns to safe code.
 
 Currently supported unsafe code is single-threaded Rust for raw pointer reads
-and writes, ordinary branches inside unsafe blocks, and calls to ordinary safe
-Rust functions. A safe function call inside an unsafe block uses the same
+and writes, ordinary branches inside unsafe blocks, ordinary reference
+construction, checked integer arithmetic, and calls to ordinary safe Rust
+functions. A safe function call inside an unsafe block uses the same
 contract behavior as safe code: the callee precondition is asserted, the callee
 postcondition is assumed, and opaque calls produce a fresh result satisfying the
 result type invariant. Unsafe function calls inside unsafe blocks are not

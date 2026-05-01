@@ -1548,12 +1548,9 @@ impl<'tcx> Verifier<'tcx> {
         value: SymValue,
         span: Span,
     ) -> Result<(), VerificationResult> {
-        let alloc = state.allocs.get(&local).cloned().ok_or_else(|| {
-            self.unsupported_result(
-                span,
-                format!("missing allocation for local {}", local.as_usize()),
-            )
-        })?;
+        let Some(alloc) = state.allocs.get(&local).cloned() else {
+            return Ok(());
+        };
         let ty = self.local_rust_ty_model_value(local);
         if let Some(index) = self.points_to_index_for_ty_value(state, &alloc.base_addr, &ty) {
             if let Resource::PointsTo { value: slot, .. } = &mut state.heap[index] {
@@ -1620,15 +1617,20 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<SymValue, VerificationResult> {
         match rvalue {
             Rvalue::Use(operand) => self.unsafe_eval_operand(state, bridge, operand, span),
+            Rvalue::Ref(_, borrow_kind, place) => match borrow_kind {
+                BorrowKind::Mut {
+                    kind: MutBorrowKind::Default | MutBorrowKind::TwoPhaseBorrow,
+                } => self.unsafe_create_mut_borrow(state, bridge, *place, span),
+                BorrowKind::Shared => self.unsafe_create_shared_borrow(state, *place, span),
+                _ => Err(self
+                    .unsupported_result(span, format!("unsupported borrow kind {borrow_kind:?}"))),
+            },
             Rvalue::RawPtr(_, place) => self.unsafe_ptr_for_place(state, *place, span),
             Rvalue::Cast(_, operand, target_ty) => {
                 self.unsafe_eval_cast(state, bridge, operand, *target_ty, span)
             }
             Rvalue::BinaryOp(op, operands) => {
-                let lhs = self.unsafe_eval_operand(state, bridge, &operands.0, span)?;
-                let rhs = self.unsafe_eval_operand(state, bridge, &operands.1, span)?;
-                let lhs_ty = operands.0.ty(&self.body().local_decls, self.tcx);
-                self.lower_unsafe_binary_value(state, *op, lhs_ty, &lhs, &rhs, span)
+                self.unsafe_eval_binary_op(state, bridge, *op, &operands.0, &operands.1, span)
             }
             Rvalue::UnaryOp(op, operand) => {
                 let value = self.unsafe_eval_operand(state, bridge, operand, span)?;
@@ -1647,13 +1649,14 @@ impl<'tcx> Verifier<'tcx> {
                     }
                     self.construct_composite(&result_ty, &values)
                 }
-                AggregateKind::Adt(def_id, variant_idx, _, _, _) => {
+                AggregateKind::Adt(def_id, variant_idx, args, _, _) => {
                     let adt_def = self.tcx.adt_def(def_id);
                     if !adt_def.is_struct() || variant_idx.as_usize() != 0 {
                         return Err(self
                             .unsupported_result(span, format!("unsupported aggregate {kind:?}")));
                     }
-                    let mut values = Vec::with_capacity(operands.len());
+                    let field_tys = self.adt_field_tys(adt_def, args);
+                    let mut values = Vec::with_capacity(field_tys.len());
                     for operand in operands {
                         values.push(self.unsafe_eval_operand(state, bridge, operand, span)?);
                     }
@@ -1739,6 +1742,125 @@ impl<'tcx> Verifier<'tcx> {
             }
             _ => Err(self.unsupported_result(span, format!("unsupported cast to {target_ty:?}"))),
         }
+    }
+
+    fn unsafe_create_mut_borrow(
+        &self,
+        state: &mut UnsafeState,
+        bridge: &UnsafeBridge,
+        place: Place<'tcx>,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let current = self.unsafe_read_place_with_mode(state, place, ReadMode::Current, span)?;
+        let final_value = if self.is_reborrow(place) {
+            self.unsafe_read_place_with_mode(state, place, ReadMode::Final, span)?
+        } else {
+            let ty = self.place_ty(place);
+            self.fresh_for_rust_ty(ty, "prophecy")?
+        };
+        self.unsafe_write_place(state, bridge, place, final_value.clone(), span)?;
+        let place_ty = self.place_ty(place);
+        let inner_ty = self.spec_ty_for_place_ty(place_ty, span)?;
+        let ptr = self.unsafe_ptr_for_place(state, place, span)?;
+        self.construct_composite(
+            &SpecTy::Mut(Box::new(inner_ty)),
+            &[current, final_value, ptr],
+        )
+    }
+
+    fn unsafe_create_shared_borrow(
+        &self,
+        state: &mut UnsafeState,
+        place: Place<'tcx>,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let value = self.unsafe_read_place(state, place, span)?;
+        let place_ty = self.place_ty(place);
+        let inner_ty = self.spec_ty_for_place_ty(place_ty, span)?;
+        let ptr = self.unsafe_ptr_for_place(state, place, span)?;
+        self.construct_composite(&SpecTy::Ref(Box::new(inner_ty)), &[value, ptr])
+    }
+
+    fn unsafe_eval_binary_op(
+        &self,
+        state: &mut UnsafeState,
+        bridge: &UnsafeBridge,
+        op: BinOp,
+        lhs: &Operand<'tcx>,
+        rhs: &Operand<'tcx>,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        if matches!(
+            op,
+            BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow
+        ) {
+            return self.unsafe_eval_checked_binary_op(state, bridge, op, lhs, rhs, span);
+        }
+        let lhs_value = self.unsafe_eval_operand(state, bridge, lhs, span)?;
+        let rhs_value = self.unsafe_eval_operand(state, bridge, rhs, span)?;
+        let lhs_ty = lhs.ty(&self.body().local_decls, self.tcx);
+        self.lower_unsafe_binary_value(state, op, lhs_ty, &lhs_value, &rhs_value, span)
+    }
+
+    fn unsafe_eval_checked_binary_op(
+        &self,
+        state: &mut UnsafeState,
+        bridge: &UnsafeBridge,
+        op: BinOp,
+        lhs: &Operand<'tcx>,
+        rhs: &Operand<'tcx>,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let lhs_value = self.unsafe_eval_operand(state, bridge, lhs, span)?;
+        let rhs_value = self.unsafe_eval_operand(state, bridge, rhs, span)?;
+        let result_ty = lhs.ty(&self.body().local_decls, self.tcx);
+        let tuple_ty = SpecTy::Tuple(vec![
+            self.spec_ty_for_place_ty(result_ty, span)?,
+            SpecTy::Bool,
+        ]);
+        let result_value = match op {
+            BinOp::Add | BinOp::AddWithOverflow => {
+                let int_value = self.value_int_data(&lhs_value) + self.value_int_data(&rhs_value);
+                self.require_unsafe_int_invariant(
+                    state,
+                    result_ty,
+                    &int_value,
+                    span,
+                    "type invariant does not hold".to_owned(),
+                )?;
+                self.value_encoder.wrap_int(&int_value)
+            }
+            BinOp::Sub | BinOp::SubWithOverflow => {
+                let int_value = self.value_int_data(&lhs_value) - self.value_int_data(&rhs_value);
+                self.require_unsafe_int_invariant(
+                    state,
+                    result_ty,
+                    &int_value,
+                    span,
+                    "type invariant does not hold".to_owned(),
+                )?;
+                self.value_encoder.wrap_int(&int_value)
+            }
+            BinOp::Mul | BinOp::MulWithOverflow => {
+                let int_value = self.value_int_data(&lhs_value) * self.value_int_data(&rhs_value);
+                self.require_unsafe_int_invariant(
+                    state,
+                    result_ty,
+                    &int_value,
+                    span,
+                    "type invariant does not hold".to_owned(),
+                )?;
+                self.value_encoder.wrap_int(&int_value)
+            }
+            other => {
+                return Err(self.unsupported_result(
+                    span,
+                    format!("unsupported checked binary operator {other:?}"),
+                ));
+            }
+        };
+        let overflow_value = self.overflow_value_for_result(result_ty, &result_value, span)?;
+        self.construct_composite(&tuple_ty, &[result_value, overflow_value])
     }
 
     fn lower_unsafe_binary_value(
@@ -1890,6 +2012,16 @@ impl<'tcx> Verifier<'tcx> {
         place: Place<'tcx>,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
+        self.unsafe_read_place_with_mode(state, place, ReadMode::Current, span)
+    }
+
+    fn unsafe_read_place_with_mode(
+        &self,
+        state: &mut UnsafeState,
+        place: Place<'tcx>,
+        mode: ReadMode,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
         let projection = place.as_ref().projection;
         let root_ty = self.body().local_decls[place.local].ty;
         let Some(root) = state.store.get(&place.local).cloned() else {
@@ -1903,17 +2035,11 @@ impl<'tcx> Verifier<'tcx> {
             let pointee_ty = self.deref_pointee_ty(root_ty, span)?;
             let value = self.unsafe_read_raw_pointer(state, &root, pointee_ty, span)?;
             let pointee_spec_ty = self.spec_ty_for_place_ty(pointee_ty, span)?;
-            return self.read_projection(
-                value,
-                &pointee_spec_ty,
-                &projection[1..],
-                ReadMode::Current,
-                span,
-            );
+            return self.read_projection(value, &pointee_spec_ty, &projection[1..], mode, span);
         }
 
         let root_spec_ty = self.spec_ty_for_place_ty(root_ty, span)?;
-        self.read_projection(root, &root_spec_ty, projection, ReadMode::Current, span)
+        self.read_projection(root, &root_spec_ty, projection, mode, span)
     }
 
     fn unsafe_write_place(
