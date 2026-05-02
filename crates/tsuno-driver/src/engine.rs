@@ -43,9 +43,10 @@ use z3::{Config, Context, RecFuncDecl, SatResult, Solver, Sort, SortKind};
 use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
     FunctionContract, LemmaCallContract, LoopContract, LoopContracts, NormalizedBinding,
-    NormalizedPredicate, ProgramPrepass, ResolvedExprEnv, TypedGhostMatchArm, TypedGhostStmt,
-    TypedLemmaDef, TypedPureFnDef, TypedResourcePattern, TypedValuePattern,
-    rust_ty_key_text_for_rust_ty as checked_rust_ty_key_text_for_rust_ty, spec_ty_for_rust_ty,
+    NormalizedPredicate, ProgramPrepass, ResolvedExprEnv, ResourceAssertionContract,
+    TypedGhostMatchArm, TypedGhostStmt, TypedLemmaDef, TypedPureFnDef, TypedResourcePattern,
+    TypedValuePattern, rust_ty_key_text_for_rust_ty as checked_rust_ty_key_text_for_rust_ty,
+    spec_ty_for_rust_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
@@ -900,16 +901,19 @@ impl<'tcx> Verifier<'tcx> {
         call: UnsafeCall<'_, 'tcx>,
     ) -> Result<Vec<UnsafeState>, VerificationResult> {
         let span = call.span;
-        if let Some(def_id) = self.called_def_id(call.func)
-            && self.fn_def_is_unsafe(def_id)
-        {
-            return Err(self.unsupported_result(
-                span,
-                "unsafe function calls inside unsafe blocks are unsupported".to_owned(),
-            ));
-        }
         let callee = self.called_local_def_id(call.func);
         if let Some(local_def_id) = callee {
+            if !self.fn_def_is_unsafe(local_def_id.to_def_id())
+                && self
+                    .called_def_id(call.func)
+                    .is_some_and(|def_id| self.fn_def_is_unsafe(def_id))
+            {
+                return Err(self.unsupported_result(
+                    span,
+                    "unsafe function calls inside unsafe blocks require a local contract"
+                        .to_owned(),
+                ));
+            }
             let contract = self
                 .contracts
                 .get(&local_def_id)
@@ -927,6 +931,17 @@ impl<'tcx> Verifier<'tcx> {
             };
             let req = self.contract_req_formula(contract, &req_env, span)?;
             self.unsafe_assert_constraint(&mut state, req, span, "precondition failed".to_owned())?;
+            let mut spec = spec;
+            for resource_req in &contract.resource_reqs {
+                let resource_spec = self.consume_unsafe_resource_contract(
+                    &mut state,
+                    resource_req,
+                    &call_env.current,
+                    &spec,
+                    span,
+                )?;
+                spec.extend(resource_spec);
+            }
             let result_ty = self.place_ty(call.destination);
             let result_value = self.fresh_for_rust_ty(result_ty, "call_result")?;
             self.unsafe_write_place(
@@ -939,12 +954,32 @@ impl<'tcx> Verifier<'tcx> {
             self.unsafe_abstract_call_mut_args(&mut state, bridge, call.args, span)?;
             let mut call_env = self.unsafe_call_env(&mut state, call.args, contract, span, spec)?;
             self.unsafe_consume_call_move_args(&mut state, bridge, call.args, span)?;
-            call_env.current.insert("result".to_owned(), result_value);
+            call_env
+                .current
+                .insert("result".to_owned(), result_value.clone());
             let ens = self.contract_ens_formula(contract, &call_env, span)?;
             if !self.assume_unsafe_path_condition(&mut state, ens) {
                 return Ok(Vec::new());
             }
+            for resource_ens in &contract.resource_ens {
+                self.assume_unsafe_resource_contract(
+                    &mut state,
+                    resource_ens,
+                    &call_env.current,
+                    &mut call_env.spec,
+                    span,
+                )?;
+            }
         } else {
+            if let Some(def_id) = self.called_def_id(call.func)
+                && self.fn_def_is_unsafe(def_id)
+            {
+                return Err(self.unsupported_result(
+                    span,
+                    "unsafe function calls inside unsafe blocks require a local contract"
+                        .to_owned(),
+                ));
+            }
             let result_ty = self.place_ty(call.destination);
             let result_value = self.fresh_for_rust_ty(result_ty, "opaque_result")?;
             self.require_unsafe_type_invariant(
@@ -2468,6 +2503,202 @@ impl<'tcx> Verifier<'tcx> {
         Err(self.fail_result(span, "resource assertion failed".to_owned()))
     }
 
+    fn consume_unsafe_resource_contract(
+        &self,
+        state: &mut UnsafeState,
+        assertion: &ResourceAssertionContract,
+        current: &HashMap<String, SymValue>,
+        spec: &HashMap<String, SymValue>,
+        span: Span,
+    ) -> Result<HashMap<String, SymValue>, VerificationResult> {
+        let initial = ResourcePatternMatch {
+            used: BTreeSet::new(),
+            condition: Bool::from_bool(true),
+            env: HashMap::new(),
+        };
+        let matches = self.match_contract_resource_pattern(
+            state,
+            current,
+            spec,
+            &assertion.pattern,
+            span,
+            vec![initial],
+        )?;
+        let mut possible = 0;
+        let mut definite = Vec::new();
+        for mut candidate in matches {
+            let mut candidate_spec = spec.clone();
+            candidate_spec.extend(candidate.env.clone());
+            let where_condition =
+                self.contract_expr_to_bool(current, &candidate_spec, &assertion.condition)?;
+            candidate.condition = bool_and(vec![candidate.condition, where_condition]).simplify();
+            if matches!(candidate.condition.as_bool(), Some(false)) {
+                continue;
+            }
+            match self.check_sat(&[state.pc.clone(), candidate.condition.clone().not()]) {
+                SatResult::Unsat => definite.push(candidate),
+                SatResult::Sat | SatResult::Unknown => {
+                    match self.check_sat(&[state.pc.clone(), candidate.condition.clone()]) {
+                        SatResult::Unsat => continue,
+                        SatResult::Sat | SatResult::Unknown => possible += 1,
+                    }
+                }
+            }
+        }
+        if definite.len() == 1 {
+            let candidate = definite.pop().expect("one definite match");
+            let mut used = candidate.used.into_iter().collect::<Vec<_>>();
+            used.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+            for index in used {
+                state.heap.remove(index);
+            }
+            state.env.extend(candidate.env.clone());
+            self.add_unsafe_path_condition(state, candidate.condition);
+            return Ok(candidate.env);
+        }
+        if definite.len() > 1 || possible > 0 {
+            return Err(self.unsupported_result(
+                span,
+                "ambiguous resource precondition matching is unsupported".to_owned(),
+            ));
+        }
+        Err(self.fail_result(span, "resource precondition failed".to_owned()))
+    }
+
+    fn assume_unsafe_resource_contract(
+        &self,
+        state: &mut UnsafeState,
+        assertion: &ResourceAssertionContract,
+        current: &HashMap<String, SymValue>,
+        spec: &mut HashMap<String, SymValue>,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        let before = spec.keys().cloned().collect::<BTreeSet<_>>();
+        self.materialize_contract_resource_pattern(state, current, spec, &assertion.pattern, span)?;
+        let condition = self.contract_expr_to_bool(current, spec, &assertion.condition)?;
+        if !self.assume_unsafe_path_condition(state, condition) {
+            state.pc = Bool::from_bool(false);
+        }
+        for (name, value) in spec.iter() {
+            if !before.contains(name) {
+                state.env.insert(name.clone(), value.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn match_contract_resource_pattern(
+        &self,
+        state: &UnsafeState,
+        current: &HashMap<String, SymValue>,
+        spec: &HashMap<String, SymValue>,
+        pattern: &TypedResourcePattern,
+        span: Span,
+        candidates: Vec<ResourcePatternMatch>,
+    ) -> Result<Vec<ResourcePatternMatch>, VerificationResult> {
+        match pattern {
+            TypedResourcePattern::Star(lhs, rhs) => {
+                let lhs_matches = self
+                    .match_contract_resource_pattern(state, current, spec, lhs, span, candidates)?;
+                self.match_contract_resource_pattern(state, current, spec, rhs, span, lhs_matches)
+            }
+            TypedResourcePattern::PointsTo { addr, ty, value } => {
+                let addr_value = self.contract_expr_to_value(current, spec, addr)?;
+                let ty_value = self.contract_expr_to_value(current, spec, ty)?;
+                let mut out = Vec::new();
+                for candidate in candidates {
+                    for (index, resource) in state.heap.iter().enumerate() {
+                        if candidate.used.contains(&index) {
+                            continue;
+                        }
+                        let Resource::PointsTo {
+                            addr: resource_addr,
+                            ty: resource_ty,
+                            value: resource_value,
+                        } = resource
+                        else {
+                            continue;
+                        };
+                        let actual_value = self.resource_option_value(
+                            resource_value.as_ref(),
+                            typed_value_pattern_ty(value),
+                        )?;
+                        let mut next_spec = spec.clone();
+                        next_spec.extend(candidate.env.clone());
+                        let mut next_env = candidate.env.clone();
+                        let value_condition = self.match_contract_value_pattern(
+                            current,
+                            &next_spec,
+                            value,
+                            &actual_value,
+                            span,
+                            &mut next_env,
+                        )?;
+                        let mut used = candidate.used.clone();
+                        used.insert(index);
+                        out.push(ResourcePatternMatch {
+                            used,
+                            condition: bool_and(vec![
+                                candidate.condition.clone(),
+                                self.eq_for_spec_ty(
+                                    &SpecTy::Usize,
+                                    &addr_value,
+                                    resource_addr,
+                                    span,
+                                )?,
+                                self.eq_for_spec_ty(&SpecTy::RustTy, &ty_value, resource_ty, span)?,
+                                value_condition,
+                            ])
+                            .simplify(),
+                            env: next_env,
+                        });
+                    }
+                }
+                Ok(out)
+            }
+            TypedResourcePattern::Alloc {
+                base,
+                size,
+                alignment,
+            } => {
+                let base = self.contract_expr_to_value(current, spec, base)?;
+                let size = self.contract_expr_to_value(current, spec, size)?;
+                let alignment = self.contract_expr_to_value(current, spec, alignment)?;
+                let mut out = Vec::new();
+                for candidate in candidates {
+                    for (index, resource) in state.heap.iter().enumerate() {
+                        if candidate.used.contains(&index) {
+                            continue;
+                        }
+                        let Resource::Alloc {
+                            base: resource_base,
+                            size: resource_size,
+                            alignment: resource_alignment,
+                        } = resource
+                        else {
+                            continue;
+                        };
+                        let mut used = candidate.used.clone();
+                        used.insert(index);
+                        out.push(ResourcePatternMatch {
+                            used,
+                            condition: bool_and(vec![
+                                candidate.condition.clone(),
+                                self.eq_for_spec_ty(&SpecTy::Usize, &base, resource_base, span)?,
+                                self.value_int_data(&size).eq(Int::from_u64(*resource_size)),
+                                self.value_int_data(&alignment)
+                                    .eq(Int::from_u64(*resource_alignment)),
+                            ])
+                            .simplify(),
+                            env: candidate.env.clone(),
+                        });
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
     fn match_resource_pattern(
         &self,
         state: &UnsafeState,
@@ -2693,6 +2924,329 @@ impl<'tcx> Verifier<'tcx> {
                 conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
                 Ok(bool_and(conditions))
             }
+        }
+    }
+
+    fn match_contract_value_pattern(
+        &self,
+        current: &HashMap<String, SymValue>,
+        spec: &HashMap<String, SymValue>,
+        pattern: &TypedValuePattern,
+        actual: &SymValue,
+        span: Span,
+        env: &mut HashMap<String, SymValue>,
+    ) -> Result<Bool, VerificationResult> {
+        match pattern {
+            TypedValuePattern::Bind { name, ty } => {
+                if let Some(value) = env.get(name).or_else(|| spec.get(name)) {
+                    return self.eq_for_spec_ty(ty, value, actual, span);
+                }
+                env.insert(name.clone(), actual.clone());
+                Ok(Bool::from_bool(true))
+            }
+            TypedValuePattern::Expr(expr) => {
+                let mut pattern_spec = spec.clone();
+                pattern_spec.extend(env.clone());
+                let expected = self.contract_expr_to_value(current, &pattern_spec, expr)?;
+                self.eq_for_spec_ty(&expr.ty, &expected, actual, span)
+            }
+            TypedValuePattern::SeqLit { ty, items } => {
+                let mut values = Vec::with_capacity(items.len());
+                let mut conditions = Vec::with_capacity(items.len() + 1);
+                for (index, item) in items.iter().enumerate() {
+                    let item_value = self.project_field(actual.clone(), ty, index, span)?;
+                    conditions.push(self.match_contract_value_pattern(
+                        current,
+                        spec,
+                        item,
+                        &item_value,
+                        span,
+                        env,
+                    )?);
+                    values.push(item_value);
+                }
+                conditions.push(self.eq_for_spec_ty(
+                    ty,
+                    &self.seq_literal_value(&values),
+                    actual,
+                    span,
+                )?);
+                Ok(bool_and(conditions))
+            }
+            TypedValuePattern::StructLit { ty, fields } => {
+                let mut values = Vec::with_capacity(fields.len());
+                let mut conditions = Vec::with_capacity(fields.len() + 1);
+                for (index, field) in fields.iter().enumerate() {
+                    let field_value = self.project_field(actual.clone(), ty, index, span)?;
+                    conditions.push(self.match_contract_value_pattern(
+                        current,
+                        spec,
+                        field,
+                        &field_value,
+                        span,
+                        env,
+                    )?);
+                    values.push(field_value);
+                }
+                let expected = self.construct_composite(ty, &values)?;
+                conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
+                Ok(bool_and(conditions))
+            }
+            TypedValuePattern::CtorCall {
+                ty,
+                ctor_index,
+                args,
+            } => {
+                let encoding = self.composite_encoding(ty)?;
+                let mut values = Vec::with_capacity(args.len());
+                let mut conditions = Vec::with_capacity(args.len() + 1);
+                for (index, arg) in args.iter().enumerate() {
+                    let arg_value = self.decode_composite_ctor_field(
+                        &encoding,
+                        *ctor_index,
+                        actual,
+                        index,
+                        span,
+                    )?;
+                    conditions.push(
+                        self.match_contract_value_pattern(
+                            current, spec, arg, &arg_value, span, env,
+                        )?,
+                    );
+                    values.push(arg_value);
+                }
+                conditions.push(self.composite_tag_formula_for_encoding(
+                    &encoding,
+                    actual,
+                    *ctor_index,
+                    span,
+                )?);
+                let expected = self.construct_composite_ctor(ty, *ctor_index, &values)?;
+                conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
+                Ok(bool_and(conditions))
+            }
+        }
+    }
+
+    fn materialize_contract_resource_pattern(
+        &self,
+        state: &mut UnsafeState,
+        current: &HashMap<String, SymValue>,
+        spec: &mut HashMap<String, SymValue>,
+        pattern: &TypedResourcePattern,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        match pattern {
+            TypedResourcePattern::Star(lhs, rhs) => {
+                self.materialize_contract_resource_pattern(state, current, spec, lhs, span)?;
+                self.materialize_contract_resource_pattern(state, current, spec, rhs, span)
+            }
+            TypedResourcePattern::PointsTo { addr, ty, value } => {
+                let addr = self.contract_expr_to_value(current, spec, addr)?;
+                let ty = self.contract_expr_to_value(current, spec, ty)?;
+                let value =
+                    self.materialize_points_to_contract_value(current, spec, value, span)?;
+                state.heap.push(Resource::PointsTo { addr, ty, value });
+                Ok(())
+            }
+            TypedResourcePattern::Alloc {
+                base,
+                size,
+                alignment,
+            } => {
+                let base = self.contract_expr_to_value(current, spec, base)?;
+                let size = self.contract_expr_to_value(current, spec, size)?;
+                let alignment = self.contract_expr_to_value(current, spec, alignment)?;
+                let Some(size) = self
+                    .value_int_data(&size)
+                    .as_i64()
+                    .and_then(|value| u64::try_from(value).ok())
+                else {
+                    return Err(self.unsupported_result(
+                        span,
+                        "resource postcondition Alloc size must be a concrete usize".to_owned(),
+                    ));
+                };
+                let Some(alignment) = self
+                    .value_int_data(&alignment)
+                    .as_i64()
+                    .and_then(|value| u64::try_from(value).ok())
+                else {
+                    return Err(self.unsupported_result(
+                        span,
+                        "resource postcondition Alloc alignment must be a concrete usize"
+                            .to_owned(),
+                    ));
+                };
+                state.heap.push(Resource::Alloc {
+                    base,
+                    size,
+                    alignment,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    fn materialize_points_to_contract_value(
+        &self,
+        current: &HashMap<String, SymValue>,
+        spec: &mut HashMap<String, SymValue>,
+        pattern: &TypedValuePattern,
+        span: Span,
+    ) -> Result<Option<SymValue>, VerificationResult> {
+        let Some(inner_ty) = option_inner_spec_ty(typed_value_pattern_ty(pattern)) else {
+            return Err(self.unsupported_result(
+                span,
+                "PointsTo postcondition value must have type Option<T>".to_owned(),
+            ));
+        };
+        match pattern {
+            TypedValuePattern::CtorCall {
+                ty,
+                ctor_index,
+                args,
+            } if *ty == *typed_value_pattern_ty(pattern) => {
+                let some = self
+                    .value_encoder
+                    .enum_ctor_index("Option", "Some")
+                    .map_err(|err| self.unsupported_result(span, err))?;
+                let none = self
+                    .value_encoder
+                    .enum_ctor_index("Option", "None")
+                    .map_err(|err| self.unsupported_result(span, err))?;
+                if *ctor_index == some {
+                    let Some(arg) = args.first() else {
+                        return Err(self.unsupported_result(
+                            span,
+                            "Option::Some resource value requires one argument".to_owned(),
+                        ));
+                    };
+                    return Ok(Some(self.materialize_contract_value_pattern(
+                        current, spec, arg, &inner_ty, span,
+                    )?));
+                }
+                if *ctor_index == none {
+                    return Ok(None);
+                }
+            }
+            TypedValuePattern::Expr(expr) => {
+                if let TypedExprKind::CtorCall {
+                    ctor_index, args, ..
+                } = &expr.kind
+                {
+                    let some = self
+                        .value_encoder
+                        .enum_ctor_index("Option", "Some")
+                        .map_err(|err| self.unsupported_result(span, err))?;
+                    let none = self
+                        .value_encoder
+                        .enum_ctor_index("Option", "None")
+                        .map_err(|err| self.unsupported_result(span, err))?;
+                    if *ctor_index == some {
+                        let Some(arg) = args.first() else {
+                            return Err(self.unsupported_result(
+                                span,
+                                "Option::Some resource value requires one argument".to_owned(),
+                            ));
+                        };
+                        return Ok(Some(self.contract_expr_to_value(current, spec, arg)?));
+                    }
+                    if *ctor_index == none {
+                        return Ok(None);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Err(self.unsupported_result(
+            span,
+            "resource postcondition PointsTo value must be Option::Some(...) or Option::None"
+                .to_owned(),
+        ))
+    }
+
+    fn materialize_contract_value_pattern(
+        &self,
+        current: &HashMap<String, SymValue>,
+        spec: &mut HashMap<String, SymValue>,
+        pattern: &TypedValuePattern,
+        expected: &SpecTy,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        match pattern {
+            TypedValuePattern::Bind { name, ty } => {
+                let value = self.fresh_for_spec_ty(ty, name)?;
+                spec.insert(name.clone(), value.clone());
+                Ok(value)
+            }
+            TypedValuePattern::Expr(expr) => self.contract_expr_to_value(current, spec, expr),
+            TypedValuePattern::SeqLit { ty, items } => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.materialize_contract_value_pattern(
+                        current,
+                        spec,
+                        item,
+                        typed_value_pattern_ty(item),
+                        span,
+                    )?);
+                }
+                let value = self.seq_literal_value(&values);
+                self.assert_materialized_value_ty(expected, ty, span)?;
+                Ok(value)
+            }
+            TypedValuePattern::StructLit { ty, fields } => {
+                let mut values = Vec::with_capacity(fields.len());
+                for field in fields {
+                    values.push(self.materialize_contract_value_pattern(
+                        current,
+                        spec,
+                        field,
+                        typed_value_pattern_ty(field),
+                        span,
+                    )?);
+                }
+                self.assert_materialized_value_ty(expected, ty, span)?;
+                self.construct_composite(ty, &values)
+            }
+            TypedValuePattern::CtorCall {
+                ty,
+                ctor_index,
+                args,
+            } => {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.materialize_contract_value_pattern(
+                        current,
+                        spec,
+                        arg,
+                        typed_value_pattern_ty(arg),
+                        span,
+                    )?);
+                }
+                self.assert_materialized_value_ty(expected, ty, span)?;
+                self.construct_composite_ctor(ty, *ctor_index, &values)
+            }
+        }
+    }
+
+    fn assert_materialized_value_ty(
+        &self,
+        expected: &SpecTy,
+        actual: &SpecTy,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        if expected == actual {
+            Ok(())
+        } else {
+            Err(self.unsupported_result(
+                span,
+                format!(
+                    "resource postcondition value type mismatch: expected {:?}, found {:?}",
+                    expected, actual
+                ),
+            ))
         }
     }
 
@@ -6490,7 +7044,15 @@ fn collect_directive_prepass_pure_fn_refs(
 ) {
     if let Some(contract) = &prepass.function_contract {
         collect_normalized_predicate_pure_fn_refs(&contract.req, out);
+        for resource_req in &contract.resource_reqs {
+            collect_typed_resource_pattern_pure_fn_refs(&resource_req.pattern, out);
+            collect_typed_expr_pure_fn_refs(&resource_req.condition, out);
+        }
         collect_typed_expr_pure_fn_refs(&contract.ens, out);
+        for resource_ens in &contract.resource_ens {
+            collect_typed_resource_pattern_pure_fn_refs(&resource_ens.pattern, out);
+            collect_typed_expr_pure_fn_refs(&resource_ens.condition, out);
+        }
     }
     for loop_contract in prepass.loop_contracts.by_header.values() {
         collect_typed_expr_pure_fn_refs(&loop_contract.invariant, out);
@@ -6851,8 +7413,10 @@ mod tests {
                     condition: bool_true.clone(),
                 },
                 req_span: "fixture.rs:1:1".to_owned(),
+                resource_reqs: Vec::new(),
                 ens: bool_true,
                 ens_span: "fixture.rs:1:1".to_owned(),
+                resource_ens: Vec::new(),
                 result: SpecTy::Bool,
             }),
             unsafe_blocks: Vec::new(),

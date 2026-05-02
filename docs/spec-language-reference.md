@@ -497,13 +497,34 @@ control returns to safe code.
 Currently supported unsafe code is single-threaded Rust for raw pointer reads
 and writes, ordinary branches inside unsafe blocks, ordinary reference
 construction, checked integer arithmetic, and calls to ordinary safe Rust
-functions. A safe function call inside an unsafe block uses the same
-contract behavior as safe code: the callee precondition is asserted, the callee
+functions. A safe function call inside an unsafe block uses the same contract
+behavior as safe code: the callee precondition is asserted, the callee
 postcondition is assumed, and opaque calls produce a fresh result satisfying the
-result type invariant. Unsafe function calls inside unsafe blocks are not
-supported. This support is for safe function calls only; unsafe API
-heap/layout/value specifications are separate unsafe resources and are not part
-of this initial model.
+result type invariant. Unsafe function calls inside unsafe blocks are supported
+when the unsafe callee has a local function contract. Ordinary `req` and `ens`
+clauses keep their path-condition meaning, and unsafe heap requirements are
+written with `resource req` and `resource ens`.
+
+```rust
+unsafe fn write_i32(p: *mut i32)
+//@ resource req *p |-> Option::Some(?old)
+//@ resource ens *p |-> Option::Some(42i32) where old >= 0i32
+{
+    // ...
+}
+```
+
+`resource req` and `resource ens` use the same resource-pattern syntax as
+`resource assert`. They may be omitted independently. `//@ let` directives may
+appear before `resource req`, as with ordinary function contracts. Resource
+function contracts are supported only on `unsafe fn`.
+
+At an unsafe call site, each `resource req` is checked against the caller's
+unsafe heap and consumes exactly the matched resources. Each `resource ens`
+materializes resources back into the caller heap after the call. If a
+`resource ens` has a `where` clause, that boolean condition is also added to the
+caller path condition after the call. The `result` variable is available in both
+the resource pattern and the `where` clause of `resource ens`.
 
 Inside unsafe blocks, ordinary `//@ let`, `//@ assert`, `//@ assume`, and
 lemma-call directives are supported when they only affect the symbolic path
@@ -521,8 +542,9 @@ are `PointsTo(addr_expr, rust_ty_expr, option_value_expr)`,
 the shorthand `*ptr |-> option_value_pattern`,
 `Alloc(base_expr, size_expr, alignment_expr)`, and separating conjunction
 `left * right`; parentheses may be used freely to group resource patterns.
-`*ptr |-> value` is accepted only when `ptr` is a Rust local whose type is a raw
-pointer `*const T` or `*mut T`; it is desugared before unsafe execution to
+`*ptr |-> value` is accepted only when `ptr` is a Rust local, function
+parameter, or allowed `result` binding whose type is a raw pointer `*const T` or
+`*mut T`; it is desugared before unsafe execution to
 `PointsTo({ptr}.addr, {type T}, value)`, so the unsafe engine only sees
 `PointsTo`. If the pointer type cannot be inferred, the directive is rejected
 before unsafe execution. The value expression for a `PointsTo` pattern is an
@@ -548,11 +570,10 @@ path-conditionally possible, the assertion is currently reported as unsupported.
 Resource assertions do not consume resources, and no backtracking crosses a
 directive boundary. Resource assertions are only supported inside unsafe blocks.
 
-Loop invariants inside unsafe blocks are not supported. Loop contracts and
-function contracts inside unsafe code are not supported yet; existing loop
-prepass restrictions still apply before unsafe execution. Aliasing,
-permissions, fractional permissions, and user-defined heap predicates are not
-part of this initial unsafe model.
+Loop invariants inside unsafe blocks are not supported. Loop contracts inside
+unsafe code are not supported yet; existing loop prepass restrictions still
+apply before unsafe execution. Aliasing, permissions, fractional permissions,
+and user-defined heap predicates are not part of this initial unsafe model.
 
 Shared references can be dereferenced with `*`. After type checking, `*r` for a
 `Ref<T>` is desugared to `r.deref`.

@@ -17,6 +17,8 @@ pub enum DirectiveKind {
     Assert,
     Assume,
     ResourceAssert,
+    ResourceReq,
+    ResourceEns,
     LemmaCall,
 }
 
@@ -30,6 +32,8 @@ impl DirectiveKind {
             Self::Assert => "assert",
             Self::Assume => "assume",
             Self::ResourceAssert => "resource assert",
+            Self::ResourceReq => "resource req",
+            Self::ResourceEns => "resource ens",
             Self::LemmaCall => "lemma_call",
         }
     }
@@ -186,7 +190,7 @@ fn collect_contract_directives<'tcx>(
     if let Some(lines) = function_contract_comment_lines_before_item(source, loc.line)
         && lines
             .iter()
-            .any(|line| line.text.starts_with("req") || line.text.starts_with("ens"))
+            .any(|line| contract_comment_kind(&line.text).is_some())
     {
         return Err(DirectiveError {
             span: item_span,
@@ -234,7 +238,10 @@ fn parse_directive_payload(
     if kind == DirectiveKind::Let {
         return parse_let_directive(text, span);
     }
-    if kind == DirectiveKind::ResourceAssert {
+    if matches!(
+        kind,
+        DirectiveKind::ResourceAssert | DirectiveKind::ResourceReq | DirectiveKind::ResourceEns
+    ) {
         return parse_resource_assert_directive(text, span);
     }
     let parsed = match kind {
@@ -969,7 +976,13 @@ fn find_next_directive_keyword(
 fn contract_comment_kind(text: &str) -> Option<DirectiveKind> {
     directive_kind_prefix(
         text,
-        &[DirectiveKind::Req, DirectiveKind::Ens, DirectiveKind::Let],
+        &[
+            DirectiveKind::ResourceReq,
+            DirectiveKind::ResourceEns,
+            DirectiveKind::Req,
+            DirectiveKind::Ens,
+            DirectiveKind::Let,
+        ],
     )
 }
 
