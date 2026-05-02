@@ -189,9 +189,12 @@ pub struct TypedGhostMatchArm {
 #[derive(Debug, Clone)]
 pub struct TypedLemmaDef {
     pub name: String,
+    pub is_unsafe: bool,
     pub params: Vec<ContractParam>,
     pub req: NormalizedPredicate,
+    pub resource_reqs: Vec<ResourceAssertionContract>,
     pub ens: TypedExpr,
+    pub resource_ens: Vec<ResourceAssertionContract>,
     pub body: Vec<TypedGhostStmt>,
 }
 
@@ -5422,6 +5425,168 @@ fn typed_contract_resource_assertions<'tcx>(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn typed_lemma_resource_assertions(
+    assertions: &[ResourceAssertion],
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    inferred: &mut SpecTypeInference,
+) -> Result<Vec<ResourceAssertionContract>, String> {
+    let mut out = Vec::with_capacity(assertions.len());
+    for assertion in assertions {
+        let pattern = typed_lemma_resource_pattern(
+            &assertion.pattern,
+            pure_fns,
+            enum_defs,
+            spec_scope,
+            params,
+            allow_result,
+            result_ty,
+            inferred,
+        )?;
+        let condition = typed_contract_expr_with_expected(
+            &assertion.condition,
+            pure_fns,
+            enum_defs,
+            &HashSet::new(),
+            spec_scope,
+            params,
+            allow_result,
+            result_ty,
+            inferred,
+            true,
+            Some(&SpecTy::Bool),
+        )?;
+        out.push(ResourceAssertionContract {
+            pattern,
+            condition,
+            resolution: ResolvedExprEnv::default(),
+            assertion_span: "lemma resource contract".to_owned(),
+        });
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_lemma_resource_pattern(
+    pattern: &ResourcePattern,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    inferred: &mut SpecTypeInference,
+) -> Result<TypedResourcePattern, String> {
+    match pattern {
+        ResourcePattern::Star(lhs, rhs) => Ok(TypedResourcePattern::Star(
+            Box::new(typed_lemma_resource_pattern(
+                lhs,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?),
+            Box::new(typed_lemma_resource_pattern(
+                rhs,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?),
+        )),
+        ResourcePattern::PointsTo { addr, ty, value } => {
+            let addr = typed_contract_resource_expr(
+                addr,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+                Some(&SpecTy::Usize),
+            )?;
+            let ty = typed_contract_resource_expr(
+                ty,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+                Some(&SpecTy::RustTy),
+            )?;
+            let expected = option_spec_ty_for_rust_ty_expr(&ty)?;
+            let value = typed_contract_value_pattern(
+                value,
+                &expected,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?;
+            Ok(TypedResourcePattern::PointsTo { addr, ty, value })
+        }
+        ResourcePattern::PointsToSugar { .. } => Err(
+            "`|->` resource sugar in unsafe lemmas is unsupported; use `PointsTo(...)`".to_owned(),
+        ),
+        ResourcePattern::Alloc {
+            base,
+            size,
+            alignment,
+        } => Ok(TypedResourcePattern::Alloc {
+            base: typed_contract_resource_expr(
+                base,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+                Some(&SpecTy::Usize),
+            )?,
+            size: typed_contract_resource_expr(
+                size,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+                Some(&SpecTy::Usize),
+            )?,
+            alignment: typed_contract_resource_expr(
+                alignment,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+                Some(&SpecTy::Usize),
+            )?,
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn typed_contract_resource_pattern<'tcx>(
     tcx: TyCtxt<'tcx>,
     pattern: &ResourcePattern,
@@ -7663,6 +7828,16 @@ fn type_lemmas(
             .collect::<Vec<_>>();
         let mut visible_lemmas = available_lemmas.clone();
         visible_lemmas.insert(lemma.name.clone(), lemma.clone());
+        if !lemma.is_unsafe && (!lemma.resource_reqs.is_empty() || !lemma.resource_ens.is_empty()) {
+            return Err(LoopPrepassError {
+                span,
+                display_span: None,
+                message: format!(
+                    "lemma `{}` resource contracts are only supported on unsafe lemmas",
+                    lemma.name
+                ),
+            });
+        }
         let result_ty = SpecTy::Bool;
         let mut inferred = SpecTypeInference::default();
         let mut infer_scope = SpecScope::default();
@@ -7683,6 +7858,23 @@ fn type_lemmas(
             message: format!("lemma `{}` req: {message}", lemma.name),
         })?;
         let mut body_infer_scope = infer_scope.clone();
+        for resource_req in &lemma.resource_reqs {
+            infer_contract_resource_assertion(
+                resource_req,
+                pure_fns,
+                enum_defs,
+                &mut body_infer_scope,
+                &param_tys,
+                false,
+                &result_ty,
+                &mut inferred,
+            )
+            .map_err(|message| LoopPrepassError {
+                span,
+                display_span: None,
+                message: format!("lemma `{}` resource req: {message}", lemma.name),
+            })?;
+        }
         infer_lemma_stmts(
             &lemma.body,
             &visible_lemmas,
@@ -7741,6 +7933,21 @@ fn type_lemmas(
                 message: format!("lemma `{}` req: {message}", lemma.name),
             })
         })?;
+        let resource_reqs = typed_lemma_resource_assertions(
+            &lemma.resource_reqs,
+            pure_fns,
+            enum_defs,
+            &mut type_scope,
+            &param_tys,
+            false,
+            &result_ty,
+            &mut inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span,
+            display_span: None,
+            message: format!("lemma `{}` resource req: {message}", lemma.name),
+        })?;
         let body = typed_lemma_stmts(
             &lemma.body,
             &visible_lemmas,
@@ -7781,11 +7988,46 @@ fn type_lemmas(
                 message: format!("lemma `{}` ens: {message}", lemma.name),
             })
         })?;
+        for resource_ens in &lemma.resource_ens {
+            infer_contract_resource_assertion(
+                resource_ens,
+                pure_fns,
+                enum_defs,
+                &mut body_infer_scope,
+                &param_tys,
+                false,
+                &result_ty,
+                &mut inferred,
+            )
+            .map_err(|message| LoopPrepassError {
+                span,
+                display_span: None,
+                message: format!("lemma `{}` resource ens: {message}", lemma.name),
+            })?;
+        }
+        let resource_ens = typed_lemma_resource_assertions(
+            &lemma.resource_ens,
+            pure_fns,
+            enum_defs,
+            &mut type_scope,
+            &param_tys,
+            false,
+            &result_ty,
+            &mut inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span,
+            display_span: None,
+            message: format!("lemma `{}` resource ens: {message}", lemma.name),
+        })?;
         let typed_def = TypedLemmaDef {
             name: lemma.name.clone(),
+            is_unsafe: lemma.is_unsafe,
             params,
             req,
+            resource_reqs,
             ens,
+            resource_ens,
             body,
         };
         validate_recursive_lemma(&typed_def).map_err(|message| LoopPrepassError {
@@ -9269,13 +9511,16 @@ mod tests {
             "seq_concat_empty_right".to_owned(),
             LemmaDef {
                 name: "seq_concat_empty_right".to_owned(),
+                is_unsafe: false,
                 type_params: vec!["T".to_owned()],
                 params: vec![PureFnParam {
                     name: "xs".to_owned(),
                     ty: SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned()))),
                 }],
                 req: true_expr(),
+                resource_reqs: vec![],
                 ens: true_expr(),
+                resource_ens: vec![],
                 body: vec![],
             },
         )]);

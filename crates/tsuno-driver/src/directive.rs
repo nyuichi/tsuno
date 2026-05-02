@@ -98,13 +98,13 @@ impl FunctionDirective {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceAssertion {
     pub pattern: ResourcePattern,
     pub condition: spec::Expr,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourcePattern {
     Star(Box<ResourcePattern>, Box<ResourcePattern>),
     PointsTo {
@@ -123,7 +123,7 @@ pub enum ResourcePattern {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValuePattern {
     Bind(String),
     Expr(spec::Expr),
@@ -139,7 +139,7 @@ pub enum ValuePattern {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValuePatternStructField {
     pub name: String,
     pub value: ValuePattern,
@@ -262,6 +262,13 @@ fn parse_resource_assert_directive(
     text: &str,
     span: Span,
 ) -> Result<DirectivePayload, DirectiveError> {
+    parse_resource_assertion(text, span).map(DirectivePayload::ResourceAssert)
+}
+
+pub fn parse_resource_assertion(
+    text: &str,
+    span: Span,
+) -> Result<ResourceAssertion, DirectiveError> {
     let text = text.trim().strip_suffix(';').unwrap_or(text.trim()).trim();
     let (pattern, condition) = split_resource_assert_where(text);
     let pattern = parse_resource_pattern(pattern, span)?;
@@ -269,10 +276,7 @@ fn parse_resource_assert_directive(
         Some(condition) => parse_resource_expr(condition, span)?,
         None => spec::Expr::Bool(true),
     };
-    Ok(DirectivePayload::ResourceAssert(ResourceAssertion {
-        pattern,
-        condition,
-    }))
+    Ok(ResourceAssertion { pattern, condition })
 }
 
 fn parse_resource_pattern(text: &str, span: Span) -> Result<ResourcePattern, DirectiveError> {
