@@ -64,7 +64,7 @@ pub struct FunctionDirective {
 pub enum DirectivePayload {
     Predicate(spec::Expr),
     Let { name: String, value: spec::Expr },
-    ResourceAssert(ResourcePattern),
+    ResourceAssert(ResourceAssertion),
     LemmaCall(spec::Expr),
 }
 
@@ -79,9 +79,9 @@ impl FunctionDirective {
         }
     }
 
-    pub fn resource_pattern(&self) -> Option<&ResourcePattern> {
+    pub fn resource_assertion(&self) -> Option<&ResourceAssertion> {
         match &self.payload {
-            DirectivePayload::ResourceAssert(pattern) => Some(pattern),
+            DirectivePayload::ResourceAssert(assertion) => Some(assertion),
             _ => None,
         }
     }
@@ -95,18 +95,46 @@ impl FunctionDirective {
 }
 
 #[derive(Debug, Clone)]
+pub struct ResourceAssertion {
+    pub pattern: ResourcePattern,
+    pub condition: spec::Expr,
+}
+
+#[derive(Debug, Clone)]
 pub enum ResourcePattern {
     Star(Box<ResourcePattern>, Box<ResourcePattern>),
     PointsTo {
         addr: spec::Expr,
         ty: spec::Expr,
-        value: spec::Expr,
+        value: ValuePattern,
     },
     Alloc {
         base: spec::Expr,
         size: spec::Expr,
         alignment: spec::Expr,
     },
+}
+
+#[derive(Debug, Clone)]
+pub enum ValuePattern {
+    Bind(String),
+    Expr(spec::Expr),
+    SeqLit(Vec<ValuePattern>),
+    StructLit {
+        name: String,
+        fields: Vec<ValuePatternStructField>,
+    },
+    Call {
+        func: String,
+        type_args: Vec<spec::SpecTy>,
+        args: Vec<ValuePattern>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ValuePatternStructField {
+    pub name: String,
+    pub value: ValuePattern,
 }
 
 #[derive(Debug, Clone)]
@@ -224,7 +252,16 @@ fn parse_resource_assert_directive(
     span: Span,
 ) -> Result<DirectivePayload, DirectiveError> {
     let text = text.trim().strip_suffix(';').unwrap_or(text.trim()).trim();
-    parse_resource_pattern(text, span).map(DirectivePayload::ResourceAssert)
+    let (pattern, condition) = split_resource_assert_where(text);
+    let pattern = parse_resource_pattern(pattern, span)?;
+    let condition = match condition {
+        Some(condition) => parse_resource_expr(condition, span)?,
+        None => spec::Expr::Bool(true),
+    };
+    Ok(DirectivePayload::ResourceAssert(ResourceAssertion {
+        pattern,
+        condition,
+    }))
 }
 
 fn parse_resource_pattern(text: &str, span: Span) -> Result<ResourcePattern, DirectiveError> {
@@ -245,7 +282,7 @@ fn parse_resource_pattern(text: &str, span: Span) -> Result<ResourcePattern, Dir
         return Ok(ResourcePattern::PointsTo {
             addr: parse_resource_expr(args[0], span)?,
             ty: parse_resource_expr(args[1], span)?,
-            value: parse_resource_expr(args[2], span)?,
+            value: parse_value_pattern(args[2], span)?,
         });
     }
     if let Some(args) = atom_args(text, "Alloc") {
@@ -266,6 +303,194 @@ fn parse_resource_pattern(text: &str, span: Span) -> Result<ResourcePattern, Dir
         span,
         message: "resource assertion must be a `PointsTo`, `Alloc`, or `*` pattern".to_owned(),
     })
+}
+
+fn split_resource_assert_where(text: &str) -> (&str, Option<&str>) {
+    let mut depth = 0usize;
+    for (index, _) in text.match_indices("where") {
+        for ch in text[..index].chars() {
+            match ch {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            depth = 0;
+            continue;
+        }
+        let before = text[..index].chars().next_back();
+        let after = text[index + "where".len()..].chars().next();
+        if before.is_none_or(|ch| ch.is_whitespace()) && after.is_none_or(|ch| ch.is_whitespace()) {
+            return (
+                text[..index].trim(),
+                Some(text[index + "where".len()..].trim()),
+            );
+        }
+        depth = 0;
+    }
+    (text, None)
+}
+
+fn parse_value_pattern(text: &str, span: Span) -> Result<ValuePattern, DirectiveError> {
+    let (rewritten, binders) = rewrite_pattern_binders(text, span)?;
+    let expr = parse_resource_expr(&rewritten, span)?;
+    Ok(expr_to_value_pattern(expr, &binders).0)
+}
+
+fn rewrite_pattern_binders(
+    text: &str,
+    span: Span,
+) -> Result<(String, Vec<(String, String)>), DirectiveError> {
+    let mut rewritten = String::with_capacity(text.len());
+    let mut binders = Vec::new();
+    let mut chars = text.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
+        if ch != '?' {
+            rewritten.push(ch);
+            continue;
+        }
+        let Some((_, first)) = chars.peek().copied() else {
+            return Err(DirectiveError {
+                span,
+                message: "resource pattern binder must be `?ident`".to_owned(),
+            });
+        };
+        if !(first == '_' || first.is_ascii_alphabetic()) {
+            return Err(DirectiveError {
+                span,
+                message: "resource pattern binder must be `?ident`".to_owned(),
+            });
+        }
+        let mut name = String::new();
+        while let Some((_, ch)) = chars.peek().copied() {
+            if ch == '_' || ch.is_ascii_alphanumeric() {
+                name.push(ch);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let placeholder = format!("__tsuno_resource_binder_{}", binders.len());
+        rewritten.push_str(&placeholder);
+        binders.push((placeholder, name));
+    }
+    Ok((rewritten, binders))
+}
+
+fn expr_to_value_pattern(expr: spec::Expr, binders: &[(String, String)]) -> (ValuePattern, bool) {
+    if let spec::Expr::Var(name) = &expr
+        && let Some((_, binder)) = binders.iter().find(|(placeholder, _)| placeholder == name)
+    {
+        return (ValuePattern::Bind(binder.clone()), true);
+    }
+    match expr {
+        spec::Expr::SeqLit(items) => {
+            let mut has_pattern = false;
+            let items = items
+                .into_iter()
+                .map(|item| {
+                    let (pattern, item_has_pattern) = expr_to_value_pattern(item, binders);
+                    has_pattern |= item_has_pattern;
+                    pattern
+                })
+                .collect::<Vec<_>>();
+            if has_pattern {
+                (ValuePattern::SeqLit(items), true)
+            } else {
+                (
+                    ValuePattern::Expr(spec::Expr::SeqLit(
+                        items
+                            .into_iter()
+                            .map(value_pattern_to_expr)
+                            .collect::<Option<Vec<_>>>()
+                            .expect("non-pattern sequence"),
+                    )),
+                    false,
+                )
+            }
+        }
+        spec::Expr::StructLit { name, fields } => {
+            let mut has_pattern = false;
+            let fields = fields
+                .into_iter()
+                .map(|field| {
+                    let (value, field_has_pattern) = expr_to_value_pattern(field.value, binders);
+                    has_pattern |= field_has_pattern;
+                    ValuePatternStructField {
+                        name: field.name,
+                        value,
+                    }
+                })
+                .collect::<Vec<_>>();
+            if has_pattern {
+                (ValuePattern::StructLit { name, fields }, true)
+            } else {
+                (
+                    ValuePattern::Expr(spec::Expr::StructLit {
+                        name,
+                        fields: fields
+                            .into_iter()
+                            .map(|field| {
+                                Some(spec::StructLitField {
+                                    name: field.name,
+                                    value: value_pattern_to_expr(field.value)?,
+                                })
+                            })
+                            .collect::<Option<Vec<_>>>()
+                            .expect("non-pattern struct"),
+                    }),
+                    false,
+                )
+            }
+        }
+        spec::Expr::Call {
+            func,
+            type_args,
+            args,
+        } => {
+            let mut has_pattern = false;
+            let args = args
+                .into_iter()
+                .map(|arg| {
+                    let (pattern, arg_has_pattern) = expr_to_value_pattern(arg, binders);
+                    has_pattern |= arg_has_pattern;
+                    pattern
+                })
+                .collect::<Vec<_>>();
+            if has_pattern {
+                (
+                    ValuePattern::Call {
+                        func,
+                        type_args,
+                        args,
+                    },
+                    true,
+                )
+            } else {
+                (
+                    ValuePattern::Expr(spec::Expr::Call {
+                        func,
+                        type_args,
+                        args: args
+                            .into_iter()
+                            .map(value_pattern_to_expr)
+                            .collect::<Option<Vec<_>>>()
+                            .expect("non-pattern call"),
+                    }),
+                    false,
+                )
+            }
+        }
+        other => (ValuePattern::Expr(other), false),
+    }
+}
+
+fn value_pattern_to_expr(pattern: ValuePattern) -> Option<spec::Expr> {
+    match pattern {
+        ValuePattern::Expr(expr) => Some(expr),
+        _ => None,
+    }
 }
 
 fn parse_resource_expr(text: &str, span: Span) -> Result<spec::Expr, DirectiveError> {

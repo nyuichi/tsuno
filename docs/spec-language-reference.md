@@ -512,6 +512,7 @@ also support resource assertions:
 
 ```rust
 //@ resource assert PointsTo({p}.addr, {type i32}, Option::Some(42i32)) * Alloc({p}.addr, 4usize, 4usize);
+//@ resource assert PointsTo({p}.addr, {type i32}, Option::Some(?v)) where v > 0i32;
 ```
 
 A resource assertion checks a `ResourcePattern`. The initial resource patterns
@@ -522,12 +523,23 @@ value expression for a `PointsTo` pattern is an ordinary spec expression whose
 type is `Option<T>`, so option constructors are written as prelude enum
 constructors such as `Option::Some(v)` and `Option::None`.
 
-Each atomic resource pattern must match exactly one currently available unsafe
-heap resource under the current path condition. `*` requires the matched atomic
-resources to be distinct. Resource assertions do not consume resources. If no
-matching resource exists, verification fails; if matching is ambiguous or only
+The third argument of `PointsTo` is a value pattern. A pattern variable is
+written `?name`; in `PointsTo(a, {type T}, ?v)`, `v` has type `Option<T>`, while
+in `PointsTo(a, {type T}, Option::Some(?v))`, `v` has type `T`. Constructor
+syntax in a value pattern is structural pattern syntax, so constructor arguments
+may themselves contain pattern variables. Pattern variables are bound from left
+to right, are visible in the optional `where` condition, and remain available to
+later directives in the same directive environment.
+
+`resource assert R where P` first enumerates matches of `R` against the current
+unsafe heap, using `*` to require distinct matched atomic resources. It then
+filters those matches by the boolean spec expression `P`; if the `where` clause
+is omitted, `P` is `true`. The directive succeeds only when exactly one match
+remains under the current path condition. If no matching resource remains,
+verification fails; if multiple matches remain or a match is only
 path-conditionally possible, the assertion is currently reported as unsupported.
-Resource assertions are only supported inside unsafe blocks.
+Resource assertions do not consume resources, and no backtracking crosses a
+directive boundary. Resource assertions are only supported inside unsafe blocks.
 
 Loop invariants inside unsafe blocks are not supported. Loop contracts and
 function contracts inside unsafe code are not supported yet; existing loop

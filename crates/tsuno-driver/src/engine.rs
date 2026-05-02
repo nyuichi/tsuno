@@ -44,7 +44,7 @@ use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
     FunctionContract, LemmaCallContract, LoopContract, LoopContracts, NormalizedBinding,
     NormalizedPredicate, ProgramPrepass, ResolvedExprEnv, TypedGhostMatchArm, TypedGhostStmt,
-    TypedLemmaDef, TypedPureFnDef, TypedResourcePattern, spec_ty_for_rust_ty,
+    TypedLemmaDef, TypedPureFnDef, TypedResourcePattern, TypedValuePattern, spec_ty_for_rust_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
@@ -154,6 +154,13 @@ enum Resource {
 #[derive(Debug, Clone, Default)]
 struct UnsafeBridge {
     locals: BTreeSet<Local>,
+}
+
+#[derive(Debug, Clone)]
+struct ResourcePatternMatch {
+    used: BTreeSet<usize>,
+    condition: Bool,
+    env: HashMap<String, SymValue>,
 }
 
 struct UnsafeCall<'mir, 'tcx> {
@@ -1406,9 +1413,11 @@ impl<'tcx> Verifier<'tcx> {
                     self.assert_unsafe_resource_pattern(
                         state,
                         &resource_assertion.pattern,
+                        &resource_assertion.condition,
                         &resource_assertion.resolution,
                         self.control_span(ctrl),
                     )?;
+                    view = self.unsafe_state_view(state);
                     true
                 }
             };
@@ -2409,15 +2418,53 @@ impl<'tcx> Verifier<'tcx> {
 
     fn assert_unsafe_resource_pattern(
         &self,
-        state: &UnsafeState,
+        state: &mut UnsafeState,
         pattern: &TypedResourcePattern,
+        condition: &TypedExpr,
         resolution: &ResolvedExprEnv,
         span: Span,
     ) -> Result<(), VerificationResult> {
         let view = self.unsafe_state_view(state);
-        let mut used = BTreeSet::new();
-        self.match_resource_pattern(state, &view, pattern, resolution, span, &mut used)?;
-        Ok(())
+        let initial = ResourcePatternMatch {
+            used: BTreeSet::new(),
+            condition: Bool::from_bool(true),
+            env: HashMap::new(),
+        };
+        let matches =
+            self.match_resource_pattern(state, &view, pattern, resolution, span, vec![initial])?;
+        let mut possible = 0;
+        let mut definite = Vec::new();
+        for mut candidate in matches {
+            let mut candidate_view = view.clone();
+            candidate_view.env.extend(candidate.env.clone());
+            let where_condition = self.spec_expr_to_bool(&candidate_view, condition, resolution)?;
+            candidate.condition = bool_and(vec![candidate.condition, where_condition]).simplify();
+            if matches!(candidate.condition.as_bool(), Some(false)) {
+                continue;
+            }
+            match self.check_sat(&[state.pc.clone(), candidate.condition.clone().not()]) {
+                SatResult::Unsat => definite.push(candidate),
+                SatResult::Sat | SatResult::Unknown => {
+                    match self.check_sat(&[state.pc.clone(), candidate.condition.clone()]) {
+                        SatResult::Unsat => continue,
+                        SatResult::Sat | SatResult::Unknown => possible += 1,
+                    }
+                }
+            }
+        }
+        if definite.len() == 1 {
+            let candidate = definite.pop().expect("one definite match");
+            state.env.extend(candidate.env);
+            self.add_unsafe_path_condition(state, candidate.condition);
+            return Ok(());
+        }
+        if definite.len() > 1 || possible > 0 {
+            return Err(self.unsupported_result(
+                span,
+                "ambiguous resource assertion matching is unsupported".to_owned(),
+            ));
+        }
+        Err(self.fail_result(span, "resource assertion failed".to_owned()))
     }
 
     fn match_resource_pattern(
@@ -2427,64 +2474,67 @@ impl<'tcx> Verifier<'tcx> {
         pattern: &TypedResourcePattern,
         resolution: &ResolvedExprEnv,
         span: Span,
-        used: &mut BTreeSet<usize>,
-    ) -> Result<(), VerificationResult> {
+        candidates: Vec<ResourcePatternMatch>,
+    ) -> Result<Vec<ResourcePatternMatch>, VerificationResult> {
         match pattern {
             TypedResourcePattern::Star(lhs, rhs) => {
-                self.match_resource_pattern(state, view, lhs, resolution, span, used)?;
-                self.match_resource_pattern(state, view, rhs, resolution, span, used)
+                let lhs_matches =
+                    self.match_resource_pattern(state, view, lhs, resolution, span, candidates)?;
+                self.match_resource_pattern(state, view, rhs, resolution, span, lhs_matches)
             }
             TypedResourcePattern::PointsTo { addr, ty, value } => {
                 let addr_value = self.spec_expr_to_value(view, addr, resolution)?;
                 let ty_value = self.spec_expr_to_value(view, ty, resolution)?;
-                let expected_value = self.spec_expr_to_value(view, value, resolution)?;
-                let Some(value_inner_ty) = option_inner_spec_ty(&value.ty) else {
-                    return Err(self.unsupported_result(
-                        span,
-                        "PointsTo value pattern must have type Option<T>".to_owned(),
-                    ));
-                };
-                let index =
-                    self.unique_matching_resource_index(
-                        state,
-                        used,
-                        span,
-                        |resource| match resource {
-                            Resource::PointsTo {
-                                addr: resource_addr,
-                                ty: resource_ty,
-                                value: resource_value,
-                            } => {
-                                let actual_value = self.resource_option_value(
-                                    resource_value.as_ref(),
-                                    value_inner_ty.clone(),
-                                )?;
-                                Ok(Some(bool_and(vec![
-                                    self.eq_for_spec_ty(
-                                        &SpecTy::Usize,
-                                        &addr_value,
-                                        resource_addr,
-                                        span,
-                                    )?,
-                                    self.eq_for_spec_ty(
-                                        &SpecTy::RustTy,
-                                        &ty_value,
-                                        resource_ty,
-                                        span,
-                                    )?,
-                                    self.eq_for_spec_ty(
-                                        &value.ty,
-                                        &expected_value,
-                                        &actual_value,
-                                        span,
-                                    )?,
-                                ])))
-                            }
-                            Resource::Alloc { .. } => Ok(None),
-                        },
-                    )?;
-                used.insert(index);
-                Ok(())
+                let mut out = Vec::new();
+                for candidate in candidates {
+                    for (index, resource) in state.heap.iter().enumerate() {
+                        if candidate.used.contains(&index) {
+                            continue;
+                        }
+                        let Resource::PointsTo {
+                            addr: resource_addr,
+                            ty: resource_ty,
+                            value: resource_value,
+                        } = resource
+                        else {
+                            continue;
+                        };
+                        let actual_value = self.resource_option_value(
+                            resource_value.as_ref(),
+                            typed_value_pattern_ty(value),
+                        )?;
+                        let mut candidate_view = view.clone();
+                        candidate_view.env.extend(candidate.env.clone());
+                        let mut next_env = candidate.env.clone();
+                        let value_condition = self.match_value_pattern(
+                            &candidate_view,
+                            value,
+                            &actual_value,
+                            resolution,
+                            span,
+                            &mut next_env,
+                        )?;
+                        let mut used = candidate.used.clone();
+                        used.insert(index);
+                        out.push(ResourcePatternMatch {
+                            used,
+                            condition: bool_and(vec![
+                                candidate.condition.clone(),
+                                self.eq_for_spec_ty(
+                                    &SpecTy::Usize,
+                                    &addr_value,
+                                    resource_addr,
+                                    span,
+                                )?,
+                                self.eq_for_spec_ty(&SpecTy::RustTy, &ty_value, resource_ty, span)?,
+                                value_condition,
+                            ])
+                            .simplify(),
+                            env: next_env,
+                        });
+                    }
+                }
+                Ok(out)
             }
             TypedResourcePattern::Alloc {
                 base,
@@ -2494,27 +2544,37 @@ impl<'tcx> Verifier<'tcx> {
                 let base = self.spec_expr_to_value(view, base, resolution)?;
                 let size = self.spec_expr_to_value(view, size, resolution)?;
                 let alignment = self.spec_expr_to_value(view, alignment, resolution)?;
-                let index =
-                    self.unique_matching_resource_index(
-                        state,
-                        used,
-                        span,
-                        |resource| match resource {
-                            Resource::Alloc {
-                                base: resource_base,
-                                size: resource_size,
-                                alignment: resource_alignment,
-                            } => Ok(Some(bool_and(vec![
+                let mut out = Vec::new();
+                for candidate in candidates {
+                    for (index, resource) in state.heap.iter().enumerate() {
+                        if candidate.used.contains(&index) {
+                            continue;
+                        }
+                        let Resource::Alloc {
+                            base: resource_base,
+                            size: resource_size,
+                            alignment: resource_alignment,
+                        } = resource
+                        else {
+                            continue;
+                        };
+                        let mut used = candidate.used.clone();
+                        used.insert(index);
+                        out.push(ResourcePatternMatch {
+                            used,
+                            condition: bool_and(vec![
+                                candidate.condition.clone(),
                                 self.eq_for_spec_ty(&SpecTy::Usize, &base, resource_base, span)?,
                                 self.value_int_data(&size).eq(Int::from_u64(*resource_size)),
                                 self.value_int_data(&alignment)
                                     .eq(Int::from_u64(*resource_alignment)),
-                            ]))),
-                            Resource::PointsTo { .. } => Ok(None),
-                        },
-                    )?;
-                used.insert(index);
-                Ok(())
+                            ])
+                            .simplify(),
+                            env: candidate.env.clone(),
+                        });
+                    }
+                }
+                Ok(out)
             }
         }
     }
@@ -2522,54 +2582,117 @@ impl<'tcx> Verifier<'tcx> {
     fn resource_option_value(
         &self,
         value: Option<&SymValue>,
-        inner_ty: SpecTy,
+        option_ty: &SpecTy,
     ) -> Result<SymValue, VerificationResult> {
+        let Some(inner_ty) = option_inner_spec_ty(option_ty) else {
+            return Err(self.unsupported_result(
+                self.report_span(),
+                "PointsTo value pattern must have type Option<T>".to_owned(),
+            ));
+        };
         match value {
             Some(value) => self.construct_option_some(inner_ty, value.clone()),
             None => self.construct_option_none(inner_ty),
         }
     }
 
-    fn unique_matching_resource_index(
+    fn match_value_pattern(
         &self,
-        state: &UnsafeState,
-        used: &BTreeSet<usize>,
+        view: &State,
+        pattern: &TypedValuePattern,
+        actual: &SymValue,
+        resolution: &ResolvedExprEnv,
         span: Span,
-        mut condition_for: impl FnMut(&Resource) -> Result<Option<Bool>, VerificationResult>,
-    ) -> Result<usize, VerificationResult> {
-        let mut possible = 0;
-        let mut definite = Vec::new();
-        for (index, resource) in state.heap.iter().enumerate() {
-            if used.contains(&index) {
-                continue;
-            }
-            let Some(condition) = condition_for(resource)? else {
-                continue;
-            };
-            let condition = condition.simplify();
-            if matches!(condition.as_bool(), Some(false)) {
-                continue;
-            }
-            match self.check_sat(&[state.pc.clone(), condition.not()]) {
-                SatResult::Unsat => definite.push(index),
-                SatResult::Sat | SatResult::Unknown => {
-                    match self.check_sat(&[state.pc.clone(), condition]) {
-                        SatResult::Unsat => continue,
-                        SatResult::Sat | SatResult::Unknown => possible += 1,
-                    }
+        env: &mut HashMap<String, SymValue>,
+    ) -> Result<Bool, VerificationResult> {
+        match pattern {
+            TypedValuePattern::Bind { name, ty } => {
+                if let Some(value) = env.get(name) {
+                    return self.eq_for_spec_ty(ty, value, actual, span);
                 }
+                env.insert(name.clone(), actual.clone());
+                Ok(Bool::from_bool(true))
+            }
+            TypedValuePattern::Expr(expr) => {
+                let mut pattern_view = view.clone();
+                pattern_view.env.extend(env.clone());
+                let expected = self.spec_expr_to_value(&pattern_view, expr, resolution)?;
+                self.eq_for_spec_ty(&expr.ty, &expected, actual, span)
+            }
+            TypedValuePattern::SeqLit { ty, items } => {
+                let mut values = Vec::with_capacity(items.len());
+                let mut conditions = Vec::with_capacity(items.len() + 1);
+                for (index, item) in items.iter().enumerate() {
+                    let item_value = self.project_field(actual.clone(), ty, index, span)?;
+                    conditions.push(self.match_value_pattern(
+                        view,
+                        item,
+                        &item_value,
+                        resolution,
+                        span,
+                        env,
+                    )?);
+                    values.push(item_value);
+                }
+                conditions.push(self.eq_for_spec_ty(
+                    ty,
+                    &self.seq_literal_value(&values),
+                    actual,
+                    span,
+                )?);
+                Ok(bool_and(conditions))
+            }
+            TypedValuePattern::StructLit { ty, fields } => {
+                let mut values = Vec::with_capacity(fields.len());
+                let mut conditions = Vec::with_capacity(fields.len() + 1);
+                for (index, field) in fields.iter().enumerate() {
+                    let field_value = self.project_field(actual.clone(), ty, index, span)?;
+                    conditions.push(self.match_value_pattern(
+                        view,
+                        field,
+                        &field_value,
+                        resolution,
+                        span,
+                        env,
+                    )?);
+                    values.push(field_value);
+                }
+                let expected = self.construct_composite(ty, &values)?;
+                conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
+                Ok(bool_and(conditions))
+            }
+            TypedValuePattern::CtorCall {
+                ty,
+                ctor_index,
+                args,
+            } => {
+                let encoding = self.composite_encoding(ty)?;
+                let mut values = Vec::with_capacity(args.len());
+                let mut conditions = Vec::with_capacity(args.len() + 1);
+                for (index, arg) in args.iter().enumerate() {
+                    let arg_value = self.decode_composite_ctor_field(
+                        &encoding,
+                        *ctor_index,
+                        actual,
+                        index,
+                        span,
+                    )?;
+                    conditions.push(
+                        self.match_value_pattern(view, arg, &arg_value, resolution, span, env)?,
+                    );
+                    values.push(arg_value);
+                }
+                conditions.push(self.composite_tag_formula_for_encoding(
+                    &encoding,
+                    actual,
+                    *ctor_index,
+                    span,
+                )?);
+                let expected = self.construct_composite_ctor(ty, *ctor_index, &values)?;
+                conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
+                Ok(bool_and(conditions))
             }
         }
-        if definite.len() == 1 {
-            return Ok(definite[0]);
-        }
-        if definite.len() > 1 || possible > 0 {
-            return Err(self.unsupported_result(
-                span,
-                "ambiguous resource assertion matching is unsupported".to_owned(),
-            ));
-        }
-        Err(self.fail_result(span, "resource assertion failed".to_owned()))
     }
 
     fn write_matching_points_to(
@@ -6442,6 +6565,7 @@ fn collect_directive_prepass_pure_fn_refs(
                 }
                 ControlPointDirective::ResourceAssert(resource_assertion) => {
                     collect_typed_resource_pattern_pure_fn_refs(&resource_assertion.pattern, out);
+                    collect_typed_expr_pure_fn_refs(&resource_assertion.condition, out);
                 }
                 ControlPointDirective::LemmaCall(call) => {
                     for arg in &call.args {
@@ -6477,7 +6601,7 @@ fn collect_typed_resource_pattern_pure_fn_refs(
         TypedResourcePattern::PointsTo { addr, ty, value } => {
             collect_typed_expr_pure_fn_refs(addr, out);
             collect_typed_expr_pure_fn_refs(ty, out);
-            collect_typed_expr_pure_fn_refs(value, out);
+            collect_typed_value_pattern_pure_fn_refs(value, out);
         }
         TypedResourcePattern::Alloc {
             base,
@@ -6487,6 +6611,23 @@ fn collect_typed_resource_pattern_pure_fn_refs(
             collect_typed_expr_pure_fn_refs(base, out);
             collect_typed_expr_pure_fn_refs(size, out);
             collect_typed_expr_pure_fn_refs(alignment, out);
+        }
+    }
+}
+
+fn collect_typed_value_pattern_pure_fn_refs(
+    pattern: &TypedValuePattern,
+    out: &mut BTreeSet<String>,
+) {
+    match pattern {
+        TypedValuePattern::Bind { .. } => {}
+        TypedValuePattern::Expr(expr) => collect_typed_expr_pure_fn_refs(expr, out),
+        TypedValuePattern::SeqLit { items, .. }
+        | TypedValuePattern::StructLit { fields: items, .. }
+        | TypedValuePattern::CtorCall { args: items, .. } => {
+            for item in items {
+                collect_typed_value_pattern_pure_fn_refs(item, out);
+            }
         }
     }
 }
@@ -6646,6 +6787,16 @@ fn option_inner_spec_ty(ty: &SpecTy) -> Option<SpecTy> {
     match ty {
         SpecTy::Enum { name, args } if name == "Option" && args.len() == 1 => Some(args[0].clone()),
         _ => None,
+    }
+}
+
+fn typed_value_pattern_ty(pattern: &TypedValuePattern) -> &SpecTy {
+    match pattern {
+        TypedValuePattern::Bind { ty, .. }
+        | TypedValuePattern::SeqLit { ty, .. }
+        | TypedValuePattern::StructLit { ty, .. }
+        | TypedValuePattern::CtorCall { ty, .. } => ty,
+        TypedValuePattern::Expr(expr) => &expr.ty,
     }
 }
 
