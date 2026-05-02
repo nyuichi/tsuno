@@ -158,6 +158,28 @@ struct UnsafeBridge {
     locals: BTreeSet<Local>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ResourceContractCheck {
+    Precondition,
+    Postcondition,
+}
+
+impl ResourceContractCheck {
+    fn ambiguous_message(self) -> &'static str {
+        match self {
+            Self::Precondition => "ambiguous resource precondition matching is unsupported",
+            Self::Postcondition => "ambiguous resource postcondition matching is unsupported",
+        }
+    }
+
+    fn failure_message(self) -> &'static str {
+        match self {
+            Self::Precondition => "resource precondition failed",
+            Self::Postcondition => "resource postcondition failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ResourcePatternMatch {
     used: BTreeSet<usize>,
@@ -368,6 +390,12 @@ impl<'tcx> Verifier<'tcx> {
             Ok(None) => return self.pass_result("all assertions discharged"),
             Err(err) => return err,
         };
+        if self.current_function_is_unsafe() {
+            return match self.verify_unsafe_function_body(initial_state) {
+                Ok(()) => self.pass_result("all assertions discharged"),
+                Err(err) => err,
+            };
+        }
         let mut pending: BTreeMap<ControlPoint, Vec<State>> = BTreeMap::new();
         let mut worklist = VecDeque::new();
         self.enqueue_state(&mut pending, &mut worklist, initial_state);
@@ -420,6 +448,109 @@ impl<'tcx> Verifier<'tcx> {
         }
 
         self.pass_result("all assertions discharged")
+    }
+
+    fn current_function_is_unsafe(&self) -> bool {
+        self.fn_def_is_unsafe(self.function_context().def_id.to_def_id())
+    }
+
+    fn verify_unsafe_function_body(&self, state: State) -> Result<(), VerificationResult> {
+        let (mut unsafe_state, bridge) = self.enter_unsafe(state, self.report_span())?;
+        self.assume_unsafe_function_resource_reqs(&mut unsafe_state)?;
+
+        let mut pending: BTreeMap<ControlPoint, Vec<UnsafeState>> = BTreeMap::new();
+        let mut worklist = VecDeque::new();
+        self.enqueue_unsafe_state(&mut pending, &mut worklist, unsafe_state);
+
+        while let Some(ctrl) = worklist.pop_front() {
+            let Some(bucket) = pending.remove(&ctrl) else {
+                continue;
+            };
+            for mut unsafe_state in bucket {
+                let unsafe_ctrl = unsafe_state.ctrl;
+                if !self.apply_unsafe_control_point_directives(&mut unsafe_state, unsafe_ctrl)? {
+                    continue;
+                }
+
+                let data = &self.body().basic_blocks[unsafe_state.ctrl.basic_block];
+                if unsafe_state.ctrl.statement_index < data.statements.len() {
+                    let statement_index = unsafe_state.ctrl.statement_index;
+                    self.step_unsafe_statement(
+                        &mut unsafe_state,
+                        &bridge,
+                        &data.statements[statement_index],
+                    )?;
+                    self.enqueue_unsafe_state(&mut pending, &mut worklist, unsafe_state);
+                } else if matches!(data.terminator().kind, TerminatorKind::Return) {
+                    self.assert_unsafe_function_postcondition(
+                        &mut unsafe_state,
+                        data.terminator(),
+                    )?;
+                } else {
+                    for next_state in
+                        self.step_unsafe_terminator(unsafe_state, &bridge, data.terminator())?
+                    {
+                        self.enqueue_unsafe_state(&mut pending, &mut worklist, next_state);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn assume_unsafe_function_resource_reqs(
+        &self,
+        state: &mut UnsafeState,
+    ) -> Result<(), VerificationResult> {
+        let contract = self.current_contract();
+        if contract.resource_reqs.is_empty() {
+            return Ok(());
+        }
+        let view = self.unsafe_state_view(state);
+        let call_env = CallEnv::for_function(self, &view, contract)?;
+        let mut spec = state.env.clone();
+        for resource_req in &contract.resource_reqs {
+            self.assume_unsafe_resource_contract(
+                state,
+                resource_req,
+                &call_env.current,
+                &mut spec,
+                self.report_span(),
+            )?;
+        }
+        state.env = spec;
+        Ok(())
+    }
+
+    fn assert_unsafe_function_postcondition(
+        &self,
+        state: &mut UnsafeState,
+        term: &Terminator<'tcx>,
+    ) -> Result<(), VerificationResult> {
+        let contract = self.current_contract();
+        let view = self.unsafe_state_view(state);
+        let call_env = CallEnv::for_function(self, &view, contract)?;
+        let ens = self.contract_ens_formula(contract, &call_env, term.source_info.span)?;
+        self.unsafe_assert_constraint(
+            state,
+            ens,
+            term.source_info.span,
+            "postcondition failed".to_owned(),
+        )?;
+
+        let mut spec = call_env.spec.clone();
+        for resource_ens in &contract.resource_ens {
+            let resource_spec = self.consume_unsafe_resource_contract(
+                state,
+                resource_ens,
+                &call_env.current,
+                &spec,
+                term.source_info.span,
+                ResourceContractCheck::Postcondition,
+            )?;
+            spec.extend(resource_spec);
+        }
+        Ok(())
     }
 
     fn apply_control_point_directives(
@@ -939,6 +1070,7 @@ impl<'tcx> Verifier<'tcx> {
                     &call_env.current,
                     &spec,
                     span,
+                    ResourceContractCheck::Precondition,
                 )?;
                 spec.extend(resource_spec);
             }
@@ -2510,6 +2642,7 @@ impl<'tcx> Verifier<'tcx> {
         current: &HashMap<String, SymValue>,
         spec: &HashMap<String, SymValue>,
         span: Span,
+        check: ResourceContractCheck,
     ) -> Result<HashMap<String, SymValue>, VerificationResult> {
         let initial = ResourcePatternMatch {
             used: BTreeSet::new(),
@@ -2557,12 +2690,9 @@ impl<'tcx> Verifier<'tcx> {
             return Ok(candidate.env);
         }
         if definite.len() > 1 || possible > 0 {
-            return Err(self.unsupported_result(
-                span,
-                "ambiguous resource precondition matching is unsupported".to_owned(),
-            ));
+            return Err(self.unsupported_result(span, check.ambiguous_message().to_owned()));
         }
-        Err(self.fail_result(span, "resource precondition failed".to_owned()))
+        Err(self.fail_result(span, check.failure_message().to_owned()))
     }
 
     fn assume_unsafe_resource_contract(
@@ -3046,6 +3176,8 @@ impl<'tcx> Verifier<'tcx> {
                 let ty = self.contract_expr_to_value(current, spec, ty)?;
                 let value =
                     self.materialize_points_to_contract_value(current, spec, value, span)?;
+                let addr_int = self.value_int_data(&addr);
+                self.add_unsafe_path_condition(state, addr_int.eq(Int::from_i64(0)).not());
                 state.heap.push(Resource::PointsTo { addr, ty, value });
                 Ok(())
             }
@@ -3078,11 +3210,15 @@ impl<'tcx> Verifier<'tcx> {
                             .to_owned(),
                     ));
                 };
-                state.heap.push(Resource::Alloc {
-                    base,
-                    size,
-                    alignment,
-                });
+                self.add_unsafe_alloc_resource(
+                    state,
+                    &Allocation {
+                        base_addr: base,
+                        size,
+                        align: alignment,
+                    },
+                    span,
+                )?;
                 Ok(())
             }
         }

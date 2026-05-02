@@ -495,13 +495,14 @@ visible: deeply nested unsafe branches can create multiple unsafe states before
 control returns to safe code.
 
 Currently supported unsafe code is single-threaded Rust for raw pointer reads
-and writes, ordinary branches inside unsafe blocks, ordinary reference
-construction, checked integer arithmetic, and calls to ordinary safe Rust
-functions. A safe function call inside an unsafe block uses the same contract
-behavior as safe code: the callee precondition is asserted, the callee
+and writes, ordinary branches, ordinary reference construction, checked integer
+arithmetic, and calls to ordinary safe Rust functions. An `unsafe fn` body is
+verified by the unsafe engine even when it has no `resource req` or
+`resource ens` clauses. A safe function call from unsafe code uses the same
+contract behavior as safe code: the callee precondition is asserted, the callee
 postcondition is assumed, and opaque calls produce a fresh result satisfying the
-result type invariant. Unsafe function calls inside unsafe blocks are supported
-when the unsafe callee has a local function contract. Ordinary `req` and `ens`
+result type invariant. Unsafe function calls from unsafe code are supported when
+the unsafe callee has a local function contract. Ordinary `req` and `ens`
 clauses keep their path-condition meaning, and unsafe heap requirements are
 written with `resource req` and `resource ens`.
 
@@ -518,6 +519,15 @@ unsafe fn write_i32(p: *mut i32)
 `resource assert`. They may be omitted independently. `//@ let` directives may
 appear before `resource req`, as with ordinary function contracts. Resource
 function contracts are supported only on `unsafe fn`.
+
+When an unsafe function body is verified, each `resource req` materializes the
+specified resources into the function's initial unsafe heap and assumes its
+`where` condition. At each return, ordinary `ens` clauses are asserted, then each
+`resource ens` is checked against the function's final unsafe heap. Resource
+postcondition matching is exact: each resource pattern must match exactly one
+set of heap resources after its `where` condition is applied. The matched
+resources are consumed at return because no unsafe heap is reflected to a caller
+during callee-body verification.
 
 At an unsafe call site, each `resource req` is checked against the caller's
 unsafe heap and consumes exactly the matched resources. Each `resource ens`
