@@ -16,6 +16,7 @@ pub enum DirectiveKind {
     Inv,
     Assert,
     Assume,
+    ResourceAssert,
     LemmaCall,
 }
 
@@ -28,6 +29,7 @@ impl DirectiveKind {
             Self::Inv => "inv",
             Self::Assert => "assert",
             Self::Assume => "assume",
+            Self::ResourceAssert => "resource assert",
             Self::LemmaCall => "lemma_call",
         }
     }
@@ -62,6 +64,7 @@ pub struct FunctionDirective {
 pub enum DirectivePayload {
     Predicate(spec::Expr),
     Let { name: String, value: spec::Expr },
+    ResourceAssert(ResourcePattern),
     LemmaCall(spec::Expr),
 }
 
@@ -70,6 +73,16 @@ impl FunctionDirective {
         match &self.payload {
             DirectivePayload::Predicate(expr) | DirectivePayload::LemmaCall(expr) => expr,
             DirectivePayload::Let { value, .. } => value,
+            DirectivePayload::ResourceAssert(_) => {
+                panic!("resource assertion directive has no single expression")
+            }
+        }
+    }
+
+    pub fn resource_pattern(&self) -> Option<&ResourcePattern> {
+        match &self.payload {
+            DirectivePayload::ResourceAssert(pattern) => Some(pattern),
+            _ => None,
         }
     }
 
@@ -79,6 +92,21 @@ impl FunctionDirective {
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum ResourcePattern {
+    Star(Box<ResourcePattern>, Box<ResourcePattern>),
+    PointsTo {
+        addr: spec::Expr,
+        ty: spec::Expr,
+        value: spec::Expr,
+    },
+    Alloc {
+        base: spec::Expr,
+        size: spec::Expr,
+        alignment: spec::Expr,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +202,9 @@ fn parse_directive_payload(
     if kind == DirectiveKind::Let {
         return parse_let_directive(text, span);
     }
+    if kind == DirectiveKind::ResourceAssert {
+        return parse_resource_assert_directive(text, span);
+    }
     let parsed = match kind {
         DirectiveKind::Assert | DirectiveKind::Assume => {
             spec::parse_statement_expr(kind.keyword(), text)
@@ -186,6 +217,137 @@ fn parse_directive_payload(
             message: render_parse_error(kind, err),
         })
         .map(DirectivePayload::Predicate)
+}
+
+fn parse_resource_assert_directive(
+    text: &str,
+    span: Span,
+) -> Result<DirectivePayload, DirectiveError> {
+    let text = text.trim().strip_suffix(';').unwrap_or(text.trim()).trim();
+    parse_resource_pattern(text, span).map(DirectivePayload::ResourceAssert)
+}
+
+fn parse_resource_pattern(text: &str, span: Span) -> Result<ResourcePattern, DirectiveError> {
+    let text = strip_enclosing_parens(text.trim());
+    if let Some(index) = top_level_star(text) {
+        let lhs = parse_resource_pattern(&text[..index], span)?;
+        let rhs = parse_resource_pattern(&text[index + 1..], span)?;
+        return Ok(ResourcePattern::Star(Box::new(lhs), Box::new(rhs)));
+    }
+    if let Some(args) = atom_args(text, "PointsTo") {
+        let args = split_top_level_args(args, span)?;
+        if args.len() != 3 {
+            return Err(DirectiveError {
+                span,
+                message: "`PointsTo` resource pattern expects three arguments".to_owned(),
+            });
+        }
+        return Ok(ResourcePattern::PointsTo {
+            addr: parse_resource_expr(args[0], span)?,
+            ty: parse_resource_expr(args[1], span)?,
+            value: parse_resource_expr(args[2], span)?,
+        });
+    }
+    if let Some(args) = atom_args(text, "Alloc") {
+        let args = split_top_level_args(args, span)?;
+        if args.len() != 3 {
+            return Err(DirectiveError {
+                span,
+                message: "`Alloc` resource pattern expects three arguments".to_owned(),
+            });
+        }
+        return Ok(ResourcePattern::Alloc {
+            base: parse_resource_expr(args[0], span)?,
+            size: parse_resource_expr(args[1], span)?,
+            alignment: parse_resource_expr(args[2], span)?,
+        });
+    }
+    Err(DirectiveError {
+        span,
+        message: "resource assertion must be a `PointsTo`, `Alloc`, or `*` pattern".to_owned(),
+    })
+}
+
+fn parse_resource_expr(text: &str, span: Span) -> Result<spec::Expr, DirectiveError> {
+    spec::parse_source_expr("resource assert", text.trim()).map_err(|err| DirectiveError {
+        span,
+        message: render_parse_error(DirectiveKind::ResourceAssert, err),
+    })
+}
+
+fn strip_enclosing_parens(mut text: &str) -> &str {
+    loop {
+        let trimmed = text.trim();
+        if !(trimmed.starts_with('(') && trimmed.ends_with(')')) {
+            return trimmed;
+        }
+        if matching_outer_parens(trimmed) {
+            text = &trimmed[1..trimmed.len() - 1];
+        } else {
+            return trimmed;
+        }
+    }
+}
+
+fn matching_outer_parens(text: &str) -> bool {
+    let mut depth = 0usize;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && index + ch.len_utf8() != text.len() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+fn top_level_star(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '*' if depth == 0 => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn atom_args<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(name)?.trim_start();
+    let args = rest.strip_prefix('(')?.strip_suffix(')')?;
+    Some(args)
+}
+
+fn split_top_level_args(text: &str, span: Span) -> Result<Vec<&str>, DirectiveError> {
+    let mut args = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                args.push(text[start..index].trim());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    args.push(text[start..].trim());
+    if args.iter().any(|arg| arg.is_empty()) {
+        return Err(DirectiveError {
+            span,
+            message: "resource pattern arguments must not be empty".to_owned(),
+        });
+    }
+    Ok(args)
 }
 
 fn parse_let_directive(text: &str, span: Span) -> Result<DirectivePayload, DirectiveError> {
@@ -386,7 +548,12 @@ fn statement_directive_entries(
         if matches_reserved_statement_directive(&comment.text)
             && !matches!(
                 classify_statement_directive(&comment.text),
-                Some(DirectiveKind::Assert | DirectiveKind::Assume | DirectiveKind::Let)
+                Some(
+                    DirectiveKind::Assert
+                        | DirectiveKind::Assume
+                        | DirectiveKind::ResourceAssert
+                        | DirectiveKind::Let
+                )
             )
         {
             return Err(position_error);
@@ -990,6 +1157,7 @@ fn classify_statement_directive(text: &str) -> Option<DirectiveKind> {
         &[
             DirectiveKind::Assert,
             DirectiveKind::Assume,
+            DirectiveKind::ResourceAssert,
             DirectiveKind::Let,
         ],
     )
@@ -1001,6 +1169,7 @@ fn matches_reserved_statement_directive(text: &str) -> bool {
         &[
             DirectiveKind::Assert,
             DirectiveKind::Assume,
+            DirectiveKind::ResourceAssert,
             DirectiveKind::Inv,
             DirectiveKind::Req,
             DirectiveKind::Ens,

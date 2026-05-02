@@ -507,13 +507,33 @@ of this initial model.
 
 Inside unsafe blocks, ordinary `//@ let`, `//@ assert`, `//@ assume`, and
 lemma-call directives are supported when they only affect the symbolic path
-condition or the directive environment, as they do in safe code. Loop invariants
-inside unsafe blocks are not supported. Future separation-logic directives for
-unsafe heap resources will be added separately. Loop contracts and function
-contracts inside unsafe code are not supported yet; existing loop prepass
-restrictions still apply before unsafe execution. Aliasing, permissions,
-fractional permissions, and user-defined heap predicates are not part of this
-initial unsafe model.
+condition or the directive environment, as they do in safe code. Unsafe blocks
+also support resource assertions:
+
+```rust
+//@ resource assert PointsTo({p}.addr, {type i32}, Option::Some(42i32)) * Alloc({p}.addr, 4usize, 4usize);
+```
+
+A resource assertion checks a `ResourcePattern`. The initial resource patterns
+are `PointsTo(addr_expr, rust_ty_expr, option_value_expr)`,
+`Alloc(base_expr, size_expr, alignment_expr)`, and separating conjunction
+`left * right`; parentheses may be used freely to group resource patterns. The
+value expression for a `PointsTo` pattern is an ordinary spec expression whose
+type is `Option<T>`, so option constructors are written as prelude enum
+constructors such as `Option::Some(v)` and `Option::None`.
+
+Each atomic resource pattern must match exactly one currently available unsafe
+heap resource under the current path condition. `*` requires the matched atomic
+resources to be distinct. Resource assertions do not consume resources. If no
+matching resource exists, verification fails; if matching is ambiguous or only
+path-conditionally possible, the assertion is currently reported as unsupported.
+Resource assertions are only supported inside unsafe blocks.
+
+Loop invariants inside unsafe blocks are not supported. Loop contracts and
+function contracts inside unsafe code are not supported yet; existing loop
+prepass restrictions still apply before unsafe execution. Aliasing,
+permissions, fractional permissions, and user-defined heap predicates are not
+part of this initial unsafe model.
 
 Shared references can be dereferenced with `*`. After type checking, `*r` for a
 `Ref<T>` is desugared to `r.deref`.

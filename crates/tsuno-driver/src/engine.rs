@@ -44,7 +44,7 @@ use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
     FunctionContract, LemmaCallContract, LoopContract, LoopContracts, NormalizedBinding,
     NormalizedPredicate, ProgramPrepass, ResolvedExprEnv, TypedGhostMatchArm, TypedGhostStmt,
-    TypedLemmaDef, TypedPureFnDef, spec_ty_for_rust_ty,
+    TypedLemmaDef, TypedPureFnDef, TypedResourcePattern, spec_ty_for_rust_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
@@ -457,6 +457,15 @@ impl<'tcx> Verifier<'tcx> {
                     if !self.execute_lemma_call(state, lemma_call, self.control_span(ctrl))? {
                         return Ok(false);
                     }
+                }
+                ControlPointDirective::ResourceAssert(resource_assertion) => {
+                    return Err(self.unsupported_result(
+                        self.control_span(ctrl),
+                        format!(
+                            "resource assertions outside unsafe blocks are unsupported: {}",
+                            resource_assertion.assertion_span
+                        ),
+                    ));
                 }
             }
         }
@@ -1392,6 +1401,15 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 ControlPointDirective::LemmaCall(lemma_call) => {
                     self.execute_lemma_call(&mut view, lemma_call, self.control_span(ctrl))?
+                }
+                ControlPointDirective::ResourceAssert(resource_assertion) => {
+                    self.assert_unsafe_resource_pattern(
+                        state,
+                        &resource_assertion.pattern,
+                        &resource_assertion.resolution,
+                        self.control_span(ctrl),
+                    )?;
+                    true
                 }
             };
             state.pc = view.pc;
@@ -2387,6 +2405,171 @@ impl<'tcx> Verifier<'tcx> {
             unreachable!("initialized PointsTo match must contain a value");
         };
         Ok(value.clone())
+    }
+
+    fn assert_unsafe_resource_pattern(
+        &self,
+        state: &UnsafeState,
+        pattern: &TypedResourcePattern,
+        resolution: &ResolvedExprEnv,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        let view = self.unsafe_state_view(state);
+        let mut used = BTreeSet::new();
+        self.match_resource_pattern(state, &view, pattern, resolution, span, &mut used)?;
+        Ok(())
+    }
+
+    fn match_resource_pattern(
+        &self,
+        state: &UnsafeState,
+        view: &State,
+        pattern: &TypedResourcePattern,
+        resolution: &ResolvedExprEnv,
+        span: Span,
+        used: &mut BTreeSet<usize>,
+    ) -> Result<(), VerificationResult> {
+        match pattern {
+            TypedResourcePattern::Star(lhs, rhs) => {
+                self.match_resource_pattern(state, view, lhs, resolution, span, used)?;
+                self.match_resource_pattern(state, view, rhs, resolution, span, used)
+            }
+            TypedResourcePattern::PointsTo { addr, ty, value } => {
+                let addr_value = self.spec_expr_to_value(view, addr, resolution)?;
+                let ty_value = self.spec_expr_to_value(view, ty, resolution)?;
+                let expected_value = self.spec_expr_to_value(view, value, resolution)?;
+                let Some(value_inner_ty) = option_inner_spec_ty(&value.ty) else {
+                    return Err(self.unsupported_result(
+                        span,
+                        "PointsTo value pattern must have type Option<T>".to_owned(),
+                    ));
+                };
+                let index =
+                    self.unique_matching_resource_index(
+                        state,
+                        used,
+                        span,
+                        |resource| match resource {
+                            Resource::PointsTo {
+                                addr: resource_addr,
+                                ty: resource_ty,
+                                value: resource_value,
+                            } => {
+                                let actual_value = self.resource_option_value(
+                                    resource_value.as_ref(),
+                                    value_inner_ty.clone(),
+                                )?;
+                                Ok(Some(bool_and(vec![
+                                    self.eq_for_spec_ty(
+                                        &SpecTy::Usize,
+                                        &addr_value,
+                                        resource_addr,
+                                        span,
+                                    )?,
+                                    self.eq_for_spec_ty(
+                                        &SpecTy::RustTy,
+                                        &ty_value,
+                                        resource_ty,
+                                        span,
+                                    )?,
+                                    self.eq_for_spec_ty(
+                                        &value.ty,
+                                        &expected_value,
+                                        &actual_value,
+                                        span,
+                                    )?,
+                                ])))
+                            }
+                            Resource::Alloc { .. } => Ok(None),
+                        },
+                    )?;
+                used.insert(index);
+                Ok(())
+            }
+            TypedResourcePattern::Alloc {
+                base,
+                size,
+                alignment,
+            } => {
+                let base = self.spec_expr_to_value(view, base, resolution)?;
+                let size = self.spec_expr_to_value(view, size, resolution)?;
+                let alignment = self.spec_expr_to_value(view, alignment, resolution)?;
+                let index =
+                    self.unique_matching_resource_index(
+                        state,
+                        used,
+                        span,
+                        |resource| match resource {
+                            Resource::Alloc {
+                                base: resource_base,
+                                size: resource_size,
+                                alignment: resource_alignment,
+                            } => Ok(Some(bool_and(vec![
+                                self.eq_for_spec_ty(&SpecTy::Usize, &base, resource_base, span)?,
+                                self.value_int_data(&size).eq(Int::from_u64(*resource_size)),
+                                self.value_int_data(&alignment)
+                                    .eq(Int::from_u64(*resource_alignment)),
+                            ]))),
+                            Resource::PointsTo { .. } => Ok(None),
+                        },
+                    )?;
+                used.insert(index);
+                Ok(())
+            }
+        }
+    }
+
+    fn resource_option_value(
+        &self,
+        value: Option<&SymValue>,
+        inner_ty: SpecTy,
+    ) -> Result<SymValue, VerificationResult> {
+        match value {
+            Some(value) => self.construct_option_some(inner_ty, value.clone()),
+            None => self.construct_option_none(inner_ty),
+        }
+    }
+
+    fn unique_matching_resource_index(
+        &self,
+        state: &UnsafeState,
+        used: &BTreeSet<usize>,
+        span: Span,
+        mut condition_for: impl FnMut(&Resource) -> Result<Option<Bool>, VerificationResult>,
+    ) -> Result<usize, VerificationResult> {
+        let mut possible = 0;
+        let mut definite = Vec::new();
+        for (index, resource) in state.heap.iter().enumerate() {
+            if used.contains(&index) {
+                continue;
+            }
+            let Some(condition) = condition_for(resource)? else {
+                continue;
+            };
+            let condition = condition.simplify();
+            if matches!(condition.as_bool(), Some(false)) {
+                continue;
+            }
+            match self.check_sat(&[state.pc.clone(), condition.not()]) {
+                SatResult::Unsat => definite.push(index),
+                SatResult::Sat | SatResult::Unknown => {
+                    match self.check_sat(&[state.pc.clone(), condition]) {
+                        SatResult::Unsat => continue,
+                        SatResult::Sat | SatResult::Unknown => possible += 1,
+                    }
+                }
+            }
+        }
+        if definite.len() == 1 {
+            return Ok(definite[0]);
+        }
+        if definite.len() > 1 || possible > 0 {
+            return Err(self.unsupported_result(
+                span,
+                "ambiguous resource assertion matching is unsupported".to_owned(),
+            ));
+        }
+        Err(self.fail_result(span, "resource assertion failed".to_owned()))
     }
 
     fn write_matching_points_to(
@@ -6257,6 +6440,9 @@ fn collect_directive_prepass_pure_fn_refs(
                 ControlPointDirective::Assume(assumption) => {
                     collect_typed_expr_pure_fn_refs(&assumption.assumption, out);
                 }
+                ControlPointDirective::ResourceAssert(resource_assertion) => {
+                    collect_typed_resource_pattern_pure_fn_refs(&resource_assertion.pattern, out);
+                }
                 ControlPointDirective::LemmaCall(call) => {
                     for arg in &call.args {
                         collect_typed_expr_pure_fn_refs(arg, out);
@@ -6276,6 +6462,32 @@ fn collect_directive_prepass_pure_fn_refs(
         };
         collect_normalized_predicate_pure_fn_refs(&lemma.req, out);
         collect_typed_expr_pure_fn_refs(&lemma.ens, out);
+    }
+}
+
+fn collect_typed_resource_pattern_pure_fn_refs(
+    pattern: &TypedResourcePattern,
+    out: &mut BTreeSet<String>,
+) {
+    match pattern {
+        TypedResourcePattern::Star(lhs, rhs) => {
+            collect_typed_resource_pattern_pure_fn_refs(lhs, out);
+            collect_typed_resource_pattern_pure_fn_refs(rhs, out);
+        }
+        TypedResourcePattern::PointsTo { addr, ty, value } => {
+            collect_typed_expr_pure_fn_refs(addr, out);
+            collect_typed_expr_pure_fn_refs(ty, out);
+            collect_typed_expr_pure_fn_refs(value, out);
+        }
+        TypedResourcePattern::Alloc {
+            base,
+            size,
+            alignment,
+        } => {
+            collect_typed_expr_pure_fn_refs(base, out);
+            collect_typed_expr_pure_fn_refs(size, out);
+            collect_typed_expr_pure_fn_refs(alignment, out);
+        }
     }
 }
 
@@ -6427,6 +6639,13 @@ fn spec_ty_contains_mut_ref(ty: &SpecTy) -> bool {
             .iter()
             .any(|field| spec_ty_contains_mut_ref(&field.ty)),
         _ => false,
+    }
+}
+
+fn option_inner_spec_ty(ty: &SpecTy) -> Option<SpecTy> {
+    match ty {
+        SpecTy::Enum { name, args } if name == "Option" && args.len() == 1 => Some(args[0].clone()),
+        _ => None,
     }
 }
 

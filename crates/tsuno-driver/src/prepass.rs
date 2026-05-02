@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::ControlFlow;
 
 use crate::directive::{
-    CollectedFunctionDirectives, DirectiveAttach, DirectiveError, DirectiveKind,
+    CollectedFunctionDirectives, DirectiveAttach, DirectiveError, DirectiveKind, ResourcePattern,
     collect_function_directives,
 };
 use crate::report::{VerificationResult, VerificationStatus};
@@ -90,10 +90,33 @@ pub struct LemmaCallContract {
 }
 
 #[derive(Debug, Clone)]
+pub struct ResourceAssertionContract {
+    pub pattern: TypedResourcePattern,
+    pub resolution: ResolvedExprEnv,
+    pub assertion_span: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum TypedResourcePattern {
+    Star(Box<TypedResourcePattern>, Box<TypedResourcePattern>),
+    PointsTo {
+        addr: TypedExpr,
+        ty: TypedExpr,
+        value: TypedExpr,
+    },
+    Alloc {
+        base: TypedExpr,
+        size: TypedExpr,
+        alignment: TypedExpr,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub enum ControlPointDirective {
     Let(LetBindingContract),
     Assert(AssertionContract),
     Assume(AssumptionContract),
+    ResourceAssert(Box<ResourceAssertionContract>),
     LemmaCall(LemmaCallContract),
 }
 
@@ -4020,6 +4043,7 @@ fn compute_directives<'tcx>(
             DirectiveKind::Let
                 | DirectiveKind::Assert
                 | DirectiveKind::Assume
+                | DirectiveKind::ResourceAssert
                 | DirectiveKind::Inv
                 | DirectiveKind::LemmaCall
         )
@@ -4064,6 +4088,18 @@ fn compute_directives<'tcx>(
                 )?;
                 resolution
             }
+            DirectiveKind::ResourceAssert => resolve_resource_pattern_env(
+                directive
+                    .resource_pattern()
+                    .expect("resource assertion payload"),
+                pure_fns,
+                enum_defs,
+                &binding_info,
+                &hir_locals,
+                directive.span,
+                directive_anchor_span(&directive.attach),
+                &mut body_scope,
+            )?,
             _ => resolve_expr_env(
                 directive.expr(),
                 pure_fns,
@@ -4149,6 +4185,7 @@ fn compute_directives<'tcx>(
             DirectiveKind::Let
                 | DirectiveKind::Assert
                 | DirectiveKind::Assume
+                | DirectiveKind::ResourceAssert
                 | DirectiveKind::Inv
                 | DirectiveKind::LemmaCall
         )
@@ -4216,6 +4253,23 @@ fn compute_directives<'tcx>(
                         display_span: Some(directive.span_text.clone()),
                         message,
                     }
+                })?;
+            }
+            DirectiveKind::ResourceAssert => {
+                infer_resource_pattern_types(
+                    directive
+                        .resource_pattern()
+                        .expect("resource assertion payload"),
+                    pure_fns,
+                    enum_defs,
+                    &mut body_infer_scope,
+                    &local_tys,
+                    &mut inferred,
+                )
+                .map_err(|message| LoopPrepassError {
+                    span: directive.span,
+                    display_span: Some(directive.span_text.clone()),
+                    message,
                 })?;
             }
             _ => {
@@ -4319,6 +4373,7 @@ fn compute_directives<'tcx>(
     let mut typed_body_assertions = HashMap::new();
     let mut typed_body_exprs = HashMap::new();
     let mut typed_body_lets = HashMap::new();
+    let mut typed_body_resource_assertions = HashMap::new();
     let mut body_type_scope = if req_directive.is_some() || !contract_lets.is_empty() {
         let mut scope = contract_type_scope.clone();
         if let Some(directive) = req_directive {
@@ -4348,6 +4403,7 @@ fn compute_directives<'tcx>(
             DirectiveKind::Let
                 | DirectiveKind::Assert
                 | DirectiveKind::Assume
+                | DirectiveKind::ResourceAssert
                 | DirectiveKind::Inv
                 | DirectiveKind::LemmaCall
         )
@@ -4419,6 +4475,24 @@ fn compute_directives<'tcx>(
                     },
                 );
             }
+            DirectiveKind::ResourceAssert => {
+                let typed = typed_resource_pattern(
+                    directive
+                        .resource_pattern()
+                        .expect("resource assertion payload"),
+                    pure_fns,
+                    enum_defs,
+                    &mut body_type_scope,
+                    &local_tys,
+                    &mut inferred,
+                )
+                .map_err(|message| LoopPrepassError {
+                    span: directive.span,
+                    display_span: Some(directive.span_text.clone()),
+                    message,
+                })?;
+                typed_body_resource_assertions.insert(directive.span_text.clone(), typed);
+            }
             _ => {
                 let typed = typed_body_expr(
                     directive.expr(),
@@ -4461,6 +4535,7 @@ fn compute_directives<'tcx>(
                         DirectiveKind::Req
                         | DirectiveKind::Ens
                         | DirectiveKind::Let
+                        | DirectiveKind::ResourceAssert
                         | DirectiveKind::LemmaCall => {
                             unreachable!("filtered above")
                         }
@@ -4633,6 +4708,37 @@ fn compute_directives<'tcx>(
                         resolution,
                     }));
             }
+            DirectiveKind::ResourceAssert => {
+                let control = control_point_after(body, directive_anchor_span(&directive.attach))
+                    .ok_or_else(|| LoopPrepassError {
+                    span: directive.span,
+                    display_span: Some(directive.span_text.clone()),
+                    message: format!(
+                        "unable to map //@ resource assert at {} to MIR",
+                        tcx.sess
+                            .source_map()
+                            .span_to_diagnostic_string(directive.span)
+                    ),
+                })?;
+                let resolution = resolved_exprs
+                    .get(&directive.span_text)
+                    .cloned()
+                    .expect("resolved resource assertion expression");
+                control_point_directives
+                    .by_control_point
+                    .entry(control)
+                    .or_default()
+                    .push(ControlPointDirective::ResourceAssert(Box::new(
+                        ResourceAssertionContract {
+                            pattern: typed_body_resource_assertions
+                                .get(&directive.span_text)
+                                .cloned()
+                                .expect("typed resource assertion expression"),
+                            resolution,
+                            assertion_span: directive.span_text.clone(),
+                        },
+                    )));
+            }
             DirectiveKind::Inv => {}
             DirectiveKind::LemmaCall => {
                 let control = control_point_after(body, directive_anchor_span(&directive.attach))
@@ -4679,6 +4785,253 @@ fn collect_unsafe_block_spans<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Ve
     collector.spans
 }
 
+#[allow(clippy::too_many_arguments)]
+fn resolve_resource_pattern_env(
+    pattern: &ResourcePattern,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    binding_info: &HirBindingInfo,
+    hir_locals: &HashMap<HirId, Local>,
+    span: Span,
+    anchor_span: Span,
+    spec_scope: &mut SpecScope,
+) -> Result<ResolvedExprEnv, LoopPrepassError> {
+    let mut resolved = ResolvedExprEnv::default();
+    resolve_resource_pattern_env_into(
+        pattern,
+        pure_fns,
+        enum_defs,
+        binding_info,
+        hir_locals,
+        span,
+        anchor_span,
+        spec_scope,
+        &mut resolved,
+    )?;
+    Ok(resolved)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_resource_pattern_env_into(
+    pattern: &ResourcePattern,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    binding_info: &HirBindingInfo,
+    hir_locals: &HashMap<HirId, Local>,
+    span: Span,
+    anchor_span: Span,
+    spec_scope: &mut SpecScope,
+    resolved: &mut ResolvedExprEnv,
+) -> Result<(), LoopPrepassError> {
+    match pattern {
+        ResourcePattern::Star(lhs, rhs) => {
+            resolve_resource_pattern_env_into(
+                lhs,
+                pure_fns,
+                enum_defs,
+                binding_info,
+                hir_locals,
+                span,
+                anchor_span,
+                spec_scope,
+                resolved,
+            )?;
+            resolve_resource_pattern_env_into(
+                rhs,
+                pure_fns,
+                enum_defs,
+                binding_info,
+                hir_locals,
+                span,
+                anchor_span,
+                spec_scope,
+                resolved,
+            )
+        }
+        ResourcePattern::PointsTo { addr, ty, value } => {
+            for expr in [addr, ty, value] {
+                let expr_resolved = resolve_expr_env(
+                    expr,
+                    pure_fns,
+                    enum_defs,
+                    binding_info,
+                    hir_locals,
+                    span,
+                    anchor_span,
+                    DirectiveKind::ResourceAssert,
+                    spec_scope,
+                )?;
+                resolved.locals.extend(expr_resolved.locals);
+            }
+            Ok(())
+        }
+        ResourcePattern::Alloc {
+            base,
+            size,
+            alignment,
+        } => {
+            for expr in [base, size, alignment] {
+                let expr_resolved = resolve_expr_env(
+                    expr,
+                    pure_fns,
+                    enum_defs,
+                    binding_info,
+                    hir_locals,
+                    span,
+                    anchor_span,
+                    DirectiveKind::ResourceAssert,
+                    spec_scope,
+                )?;
+                resolved.locals.extend(expr_resolved.locals);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn infer_resource_pattern_types(
+    pattern: &ResourcePattern,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    local_tys: &HashMap<String, SpecTy>,
+    inferred: &mut SpecTypeInference,
+) -> Result<(), String> {
+    match pattern {
+        ResourcePattern::Star(lhs, rhs) => {
+            infer_resource_pattern_types(
+                lhs, pure_fns, enum_defs, spec_scope, local_tys, inferred,
+            )?;
+            infer_resource_pattern_types(rhs, pure_fns, enum_defs, spec_scope, local_tys, inferred)
+        }
+        ResourcePattern::PointsTo { addr, ty, value } => {
+            for expr in [addr, ty, value] {
+                infer_body_expr_types(
+                    expr,
+                    pure_fns,
+                    enum_defs,
+                    DirectiveKind::ResourceAssert,
+                    spec_scope,
+                    local_tys,
+                    inferred,
+                )?;
+            }
+            Ok(())
+        }
+        ResourcePattern::Alloc {
+            base,
+            size,
+            alignment,
+        } => {
+            for expr in [base, size, alignment] {
+                infer_body_expr_types(
+                    expr,
+                    pure_fns,
+                    enum_defs,
+                    DirectiveKind::ResourceAssert,
+                    spec_scope,
+                    local_tys,
+                    inferred,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn typed_resource_pattern(
+    pattern: &ResourcePattern,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    local_tys: &HashMap<String, SpecTy>,
+    inferred: &mut SpecTypeInference,
+) -> Result<TypedResourcePattern, String> {
+    match pattern {
+        ResourcePattern::Star(lhs, rhs) => Ok(TypedResourcePattern::Star(
+            Box::new(typed_resource_pattern(
+                lhs, pure_fns, enum_defs, spec_scope, local_tys, inferred,
+            )?),
+            Box::new(typed_resource_pattern(
+                rhs, pure_fns, enum_defs, spec_scope, local_tys, inferred,
+            )?),
+        )),
+        ResourcePattern::PointsTo { addr, ty, value } => {
+            let addr =
+                typed_resource_expr(addr, pure_fns, enum_defs, spec_scope, local_tys, inferred)?;
+            ensure_resource_expr_ty(&addr, &SpecTy::Usize, "PointsTo address")?;
+            let ty = typed_resource_expr(ty, pure_fns, enum_defs, spec_scope, local_tys, inferred)?;
+            ensure_resource_expr_ty(&ty, &SpecTy::RustTy, "PointsTo type")?;
+            let value =
+                typed_resource_expr(value, pure_fns, enum_defs, spec_scope, local_tys, inferred)?;
+            ensure_option_resource_value(&value)?;
+            Ok(TypedResourcePattern::PointsTo { addr, ty, value })
+        }
+        ResourcePattern::Alloc {
+            base,
+            size,
+            alignment,
+        } => {
+            let base =
+                typed_resource_expr(base, pure_fns, enum_defs, spec_scope, local_tys, inferred)?;
+            ensure_resource_expr_ty(&base, &SpecTy::Usize, "Alloc base")?;
+            let size =
+                typed_resource_expr(size, pure_fns, enum_defs, spec_scope, local_tys, inferred)?;
+            ensure_resource_expr_ty(&size, &SpecTy::Usize, "Alloc size")?;
+            let alignment = typed_resource_expr(
+                alignment, pure_fns, enum_defs, spec_scope, local_tys, inferred,
+            )?;
+            ensure_resource_expr_ty(&alignment, &SpecTy::Usize, "Alloc alignment")?;
+            Ok(TypedResourcePattern::Alloc {
+                base,
+                size,
+                alignment,
+            })
+        }
+    }
+}
+
+fn typed_resource_expr(
+    expr: &Expr,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    local_tys: &HashMap<String, SpecTy>,
+    inferred: &mut SpecTypeInference,
+) -> Result<TypedExpr, String> {
+    typed_body_expr(
+        expr,
+        pure_fns,
+        enum_defs,
+        DirectiveKind::ResourceAssert,
+        spec_scope,
+        local_tys,
+        inferred,
+    )
+}
+
+fn ensure_resource_expr_ty(expr: &TypedExpr, expected: &SpecTy, label: &str) -> Result<(), String> {
+    if &expr.ty == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} must have type {}, got {}",
+            display_spec_ty(expected),
+            display_spec_ty(&expr.ty)
+        ))
+    }
+}
+
+fn ensure_option_resource_value(expr: &TypedExpr) -> Result<(), String> {
+    match &expr.ty {
+        SpecTy::Enum { name, args } if name == "Option" && args.len() == 1 => Ok(()),
+        ty => Err(format!(
+            "PointsTo value pattern must have type Option<T>, got {}",
+            display_spec_ty(ty)
+        )),
+    }
+}
+
 struct UnsafeBlockCollector {
     spans: Vec<Span>,
 }
@@ -4709,6 +5062,7 @@ fn reject_directives_inside_unsafe_blocks(
                 | DirectiveKind::Let
                 | DirectiveKind::Assert
                 | DirectiveKind::Assume
+                | DirectiveKind::ResourceAssert
                 | DirectiveKind::LemmaCall
         ) {
             continue;
