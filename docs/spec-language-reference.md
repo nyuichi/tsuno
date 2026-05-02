@@ -513,15 +513,22 @@ also support resource assertions:
 ```rust
 //@ resource assert PointsTo({p}.addr, {type i32}, Option::Some(42i32)) * Alloc({p}.addr, 4usize, 4usize);
 //@ resource assert PointsTo({p}.addr, {type i32}, Option::Some(?v)) where v > 0i32;
+//@ resource assert *p |-> Option::Some(?v) where v > 0i32;
 ```
 
 A resource assertion checks a `ResourcePattern`. The initial resource patterns
 are `PointsTo(addr_expr, rust_ty_expr, option_value_expr)`,
+the shorthand `*ptr |-> option_value_pattern`,
 `Alloc(base_expr, size_expr, alignment_expr)`, and separating conjunction
-`left * right`; parentheses may be used freely to group resource patterns. The
-value expression for a `PointsTo` pattern is an ordinary spec expression whose
-type is `Option<T>`, so option constructors are written as prelude enum
-constructors such as `Option::Some(v)` and `Option::None`.
+`left * right`; parentheses may be used freely to group resource patterns.
+`*ptr |-> value` is accepted only when `ptr` is a Rust local whose type is a raw
+pointer `*const T` or `*mut T`; it is desugared before unsafe execution to
+`PointsTo({ptr}.addr, {type T}, value)`, so the unsafe engine only sees
+`PointsTo`. If the pointer type cannot be inferred, the directive is rejected
+before unsafe execution. The value expression for a `PointsTo` pattern is an
+ordinary spec expression whose type is `Option<T>`, so option constructors are
+written as prelude enum constructors such as `Option::Some(v)` and
+`Option::None`.
 
 The third argument of `PointsTo` is a value pattern. A pattern variable is
 written `?name`; in `PointsTo(a, {type T}, ?v)`, `v` has type `Option<T>`, while

@@ -44,7 +44,8 @@ use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
     FunctionContract, LemmaCallContract, LoopContract, LoopContracts, NormalizedBinding,
     NormalizedPredicate, ProgramPrepass, ResolvedExprEnv, TypedGhostMatchArm, TypedGhostStmt,
-    TypedLemmaDef, TypedPureFnDef, TypedResourcePattern, TypedValuePattern, spec_ty_for_rust_ty,
+    TypedLemmaDef, TypedPureFnDef, TypedResourcePattern, TypedValuePattern,
+    rust_ty_key_text_for_rust_ty as checked_rust_ty_key_text_for_rust_ty, spec_ty_for_rust_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
@@ -5470,63 +5471,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn rust_ty_key_text_for_rust_ty(&self, ty: Ty<'tcx>) -> String {
-        match ty.kind() {
-            TyKind::Bool => "bool".to_owned(),
-            TyKind::Int(kind) => match kind {
-                ty::IntTy::I8 => "i8".to_owned(),
-                ty::IntTy::I16 => "i16".to_owned(),
-                ty::IntTy::I32 => "i32".to_owned(),
-                ty::IntTy::I64 => "i64".to_owned(),
-                ty::IntTy::I128 => "i128".to_owned(),
-                ty::IntTy::Isize => "isize".to_owned(),
-            },
-            TyKind::Uint(kind) => match kind {
-                ty::UintTy::U8 => "u8".to_owned(),
-                ty::UintTy::U16 => "u16".to_owned(),
-                ty::UintTy::U32 => "u32".to_owned(),
-                ty::UintTy::U64 => "u64".to_owned(),
-                ty::UintTy::U128 => "u128".to_owned(),
-                ty::UintTy::Usize => "usize".to_owned(),
-            },
-            TyKind::RawPtr(pointee, mutability) => {
-                let kind = if mutability.is_mut() { "mut" } else { "const" };
-                format!("*{kind} {}", self.rust_ty_key_text_for_rust_ty(*pointee))
-            }
-            TyKind::Ref(_, inner, mutability) => {
-                let inner = self.rust_ty_key_text_for_rust_ty(*inner);
-                if mutability.is_mut() {
-                    format!("&mut {inner}")
-                } else {
-                    format!("&{inner}")
-                }
-            }
-            TyKind::Tuple(fields) => {
-                let fields = fields
-                    .iter()
-                    .map(|field| self.rust_ty_key_text_for_rust_ty(field))
-                    .collect::<Vec<_>>();
-                match fields.as_slice() {
-                    [] => "()".to_owned(),
-                    [field] => format!("({field},)"),
-                    _ => format!("({})", fields.join(", ")),
-                }
-            }
-            TyKind::Adt(adt_def, args) => {
-                let mut text = self.tcx.def_path_str(adt_def.did());
-                let type_args = args
-                    .types()
-                    .map(|arg| self.rust_ty_key_text_for_rust_ty(arg))
-                    .collect::<Vec<_>>();
-                if !type_args.is_empty() {
-                    text.push('<');
-                    text.push_str(&type_args.join(", "));
-                    text.push('>');
-                }
-                text
-            }
-            TyKind::Param(param) => param.name.to_string(),
-            _ => format!("{ty:?}"),
-        }
+        checked_rust_ty_key_text_for_rust_ty(self.tcx, ty).unwrap_or_else(|_| format!("{ty:?}"))
     }
 
     fn fresh_for_spec_ty(&self, ty: &SpecTy, hint: &str) -> Result<SymValue, VerificationResult> {

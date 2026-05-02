@@ -108,6 +108,10 @@ pub enum ResourcePattern {
         ty: spec::Expr,
         value: ValuePattern,
     },
+    PointsToSugar {
+        pointer: String,
+        value: ValuePattern,
+    },
     Alloc {
         base: spec::Expr,
         size: spec::Expr,
@@ -271,6 +275,9 @@ fn parse_resource_pattern(text: &str, span: Span) -> Result<ResourcePattern, Dir
         let rhs = parse_resource_pattern(&text[index + 1..], span)?;
         return Ok(ResourcePattern::Star(Box::new(lhs), Box::new(rhs)));
     }
+    if let Some(index) = top_level_points_to_arrow(text) {
+        return parse_points_to_sugar(&text[..index], &text[index + "|->".len()..], span);
+    }
     if let Some(args) = atom_args(text, "PointsTo") {
         let args = split_top_level_args(args, span)?;
         if args.len() != 3 {
@@ -302,6 +309,30 @@ fn parse_resource_pattern(text: &str, span: Span) -> Result<ResourcePattern, Dir
     Err(DirectiveError {
         span,
         message: "resource assertion must be a `PointsTo`, `Alloc`, or `*` pattern".to_owned(),
+    })
+}
+
+fn parse_points_to_sugar(
+    lhs: &str,
+    rhs: &str,
+    span: Span,
+) -> Result<ResourcePattern, DirectiveError> {
+    let lhs = strip_enclosing_parens(lhs.trim());
+    let Some(pointer) = lhs.strip_prefix('*').map(str::trim) else {
+        return Err(DirectiveError {
+            span,
+            message: "`|->` resource pattern must have the form `*ptr |-> value`".to_owned(),
+        });
+    };
+    if !is_ident(pointer) {
+        return Err(DirectiveError {
+            span,
+            message: "`|->` resource pattern pointer must be a Rust local name".to_owned(),
+        });
+    }
+    Ok(ResourcePattern::PointsToSugar {
+        pointer: pointer.to_owned(),
+        value: parse_value_pattern(rhs, span)?,
     })
 }
 
@@ -537,9 +568,25 @@ fn top_level_star(text: &str) -> Option<usize> {
         match ch {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            '*' if depth == 0 => return Some(index),
+            '*' if depth == 0 && index != 0 => return Some(index),
             _ => {}
         }
+    }
+    None
+}
+
+fn top_level_points_to_arrow(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < text.len() {
+        let ch = text[index..].chars().next().expect("valid char boundary");
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '|' if depth == 0 && text[index..].starts_with("|->") => return Some(index),
+            _ => {}
+        }
+        index += ch.len_utf8();
     }
     None
 }

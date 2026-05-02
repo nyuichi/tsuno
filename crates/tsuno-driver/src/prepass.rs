@@ -134,6 +134,15 @@ pub enum TypedValuePattern {
     },
 }
 
+struct ResourceTypingCtx<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    body: &'a Body<'tcx>,
+    resolution: &'a ResolvedExprEnv,
+    pure_fns: &'a HashMap<String, PureFnDef>,
+    enum_defs: &'a HashMap<String, EnumDef>,
+    local_tys: &'a HashMap<String, SpecTy>,
+}
+
 #[derive(Debug, Clone)]
 pub enum ControlPointDirective {
     Let(LetBindingContract),
@@ -4499,15 +4508,24 @@ fn compute_directives<'tcx>(
                 );
             }
             DirectiveKind::ResourceAssert => {
+                let resolution = resolved_exprs
+                    .get(&directive.span_text)
+                    .expect("resolved resource assertion expression");
                 let assertion = directive
                     .resource_assertion()
                     .expect("resource assertion payload");
-                let typed = typed_resource_pattern(
-                    assertion,
+                let resource_ctx = ResourceTypingCtx {
+                    tcx,
+                    body,
+                    resolution,
                     pure_fns,
                     enum_defs,
+                    local_tys: &local_tys,
+                };
+                let typed = typed_resource_pattern(
+                    assertion,
+                    &resource_ctx,
                     &mut body_type_scope,
-                    &local_tys,
                     &mut inferred,
                 )
                 .map_err(|message| LoopPrepassError {
@@ -4934,6 +4952,36 @@ fn resolve_resource_pattern_env_into(
             )?;
             Ok(())
         }
+        ResourcePattern::PointsToSugar { pointer, value } => {
+            let symbol = Symbol::intern(pointer);
+            let Some(hir_id) = resolve_binding_hir_id(binding_info, symbol, anchor_span) else {
+                return Err(LoopPrepassError {
+                    span,
+                    display_span: None,
+                    message: format!("unresolved pointer `{pointer}` in //@ resource assert"),
+                });
+            };
+            let Some(local) = hir_locals.get(&hir_id).copied() else {
+                return Err(LoopPrepassError {
+                    span,
+                    display_span: None,
+                    message: format!("missing MIR local for pointer `{pointer}`"),
+                });
+            };
+            resolved.locals.insert(pointer.clone(), local);
+            resolve_value_pattern_env(
+                value,
+                pure_fns,
+                enum_defs,
+                binding_info,
+                hir_locals,
+                span,
+                anchor_span,
+                spec_scope,
+                resolved,
+            )?;
+            Ok(())
+        }
         ResourcePattern::Alloc {
             base,
             size,
@@ -5121,6 +5169,24 @@ fn infer_resource_pattern_types_into(
             }
             Ok(())
         }
+        ResourcePattern::PointsToSugar { value, .. } => {
+            if value_pattern_contains_bind(value) {
+                bind_value_pattern_vars(value, spec_scope, inferred)?;
+                return Ok(());
+            }
+            if let ValuePattern::Expr(expr) = value {
+                infer_body_expr_types(
+                    expr,
+                    pure_fns,
+                    enum_defs,
+                    DirectiveKind::ResourceAssert,
+                    spec_scope,
+                    local_tys,
+                    inferred,
+                )?;
+            }
+            Ok(())
+        }
         ResourcePattern::Alloc {
             base,
             size,
@@ -5144,53 +5210,126 @@ fn infer_resource_pattern_types_into(
 
 fn typed_resource_pattern(
     assertion: &ResourceAssertion,
-    pure_fns: &HashMap<String, PureFnDef>,
-    enum_defs: &HashMap<String, EnumDef>,
+    ctx: &ResourceTypingCtx<'_, '_>,
     spec_scope: &mut SpecScope,
-    local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
 ) -> Result<TypedResourcePattern, String> {
-    typed_resource_pattern_into(
-        &assertion.pattern,
-        pure_fns,
-        enum_defs,
-        spec_scope,
-        local_tys,
-        inferred,
-    )
+    typed_resource_pattern_into(&assertion.pattern, ctx, spec_scope, inferred)
 }
 
 fn typed_resource_pattern_into(
     pattern: &ResourcePattern,
-    pure_fns: &HashMap<String, PureFnDef>,
-    enum_defs: &HashMap<String, EnumDef>,
+    ctx: &ResourceTypingCtx<'_, '_>,
     spec_scope: &mut SpecScope,
-    local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
 ) -> Result<TypedResourcePattern, String> {
     match pattern {
         ResourcePattern::Star(lhs, rhs) => Ok(TypedResourcePattern::Star(
-            Box::new(typed_resource_pattern_into(
-                lhs, pure_fns, enum_defs, spec_scope, local_tys, inferred,
-            )?),
-            Box::new(typed_resource_pattern_into(
-                rhs, pure_fns, enum_defs, spec_scope, local_tys, inferred,
-            )?),
+            Box::new(typed_resource_pattern_into(lhs, ctx, spec_scope, inferred)?),
+            Box::new(typed_resource_pattern_into(rhs, ctx, spec_scope, inferred)?),
         )),
         ResourcePattern::PointsTo { addr, ty, value } => {
-            let addr =
-                typed_resource_expr(addr, pure_fns, enum_defs, spec_scope, local_tys, inferred)?;
+            let addr = typed_resource_expr(
+                addr,
+                ctx.pure_fns,
+                ctx.enum_defs,
+                spec_scope,
+                ctx.local_tys,
+                inferred,
+            )?;
             ensure_resource_expr_ty(&addr, &SpecTy::Usize, "PointsTo address")?;
-            let ty = typed_resource_expr(ty, pure_fns, enum_defs, spec_scope, local_tys, inferred)?;
+            let ty = typed_resource_expr(
+                ty,
+                ctx.pure_fns,
+                ctx.enum_defs,
+                spec_scope,
+                ctx.local_tys,
+                inferred,
+            )?;
             ensure_resource_expr_ty(&ty, &SpecTy::RustTy, "PointsTo type")?;
             let value = if value_pattern_contains_bind(value) {
                 let expected = option_spec_ty_for_rust_ty_expr(&ty)?;
                 typed_value_pattern(
-                    value, &expected, pure_fns, enum_defs, spec_scope, local_tys, inferred,
+                    value,
+                    &expected,
+                    ctx.pure_fns,
+                    ctx.enum_defs,
+                    spec_scope,
+                    ctx.local_tys,
+                    inferred,
                 )?
             } else if let ValuePattern::Expr(expr) = value {
                 let typed = typed_resource_expr(
-                    expr, pure_fns, enum_defs, spec_scope, local_tys, inferred,
+                    expr,
+                    ctx.pure_fns,
+                    ctx.enum_defs,
+                    spec_scope,
+                    ctx.local_tys,
+                    inferred,
+                )?;
+                ensure_option_resource_value(&typed)?;
+                TypedValuePattern::Expr(typed)
+            } else {
+                unreachable!("pattern without binders must be an expression")
+            };
+            Ok(TypedResourcePattern::PointsTo { addr, ty, value })
+        }
+        ResourcePattern::PointsToSugar { pointer, value } => {
+            let local =
+                *ctx.resolution.locals.get(pointer).ok_or_else(|| {
+                    format!("unresolved pointer `{pointer}` in //@ resource assert")
+                })?;
+            let pointer_ty = ctx.body.local_decls[local].ty;
+            let pointee_ty = match pointer_ty.kind() {
+                TyKind::RawPtr(pointee, _) => *pointee,
+                _ => {
+                    return Err(format!(
+                        "`|->` resource pattern requires a raw pointer, found `{}`",
+                        display_spec_ty(&spec_ty_for_rust_ty(ctx.tcx, pointer_ty)?)
+                    ));
+                }
+            };
+            let ptr_ty = ptr_spec_ty();
+            let addr = TypedExpr {
+                ty: SpecTy::Usize,
+                kind: TypedExprKind::Field {
+                    base: Box::new(TypedExpr {
+                        ty: ptr_ty,
+                        kind: TypedExprKind::RustVar(pointer.clone()),
+                    }),
+                    name: "addr".to_owned(),
+                    index: 0,
+                },
+            };
+            let ty = TypedExpr {
+                ty: SpecTy::RustTy,
+                kind: TypedExprKind::RustType(RustTyKey::new(rust_ty_key_text_for_rust_ty(
+                    ctx.tcx, pointee_ty,
+                )?)),
+            };
+            let expected = option_spec_ty(spec_ty_for_rust_ty(ctx.tcx, pointee_ty)?);
+            let value = if value_pattern_contains_bind(value) {
+                typed_value_pattern(
+                    value,
+                    &expected,
+                    ctx.pure_fns,
+                    ctx.enum_defs,
+                    spec_scope,
+                    ctx.local_tys,
+                    inferred,
+                )?
+            } else if let ValuePattern::Expr(expr) = value {
+                let typed = typed_body_expr_with_expected(
+                    expr,
+                    ctx.pure_fns,
+                    ctx.enum_defs,
+                    &HashSet::new(),
+                    DirectiveKind::ResourceAssert,
+                    spec_scope,
+                    ctx.local_tys,
+                    inferred,
+                    false,
+                    Some(&expected),
                 )?;
                 ensure_option_resource_value(&typed)?;
                 TypedValuePattern::Expr(typed)
@@ -5204,14 +5343,31 @@ fn typed_resource_pattern_into(
             size,
             alignment,
         } => {
-            let base =
-                typed_resource_expr(base, pure_fns, enum_defs, spec_scope, local_tys, inferred)?;
+            let base = typed_resource_expr(
+                base,
+                ctx.pure_fns,
+                ctx.enum_defs,
+                spec_scope,
+                ctx.local_tys,
+                inferred,
+            )?;
             ensure_resource_expr_ty(&base, &SpecTy::Usize, "Alloc base")?;
-            let size =
-                typed_resource_expr(size, pure_fns, enum_defs, spec_scope, local_tys, inferred)?;
+            let size = typed_resource_expr(
+                size,
+                ctx.pure_fns,
+                ctx.enum_defs,
+                spec_scope,
+                ctx.local_tys,
+                inferred,
+            )?;
             ensure_resource_expr_ty(&size, &SpecTy::Usize, "Alloc size")?;
             let alignment = typed_resource_expr(
-                alignment, pure_fns, enum_defs, spec_scope, local_tys, inferred,
+                alignment,
+                ctx.pure_fns,
+                ctx.enum_defs,
+                spec_scope,
+                ctx.local_tys,
+                inferred,
             )?;
             ensure_resource_expr_ty(&alignment, &SpecTy::Usize, "Alloc alignment")?;
             Ok(TypedResourcePattern::Alloc {
@@ -5351,6 +5507,33 @@ fn infer_value_pattern_types(
             Ok(())
         }
     }
+}
+
+fn bind_value_pattern_vars(
+    pattern: &ValuePattern,
+    spec_scope: &mut SpecScope,
+    inferred: &mut SpecTypeInference,
+) -> Result<(), String> {
+    match pattern {
+        ValuePattern::Bind(name) => {
+            spec_scope
+                .bind_let(name, DUMMY_SP, None, None)
+                .map_err(|err| err.message)?;
+            inferred.ensure_var(name);
+        }
+        ValuePattern::Expr(_) => {}
+        ValuePattern::SeqLit(items) | ValuePattern::Call { args: items, .. } => {
+            for item in items {
+                bind_value_pattern_vars(item, spec_scope, inferred)?;
+            }
+        }
+        ValuePattern::StructLit { fields, .. } => {
+            for field in fields {
+                bind_value_pattern_vars(&field.value, spec_scope, inferred)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn typed_value_pattern(
@@ -5546,6 +5729,70 @@ fn rust_ty_key_to_spec_ty(key: &str) -> Result<SpecTy, String> {
             "unsupported PointsTo Rust type expression `{other}` in resource pattern"
         )),
     }
+}
+
+pub fn rust_ty_key_text_for_rust_ty(tcx: TyCtxt<'_>, ty: Ty<'_>) -> Result<String, String> {
+    Ok(match ty.kind() {
+        TyKind::Bool => "bool".to_owned(),
+        TyKind::Int(kind) => match kind {
+            ty::IntTy::I8 => "i8".to_owned(),
+            ty::IntTy::I16 => "i16".to_owned(),
+            ty::IntTy::I32 => "i32".to_owned(),
+            ty::IntTy::I64 => "i64".to_owned(),
+            ty::IntTy::I128 => "i128".to_owned(),
+            ty::IntTy::Isize => "isize".to_owned(),
+        },
+        TyKind::Uint(kind) => match kind {
+            ty::UintTy::U8 => "u8".to_owned(),
+            ty::UintTy::U16 => "u16".to_owned(),
+            ty::UintTy::U32 => "u32".to_owned(),
+            ty::UintTy::U64 => "u64".to_owned(),
+            ty::UintTy::U128 => "u128".to_owned(),
+            ty::UintTy::Usize => "usize".to_owned(),
+        },
+        TyKind::RawPtr(pointee, mutability) => {
+            let kind = if mutability.is_mut() { "mut" } else { "const" };
+            format!("*{kind} {}", rust_ty_key_text_for_rust_ty(tcx, *pointee)?)
+        }
+        TyKind::Ref(_, inner, mutability) => {
+            let inner = rust_ty_key_text_for_rust_ty(tcx, *inner)?;
+            if mutability.is_mut() {
+                format!("&mut {inner}")
+            } else {
+                format!("&{inner}")
+            }
+        }
+        TyKind::Tuple(fields) => {
+            let fields = fields
+                .iter()
+                .map(|field| rust_ty_key_text_for_rust_ty(tcx, field))
+                .collect::<Result<Vec<_>, _>>()?;
+            match fields.as_slice() {
+                [] => "()".to_owned(),
+                [field] => format!("({field},)"),
+                _ => format!("({})", fields.join(", ")),
+            }
+        }
+        TyKind::Adt(adt_def, args) => {
+            let mut text = tcx.def_path_str(adt_def.did());
+            let type_args = args
+                .types()
+                .map(|arg| rust_ty_key_text_for_rust_ty(tcx, arg))
+                .collect::<Result<Vec<_>, _>>()?;
+            if !type_args.is_empty() {
+                text.push('<');
+                text.push_str(&type_args.join(", "));
+                text.push('>');
+            }
+            text
+        }
+        TyKind::Param(param) => param.name.to_string(),
+        other => {
+            return Err(format!(
+                "unsupported Rust type in resource pattern `{other:?}`"
+            ));
+        }
+    })
 }
 
 struct UnsafeBlockCollector {
