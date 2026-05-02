@@ -1575,7 +1575,9 @@ impl<'tcx> Verifier<'tcx> {
                     self.assume_checked_path_condition(&mut view, formula)
                 }
                 ControlPointDirective::LemmaCall(lemma_call) => {
-                    self.execute_lemma_call(&mut view, lemma_call, self.control_span(ctrl))?
+                    self.execute_unsafe_lemma_call(state, lemma_call, self.control_span(ctrl))?;
+                    view = self.unsafe_state_view(state);
+                    true
                 }
                 ControlPointDirective::ResourceAssert(resource_assertion) => {
                     self.assert_unsafe_resource_pattern(
@@ -3624,6 +3626,9 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn verify_lemma(&self, lemma: &TypedLemmaDef) -> Result<(), VerificationResult> {
+        if lemma.is_unsafe {
+            return self.verify_unsafe_lemma(lemma);
+        }
         let mut current = HashMap::new();
         for param in &lemma.params {
             let value =
@@ -3667,6 +3672,78 @@ impl<'tcx> Verifier<'tcx> {
                 format!("lemma `{}`", lemma.name),
                 format!("lemma `{}` postcondition failed", lemma.name),
             )?;
+        }
+        Ok(())
+    }
+
+    fn verify_unsafe_lemma(&self, lemma: &TypedLemmaDef) -> Result<(), VerificationResult> {
+        let mut current = HashMap::new();
+        for param in &lemma.params {
+            let value =
+                self.fresh_for_spec_ty(&param.ty, &format!("lemma_{}_{}", lemma.name, param.name))?;
+            current.insert(param.name.clone(), value);
+        }
+        let mut state = UnsafeState {
+            pc: Bool::from_bool(true),
+            store: BTreeMap::new(),
+            allocs: BTreeMap::new(),
+            env: HashMap::new(),
+            heap: Vec::new(),
+            ctrl: ControlPoint {
+                basic_block: BasicBlock::from_usize(0),
+                statement_index: 0,
+            },
+        };
+        let spec = self.assume_unsafe_contract_predicate(
+            &mut state,
+            &lemma.req,
+            &current,
+            &HashMap::new(),
+        )?;
+        let Some(mut spec) = spec else {
+            return Ok(());
+        };
+        state.env = spec.clone();
+        for param in &lemma.params {
+            let value = current.get(&param.name).expect("lemma parameter value");
+            if let Some(formula) = self.spec_ty_formula(&param.ty, value, self.report_span())?
+                && !self.assume_unsafe_path_condition(&mut state, formula)
+            {
+                return Ok(());
+            }
+        }
+        for resource_req in &lemma.resource_reqs {
+            self.assume_unsafe_resource_contract(
+                &mut state,
+                resource_req,
+                &current,
+                &mut spec,
+                self.report_span(),
+            )?;
+        }
+        state.env = spec;
+        let final_states = self.execute_unsafe_lemma_stmts(lemma, &current, state, &lemma.body)?;
+        for final_exec in final_states {
+            let mut final_state = final_exec.state;
+            let mut spec = final_state.env.clone();
+            let ens = self.contract_expr_to_bool(&final_exec.current, &spec, &lemma.ens)?;
+            self.unsafe_assert_constraint(
+                &mut final_state,
+                ens,
+                self.report_span(),
+                format!("lemma `{}` postcondition failed", lemma.name),
+            )?;
+            for resource_ens in &lemma.resource_ens {
+                let resource_spec = self.consume_unsafe_resource_contract(
+                    &mut final_state,
+                    resource_ens,
+                    &final_exec.current,
+                    &spec,
+                    self.report_span(),
+                    ResourceContractCheck::Postcondition,
+                )?;
+                spec.extend(resource_spec);
+            }
         }
         Ok(())
     }
@@ -3734,6 +3811,82 @@ impl<'tcx> Verifier<'tcx> {
                 arms,
                 default,
             } => self.execute_lemma_match(
+                lemma,
+                current,
+                state,
+                scrutinee,
+                arms,
+                default.as_deref(),
+                rest,
+            ),
+        }
+    }
+
+    fn execute_unsafe_lemma_stmts(
+        &self,
+        lemma: &TypedLemmaDef,
+        current: &HashMap<String, SymValue>,
+        mut state: UnsafeState,
+        stmts: &[TypedGhostStmt],
+    ) -> Result<Vec<UnsafeLemmaExecState>, VerificationResult> {
+        let Some((stmt, rest)) = stmts.split_first() else {
+            return Ok(vec![UnsafeLemmaExecState {
+                current: current.clone(),
+                state,
+            }]);
+        };
+        match stmt {
+            TypedGhostStmt::Assert(expr) => {
+                let spec = state.env.clone();
+                let spec = self.assert_unsafe_contract_predicate_constraint(
+                    &mut state,
+                    expr,
+                    current,
+                    &spec,
+                    self.report_span(),
+                    format!("lemma `{}` assertion failed", lemma.name),
+                )?;
+                state.env = spec;
+                self.execute_unsafe_lemma_stmts(lemma, current, state, rest)
+            }
+            TypedGhostStmt::Assume(expr) => {
+                let formula = self.contract_expr_to_bool(current, &state.env, expr)?;
+                if !self.assume_unsafe_path_condition(&mut state, formula) {
+                    return Ok(Vec::new());
+                }
+                self.execute_unsafe_lemma_stmts(lemma, current, state, rest)
+            }
+            TypedGhostStmt::Call { lemma_name, args } => {
+                let callee = self.lemmas.get(lemma_name).ok_or_else(|| {
+                    self.unsupported_result(
+                        self.report_span(),
+                        format!("unknown lemma `{lemma_name}`"),
+                    )
+                })?;
+                let env = self.lemma_env_from_contract_args(args, current, &state.env, callee)?;
+                if callee.is_unsafe {
+                    self.apply_unsafe_lemma_contract(&mut state, callee, env, self.report_span())?;
+                } else {
+                    let spec = self.assert_unsafe_contract_predicate_constraint(
+                        &mut state,
+                        &callee.req,
+                        &env.current,
+                        &env.spec,
+                        self.report_span(),
+                        format!("lemma `{}` precondition failed", callee.name),
+                    )?;
+                    let ens = self.contract_expr_to_bool(&env.current, &spec, &callee.ens)?;
+                    if !self.assume_unsafe_path_condition(&mut state, ens) {
+                        return Ok(Vec::new());
+                    }
+                }
+                self.execute_unsafe_lemma_stmts(lemma, current, state, rest)
+            }
+            TypedGhostStmt::Match {
+                scrutinee,
+                arms,
+                default,
+            } => self.execute_unsafe_lemma_match(
                 lemma,
                 current,
                 state,
@@ -3833,6 +3986,94 @@ impl<'tcx> Verifier<'tcx> {
         Ok(final_states)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn execute_unsafe_lemma_match(
+        &self,
+        lemma: &TypedLemmaDef,
+        current: &HashMap<String, SymValue>,
+        state: UnsafeState,
+        scrutinee: &TypedExpr,
+        arms: &[TypedGhostMatchArm],
+        default: Option<&[TypedGhostStmt]>,
+        rest: &[TypedGhostStmt],
+    ) -> Result<Vec<UnsafeLemmaExecState>, VerificationResult> {
+        let scrutinee_value = self.contract_expr_to_value(current, &state.env, scrutinee)?;
+        let composite = self.composite_encoding(&scrutinee.ty)?;
+        let mut guard_formulas = Vec::with_capacity(arms.len());
+        let mut final_states = Vec::new();
+        for arm in arms {
+            let mut branch_state = state.clone();
+            let guard = self.composite_tag_formula_for_encoding(
+                &composite,
+                &scrutinee_value,
+                arm.ctor_index,
+                self.report_span(),
+            )?;
+            guard_formulas.push(guard.clone());
+            if !self.assume_unsafe_path_condition(&mut branch_state, guard) {
+                continue;
+            }
+            let mut branch_current = current.clone();
+            let mut field_values = Vec::with_capacity(arm.bindings.len());
+            for (field_index, binding) in arm.bindings.iter().enumerate() {
+                let field_value = self
+                    .value_encoder
+                    .project_composite_ctor_field(
+                        &composite,
+                        arm.ctor_index,
+                        &scrutinee_value,
+                        field_index,
+                    )
+                    .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+                if let TypedMatchBinding::Var { name, .. } = binding {
+                    branch_current.insert(name.clone(), field_value.clone());
+                }
+                field_values.push(field_value);
+            }
+            let ctor_value =
+                self.construct_composite_ctor(&scrutinee.ty, arm.ctor_index, &field_values)?;
+            if let TypedExprKind::Var(name) = &scrutinee.kind {
+                branch_current.insert(name.clone(), ctor_value.clone());
+            }
+            let branch_eq = self.eq_for_spec_ty(
+                &scrutinee.ty,
+                &scrutinee_value,
+                &ctor_value,
+                self.report_span(),
+            )?;
+            if !self.assume_unsafe_path_condition(&mut branch_state, branch_eq) {
+                continue;
+            }
+            let branch_end_states =
+                self.execute_unsafe_lemma_stmts(lemma, &branch_current, branch_state, &arm.body)?;
+            for branch_end_state in branch_end_states {
+                final_states.extend(self.execute_unsafe_lemma_stmts(
+                    lemma,
+                    &branch_end_state.current,
+                    branch_end_state.state,
+                    rest,
+                )?);
+            }
+        }
+        if let Some(default) = default {
+            let mut default_state = state;
+            let default_guard = bool_and(guard_formulas.into_iter().map(bool_not).collect());
+            if self.assume_unsafe_path_condition(&mut default_state, default_guard) {
+                let default_end_states =
+                    self.execute_unsafe_lemma_stmts(lemma, current, default_state, default)?;
+                for default_end_state in default_end_states {
+                    final_states.extend(self.execute_unsafe_lemma_stmts(
+                        lemma,
+                        &default_end_state.current,
+                        default_end_state.state,
+                        rest,
+                    )?);
+                }
+            }
+        }
+        Ok(final_states)
+    }
+
     fn execute_lemma_call(
         &self,
         state: &mut State,
@@ -3842,6 +4083,12 @@ impl<'tcx> Verifier<'tcx> {
         let lemma = self.lemmas.get(&call.lemma_name).ok_or_else(|| {
             self.unsupported_result(span, format!("unknown lemma `{}`", call.lemma_name))
         })?;
+        if lemma.is_unsafe {
+            return Err(self.unsupported_result(
+                span,
+                format!("unsafe lemma `{}` requires unsafe code", lemma.name),
+            ));
+        }
         let env = self.lemma_env_from_state_exprs(state, &call.args, &call.resolution, lemma)?;
         let spec = self.assert_contract_predicate_constraint(
             state,
@@ -3854,6 +4101,87 @@ impl<'tcx> Verifier<'tcx> {
         )?;
         let ens = self.contract_expr_to_bool(&env.current, &spec, &lemma.ens)?;
         Ok(self.assume_path_condition(state, ens))
+    }
+
+    fn execute_unsafe_lemma_call(
+        &self,
+        state: &mut UnsafeState,
+        call: &LemmaCallContract,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        let lemma = self.lemmas.get(&call.lemma_name).ok_or_else(|| {
+            self.unsupported_result(span, format!("unknown lemma `{}`", call.lemma_name))
+        })?;
+        let mut view = self.unsafe_state_view(state);
+        let env = self.lemma_env_from_state_exprs(&view, &call.args, &call.resolution, lemma)?;
+        if lemma.is_unsafe {
+            state.env = view.env;
+            state.pc = view.pc;
+            self.apply_unsafe_lemma_contract(state, lemma, env, span)
+        } else {
+            let spec = self.assert_contract_predicate_constraint(
+                &mut view,
+                &lemma.req,
+                &env.current,
+                &env.spec,
+                span,
+                call.span_text.clone(),
+                format!("lemma `{}` precondition failed", lemma.name),
+            )?;
+            let ens = self.contract_expr_to_bool(&env.current, &spec, &lemma.ens)?;
+            if !self.assume_path_condition(&mut view, ens) {
+                state.pc = Bool::from_bool(false);
+            } else {
+                state.pc = view.pc;
+                state.env = view.env;
+            }
+            Ok(())
+        }
+    }
+
+    fn apply_unsafe_lemma_contract(
+        &self,
+        state: &mut UnsafeState,
+        lemma: &TypedLemmaDef,
+        env: CallEnv,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        let mut spec = self.assert_unsafe_contract_predicate_constraint(
+            state,
+            &lemma.req,
+            &env.current,
+            &env.spec,
+            span,
+            format!("lemma `{}` precondition failed", lemma.name),
+        )?;
+        for resource_req in &lemma.resource_reqs {
+            let resource_spec = self.consume_unsafe_resource_contract(
+                state,
+                resource_req,
+                &env.current,
+                &spec,
+                span,
+                ResourceContractCheck::Precondition,
+            )?;
+            spec.extend(resource_spec);
+        }
+        let ens = self.contract_expr_to_bool(&env.current, &spec, &lemma.ens)?;
+        if !self.assume_unsafe_path_condition(state, ens) {
+            state.pc = Bool::from_bool(false);
+            return Ok(());
+        }
+        let mut spec = spec;
+        for resource_ens in &lemma.resource_ens {
+            self.assume_unsafe_resource_contract(
+                state,
+                resource_ens,
+                &env.current,
+                &mut spec,
+                span,
+            )?;
+        }
+        state.env = spec;
+        Ok(())
     }
 
     fn lemma_env_from_state_exprs(
@@ -5348,6 +5676,21 @@ impl<'tcx> Verifier<'tcx> {
         Ok(spec)
     }
 
+    fn assert_unsafe_contract_predicate_constraint(
+        &self,
+        state: &mut UnsafeState,
+        predicate: &NormalizedPredicate,
+        current: &HashMap<String, SymValue>,
+        spec: &HashMap<String, SymValue>,
+        span: Span,
+        message: String,
+    ) -> Result<HashMap<String, SymValue>, VerificationResult> {
+        let spec = self.bind_contract_spec_values(current, spec, &predicate.bindings)?;
+        let constraint = self.contract_expr_to_bool(current, &spec, &predicate.condition)?;
+        self.unsafe_assert_constraint(state, constraint, span, message)?;
+        Ok(spec)
+    }
+
     fn assume_contract_predicate(
         &self,
         state: &mut State,
@@ -5358,6 +5701,22 @@ impl<'tcx> Verifier<'tcx> {
         let spec = self.bind_contract_spec_values(current, spec, &predicate.bindings)?;
         let constraint = self.contract_expr_to_bool(current, &spec, &predicate.condition)?;
         if self.assume_path_condition(state, constraint) {
+            Ok(Some(spec))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn assume_unsafe_contract_predicate(
+        &self,
+        state: &mut UnsafeState,
+        predicate: &NormalizedPredicate,
+        current: &HashMap<String, SymValue>,
+        spec: &HashMap<String, SymValue>,
+    ) -> Result<Option<HashMap<String, SymValue>>, VerificationResult> {
+        let spec = self.bind_contract_spec_values(current, spec, &predicate.bindings)?;
+        let constraint = self.contract_expr_to_bool(current, &spec, &predicate.condition)?;
+        if self.assume_unsafe_path_condition(state, constraint) {
             Ok(Some(spec))
         } else {
             Ok(None)
@@ -7107,6 +7466,12 @@ struct LemmaExecState {
     state: State,
 }
 
+#[derive(Debug, Clone)]
+struct UnsafeLemmaExecState {
+    current: HashMap<String, SymValue>,
+    state: UnsafeState,
+}
+
 impl CallEnv {
     fn for_function<'tcx>(
         verifier: &Verifier<'tcx>,
@@ -7228,7 +7593,15 @@ fn collect_directive_prepass_pure_fn_refs(
             continue;
         };
         collect_normalized_predicate_pure_fn_refs(&lemma.req, out);
+        for resource_req in &lemma.resource_reqs {
+            collect_typed_resource_pattern_pure_fn_refs(&resource_req.pattern, out);
+            collect_typed_expr_pure_fn_refs(&resource_req.condition, out);
+        }
         collect_typed_expr_pure_fn_refs(&lemma.ens, out);
+        for resource_ens in &lemma.resource_ens {
+            collect_typed_resource_pattern_pure_fn_refs(&resource_ens.pattern, out);
+            collect_typed_expr_pure_fn_refs(&resource_ens.condition, out);
+        }
     }
 }
 

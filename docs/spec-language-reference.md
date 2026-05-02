@@ -536,10 +536,33 @@ materializes resources back into the caller heap after the call. If a
 caller path condition after the call. The `result` variable is available in both
 the resource pattern and the `where` clause of `resource ens`.
 
-Inside unsafe blocks, ordinary `//@ let`, `//@ assert`, `//@ assume`, and
-lemma-call directives are supported when they only affect the symbolic path
-condition or the directive environment, as they do in safe code. Unsafe blocks
-also support resource assertions:
+Unsafe lemmas use the same resource contract model as unsafe functions. They are
+declared as ghost items with `unsafe fn`, spec parameters, optional ordinary
+`req` and `ens` clauses, and optional `resource req` and `resource ens` clauses:
+
+```rust
+/*@
+unsafe fn keep_i32_cell(p: Ptr)
+  req p.prov == Option::Some(Provenance { base: p.addr })
+  resource req PointsTo(p.addr, {type i32}, Option::Some(?old)) * Alloc(p.addr, 4usize, 4usize)
+  resource ens PointsTo(p.addr, {type i32}, Option::Some(?v)) * Alloc(p.addr, 4usize, 4usize) where v == old
+{
+}
+*/
+```
+
+An unsafe lemma body is verified. Its `resource req` clauses materialize the
+initial unsafe heap, and its `resource ens` clauses are checked against the final
+unsafe heap. Calling an unsafe lemma from unsafe code applies the same resource
+contract behavior as an unsafe function call: resource preconditions are
+consumed from the caller heap and resource postconditions are materialized back
+into it. Unsafe lemma calls are supported inside both unsafe blocks and unsafe
+function bodies.
+
+Inside unsafe blocks and unsafe function bodies, ordinary `//@ let`,
+`//@ assert`, `//@ assume`, and lemma-call directives are supported when they
+only affect the symbolic path condition or the directive environment, as they do
+in safe code. Unsafe code also supports resource assertions:
 
 ```rust
 //@ resource assert PointsTo({p}.addr, {type i32}, Option::Some(42i32)) * Alloc({p}.addr, 4usize, 4usize);
@@ -676,6 +699,8 @@ Supported items:
 - `struct`
 - pure functions: `fn name<T>(args...) -> Ty { expr }`
 - lemmas: `fn name<T>(args...) req <expr> ens <expr> { stmts }`
+- unsafe lemmas:
+  `unsafe fn name<T>(args...) req <expr> resource req <pattern> ens <expr> resource ens <pattern> { stmts }`
 
 Pure function bodies are expression bodies. Lemma bodies are statement bodies.
 

@@ -1,3 +1,6 @@
+use crate::directive::{ResourceAssertion, parse_resource_assertion};
+use rustc_span::DUMMY_SP;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expr {
     Bool(bool),
@@ -288,10 +291,13 @@ pub struct GhostMatchArm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LemmaDef {
     pub name: String,
+    pub is_unsafe: bool,
     pub type_params: Vec<String>,
     pub params: Vec<PureFnParam>,
     pub req: Expr,
+    pub resource_reqs: Vec<ResourceAssertion>,
     pub ens: Expr,
+    pub resource_ens: Vec<ResourceAssertion>,
     pub body: Vec<GhostStmt>,
 }
 
@@ -449,7 +455,10 @@ pub struct SpecComment {
 
 pub fn is_ghost_item_block(text: &str) -> bool {
     let trimmed = text.trim_start();
-    trimmed.starts_with("fn ") || trimmed.starts_with("enum ") || trimmed.starts_with("struct ")
+    trimmed.starts_with("fn ")
+        || trimmed.starts_with("unsafe fn ")
+        || trimmed.starts_with("enum ")
+        || trimmed.starts_with("struct ")
 }
 
 pub fn is_complete_ghost_item_comment(text: &str) -> bool {
@@ -1543,6 +1552,12 @@ impl<'a> GhostBlockParser<'a> {
             self.expect_keyword("struct")?;
             return Ok(GhostItem::Struct(self.parse_struct_def()?));
         }
+        let is_unsafe = if self.starts_with_keyword("unsafe") {
+            self.expect_keyword("unsafe")?;
+            true
+        } else {
+            false
+        };
         self.expect_keyword("fn")?;
         let name = self.parse_ident()?;
         let type_params = self.parse_type_params()?;
@@ -1575,6 +1590,7 @@ impl<'a> GhostBlockParser<'a> {
         }
         Ok(GhostItem::Lemma(self.parse_lemma_def(
             name,
+            is_unsafe,
             type_params,
             params,
         )?))
@@ -1677,22 +1693,61 @@ impl<'a> GhostBlockParser<'a> {
     fn parse_lemma_def(
         &mut self,
         name: String,
+        is_unsafe: bool,
         type_params: Vec<String>,
         params: Vec<PureFnParam>,
     ) -> Result<LemmaDef, ParseError> {
-        self.expect_keyword("req")?;
-        let req = self.parse_line_expr("lemma req", &type_params)?;
-        self.expect_keyword("ens")?;
-        let ens = self.parse_line_expr("lemma ens", &type_params)?;
+        let mut req = None;
+        let mut resource_reqs = Vec::new();
+        let mut ens = None;
+        let mut resource_ens = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.peek_char() == Some('{') {
+                break;
+            }
+            if self.starts_with_keyword("resource") {
+                self.expect_keyword("resource")?;
+                self.skip_ws();
+                if self.starts_with_keyword("req") {
+                    self.expect_keyword("req")?;
+                    resource_reqs.push(self.parse_line_resource_assertion("lemma resource req")?);
+                    continue;
+                }
+                self.expect_keyword("ens")?;
+                resource_ens.push(self.parse_line_resource_assertion("lemma resource ens")?);
+                continue;
+            }
+            if self.starts_with_keyword("req") {
+                if req.is_some() {
+                    return Err(ParseError::new("multiple lemma req clauses"));
+                }
+                self.expect_keyword("req")?;
+                req = Some(self.parse_line_expr("lemma req", &type_params)?);
+                continue;
+            }
+            if self.starts_with_keyword("ens") {
+                if ens.is_some() {
+                    return Err(ParseError::new("multiple lemma ens clauses"));
+                }
+                self.expect_keyword("ens")?;
+                ens = Some(self.parse_line_expr("lemma ens", &type_params)?);
+                continue;
+            }
+            return Err(ParseError::new("expected lemma contract clause"));
+        }
         self.expect_char('{')?;
         let body = self.parse_braced_body()?;
         let body = self.parse_lemma_body(body, &type_params)?;
         Ok(LemmaDef {
             name,
+            is_unsafe,
             type_params,
             params,
-            req,
-            ens,
+            req: req.unwrap_or(Expr::Bool(true)),
+            resource_reqs,
+            ens: ens.unwrap_or(Expr::Bool(true)),
+            resource_ens,
             body,
         })
     }
@@ -1854,6 +1909,16 @@ impl<'a> GhostBlockParser<'a> {
         let (text, next) = self.parse_line_expr_text(self.text, self.cursor)?;
         self.cursor = next;
         parse_source_expr_with_type_params(kind, text, type_params)
+    }
+
+    fn parse_line_resource_assertion(
+        &mut self,
+        kind: &str,
+    ) -> Result<ResourceAssertion, ParseError> {
+        let (text, next) = self.parse_line_expr_text(self.text, self.cursor)?;
+        self.cursor = next;
+        parse_resource_assertion(text, DUMMY_SP)
+            .map_err(|err| ParseError::new(err.message.replace("//@ resource assert", kind)))
     }
 
     fn parse_spec_ty_annotation(
@@ -2596,12 +2661,14 @@ fn add1_done(x: i32)
                 }],
                 lemmas: vec![LemmaDef {
                     name: "add1_done".to_owned(),
+                    is_unsafe: false,
                     type_params: vec![],
                     params: vec![PureFnParam {
                         name: "x".to_owned(),
                         ty: SpecTy::I32,
                     }],
                     req: true_expr(),
+                    resource_reqs: vec![],
                     ens: Expr::Binary {
                         op: BinaryOp::Eq,
                         lhs: Box::new(Expr::Call {
@@ -2618,6 +2685,7 @@ fn add1_done(x: i32)
                             })),
                         }),
                     },
+                    resource_ens: vec![],
                     body: vec![GhostStmt::Assert(Expr::Binary {
                         op: BinaryOp::Eq,
                         lhs: Box::new(Expr::Call {
@@ -2683,13 +2751,16 @@ fn refl<T>(xs: Seq<T>)
             block.lemmas,
             vec![LemmaDef {
                 name: "refl".to_owned(),
+                is_unsafe: false,
                 type_params: vec!["T".to_owned()],
                 params: vec![PureFnParam {
                     name: "xs".to_owned(),
                     ty: SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned()))),
                 }],
                 req: true_expr(),
+                resource_reqs: vec![],
                 ens: true_expr(),
+                resource_ens: vec![],
                 body: vec![GhostStmt::Call {
                     name: "refl".to_owned(),
                     type_args: vec![SpecTy::TypeParam("T".to_owned())],
