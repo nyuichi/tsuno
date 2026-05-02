@@ -1,0 +1,15 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+expression: result
+---
+status: Some(1)
+stdout:
+PASS needs_points_to
+  all assertions discharged
+FAIL rejects_missing_unsafe_resource_req
+  resource precondition failed
+  src/main.rs:12:9: 12:27
+PASS main
+  all assertions discharged
+
+stderr:

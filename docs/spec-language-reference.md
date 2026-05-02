@@ -495,25 +495,95 @@ visible: deeply nested unsafe branches can create multiple unsafe states before
 control returns to safe code.
 
 Currently supported unsafe code is single-threaded Rust for raw pointer reads
-and writes, ordinary branches inside unsafe blocks, ordinary reference
-construction, checked integer arithmetic, and calls to ordinary safe Rust
-functions. A safe function call inside an unsafe block uses the same
+and writes, ordinary branches, ordinary reference construction, checked integer
+arithmetic, and calls to ordinary safe Rust functions. An `unsafe fn` body is
+verified by the unsafe engine even when it has no `resource req` or
+`resource ens` clauses. A safe function call from unsafe code uses the same
 contract behavior as safe code: the callee precondition is asserted, the callee
 postcondition is assumed, and opaque calls produce a fresh result satisfying the
-result type invariant. Unsafe function calls inside unsafe blocks are not
-supported. This support is for safe function calls only; unsafe API
-heap/layout/value specifications are separate unsafe resources and are not part
-of this initial model.
+result type invariant. Unsafe function calls from unsafe code are supported when
+the unsafe callee has a local function contract. Ordinary `req` and `ens`
+clauses keep their path-condition meaning, and unsafe heap requirements are
+written with `resource req` and `resource ens`.
+
+```rust
+unsafe fn write_i32(p: *mut i32)
+//@ resource req *p |-> Option::Some(?old)
+//@ resource ens *p |-> Option::Some(42i32) where old >= 0i32
+{
+    // ...
+}
+```
+
+`resource req` and `resource ens` use the same resource-pattern syntax as
+`resource assert`. They may be omitted independently. `//@ let` directives may
+appear before `resource req`, as with ordinary function contracts. Resource
+function contracts are supported only on `unsafe fn`.
+
+When an unsafe function body is verified, each `resource req` materializes the
+specified resources into the function's initial unsafe heap and assumes its
+`where` condition. At each return, ordinary `ens` clauses are asserted, then each
+`resource ens` is checked against the function's final unsafe heap. Resource
+postcondition matching is exact: each resource pattern must match exactly one
+set of heap resources after its `where` condition is applied. The matched
+resources are consumed at return because no unsafe heap is reflected to a caller
+during callee-body verification.
+
+At an unsafe call site, each `resource req` is checked against the caller's
+unsafe heap and consumes exactly the matched resources. Each `resource ens`
+materializes resources back into the caller heap after the call. If a
+`resource ens` has a `where` clause, that boolean condition is also added to the
+caller path condition after the call. The `result` variable is available in both
+the resource pattern and the `where` clause of `resource ens`.
 
 Inside unsafe blocks, ordinary `//@ let`, `//@ assert`, `//@ assume`, and
 lemma-call directives are supported when they only affect the symbolic path
-condition or the directive environment, as they do in safe code. Loop invariants
-inside unsafe blocks are not supported. Future separation-logic directives for
-unsafe heap resources will be added separately. Loop contracts and function
-contracts inside unsafe code are not supported yet; existing loop prepass
-restrictions still apply before unsafe execution. Aliasing, permissions,
-fractional permissions, and user-defined heap predicates are not part of this
-initial unsafe model.
+condition or the directive environment, as they do in safe code. Unsafe blocks
+also support resource assertions:
+
+```rust
+//@ resource assert PointsTo({p}.addr, {type i32}, Option::Some(42i32)) * Alloc({p}.addr, 4usize, 4usize);
+//@ resource assert PointsTo({p}.addr, {type i32}, Option::Some(?v)) where v > 0i32;
+//@ resource assert *p |-> Option::Some(?v) where v > 0i32;
+```
+
+A resource assertion checks a `ResourcePattern`. The initial resource patterns
+are `PointsTo(addr_expr, rust_ty_expr, option_value_expr)`,
+the shorthand `*ptr |-> option_value_pattern`,
+`Alloc(base_expr, size_expr, alignment_expr)`, and separating conjunction
+`left * right`; parentheses may be used freely to group resource patterns.
+`*ptr |-> value` is accepted only when `ptr` is a Rust local, function
+parameter, or allowed `result` binding whose type is a raw pointer `*const T` or
+`*mut T`; it is desugared before unsafe execution to
+`PointsTo({ptr}.addr, {type T}, value)`, so the unsafe engine only sees
+`PointsTo`. If the pointer type cannot be inferred, the directive is rejected
+before unsafe execution. The value expression for a `PointsTo` pattern is an
+ordinary spec expression whose type is `Option<T>`, so option constructors are
+written as prelude enum constructors such as `Option::Some(v)` and
+`Option::None`.
+
+The third argument of `PointsTo` is a value pattern. A pattern variable is
+written `?name`; in `PointsTo(a, {type T}, ?v)`, `v` has type `Option<T>`, while
+in `PointsTo(a, {type T}, Option::Some(?v))`, `v` has type `T`. Constructor
+syntax in a value pattern is structural pattern syntax, so constructor arguments
+may themselves contain pattern variables. Pattern variables are bound from left
+to right, are visible in the optional `where` condition, and remain available to
+later directives in the same directive environment.
+
+`resource assert R where P` first enumerates matches of `R` against the current
+unsafe heap, using `*` to require distinct matched atomic resources. It then
+filters those matches by the boolean spec expression `P`; if the `where` clause
+is omitted, `P` is `true`. The directive succeeds only when exactly one match
+remains under the current path condition. If no matching resource remains,
+verification fails; if multiple matches remain or a match is only
+path-conditionally possible, the assertion is currently reported as unsupported.
+Resource assertions do not consume resources, and no backtracking crosses a
+directive boundary. Resource assertions are only supported inside unsafe blocks.
+
+Loop invariants inside unsafe blocks are not supported. Loop contracts inside
+unsafe code are not supported yet; existing loop prepass restrictions still
+apply before unsafe execution. Aliasing, permissions, fractional permissions,
+and user-defined heap predicates are not part of this initial unsafe model.
 
 Shared references can be dereferenced with `*`. After type checking, `*r` for a
 `Ref<T>` is desugared to `r.deref`.

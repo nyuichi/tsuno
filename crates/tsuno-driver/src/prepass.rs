@@ -2,14 +2,14 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::ControlFlow;
 
 use crate::directive::{
-    CollectedFunctionDirectives, DirectiveAttach, DirectiveError, DirectiveKind,
-    collect_function_directives,
+    CollectedFunctionDirectives, DirectiveAttach, DirectiveError, DirectiveKind, FunctionDirective,
+    ResourceAssertion, ResourcePattern, ValuePattern, collect_function_directives,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
     EnumDef, Expr, GhostMatchArm, LemmaDef, MatchBinding, MatchPattern, PureFnDef, RustTyKey,
     RustTypeExpr, SpecTy, StructDef, StructFieldTy, StructTy, TypedExpr, TypedExprKind,
-    TypedMatchArm, TypedMatchBinding, parse_ghost_block, ptr_spec_ty,
+    TypedMatchArm, TypedMatchBinding, option_spec_ty, parse_ghost_block, ptr_spec_ty,
 };
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{BlockCheckMode, Expr as HirExpr, ExprKind, HirId, Pat, PatKind, UnsafeSource};
@@ -90,10 +90,65 @@ pub struct LemmaCallContract {
 }
 
 #[derive(Debug, Clone)]
+pub struct ResourceAssertionContract {
+    pub pattern: TypedResourcePattern,
+    pub condition: TypedExpr,
+    pub resolution: ResolvedExprEnv,
+    pub assertion_span: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum TypedResourcePattern {
+    Star(Box<TypedResourcePattern>, Box<TypedResourcePattern>),
+    PointsTo {
+        addr: TypedExpr,
+        ty: TypedExpr,
+        value: TypedValuePattern,
+    },
+    Alloc {
+        base: TypedExpr,
+        size: TypedExpr,
+        alignment: TypedExpr,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum TypedValuePattern {
+    Bind {
+        name: String,
+        ty: SpecTy,
+    },
+    Expr(TypedExpr),
+    SeqLit {
+        ty: SpecTy,
+        items: Vec<TypedValuePattern>,
+    },
+    StructLit {
+        ty: SpecTy,
+        fields: Vec<TypedValuePattern>,
+    },
+    CtorCall {
+        ty: SpecTy,
+        ctor_index: usize,
+        args: Vec<TypedValuePattern>,
+    },
+}
+
+struct ResourceTypingCtx<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    body: &'a Body<'tcx>,
+    resolution: &'a ResolvedExprEnv,
+    pure_fns: &'a HashMap<String, PureFnDef>,
+    enum_defs: &'a HashMap<String, EnumDef>,
+    local_tys: &'a HashMap<String, SpecTy>,
+}
+
+#[derive(Debug, Clone)]
 pub enum ControlPointDirective {
     Let(LetBindingContract),
     Assert(AssertionContract),
     Assume(AssumptionContract),
+    ResourceAssert(Box<ResourceAssertionContract>),
     LemmaCall(LemmaCallContract),
 }
 
@@ -158,8 +213,10 @@ pub struct FunctionContract {
     pub req: NormalizedPredicate,
     #[allow(dead_code)]
     pub req_span: String,
+    pub resource_reqs: Vec<ResourceAssertionContract>,
     pub ens: TypedExpr,
     pub ens_span: String,
+    pub resource_ens: Vec<ResourceAssertionContract>,
     pub result: SpecTy,
 }
 
@@ -3918,6 +3975,8 @@ fn compute_directives<'tcx>(
     let mut contract_scope = SpecScope::default();
     let mut req_directive = None;
     let mut ens_directive = None;
+    let mut resource_req_directives = Vec::new();
+    let mut resource_ens_directives = Vec::new();
     let mut contract_lets = Vec::new();
     for directive in &directives.directives {
         match directive.kind {
@@ -3942,32 +4001,60 @@ fn compute_directives<'tcx>(
                     });
                 }
             }
+            DirectiveKind::ResourceReq if matches!(directive.attach, DirectiveAttach::Function) => {
+                resource_req_directives.push(directive);
+            }
+            DirectiveKind::ResourceEns if matches!(directive.attach, DirectiveAttach::Function) => {
+                resource_ens_directives.push(directive);
+            }
             _ => {}
         }
     }
-    if let Some(req) = req_directive {
+    let first_req_line = req_directive
+        .map(|directive| directive.line_no)
+        .into_iter()
+        .chain(
+            resource_req_directives
+                .iter()
+                .map(|directive| directive.line_no),
+        )
+        .min();
+    if let Some(req_line) = first_req_line {
         for directive in &contract_lets {
-            if directive.line_no > req.line_no {
+            if directive.line_no > req_line {
                 return Err(LoopPrepassError {
                     span: directive.span,
                     display_span: Some(directive.span_text.clone()),
                     message:
-                        "//@ let directives in function contracts must be placed before //@ req"
+                        "//@ let directives in function contracts must be placed before //@ req or //@ resource req"
                             .to_owned(),
                 });
             }
         }
     }
-    let param_names =
-        if req_directive.is_some() || ens_directive.is_some() || !contract_lets.is_empty() {
-            function_param_names(tcx, def_id).map_err(|err| LoopPrepassError {
-                span: tcx.def_span(def_id.to_def_id()),
-                display_span: None,
-                message: err.message,
-            })?
-        } else {
-            function_param_names_relaxed(tcx, def_id)
-        };
+    let has_resource_contract =
+        !resource_req_directives.is_empty() || !resource_ens_directives.is_empty();
+    if has_resource_contract && !tcx.fn_sig(def_id).skip_binder().safety().is_unsafe() {
+        return Err(LoopPrepassError {
+            span: tcx.def_span(def_id.to_def_id()),
+            display_span: None,
+            message: "resource function contracts are only supported on unsafe functions"
+                .to_owned(),
+        });
+    }
+    let param_names = if req_directive.is_some()
+        || ens_directive.is_some()
+        || has_resource_contract
+        || !contract_lets.is_empty()
+    {
+        function_param_names(tcx, def_id).map_err(|err| LoopPrepassError {
+            span: tcx.def_span(def_id.to_def_id()),
+            display_span: None,
+            message: err.message,
+        })?
+    } else {
+        function_param_names_relaxed(tcx, def_id)
+    };
     let (params, result) = function_contract_signature_with_names(tcx, def_id, param_names.clone())
         .map_err(|err| LoopPrepassError {
             span: tcx.def_span(def_id.to_def_id()),
@@ -3978,6 +4065,13 @@ fn compute_directives<'tcx>(
         .iter()
         .map(|param| (param.name.clone(), param.ty.clone()))
         .collect();
+    let sig = tcx.fn_sig(def_id).instantiate_identity();
+    let param_rust_tys: HashMap<_, _> = param_names
+        .iter()
+        .cloned()
+        .zip(sig.inputs().skip_binder().iter().copied())
+        .collect();
+    let result_rust_ty = sig.output().skip_binder();
     let result_ty = result.clone();
     for directive in &contract_lets {
         let (name, value) = directive.let_binding().expect("let directive payload");
@@ -4012,6 +4106,17 @@ fn compute_directives<'tcx>(
             &mut contract_scope,
         )?
     }
+    for directive in &resource_req_directives {
+        validate_function_contract_resource_prepass(
+            directive,
+            pure_fns,
+            enum_defs,
+            &directive_type_param_scope,
+            &param_names,
+            false,
+            &mut contract_scope,
+        )?;
+    }
     let mut body_scope = contract_scope.clone();
     let mut resolved_exprs = HashMap::new();
     for directive in directives.directives.iter().filter(|directive| {
@@ -4020,6 +4125,7 @@ fn compute_directives<'tcx>(
             DirectiveKind::Let
                 | DirectiveKind::Assert
                 | DirectiveKind::Assume
+                | DirectiveKind::ResourceAssert
                 | DirectiveKind::Inv
                 | DirectiveKind::LemmaCall
         )
@@ -4064,6 +4170,18 @@ fn compute_directives<'tcx>(
                 )?;
                 resolution
             }
+            DirectiveKind::ResourceAssert => resolve_resource_pattern_env(
+                directive
+                    .resource_assertion()
+                    .expect("resource assertion payload"),
+                pure_fns,
+                enum_defs,
+                &binding_info,
+                &hir_locals,
+                directive.span,
+                directive_anchor_span(&directive.attach),
+                &mut body_scope,
+            )?,
             _ => resolve_expr_env(
                 directive.expr(),
                 pure_fns,
@@ -4090,6 +4208,17 @@ fn compute_directives<'tcx>(
             true,
             &mut contract_scope,
         )?
+    }
+    for directive in &resource_ens_directives {
+        validate_function_contract_resource_prepass(
+            directive,
+            pure_fns,
+            enum_defs,
+            &directive_type_param_scope,
+            &param_names,
+            true,
+            &mut contract_scope,
+        )?;
     }
     let mut inferred = SpecTypeInference::default();
     let mut contract_infer_scope = SpecScope::default();
@@ -4141,6 +4270,25 @@ fn compute_directives<'tcx>(
             message,
         })?;
     }
+    for directive in &resource_req_directives {
+        infer_contract_resource_assertion(
+            directive
+                .resource_assertion()
+                .expect("resource req payload"),
+            pure_fns,
+            enum_defs,
+            &mut contract_infer_scope,
+            &param_tys,
+            false,
+            &result_ty,
+            &mut inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span: directive.span,
+            display_span: Some(directive.span_text.clone()),
+            message,
+        })?;
+    }
     let mut body_infer_scope = contract_infer_scope.clone();
     let mut typed_lemma_calls = HashMap::new();
     for directive in directives.directives.iter().filter(|directive| {
@@ -4149,6 +4297,7 @@ fn compute_directives<'tcx>(
             DirectiveKind::Let
                 | DirectiveKind::Assert
                 | DirectiveKind::Assume
+                | DirectiveKind::ResourceAssert
                 | DirectiveKind::Inv
                 | DirectiveKind::LemmaCall
         )
@@ -4218,6 +4367,23 @@ fn compute_directives<'tcx>(
                     }
                 })?;
             }
+            DirectiveKind::ResourceAssert => {
+                infer_resource_pattern_types(
+                    directive
+                        .resource_assertion()
+                        .expect("resource assertion payload"),
+                    pure_fns,
+                    enum_defs,
+                    &mut body_infer_scope,
+                    &local_tys,
+                    &mut inferred,
+                )
+                .map_err(|message| LoopPrepassError {
+                    span: directive.span,
+                    display_span: Some(directive.span_text.clone()),
+                    message,
+                })?;
+            }
             _ => {
                 infer_body_expr_types(
                     directive.expr(),
@@ -4239,6 +4405,25 @@ fn compute_directives<'tcx>(
     if let Some(directive) = ens_directive {
         infer_runtime_contract_expr_types(
             directive.expr(),
+            pure_fns,
+            enum_defs,
+            &mut contract_infer_scope,
+            &param_tys,
+            true,
+            &result_ty,
+            &mut inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span: directive.span,
+            display_span: Some(directive.span_text.clone()),
+            message,
+        })?;
+    }
+    for directive in &resource_ens_directives {
+        infer_contract_resource_assertion(
+            directive
+                .resource_assertion()
+                .expect("resource ens payload"),
             pure_fns,
             enum_defs,
             &mut contract_infer_scope,
@@ -4316,9 +4501,23 @@ fn compute_directives<'tcx>(
         }
         None => None,
     };
+    let typed_resource_reqs = typed_contract_resource_assertions(
+        tcx,
+        &resource_req_directives,
+        pure_fns,
+        enum_defs,
+        &mut contract_type_scope,
+        &param_tys,
+        &param_rust_tys,
+        false,
+        &result_ty,
+        result_rust_ty,
+        &mut inferred,
+    )?;
     let mut typed_body_assertions = HashMap::new();
     let mut typed_body_exprs = HashMap::new();
     let mut typed_body_lets = HashMap::new();
+    let mut typed_body_resource_assertions = HashMap::new();
     let mut body_type_scope = if req_directive.is_some() || !contract_lets.is_empty() {
         let mut scope = contract_type_scope.clone();
         if let Some(directive) = req_directive {
@@ -4348,6 +4547,7 @@ fn compute_directives<'tcx>(
             DirectiveKind::Let
                 | DirectiveKind::Assert
                 | DirectiveKind::Assume
+                | DirectiveKind::ResourceAssert
                 | DirectiveKind::Inv
                 | DirectiveKind::LemmaCall
         )
@@ -4419,6 +4619,52 @@ fn compute_directives<'tcx>(
                     },
                 );
             }
+            DirectiveKind::ResourceAssert => {
+                let resolution = resolved_exprs
+                    .get(&directive.span_text)
+                    .expect("resolved resource assertion expression");
+                let assertion = directive
+                    .resource_assertion()
+                    .expect("resource assertion payload");
+                let resource_ctx = ResourceTypingCtx {
+                    tcx,
+                    body,
+                    resolution,
+                    pure_fns,
+                    enum_defs,
+                    local_tys: &local_tys,
+                };
+                let typed = typed_resource_pattern(
+                    assertion,
+                    &resource_ctx,
+                    &mut body_type_scope,
+                    &mut inferred,
+                )
+                .map_err(|message| LoopPrepassError {
+                    span: directive.span,
+                    display_span: Some(directive.span_text.clone()),
+                    message,
+                })?;
+                typed_body_resource_assertions.insert(directive.span_text.clone(), typed);
+                let condition = typed_body_expr_with_expected(
+                    &assertion.condition,
+                    pure_fns,
+                    enum_defs,
+                    &HashSet::new(),
+                    directive.kind,
+                    &mut body_type_scope,
+                    &local_tys,
+                    &mut inferred,
+                    false,
+                    Some(&SpecTy::Bool),
+                )
+                .map_err(|message| LoopPrepassError {
+                    span: directive.span,
+                    display_span: Some(directive.span_text.clone()),
+                    message,
+                })?;
+                typed_body_exprs.insert(directive.span_text.clone(), condition);
+            }
             _ => {
                 let typed = typed_body_expr(
                     directive.expr(),
@@ -4461,6 +4707,9 @@ fn compute_directives<'tcx>(
                         DirectiveKind::Req
                         | DirectiveKind::Ens
                         | DirectiveKind::Let
+                        | DirectiveKind::ResourceAssert
+                        | DirectiveKind::ResourceReq
+                        | DirectiveKind::ResourceEns
                         | DirectiveKind::LemmaCall => {
                             unreachable!("filtered above")
                         }
@@ -4516,15 +4765,35 @@ fn compute_directives<'tcx>(
         }
         None => None,
     };
-    let function_contract = match (req_directive, ens_directive) {
-        (None, None) if !contract_lets.is_empty() => {
+    let typed_resource_ens = typed_contract_resource_assertions(
+        tcx,
+        &resource_ens_directives,
+        pure_fns,
+        enum_defs,
+        &mut contract_type_scope,
+        &param_tys,
+        &param_rust_tys,
+        true,
+        &result_ty,
+        result_rust_ty,
+        &mut inferred,
+    )?;
+    let function_contract = match (
+        req_directive,
+        ens_directive,
+        typed_resource_reqs.is_empty(),
+        typed_resource_ens.is_empty(),
+    ) {
+        (None, None, true, true) if !contract_lets.is_empty() => {
             return Err(LoopPrepassError {
                 span: tcx.def_span(def_id.to_def_id()),
                 display_span: None,
-                message: "function contract requires a //@ req or //@ ens predicate".to_owned(),
+                message:
+                    "function contract requires a //@ req, //@ ens, //@ resource req, or //@ resource ens predicate"
+                        .to_owned(),
             });
         }
-        (req, ens) => Some(FunctionContract {
+        (req, ens, _, _) => Some(FunctionContract {
             params: params.clone(),
             req: typed_req.unwrap_or_else(|| NormalizedPredicate {
                 bindings: typed_contract_lets,
@@ -4533,10 +4802,12 @@ fn compute_directives<'tcx>(
             req_span: req
                 .map(|directive| directive.span_text.clone())
                 .unwrap_or_else(|| def_span.clone()),
+            resource_reqs: typed_resource_reqs,
             ens: typed_ens.unwrap_or_else(|| typed_bool_expr(true)),
             ens_span: ens
                 .map(|directive| directive.span_text.clone())
                 .unwrap_or(def_span),
+            resource_ens: typed_resource_ens,
             result,
         }),
     };
@@ -4546,7 +4817,10 @@ fn compute_directives<'tcx>(
 
     for directive in directives.directives {
         match directive.kind {
-            DirectiveKind::Req | DirectiveKind::Ens => {}
+            DirectiveKind::Req
+            | DirectiveKind::Ens
+            | DirectiveKind::ResourceReq
+            | DirectiveKind::ResourceEns => {}
             DirectiveKind::Let if matches!(directive.attach, DirectiveAttach::Function) => {}
             DirectiveKind::Let => {
                 let control = control_point_after(body, directive_anchor_span(&directive.attach))
@@ -4633,6 +4907,41 @@ fn compute_directives<'tcx>(
                         resolution,
                     }));
             }
+            DirectiveKind::ResourceAssert => {
+                let control = control_point_after(body, directive_anchor_span(&directive.attach))
+                    .ok_or_else(|| LoopPrepassError {
+                    span: directive.span,
+                    display_span: Some(directive.span_text.clone()),
+                    message: format!(
+                        "unable to map //@ resource assert at {} to MIR",
+                        tcx.sess
+                            .source_map()
+                            .span_to_diagnostic_string(directive.span)
+                    ),
+                })?;
+                let resolution = resolved_exprs
+                    .get(&directive.span_text)
+                    .cloned()
+                    .expect("resolved resource assertion expression");
+                control_point_directives
+                    .by_control_point
+                    .entry(control)
+                    .or_default()
+                    .push(ControlPointDirective::ResourceAssert(Box::new(
+                        ResourceAssertionContract {
+                            pattern: typed_body_resource_assertions
+                                .get(&directive.span_text)
+                                .cloned()
+                                .expect("typed resource assertion expression"),
+                            condition: typed_body_exprs
+                                .get(&directive.span_text)
+                                .cloned()
+                                .expect("typed resource assertion condition"),
+                            resolution,
+                            assertion_span: directive.span_text.clone(),
+                        },
+                    )));
+            }
             DirectiveKind::Inv => {}
             DirectiveKind::LemmaCall => {
                 let control = control_point_after(body, directive_anchor_span(&directive.attach))
@@ -4679,6 +4988,1527 @@ fn collect_unsafe_block_spans<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Ve
     collector.spans
 }
 
+#[allow(clippy::too_many_arguments)]
+fn resolve_resource_pattern_env(
+    assertion: &ResourceAssertion,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    binding_info: &HirBindingInfo,
+    hir_locals: &HashMap<HirId, Local>,
+    span: Span,
+    anchor_span: Span,
+    spec_scope: &mut SpecScope,
+) -> Result<ResolvedExprEnv, LoopPrepassError> {
+    let mut resolved = ResolvedExprEnv::default();
+    resolve_resource_pattern_env_into(
+        &assertion.pattern,
+        pure_fns,
+        enum_defs,
+        binding_info,
+        hir_locals,
+        span,
+        anchor_span,
+        spec_scope,
+        &mut resolved,
+    )?;
+    let condition_resolved = resolve_expr_env(
+        &assertion.condition,
+        pure_fns,
+        enum_defs,
+        binding_info,
+        hir_locals,
+        span,
+        anchor_span,
+        DirectiveKind::ResourceAssert,
+        spec_scope,
+    )?;
+    resolved.locals.extend(condition_resolved.locals);
+    Ok(resolved)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_resource_pattern_env_into(
+    pattern: &ResourcePattern,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    binding_info: &HirBindingInfo,
+    hir_locals: &HashMap<HirId, Local>,
+    span: Span,
+    anchor_span: Span,
+    spec_scope: &mut SpecScope,
+    resolved: &mut ResolvedExprEnv,
+) -> Result<(), LoopPrepassError> {
+    match pattern {
+        ResourcePattern::Star(lhs, rhs) => {
+            resolve_resource_pattern_env_into(
+                lhs,
+                pure_fns,
+                enum_defs,
+                binding_info,
+                hir_locals,
+                span,
+                anchor_span,
+                spec_scope,
+                resolved,
+            )?;
+            resolve_resource_pattern_env_into(
+                rhs,
+                pure_fns,
+                enum_defs,
+                binding_info,
+                hir_locals,
+                span,
+                anchor_span,
+                spec_scope,
+                resolved,
+            )
+        }
+        ResourcePattern::PointsTo { addr, ty, value } => {
+            for expr in [addr, ty] {
+                let expr_resolved = resolve_expr_env(
+                    expr,
+                    pure_fns,
+                    enum_defs,
+                    binding_info,
+                    hir_locals,
+                    span,
+                    anchor_span,
+                    DirectiveKind::ResourceAssert,
+                    spec_scope,
+                )?;
+                resolved.locals.extend(expr_resolved.locals);
+            }
+            resolve_value_pattern_env(
+                value,
+                pure_fns,
+                enum_defs,
+                binding_info,
+                hir_locals,
+                span,
+                anchor_span,
+                spec_scope,
+                resolved,
+            )?;
+            Ok(())
+        }
+        ResourcePattern::PointsToSugar { pointer, value } => {
+            let symbol = Symbol::intern(pointer);
+            let Some(hir_id) = resolve_binding_hir_id(binding_info, symbol, anchor_span) else {
+                return Err(LoopPrepassError {
+                    span,
+                    display_span: None,
+                    message: format!("unresolved pointer `{pointer}` in //@ resource assert"),
+                });
+            };
+            let Some(local) = hir_locals.get(&hir_id).copied() else {
+                return Err(LoopPrepassError {
+                    span,
+                    display_span: None,
+                    message: format!("missing MIR local for pointer `{pointer}`"),
+                });
+            };
+            resolved.locals.insert(pointer.clone(), local);
+            resolve_value_pattern_env(
+                value,
+                pure_fns,
+                enum_defs,
+                binding_info,
+                hir_locals,
+                span,
+                anchor_span,
+                spec_scope,
+                resolved,
+            )?;
+            Ok(())
+        }
+        ResourcePattern::Alloc {
+            base,
+            size,
+            alignment,
+        } => {
+            for expr in [base, size, alignment] {
+                let expr_resolved = resolve_expr_env(
+                    expr,
+                    pure_fns,
+                    enum_defs,
+                    binding_info,
+                    hir_locals,
+                    span,
+                    anchor_span,
+                    DirectiveKind::ResourceAssert,
+                    spec_scope,
+                )?;
+                resolved.locals.extend(expr_resolved.locals);
+            }
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_value_pattern_env(
+    pattern: &ValuePattern,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    binding_info: &HirBindingInfo,
+    hir_locals: &HashMap<HirId, Local>,
+    span: Span,
+    anchor_span: Span,
+    spec_scope: &mut SpecScope,
+    resolved: &mut ResolvedExprEnv,
+) -> Result<(), LoopPrepassError> {
+    match pattern {
+        ValuePattern::Bind(name) => {
+            spec_scope.bind_let(name, span, None, None)?;
+            Ok(())
+        }
+        ValuePattern::Expr(expr) => {
+            let expr_resolved = resolve_expr_env(
+                expr,
+                pure_fns,
+                enum_defs,
+                binding_info,
+                hir_locals,
+                span,
+                anchor_span,
+                DirectiveKind::ResourceAssert,
+                spec_scope,
+            )?;
+            resolved.locals.extend(expr_resolved.locals);
+            Ok(())
+        }
+        ValuePattern::SeqLit(items) => {
+            for item in items {
+                resolve_value_pattern_env(
+                    item,
+                    pure_fns,
+                    enum_defs,
+                    binding_info,
+                    hir_locals,
+                    span,
+                    anchor_span,
+                    spec_scope,
+                    resolved,
+                )?;
+            }
+            Ok(())
+        }
+        ValuePattern::StructLit { fields, .. } => {
+            for field in fields {
+                resolve_value_pattern_env(
+                    &field.value,
+                    pure_fns,
+                    enum_defs,
+                    binding_info,
+                    hir_locals,
+                    span,
+                    anchor_span,
+                    spec_scope,
+                    resolved,
+                )?;
+            }
+            Ok(())
+        }
+        ValuePattern::Call { args, .. } => {
+            for arg in args {
+                resolve_value_pattern_env(
+                    arg,
+                    pure_fns,
+                    enum_defs,
+                    binding_info,
+                    hir_locals,
+                    span,
+                    anchor_span,
+                    spec_scope,
+                    resolved,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn infer_resource_pattern_types(
+    assertion: &ResourceAssertion,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    local_tys: &HashMap<String, SpecTy>,
+    inferred: &mut SpecTypeInference,
+) -> Result<(), String> {
+    infer_resource_pattern_types_into(
+        &assertion.pattern,
+        pure_fns,
+        enum_defs,
+        spec_scope,
+        local_tys,
+        inferred,
+    )?;
+    let condition_ty = infer_body_expr_types(
+        &assertion.condition,
+        pure_fns,
+        enum_defs,
+        DirectiveKind::ResourceAssert,
+        spec_scope,
+        local_tys,
+        inferred,
+    )?;
+    if let InferredExprTy::Known(ty) = condition_ty {
+        let _ = unify_spec_tys(&ty, &SpecTy::Bool)?;
+    }
+    Ok(())
+}
+
+fn infer_resource_pattern_types_into(
+    pattern: &ResourcePattern,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    local_tys: &HashMap<String, SpecTy>,
+    inferred: &mut SpecTypeInference,
+) -> Result<(), String> {
+    match pattern {
+        ResourcePattern::Star(lhs, rhs) => {
+            infer_resource_pattern_types_into(
+                lhs, pure_fns, enum_defs, spec_scope, local_tys, inferred,
+            )?;
+            infer_resource_pattern_types_into(
+                rhs, pure_fns, enum_defs, spec_scope, local_tys, inferred,
+            )
+        }
+        ResourcePattern::PointsTo { addr, ty, value } => {
+            for expr in [addr, ty] {
+                infer_body_expr_types(
+                    expr,
+                    pure_fns,
+                    enum_defs,
+                    DirectiveKind::ResourceAssert,
+                    spec_scope,
+                    local_tys,
+                    inferred,
+                )?;
+            }
+            if value_pattern_contains_bind(value) {
+                let ty_ty =
+                    typed_resource_expr(ty, pure_fns, enum_defs, spec_scope, local_tys, inferred)?;
+                let expected = option_spec_ty_for_rust_ty_expr(&ty_ty)?;
+                infer_value_pattern_types(
+                    value, &expected, pure_fns, enum_defs, spec_scope, local_tys, inferred,
+                )?;
+            } else if let ValuePattern::Expr(expr) = value {
+                infer_body_expr_types(
+                    expr,
+                    pure_fns,
+                    enum_defs,
+                    DirectiveKind::ResourceAssert,
+                    spec_scope,
+                    local_tys,
+                    inferred,
+                )?;
+            }
+            Ok(())
+        }
+        ResourcePattern::PointsToSugar { value, .. } => {
+            if value_pattern_contains_bind(value) {
+                bind_value_pattern_vars(value, spec_scope, inferred)?;
+                return Ok(());
+            }
+            if let ValuePattern::Expr(expr) = value {
+                infer_body_expr_types(
+                    expr,
+                    pure_fns,
+                    enum_defs,
+                    DirectiveKind::ResourceAssert,
+                    spec_scope,
+                    local_tys,
+                    inferred,
+                )?;
+            }
+            Ok(())
+        }
+        ResourcePattern::Alloc {
+            base,
+            size,
+            alignment,
+        } => {
+            for expr in [base, size, alignment] {
+                infer_body_expr_types(
+                    expr,
+                    pure_fns,
+                    enum_defs,
+                    DirectiveKind::ResourceAssert,
+                    spec_scope,
+                    local_tys,
+                    inferred,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn typed_resource_pattern(
+    assertion: &ResourceAssertion,
+    ctx: &ResourceTypingCtx<'_, '_>,
+    spec_scope: &mut SpecScope,
+    inferred: &mut SpecTypeInference,
+) -> Result<TypedResourcePattern, String> {
+    typed_resource_pattern_into(&assertion.pattern, ctx, spec_scope, inferred)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_contract_resource_assertions<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    directives: &[&FunctionDirective],
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    rust_params: &HashMap<String, Ty<'tcx>>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    result_rust_ty: Ty<'tcx>,
+    inferred: &mut SpecTypeInference,
+) -> Result<Vec<ResourceAssertionContract>, LoopPrepassError> {
+    let mut out = Vec::with_capacity(directives.len());
+    for directive in directives {
+        let assertion = directive
+            .resource_assertion()
+            .expect("resource contract payload");
+        let pattern = typed_contract_resource_pattern(
+            tcx,
+            &assertion.pattern,
+            pure_fns,
+            enum_defs,
+            spec_scope,
+            params,
+            rust_params,
+            allow_result,
+            result_ty,
+            result_rust_ty,
+            inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span: directive.span,
+            display_span: Some(directive.span_text.clone()),
+            message,
+        })?;
+        let condition = typed_contract_expr_with_expected(
+            &assertion.condition,
+            pure_fns,
+            enum_defs,
+            &HashSet::new(),
+            spec_scope,
+            params,
+            allow_result,
+            result_ty,
+            inferred,
+            true,
+            Some(&SpecTy::Bool),
+        )
+        .map_err(|message| LoopPrepassError {
+            span: directive.span,
+            display_span: Some(directive.span_text.clone()),
+            message,
+        })?;
+        out.push(ResourceAssertionContract {
+            pattern,
+            condition,
+            resolution: ResolvedExprEnv::default(),
+            assertion_span: directive.span_text.clone(),
+        });
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_contract_resource_pattern<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    pattern: &ResourcePattern,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    rust_params: &HashMap<String, Ty<'tcx>>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    result_rust_ty: Ty<'tcx>,
+    inferred: &mut SpecTypeInference,
+) -> Result<TypedResourcePattern, String> {
+    match pattern {
+        ResourcePattern::Star(lhs, rhs) => Ok(TypedResourcePattern::Star(
+            Box::new(typed_contract_resource_pattern(
+                tcx,
+                lhs,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                rust_params,
+                allow_result,
+                result_ty,
+                result_rust_ty,
+                inferred,
+            )?),
+            Box::new(typed_contract_resource_pattern(
+                tcx,
+                rhs,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                rust_params,
+                allow_result,
+                result_ty,
+                result_rust_ty,
+                inferred,
+            )?),
+        )),
+        ResourcePattern::PointsTo { addr, ty, value } => {
+            let addr = typed_contract_resource_expr(
+                addr,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+                Some(&SpecTy::Usize),
+            )?;
+            let ty = typed_contract_resource_expr(
+                ty,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+                Some(&SpecTy::RustTy),
+            )?;
+            let expected = option_spec_ty_for_rust_ty_expr(&ty)?;
+            let value = typed_contract_value_pattern(
+                value,
+                &expected,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?;
+            Ok(TypedResourcePattern::PointsTo { addr, ty, value })
+        }
+        ResourcePattern::PointsToSugar { pointer, value } => {
+            let pointer_ty = if allow_result && pointer == "result" {
+                result_rust_ty
+            } else {
+                *rust_params
+                    .get(pointer)
+                    .ok_or_else(|| format!("unresolved pointer `{pointer}` in resource contract"))?
+            };
+            let pointee_rust_ty = match pointer_ty.kind() {
+                TyKind::RawPtr(pointee, _) => *pointee,
+                _ => {
+                    return Err(format!(
+                        "`|->` resource pattern requires a raw pointer, found `{}`",
+                        display_spec_ty(&spec_ty_for_rust_ty(tcx, pointer_ty)?)
+                    ));
+                }
+            };
+            let pointee_ty = spec_ty_for_rust_ty(tcx, pointee_rust_ty)?;
+            let addr = TypedExpr {
+                ty: SpecTy::Usize,
+                kind: TypedExprKind::Field {
+                    base: Box::new(TypedExpr {
+                        ty: ptr_spec_ty(),
+                        kind: if allow_result && pointer == "result" {
+                            TypedExprKind::Var(pointer.clone())
+                        } else {
+                            TypedExprKind::RustVar(pointer.clone())
+                        },
+                    }),
+                    name: "addr".to_owned(),
+                    index: 0,
+                },
+            };
+            let ty = TypedExpr {
+                ty: SpecTy::RustTy,
+                kind: TypedExprKind::RustType(RustTyKey::new(rust_ty_key_text_for_rust_ty(
+                    tcx,
+                    pointee_rust_ty,
+                )?)),
+            };
+            let expected = option_spec_ty(pointee_ty);
+            let value = typed_contract_value_pattern(
+                value,
+                &expected,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?;
+            Ok(TypedResourcePattern::PointsTo { addr, ty, value })
+        }
+        ResourcePattern::Alloc {
+            base,
+            size,
+            alignment,
+        } => Ok(TypedResourcePattern::Alloc {
+            base: typed_contract_resource_expr(
+                base,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+                Some(&SpecTy::Usize),
+            )?,
+            size: typed_contract_resource_expr(
+                size,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+                Some(&SpecTy::Usize),
+            )?,
+            alignment: typed_contract_resource_expr(
+                alignment,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+                Some(&SpecTy::Usize),
+            )?,
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_contract_resource_expr(
+    expr: &Expr,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    inferred: &mut SpecTypeInference,
+    expected: Option<&SpecTy>,
+) -> Result<TypedExpr, String> {
+    typed_contract_expr_with_expected(
+        expr,
+        pure_fns,
+        enum_defs,
+        &HashSet::new(),
+        spec_scope,
+        params,
+        allow_result,
+        result_ty,
+        inferred,
+        true,
+        expected,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_contract_value_pattern(
+    pattern: &ValuePattern,
+    expected: &SpecTy,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    inferred: &mut SpecTypeInference,
+) -> Result<TypedValuePattern, String> {
+    match pattern {
+        ValuePattern::Bind(name) => {
+            spec_scope
+                .bind_let(name, DUMMY_SP, None, None)
+                .map_err(|err| err.message)?;
+            inferred.constrain(name, expected)?;
+            Ok(TypedValuePattern::Bind {
+                name: name.clone(),
+                ty: expected.clone(),
+            })
+        }
+        ValuePattern::Expr(expr) => Ok(TypedValuePattern::Expr(typed_contract_resource_expr(
+            expr,
+            pure_fns,
+            enum_defs,
+            spec_scope,
+            params,
+            allow_result,
+            result_ty,
+            inferred,
+            Some(expected),
+        )?)),
+        ValuePattern::SeqLit(items) => {
+            let SpecTy::Seq(inner) = expected else {
+                return Err(format!(
+                    "sequence resource pattern requires `Seq<T>`, got {}",
+                    display_spec_ty(expected)
+                ));
+            };
+            let mut typed_items = Vec::with_capacity(items.len());
+            for item in items {
+                typed_items.push(typed_contract_value_pattern(
+                    item,
+                    inner,
+                    pure_fns,
+                    enum_defs,
+                    spec_scope,
+                    params,
+                    allow_result,
+                    result_ty,
+                    inferred,
+                )?);
+            }
+            Ok(TypedValuePattern::SeqLit {
+                ty: expected.clone(),
+                items: typed_items,
+            })
+        }
+        ValuePattern::StructLit { name, fields } => {
+            let SpecTy::Struct(struct_ty) = expected else {
+                return Err(format!(
+                    "struct resource pattern `{name}` requires a struct type, got {}",
+                    display_spec_ty(expected)
+                ));
+            };
+            if &struct_ty.name != name {
+                return Err(format!(
+                    "struct resource pattern `{name}` does not match `{}`",
+                    struct_ty.name
+                ));
+            }
+            let mut typed_fields = Vec::with_capacity(fields.len());
+            for field in fields {
+                let (_, field_ty) = struct_ty
+                    .field(&field.name)
+                    .ok_or_else(|| format!("unknown field `{}` in `{name}`", field.name))?;
+                typed_fields.push(typed_contract_value_pattern(
+                    &field.value,
+                    &field_ty.ty,
+                    pure_fns,
+                    enum_defs,
+                    spec_scope,
+                    params,
+                    allow_result,
+                    result_ty,
+                    inferred,
+                )?);
+            }
+            Ok(TypedValuePattern::StructLit {
+                ty: expected.clone(),
+                fields: typed_fields,
+            })
+        }
+        ValuePattern::Call {
+            func,
+            type_args,
+            args,
+        } => {
+            let (enum_def, ctor_index) = lookup_enum_ctor(enum_defs, func)
+                .ok_or_else(|| format!("unknown constructor `{func}`"))?;
+            let mut bindings = explicit_enum_type_bindings(func, enum_def, type_args, enum_defs)?;
+            let _ = seed_enum_type_param_bindings(enum_def, expected, &mut bindings)?;
+            let (_, ctor) = enum_def
+                .ctor(func.rsplit("::").next().unwrap_or(func))
+                .ok_or_else(|| format!("unknown constructor `{func}`"))?;
+            if ctor.fields.len() != args.len() {
+                return Err(format!(
+                    "constructor `{func}` expects {} arguments, found {}",
+                    ctor.fields.len(),
+                    args.len()
+                ));
+            }
+            let ctor_result_ty = instantiate_enum_result_ty(func, enum_def, &bindings)?;
+            let _ = unify_spec_tys(&ctor_result_ty, expected)?;
+            let mut typed_args = Vec::with_capacity(args.len());
+            for (arg, field_ty) in args.iter().zip(&ctor.fields) {
+                let expected_field_ty = try_instantiate_spec_ty(field_ty, &bindings)
+                    .ok_or_else(|| format!("could not resolve constructor `{func}` field type"))?;
+                typed_args.push(typed_contract_value_pattern(
+                    arg,
+                    &expected_field_ty,
+                    pure_fns,
+                    enum_defs,
+                    spec_scope,
+                    params,
+                    allow_result,
+                    result_ty,
+                    inferred,
+                )?);
+            }
+            Ok(TypedValuePattern::CtorCall {
+                ty: expected.clone(),
+                ctor_index,
+                args: typed_args,
+            })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn infer_contract_resource_assertion(
+    assertion: &ResourceAssertion,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    inferred: &mut SpecTypeInference,
+) -> Result<(), String> {
+    infer_contract_resource_pattern_types(
+        &assertion.pattern,
+        pure_fns,
+        enum_defs,
+        spec_scope,
+        params,
+        allow_result,
+        result_ty,
+        inferred,
+    )?;
+    infer_contract_expr_types_with_expected(
+        &assertion.condition,
+        pure_fns,
+        enum_defs,
+        &HashSet::new(),
+        spec_scope,
+        params,
+        allow_result,
+        result_ty,
+        inferred,
+        true,
+        Some(&SpecTy::Bool),
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn infer_contract_resource_pattern_types(
+    pattern: &ResourcePattern,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    inferred: &mut SpecTypeInference,
+) -> Result<(), String> {
+    match pattern {
+        ResourcePattern::Star(lhs, rhs) => {
+            infer_contract_resource_pattern_types(
+                lhs,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?;
+            infer_contract_resource_pattern_types(
+                rhs,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )
+        }
+        ResourcePattern::PointsTo { addr, ty, value } => {
+            for (expr, expected) in [(addr, &SpecTy::Usize), (ty, &SpecTy::RustTy)] {
+                infer_contract_expr_types_with_expected(
+                    expr,
+                    pure_fns,
+                    enum_defs,
+                    &HashSet::new(),
+                    spec_scope,
+                    params,
+                    allow_result,
+                    result_ty,
+                    inferred,
+                    true,
+                    Some(expected),
+                )?;
+            }
+            infer_contract_value_pattern(
+                value,
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )
+        }
+        ResourcePattern::PointsToSugar { value, .. } => infer_contract_value_pattern(
+            value,
+            pure_fns,
+            enum_defs,
+            spec_scope,
+            params,
+            allow_result,
+            result_ty,
+            inferred,
+        ),
+        ResourcePattern::Alloc {
+            base,
+            size,
+            alignment,
+        } => {
+            for expr in [base, size, alignment] {
+                infer_contract_expr_types_with_expected(
+                    expr,
+                    pure_fns,
+                    enum_defs,
+                    &HashSet::new(),
+                    spec_scope,
+                    params,
+                    allow_result,
+                    result_ty,
+                    inferred,
+                    true,
+                    Some(&SpecTy::Usize),
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn infer_contract_value_pattern(
+    pattern: &ValuePattern,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    inferred: &mut SpecTypeInference,
+) -> Result<(), String> {
+    if value_pattern_contains_bind(pattern) {
+        bind_value_pattern_vars(pattern, spec_scope, inferred)
+    } else if let ValuePattern::Expr(expr) = pattern {
+        infer_contract_expr_types_with_expected(
+            expr,
+            pure_fns,
+            enum_defs,
+            &HashSet::new(),
+            spec_scope,
+            params,
+            allow_result,
+            result_ty,
+            inferred,
+            true,
+            None,
+        )?;
+        Ok(())
+    } else {
+        Ok(())
+    }
+}
+
+fn typed_resource_pattern_into(
+    pattern: &ResourcePattern,
+    ctx: &ResourceTypingCtx<'_, '_>,
+    spec_scope: &mut SpecScope,
+    inferred: &mut SpecTypeInference,
+) -> Result<TypedResourcePattern, String> {
+    match pattern {
+        ResourcePattern::Star(lhs, rhs) => Ok(TypedResourcePattern::Star(
+            Box::new(typed_resource_pattern_into(lhs, ctx, spec_scope, inferred)?),
+            Box::new(typed_resource_pattern_into(rhs, ctx, spec_scope, inferred)?),
+        )),
+        ResourcePattern::PointsTo { addr, ty, value } => {
+            let addr = typed_resource_expr(
+                addr,
+                ctx.pure_fns,
+                ctx.enum_defs,
+                spec_scope,
+                ctx.local_tys,
+                inferred,
+            )?;
+            ensure_resource_expr_ty(&addr, &SpecTy::Usize, "PointsTo address")?;
+            let ty = typed_resource_expr(
+                ty,
+                ctx.pure_fns,
+                ctx.enum_defs,
+                spec_scope,
+                ctx.local_tys,
+                inferred,
+            )?;
+            ensure_resource_expr_ty(&ty, &SpecTy::RustTy, "PointsTo type")?;
+            let value = if value_pattern_contains_bind(value) {
+                let expected = option_spec_ty_for_rust_ty_expr(&ty)?;
+                typed_value_pattern(
+                    value,
+                    &expected,
+                    ctx.pure_fns,
+                    ctx.enum_defs,
+                    spec_scope,
+                    ctx.local_tys,
+                    inferred,
+                )?
+            } else if let ValuePattern::Expr(expr) = value {
+                let typed = typed_resource_expr(
+                    expr,
+                    ctx.pure_fns,
+                    ctx.enum_defs,
+                    spec_scope,
+                    ctx.local_tys,
+                    inferred,
+                )?;
+                ensure_option_resource_value(&typed)?;
+                TypedValuePattern::Expr(typed)
+            } else {
+                unreachable!("pattern without binders must be an expression")
+            };
+            Ok(TypedResourcePattern::PointsTo { addr, ty, value })
+        }
+        ResourcePattern::PointsToSugar { pointer, value } => {
+            let local =
+                *ctx.resolution.locals.get(pointer).ok_or_else(|| {
+                    format!("unresolved pointer `{pointer}` in //@ resource assert")
+                })?;
+            let pointer_ty = ctx.body.local_decls[local].ty;
+            let pointee_ty = match pointer_ty.kind() {
+                TyKind::RawPtr(pointee, _) => *pointee,
+                _ => {
+                    return Err(format!(
+                        "`|->` resource pattern requires a raw pointer, found `{}`",
+                        display_spec_ty(&spec_ty_for_rust_ty(ctx.tcx, pointer_ty)?)
+                    ));
+                }
+            };
+            let ptr_ty = ptr_spec_ty();
+            let addr = TypedExpr {
+                ty: SpecTy::Usize,
+                kind: TypedExprKind::Field {
+                    base: Box::new(TypedExpr {
+                        ty: ptr_ty,
+                        kind: TypedExprKind::RustVar(pointer.clone()),
+                    }),
+                    name: "addr".to_owned(),
+                    index: 0,
+                },
+            };
+            let ty = TypedExpr {
+                ty: SpecTy::RustTy,
+                kind: TypedExprKind::RustType(RustTyKey::new(rust_ty_key_text_for_rust_ty(
+                    ctx.tcx, pointee_ty,
+                )?)),
+            };
+            let expected = option_spec_ty(spec_ty_for_rust_ty(ctx.tcx, pointee_ty)?);
+            let value = if value_pattern_contains_bind(value) {
+                typed_value_pattern(
+                    value,
+                    &expected,
+                    ctx.pure_fns,
+                    ctx.enum_defs,
+                    spec_scope,
+                    ctx.local_tys,
+                    inferred,
+                )?
+            } else if let ValuePattern::Expr(expr) = value {
+                let typed = typed_body_expr_with_expected(
+                    expr,
+                    ctx.pure_fns,
+                    ctx.enum_defs,
+                    &HashSet::new(),
+                    DirectiveKind::ResourceAssert,
+                    spec_scope,
+                    ctx.local_tys,
+                    inferred,
+                    false,
+                    Some(&expected),
+                )?;
+                ensure_option_resource_value(&typed)?;
+                TypedValuePattern::Expr(typed)
+            } else {
+                unreachable!("pattern without binders must be an expression")
+            };
+            Ok(TypedResourcePattern::PointsTo { addr, ty, value })
+        }
+        ResourcePattern::Alloc {
+            base,
+            size,
+            alignment,
+        } => {
+            let base = typed_resource_expr(
+                base,
+                ctx.pure_fns,
+                ctx.enum_defs,
+                spec_scope,
+                ctx.local_tys,
+                inferred,
+            )?;
+            ensure_resource_expr_ty(&base, &SpecTy::Usize, "Alloc base")?;
+            let size = typed_resource_expr(
+                size,
+                ctx.pure_fns,
+                ctx.enum_defs,
+                spec_scope,
+                ctx.local_tys,
+                inferred,
+            )?;
+            ensure_resource_expr_ty(&size, &SpecTy::Usize, "Alloc size")?;
+            let alignment = typed_resource_expr(
+                alignment,
+                ctx.pure_fns,
+                ctx.enum_defs,
+                spec_scope,
+                ctx.local_tys,
+                inferred,
+            )?;
+            ensure_resource_expr_ty(&alignment, &SpecTy::Usize, "Alloc alignment")?;
+            Ok(TypedResourcePattern::Alloc {
+                base,
+                size,
+                alignment,
+            })
+        }
+    }
+}
+
+fn typed_resource_expr(
+    expr: &Expr,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    local_tys: &HashMap<String, SpecTy>,
+    inferred: &mut SpecTypeInference,
+) -> Result<TypedExpr, String> {
+    typed_body_expr(
+        expr,
+        pure_fns,
+        enum_defs,
+        DirectiveKind::ResourceAssert,
+        spec_scope,
+        local_tys,
+        inferred,
+    )
+}
+
+fn infer_value_pattern_types(
+    pattern: &ValuePattern,
+    expected: &SpecTy,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    local_tys: &HashMap<String, SpecTy>,
+    inferred: &mut SpecTypeInference,
+) -> Result<(), String> {
+    match pattern {
+        ValuePattern::Bind(name) => {
+            spec_scope
+                .bind_let(name, DUMMY_SP, None, None)
+                .map_err(|err| err.message)?;
+            inferred.constrain(name, expected)
+        }
+        ValuePattern::Expr(expr) => {
+            infer_body_expr_types_with_expected(
+                expr,
+                pure_fns,
+                enum_defs,
+                &HashSet::new(),
+                DirectiveKind::ResourceAssert,
+                spec_scope,
+                local_tys,
+                inferred,
+                false,
+                Some(expected),
+            )?;
+            Ok(())
+        }
+        ValuePattern::SeqLit(items) => {
+            let SpecTy::Seq(inner) = expected else {
+                return Err(format!(
+                    "sequence resource pattern requires `Seq<T>`, got {}",
+                    display_spec_ty(expected)
+                ));
+            };
+            for item in items {
+                infer_value_pattern_types(
+                    item, inner, pure_fns, enum_defs, spec_scope, local_tys, inferred,
+                )?;
+            }
+            Ok(())
+        }
+        ValuePattern::StructLit { name, fields } => {
+            let SpecTy::Struct(struct_ty) = expected else {
+                return Err(format!(
+                    "struct resource pattern `{name}` requires a struct type, got {}",
+                    display_spec_ty(expected)
+                ));
+            };
+            if &struct_ty.name != name {
+                return Err(format!(
+                    "struct resource pattern `{name}` does not match `{}`",
+                    struct_ty.name
+                ));
+            }
+            for field in fields {
+                let (_, field_ty) = struct_ty
+                    .field(&field.name)
+                    .ok_or_else(|| format!("unknown field `{}` in `{name}`", field.name))?;
+                infer_value_pattern_types(
+                    &field.value,
+                    &field_ty.ty,
+                    pure_fns,
+                    enum_defs,
+                    spec_scope,
+                    local_tys,
+                    inferred,
+                )?;
+            }
+            Ok(())
+        }
+        ValuePattern::Call {
+            func,
+            type_args,
+            args,
+        } => {
+            let (enum_def, _) = lookup_enum_ctor(enum_defs, func)
+                .ok_or_else(|| format!("unknown constructor `{func}`"))?;
+            let mut bindings = explicit_enum_type_bindings(func, enum_def, type_args, enum_defs)?;
+            let _ = seed_enum_type_param_bindings(enum_def, expected, &mut bindings)?;
+            let (_, ctor) = enum_def
+                .ctor(func.rsplit("::").next().unwrap_or(func))
+                .ok_or_else(|| format!("unknown constructor `{func}`"))?;
+            if ctor.fields.len() != args.len() {
+                return Err(format!(
+                    "constructor `{func}` expects {} arguments, found {}",
+                    ctor.fields.len(),
+                    args.len()
+                ));
+            }
+            for (arg, field_ty) in args.iter().zip(&ctor.fields) {
+                let expected_field_ty = try_instantiate_spec_ty(field_ty, &bindings)
+                    .ok_or_else(|| format!("could not infer type arguments for `{func}`"))?;
+                infer_value_pattern_types(
+                    arg,
+                    &expected_field_ty,
+                    pure_fns,
+                    enum_defs,
+                    spec_scope,
+                    local_tys,
+                    inferred,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn bind_value_pattern_vars(
+    pattern: &ValuePattern,
+    spec_scope: &mut SpecScope,
+    inferred: &mut SpecTypeInference,
+) -> Result<(), String> {
+    match pattern {
+        ValuePattern::Bind(name) => {
+            spec_scope
+                .bind_let(name, DUMMY_SP, None, None)
+                .map_err(|err| err.message)?;
+            inferred.ensure_var(name);
+        }
+        ValuePattern::Expr(_) => {}
+        ValuePattern::SeqLit(items) | ValuePattern::Call { args: items, .. } => {
+            for item in items {
+                bind_value_pattern_vars(item, spec_scope, inferred)?;
+            }
+        }
+        ValuePattern::StructLit { fields, .. } => {
+            for field in fields {
+                bind_value_pattern_vars(&field.value, spec_scope, inferred)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn typed_value_pattern(
+    pattern: &ValuePattern,
+    expected: &SpecTy,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    local_tys: &HashMap<String, SpecTy>,
+    inferred: &mut SpecTypeInference,
+) -> Result<TypedValuePattern, String> {
+    match pattern {
+        ValuePattern::Bind(name) => {
+            spec_scope
+                .bind_let(name, DUMMY_SP, None, None)
+                .map_err(|err| err.message)?;
+            inferred.constrain(name, expected)?;
+            Ok(TypedValuePattern::Bind {
+                name: name.clone(),
+                ty: expected.clone(),
+            })
+        }
+        ValuePattern::Expr(expr) => Ok(TypedValuePattern::Expr(typed_body_expr_with_expected(
+            expr,
+            pure_fns,
+            enum_defs,
+            &HashSet::new(),
+            DirectiveKind::ResourceAssert,
+            spec_scope,
+            local_tys,
+            inferred,
+            false,
+            Some(expected),
+        )?)),
+        ValuePattern::SeqLit(items) => {
+            let SpecTy::Seq(inner) = expected else {
+                return Err(format!(
+                    "sequence resource pattern requires `Seq<T>`, got {}",
+                    display_spec_ty(expected)
+                ));
+            };
+            let mut typed_items = Vec::with_capacity(items.len());
+            for item in items {
+                typed_items.push(typed_value_pattern(
+                    item, inner, pure_fns, enum_defs, spec_scope, local_tys, inferred,
+                )?);
+            }
+            Ok(TypedValuePattern::SeqLit {
+                ty: expected.clone(),
+                items: typed_items,
+            })
+        }
+        ValuePattern::StructLit { name, fields } => {
+            let SpecTy::Struct(struct_ty) = expected else {
+                return Err(format!(
+                    "struct resource pattern `{name}` requires a struct type, got {}",
+                    display_spec_ty(expected)
+                ));
+            };
+            if &struct_ty.name != name {
+                return Err(format!(
+                    "struct resource pattern `{name}` does not match `{}`",
+                    struct_ty.name
+                ));
+            }
+            let mut typed_fields = Vec::with_capacity(fields.len());
+            for field in fields {
+                let (_, field_ty) = struct_ty
+                    .field(&field.name)
+                    .ok_or_else(|| format!("unknown field `{}` in `{name}`", field.name))?;
+                typed_fields.push(typed_value_pattern(
+                    &field.value,
+                    &field_ty.ty,
+                    pure_fns,
+                    enum_defs,
+                    spec_scope,
+                    local_tys,
+                    inferred,
+                )?);
+            }
+            Ok(TypedValuePattern::StructLit {
+                ty: expected.clone(),
+                fields: typed_fields,
+            })
+        }
+        ValuePattern::Call {
+            func,
+            type_args,
+            args,
+        } => {
+            let (enum_def, ctor_index) = lookup_enum_ctor(enum_defs, func)
+                .ok_or_else(|| format!("unknown constructor `{func}`"))?;
+            let mut bindings = explicit_enum_type_bindings(func, enum_def, type_args, enum_defs)?;
+            let _ = seed_enum_type_param_bindings(enum_def, expected, &mut bindings)?;
+            let (_, ctor) = enum_def
+                .ctor(func.rsplit("::").next().unwrap_or(func))
+                .ok_or_else(|| format!("unknown constructor `{func}`"))?;
+            if ctor.fields.len() != args.len() {
+                return Err(format!(
+                    "constructor `{func}` expects {} arguments, found {}",
+                    ctor.fields.len(),
+                    args.len()
+                ));
+            }
+            let result_ty = instantiate_enum_result_ty(func, enum_def, &bindings)?;
+            let _ = unify_spec_tys(&result_ty, expected)?;
+            let mut typed_args = Vec::with_capacity(args.len());
+            for (arg, field_ty) in args.iter().zip(&ctor.fields) {
+                let expected_field_ty = try_instantiate_spec_ty(field_ty, &bindings)
+                    .ok_or_else(|| format!("could not infer type arguments for `{func}`"))?;
+                typed_args.push(typed_value_pattern(
+                    arg,
+                    &expected_field_ty,
+                    pure_fns,
+                    enum_defs,
+                    spec_scope,
+                    local_tys,
+                    inferred,
+                )?);
+            }
+            Ok(TypedValuePattern::CtorCall {
+                ty: result_ty,
+                ctor_index,
+                args: typed_args,
+            })
+        }
+    }
+}
+
+fn ensure_resource_expr_ty(expr: &TypedExpr, expected: &SpecTy, label: &str) -> Result<(), String> {
+    if &expr.ty == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} must have type {}, got {}",
+            display_spec_ty(expected),
+            display_spec_ty(&expr.ty)
+        ))
+    }
+}
+
+fn ensure_option_resource_value(expr: &TypedExpr) -> Result<(), String> {
+    match &expr.ty {
+        SpecTy::Enum { name, args } if name == "Option" && args.len() == 1 => Ok(()),
+        ty => Err(format!(
+            "PointsTo value pattern must have type Option<T>, got {}",
+            display_spec_ty(ty)
+        )),
+    }
+}
+
+fn value_pattern_contains_bind(pattern: &ValuePattern) -> bool {
+    match pattern {
+        ValuePattern::Bind(_) => true,
+        ValuePattern::Expr(_) => false,
+        ValuePattern::SeqLit(items) | ValuePattern::Call { args: items, .. } => {
+            items.iter().any(value_pattern_contains_bind)
+        }
+        ValuePattern::StructLit { fields, .. } => fields
+            .iter()
+            .any(|field| value_pattern_contains_bind(&field.value)),
+    }
+}
+
+fn option_spec_ty_for_rust_ty_expr(expr: &TypedExpr) -> Result<SpecTy, String> {
+    let TypedExprKind::RustType(key) = &expr.kind else {
+        return Err("PointsTo type must be a concrete Rust type expression".to_owned());
+    };
+    Ok(option_spec_ty(rust_ty_key_to_spec_ty(key.as_str())?))
+}
+
+fn rust_ty_key_to_spec_ty(key: &str) -> Result<SpecTy, String> {
+    match key {
+        "bool" => Ok(SpecTy::Bool),
+        "i8" => Ok(SpecTy::I8),
+        "i16" => Ok(SpecTy::I16),
+        "i32" => Ok(SpecTy::I32),
+        "i64" => Ok(SpecTy::I64),
+        "isize" => Ok(SpecTy::Isize),
+        "u8" => Ok(SpecTy::U8),
+        "u16" => Ok(SpecTy::U16),
+        "u32" => Ok(SpecTy::U32),
+        "u64" => Ok(SpecTy::U64),
+        "usize" => Ok(SpecTy::Usize),
+        raw if raw.starts_with("*const ") || raw.starts_with("*mut ") => Ok(ptr_spec_ty()),
+        raw if raw.starts_with("&mut ") => Ok(SpecTy::Mut(Box::new(rust_ty_key_to_spec_ty(
+            raw.trim_start_matches("&mut ").trim(),
+        )?))),
+        raw if raw.starts_with('&') => Ok(SpecTy::Ref(Box::new(rust_ty_key_to_spec_ty(
+            raw.trim_start_matches('&').trim(),
+        )?))),
+        other => Err(format!(
+            "unsupported PointsTo Rust type expression `{other}` in resource pattern"
+        )),
+    }
+}
+
+pub fn rust_ty_key_text_for_rust_ty(tcx: TyCtxt<'_>, ty: Ty<'_>) -> Result<String, String> {
+    Ok(match ty.kind() {
+        TyKind::Bool => "bool".to_owned(),
+        TyKind::Int(kind) => match kind {
+            ty::IntTy::I8 => "i8".to_owned(),
+            ty::IntTy::I16 => "i16".to_owned(),
+            ty::IntTy::I32 => "i32".to_owned(),
+            ty::IntTy::I64 => "i64".to_owned(),
+            ty::IntTy::I128 => "i128".to_owned(),
+            ty::IntTy::Isize => "isize".to_owned(),
+        },
+        TyKind::Uint(kind) => match kind {
+            ty::UintTy::U8 => "u8".to_owned(),
+            ty::UintTy::U16 => "u16".to_owned(),
+            ty::UintTy::U32 => "u32".to_owned(),
+            ty::UintTy::U64 => "u64".to_owned(),
+            ty::UintTy::U128 => "u128".to_owned(),
+            ty::UintTy::Usize => "usize".to_owned(),
+        },
+        TyKind::RawPtr(pointee, mutability) => {
+            let kind = if mutability.is_mut() { "mut" } else { "const" };
+            format!("*{kind} {}", rust_ty_key_text_for_rust_ty(tcx, *pointee)?)
+        }
+        TyKind::Ref(_, inner, mutability) => {
+            let inner = rust_ty_key_text_for_rust_ty(tcx, *inner)?;
+            if mutability.is_mut() {
+                format!("&mut {inner}")
+            } else {
+                format!("&{inner}")
+            }
+        }
+        TyKind::Tuple(fields) => {
+            let fields = fields
+                .iter()
+                .map(|field| rust_ty_key_text_for_rust_ty(tcx, field))
+                .collect::<Result<Vec<_>, _>>()?;
+            match fields.as_slice() {
+                [] => "()".to_owned(),
+                [field] => format!("({field},)"),
+                _ => format!("({})", fields.join(", ")),
+            }
+        }
+        TyKind::Adt(adt_def, args) => {
+            let mut text = tcx.def_path_str(adt_def.did());
+            let type_args = args
+                .types()
+                .map(|arg| rust_ty_key_text_for_rust_ty(tcx, arg))
+                .collect::<Result<Vec<_>, _>>()?;
+            if !type_args.is_empty() {
+                text.push('<');
+                text.push_str(&type_args.join(", "));
+                text.push('>');
+            }
+            text
+        }
+        TyKind::Param(param) => param.name.to_string(),
+        other => {
+            return Err(format!(
+                "unsupported Rust type in resource pattern `{other:?}`"
+            ));
+        }
+    })
+}
+
 struct UnsafeBlockCollector {
     spans: Vec<Span>,
 }
@@ -4709,6 +6539,9 @@ fn reject_directives_inside_unsafe_blocks(
                 | DirectiveKind::Let
                 | DirectiveKind::Assert
                 | DirectiveKind::Assume
+                | DirectiveKind::ResourceAssert
+                | DirectiveKind::ResourceReq
+                | DirectiveKind::ResourceEns
                 | DirectiveKind::LemmaCall
         ) {
             continue;
@@ -6280,6 +8113,209 @@ fn validate_function_contract_expr_prepass(
         display_span: Some(span_text.to_owned()),
         message,
     })
+}
+
+fn validate_function_contract_resource_prepass(
+    directive: &FunctionDirective,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    type_param_scope: &HashSet<String>,
+    params: &[String],
+    allow_result: bool,
+    spec_scope: &mut SpecScope,
+) -> Result<(), LoopPrepassError> {
+    let assertion = directive
+        .resource_assertion()
+        .expect("resource contract payload");
+    validate_function_contract_resource_pattern_prepass(
+        &assertion.pattern,
+        directive,
+        pure_fns,
+        enum_defs,
+        type_param_scope,
+        params,
+        allow_result,
+        spec_scope,
+    )?;
+    validate_function_contract_expr_prepass(
+        directive.span,
+        &directive.span_text,
+        &assertion.condition,
+        pure_fns,
+        enum_defs,
+        type_param_scope,
+        params,
+        allow_result,
+        spec_scope,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_function_contract_resource_pattern_prepass(
+    pattern: &ResourcePattern,
+    directive: &FunctionDirective,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    type_param_scope: &HashSet<String>,
+    params: &[String],
+    allow_result: bool,
+    spec_scope: &mut SpecScope,
+) -> Result<(), LoopPrepassError> {
+    match pattern {
+        ResourcePattern::Star(lhs, rhs) => {
+            validate_function_contract_resource_pattern_prepass(
+                lhs,
+                directive,
+                pure_fns,
+                enum_defs,
+                type_param_scope,
+                params,
+                allow_result,
+                spec_scope,
+            )?;
+            validate_function_contract_resource_pattern_prepass(
+                rhs,
+                directive,
+                pure_fns,
+                enum_defs,
+                type_param_scope,
+                params,
+                allow_result,
+                spec_scope,
+            )
+        }
+        ResourcePattern::PointsTo { addr, ty, value } => {
+            for expr in [addr, ty] {
+                validate_function_contract_expr_prepass(
+                    directive.span,
+                    &directive.span_text,
+                    expr,
+                    pure_fns,
+                    enum_defs,
+                    type_param_scope,
+                    params,
+                    allow_result,
+                    spec_scope,
+                )?;
+            }
+            validate_function_contract_value_pattern_prepass(
+                value,
+                directive,
+                pure_fns,
+                enum_defs,
+                type_param_scope,
+                params,
+                allow_result,
+                spec_scope,
+            )
+        }
+        ResourcePattern::PointsToSugar { pointer, value } => {
+            if !(params.iter().any(|param| param == pointer)
+                || (allow_result && pointer == "result"))
+            {
+                return Err(LoopPrepassError {
+                    span: directive.span,
+                    display_span: Some(directive.span_text.clone()),
+                    message: format!("unresolved pointer `{pointer}` in resource contract"),
+                });
+            }
+            validate_function_contract_value_pattern_prepass(
+                value,
+                directive,
+                pure_fns,
+                enum_defs,
+                type_param_scope,
+                params,
+                allow_result,
+                spec_scope,
+            )
+        }
+        ResourcePattern::Alloc {
+            base,
+            size,
+            alignment,
+        } => {
+            for expr in [base, size, alignment] {
+                validate_function_contract_expr_prepass(
+                    directive.span,
+                    &directive.span_text,
+                    expr,
+                    pure_fns,
+                    enum_defs,
+                    type_param_scope,
+                    params,
+                    allow_result,
+                    spec_scope,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_function_contract_value_pattern_prepass(
+    pattern: &ValuePattern,
+    directive: &FunctionDirective,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    type_param_scope: &HashSet<String>,
+    params: &[String],
+    allow_result: bool,
+    spec_scope: &mut SpecScope,
+) -> Result<(), LoopPrepassError> {
+    match pattern {
+        ValuePattern::Bind(name) => {
+            spec_scope.bind_let(
+                name,
+                directive.span,
+                Some(directive.span_text.clone()),
+                None,
+            )?;
+            Ok(())
+        }
+        ValuePattern::Expr(expr) => validate_function_contract_expr_prepass(
+            directive.span,
+            &directive.span_text,
+            expr,
+            pure_fns,
+            enum_defs,
+            type_param_scope,
+            params,
+            allow_result,
+            spec_scope,
+        ),
+        ValuePattern::SeqLit(items) | ValuePattern::Call { args: items, .. } => {
+            for item in items {
+                validate_function_contract_value_pattern_prepass(
+                    item,
+                    directive,
+                    pure_fns,
+                    enum_defs,
+                    type_param_scope,
+                    params,
+                    allow_result,
+                    spec_scope,
+                )?;
+            }
+            Ok(())
+        }
+        ValuePattern::StructLit { fields, .. } => {
+            for field in fields {
+                validate_function_contract_value_pattern_prepass(
+                    &field.value,
+                    directive,
+                    pure_fns,
+                    enum_defs,
+                    type_param_scope,
+                    params,
+                    allow_result,
+                    spec_scope,
+                )?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn validate_contract_expr_core(

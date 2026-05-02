@@ -1,0 +1,14 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+expression: result
+---
+status: Some(0)
+stdout:
+PASS write_through_raw_pointer
+  all assertions discharged
+PASS unsafe_function_body_uses_unsafe_engine
+  all assertions discharged
+PASS main
+  all assertions discharged
+
+stderr:

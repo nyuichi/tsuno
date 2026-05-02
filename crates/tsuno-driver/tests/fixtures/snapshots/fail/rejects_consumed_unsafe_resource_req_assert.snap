@@ -1,0 +1,15 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+expression: result
+---
+status: Some(1)
+stdout:
+PASS consume_points_to
+  all assertions discharged
+FAIL rejects_consumed_unsafe_resource_req_assert
+  resource assertion failed
+  src/main.rs:13:13: 13:18
+PASS main
+  all assertions discharged
+
+stderr:

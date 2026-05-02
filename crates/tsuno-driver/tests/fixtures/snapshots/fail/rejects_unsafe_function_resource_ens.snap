@@ -1,0 +1,15 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+expression: result
+---
+status: Some(1)
+stdout:
+FAIL leaves_value_unchanged
+  resource postcondition failed
+  src/main.rs:5:2: 5:2
+PASS rejects_unsafe_function_resource_ens
+  all assertions discharged
+PASS main
+  all assertions discharged
+
+stderr:

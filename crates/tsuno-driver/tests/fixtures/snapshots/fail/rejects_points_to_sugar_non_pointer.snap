@@ -1,0 +1,11 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+expression: snapshot_output(output)
+---
+status: Some(1)
+stdout:
+UNSUPPORTED rejects_points_to_sugar_non_pointer
+  `|->` resource pattern requires a raw pointer, found `i32`
+  src/main.rs:5:1: 5:48
+
+stderr:

@@ -16,6 +16,9 @@ pub enum DirectiveKind {
     Inv,
     Assert,
     Assume,
+    ResourceAssert,
+    ResourceReq,
+    ResourceEns,
     LemmaCall,
 }
 
@@ -28,6 +31,9 @@ impl DirectiveKind {
             Self::Inv => "inv",
             Self::Assert => "assert",
             Self::Assume => "assume",
+            Self::ResourceAssert => "resource assert",
+            Self::ResourceReq => "resource req",
+            Self::ResourceEns => "resource ens",
             Self::LemmaCall => "lemma_call",
         }
     }
@@ -62,6 +68,7 @@ pub struct FunctionDirective {
 pub enum DirectivePayload {
     Predicate(spec::Expr),
     Let { name: String, value: spec::Expr },
+    ResourceAssert(ResourceAssertion),
     LemmaCall(spec::Expr),
 }
 
@@ -70,6 +77,16 @@ impl FunctionDirective {
         match &self.payload {
             DirectivePayload::Predicate(expr) | DirectivePayload::LemmaCall(expr) => expr,
             DirectivePayload::Let { value, .. } => value,
+            DirectivePayload::ResourceAssert(_) => {
+                panic!("resource assertion directive has no single expression")
+            }
+        }
+    }
+
+    pub fn resource_assertion(&self) -> Option<&ResourceAssertion> {
+        match &self.payload {
+            DirectivePayload::ResourceAssert(assertion) => Some(assertion),
+            _ => None,
         }
     }
 
@@ -79,6 +96,53 @@ impl FunctionDirective {
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResourceAssertion {
+    pub pattern: ResourcePattern,
+    pub condition: spec::Expr,
+}
+
+#[derive(Debug, Clone)]
+pub enum ResourcePattern {
+    Star(Box<ResourcePattern>, Box<ResourcePattern>),
+    PointsTo {
+        addr: spec::Expr,
+        ty: spec::Expr,
+        value: ValuePattern,
+    },
+    PointsToSugar {
+        pointer: String,
+        value: ValuePattern,
+    },
+    Alloc {
+        base: spec::Expr,
+        size: spec::Expr,
+        alignment: spec::Expr,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum ValuePattern {
+    Bind(String),
+    Expr(spec::Expr),
+    SeqLit(Vec<ValuePattern>),
+    StructLit {
+        name: String,
+        fields: Vec<ValuePatternStructField>,
+    },
+    Call {
+        func: String,
+        type_args: Vec<spec::SpecTy>,
+        args: Vec<ValuePattern>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ValuePatternStructField {
+    pub name: String,
+    pub value: ValuePattern,
 }
 
 #[derive(Debug, Clone)]
@@ -126,7 +190,7 @@ fn collect_contract_directives<'tcx>(
     if let Some(lines) = function_contract_comment_lines_before_item(source, loc.line)
         && lines
             .iter()
-            .any(|line| line.text.starts_with("req") || line.text.starts_with("ens"))
+            .any(|line| contract_comment_kind(&line.text).is_some())
     {
         return Err(DirectiveError {
             span: item_span,
@@ -174,6 +238,12 @@ fn parse_directive_payload(
     if kind == DirectiveKind::Let {
         return parse_let_directive(text, span);
     }
+    if matches!(
+        kind,
+        DirectiveKind::ResourceAssert | DirectiveKind::ResourceReq | DirectiveKind::ResourceEns
+    ) {
+        return parse_resource_assert_directive(text, span);
+    }
     let parsed = match kind {
         DirectiveKind::Assert | DirectiveKind::Assume => {
             spec::parse_statement_expr(kind.keyword(), text)
@@ -186,6 +256,377 @@ fn parse_directive_payload(
             message: render_parse_error(kind, err),
         })
         .map(DirectivePayload::Predicate)
+}
+
+fn parse_resource_assert_directive(
+    text: &str,
+    span: Span,
+) -> Result<DirectivePayload, DirectiveError> {
+    let text = text.trim().strip_suffix(';').unwrap_or(text.trim()).trim();
+    let (pattern, condition) = split_resource_assert_where(text);
+    let pattern = parse_resource_pattern(pattern, span)?;
+    let condition = match condition {
+        Some(condition) => parse_resource_expr(condition, span)?,
+        None => spec::Expr::Bool(true),
+    };
+    Ok(DirectivePayload::ResourceAssert(ResourceAssertion {
+        pattern,
+        condition,
+    }))
+}
+
+fn parse_resource_pattern(text: &str, span: Span) -> Result<ResourcePattern, DirectiveError> {
+    let text = strip_enclosing_parens(text.trim());
+    if let Some(index) = top_level_star(text) {
+        let lhs = parse_resource_pattern(&text[..index], span)?;
+        let rhs = parse_resource_pattern(&text[index + 1..], span)?;
+        return Ok(ResourcePattern::Star(Box::new(lhs), Box::new(rhs)));
+    }
+    if let Some(index) = top_level_points_to_arrow(text) {
+        return parse_points_to_sugar(&text[..index], &text[index + "|->".len()..], span);
+    }
+    if let Some(args) = atom_args(text, "PointsTo") {
+        let args = split_top_level_args(args, span)?;
+        if args.len() != 3 {
+            return Err(DirectiveError {
+                span,
+                message: "`PointsTo` resource pattern expects three arguments".to_owned(),
+            });
+        }
+        return Ok(ResourcePattern::PointsTo {
+            addr: parse_resource_expr(args[0], span)?,
+            ty: parse_resource_expr(args[1], span)?,
+            value: parse_value_pattern(args[2], span)?,
+        });
+    }
+    if let Some(args) = atom_args(text, "Alloc") {
+        let args = split_top_level_args(args, span)?;
+        if args.len() != 3 {
+            return Err(DirectiveError {
+                span,
+                message: "`Alloc` resource pattern expects three arguments".to_owned(),
+            });
+        }
+        return Ok(ResourcePattern::Alloc {
+            base: parse_resource_expr(args[0], span)?,
+            size: parse_resource_expr(args[1], span)?,
+            alignment: parse_resource_expr(args[2], span)?,
+        });
+    }
+    Err(DirectiveError {
+        span,
+        message: "resource assertion must be a `PointsTo`, `Alloc`, or `*` pattern".to_owned(),
+    })
+}
+
+fn parse_points_to_sugar(
+    lhs: &str,
+    rhs: &str,
+    span: Span,
+) -> Result<ResourcePattern, DirectiveError> {
+    let lhs = strip_enclosing_parens(lhs.trim());
+    let Some(pointer) = lhs.strip_prefix('*').map(str::trim) else {
+        return Err(DirectiveError {
+            span,
+            message: "`|->` resource pattern must have the form `*ptr |-> value`".to_owned(),
+        });
+    };
+    if !is_ident(pointer) {
+        return Err(DirectiveError {
+            span,
+            message: "`|->` resource pattern pointer must be a Rust local name".to_owned(),
+        });
+    }
+    Ok(ResourcePattern::PointsToSugar {
+        pointer: pointer.to_owned(),
+        value: parse_value_pattern(rhs, span)?,
+    })
+}
+
+fn split_resource_assert_where(text: &str) -> (&str, Option<&str>) {
+    let mut depth = 0usize;
+    for (index, _) in text.match_indices("where") {
+        for ch in text[..index].chars() {
+            match ch {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            depth = 0;
+            continue;
+        }
+        let before = text[..index].chars().next_back();
+        let after = text[index + "where".len()..].chars().next();
+        if before.is_none_or(|ch| ch.is_whitespace()) && after.is_none_or(|ch| ch.is_whitespace()) {
+            return (
+                text[..index].trim(),
+                Some(text[index + "where".len()..].trim()),
+            );
+        }
+        depth = 0;
+    }
+    (text, None)
+}
+
+fn parse_value_pattern(text: &str, span: Span) -> Result<ValuePattern, DirectiveError> {
+    let (rewritten, binders) = rewrite_pattern_binders(text, span)?;
+    let expr = parse_resource_expr(&rewritten, span)?;
+    Ok(expr_to_value_pattern(expr, &binders).0)
+}
+
+fn rewrite_pattern_binders(
+    text: &str,
+    span: Span,
+) -> Result<(String, Vec<(String, String)>), DirectiveError> {
+    let mut rewritten = String::with_capacity(text.len());
+    let mut binders = Vec::new();
+    let mut chars = text.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
+        if ch != '?' {
+            rewritten.push(ch);
+            continue;
+        }
+        let Some((_, first)) = chars.peek().copied() else {
+            return Err(DirectiveError {
+                span,
+                message: "resource pattern binder must be `?ident`".to_owned(),
+            });
+        };
+        if !(first == '_' || first.is_ascii_alphabetic()) {
+            return Err(DirectiveError {
+                span,
+                message: "resource pattern binder must be `?ident`".to_owned(),
+            });
+        }
+        let mut name = String::new();
+        while let Some((_, ch)) = chars.peek().copied() {
+            if ch == '_' || ch.is_ascii_alphanumeric() {
+                name.push(ch);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let placeholder = format!("__tsuno_resource_binder_{}", binders.len());
+        rewritten.push_str(&placeholder);
+        binders.push((placeholder, name));
+    }
+    Ok((rewritten, binders))
+}
+
+fn expr_to_value_pattern(expr: spec::Expr, binders: &[(String, String)]) -> (ValuePattern, bool) {
+    if let spec::Expr::Var(name) = &expr
+        && let Some((_, binder)) = binders.iter().find(|(placeholder, _)| placeholder == name)
+    {
+        return (ValuePattern::Bind(binder.clone()), true);
+    }
+    match expr {
+        spec::Expr::SeqLit(items) => {
+            let mut has_pattern = false;
+            let items = items
+                .into_iter()
+                .map(|item| {
+                    let (pattern, item_has_pattern) = expr_to_value_pattern(item, binders);
+                    has_pattern |= item_has_pattern;
+                    pattern
+                })
+                .collect::<Vec<_>>();
+            if has_pattern {
+                (ValuePattern::SeqLit(items), true)
+            } else {
+                (
+                    ValuePattern::Expr(spec::Expr::SeqLit(
+                        items
+                            .into_iter()
+                            .map(value_pattern_to_expr)
+                            .collect::<Option<Vec<_>>>()
+                            .expect("non-pattern sequence"),
+                    )),
+                    false,
+                )
+            }
+        }
+        spec::Expr::StructLit { name, fields } => {
+            let mut has_pattern = false;
+            let fields = fields
+                .into_iter()
+                .map(|field| {
+                    let (value, field_has_pattern) = expr_to_value_pattern(field.value, binders);
+                    has_pattern |= field_has_pattern;
+                    ValuePatternStructField {
+                        name: field.name,
+                        value,
+                    }
+                })
+                .collect::<Vec<_>>();
+            if has_pattern {
+                (ValuePattern::StructLit { name, fields }, true)
+            } else {
+                (
+                    ValuePattern::Expr(spec::Expr::StructLit {
+                        name,
+                        fields: fields
+                            .into_iter()
+                            .map(|field| {
+                                Some(spec::StructLitField {
+                                    name: field.name,
+                                    value: value_pattern_to_expr(field.value)?,
+                                })
+                            })
+                            .collect::<Option<Vec<_>>>()
+                            .expect("non-pattern struct"),
+                    }),
+                    false,
+                )
+            }
+        }
+        spec::Expr::Call {
+            func,
+            type_args,
+            args,
+        } => {
+            let mut has_pattern = false;
+            let args = args
+                .into_iter()
+                .map(|arg| {
+                    let (pattern, arg_has_pattern) = expr_to_value_pattern(arg, binders);
+                    has_pattern |= arg_has_pattern;
+                    pattern
+                })
+                .collect::<Vec<_>>();
+            if has_pattern {
+                (
+                    ValuePattern::Call {
+                        func,
+                        type_args,
+                        args,
+                    },
+                    true,
+                )
+            } else {
+                (
+                    ValuePattern::Expr(spec::Expr::Call {
+                        func,
+                        type_args,
+                        args: args
+                            .into_iter()
+                            .map(value_pattern_to_expr)
+                            .collect::<Option<Vec<_>>>()
+                            .expect("non-pattern call"),
+                    }),
+                    false,
+                )
+            }
+        }
+        other => (ValuePattern::Expr(other), false),
+    }
+}
+
+fn value_pattern_to_expr(pattern: ValuePattern) -> Option<spec::Expr> {
+    match pattern {
+        ValuePattern::Expr(expr) => Some(expr),
+        _ => None,
+    }
+}
+
+fn parse_resource_expr(text: &str, span: Span) -> Result<spec::Expr, DirectiveError> {
+    spec::parse_source_expr("resource assert", text.trim()).map_err(|err| DirectiveError {
+        span,
+        message: render_parse_error(DirectiveKind::ResourceAssert, err),
+    })
+}
+
+fn strip_enclosing_parens(mut text: &str) -> &str {
+    loop {
+        let trimmed = text.trim();
+        if !(trimmed.starts_with('(') && trimmed.ends_with(')')) {
+            return trimmed;
+        }
+        if matching_outer_parens(trimmed) {
+            text = &trimmed[1..trimmed.len() - 1];
+        } else {
+            return trimmed;
+        }
+    }
+}
+
+fn matching_outer_parens(text: &str) -> bool {
+    let mut depth = 0usize;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && index + ch.len_utf8() != text.len() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+fn top_level_star(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '*' if depth == 0 && index != 0 => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn top_level_points_to_arrow(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < text.len() {
+        let ch = text[index..].chars().next().expect("valid char boundary");
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '|' if depth == 0 && text[index..].starts_with("|->") => return Some(index),
+            _ => {}
+        }
+        index += ch.len_utf8();
+    }
+    None
+}
+
+fn atom_args<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(name)?.trim_start();
+    let args = rest.strip_prefix('(')?.strip_suffix(')')?;
+    Some(args)
+}
+
+fn split_top_level_args(text: &str, span: Span) -> Result<Vec<&str>, DirectiveError> {
+    let mut args = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                args.push(text[start..index].trim());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    args.push(text[start..].trim());
+    if args.iter().any(|arg| arg.is_empty()) {
+        return Err(DirectiveError {
+            span,
+            message: "resource pattern arguments must not be empty".to_owned(),
+        });
+    }
+    Ok(args)
 }
 
 fn parse_let_directive(text: &str, span: Span) -> Result<DirectivePayload, DirectiveError> {
@@ -386,7 +827,12 @@ fn statement_directive_entries(
         if matches_reserved_statement_directive(&comment.text)
             && !matches!(
                 classify_statement_directive(&comment.text),
-                Some(DirectiveKind::Assert | DirectiveKind::Assume | DirectiveKind::Let)
+                Some(
+                    DirectiveKind::Assert
+                        | DirectiveKind::Assume
+                        | DirectiveKind::ResourceAssert
+                        | DirectiveKind::Let
+                )
             )
         {
             return Err(position_error);
@@ -530,7 +976,13 @@ fn find_next_directive_keyword(
 fn contract_comment_kind(text: &str) -> Option<DirectiveKind> {
     directive_kind_prefix(
         text,
-        &[DirectiveKind::Req, DirectiveKind::Ens, DirectiveKind::Let],
+        &[
+            DirectiveKind::ResourceReq,
+            DirectiveKind::ResourceEns,
+            DirectiveKind::Req,
+            DirectiveKind::Ens,
+            DirectiveKind::Let,
+        ],
     )
 }
 
@@ -990,6 +1442,7 @@ fn classify_statement_directive(text: &str) -> Option<DirectiveKind> {
         &[
             DirectiveKind::Assert,
             DirectiveKind::Assume,
+            DirectiveKind::ResourceAssert,
             DirectiveKind::Let,
         ],
     )
@@ -1001,6 +1454,7 @@ fn matches_reserved_statement_directive(text: &str) -> bool {
         &[
             DirectiveKind::Assert,
             DirectiveKind::Assume,
+            DirectiveKind::ResourceAssert,
             DirectiveKind::Inv,
             DirectiveKind::Req,
             DirectiveKind::Ens,

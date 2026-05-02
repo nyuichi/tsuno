@@ -43,8 +43,10 @@ use z3::{Config, Context, RecFuncDecl, SatResult, Solver, Sort, SortKind};
 use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
     FunctionContract, LemmaCallContract, LoopContract, LoopContracts, NormalizedBinding,
-    NormalizedPredicate, ProgramPrepass, ResolvedExprEnv, TypedGhostMatchArm, TypedGhostStmt,
-    TypedLemmaDef, TypedPureFnDef, spec_ty_for_rust_ty,
+    NormalizedPredicate, ProgramPrepass, ResolvedExprEnv, ResourceAssertionContract,
+    TypedGhostMatchArm, TypedGhostStmt, TypedLemmaDef, TypedPureFnDef, TypedResourcePattern,
+    TypedValuePattern, rust_ty_key_text_for_rust_ty as checked_rust_ty_key_text_for_rust_ty,
+    spec_ty_for_rust_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
@@ -154,6 +156,35 @@ enum Resource {
 #[derive(Debug, Clone, Default)]
 struct UnsafeBridge {
     locals: BTreeSet<Local>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResourceContractCheck {
+    Precondition,
+    Postcondition,
+}
+
+impl ResourceContractCheck {
+    fn ambiguous_message(self) -> &'static str {
+        match self {
+            Self::Precondition => "ambiguous resource precondition matching is unsupported",
+            Self::Postcondition => "ambiguous resource postcondition matching is unsupported",
+        }
+    }
+
+    fn failure_message(self) -> &'static str {
+        match self {
+            Self::Precondition => "resource precondition failed",
+            Self::Postcondition => "resource postcondition failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResourcePatternMatch {
+    used: BTreeSet<usize>,
+    condition: Bool,
+    env: HashMap<String, SymValue>,
 }
 
 struct UnsafeCall<'mir, 'tcx> {
@@ -359,6 +390,12 @@ impl<'tcx> Verifier<'tcx> {
             Ok(None) => return self.pass_result("all assertions discharged"),
             Err(err) => return err,
         };
+        if self.current_function_is_unsafe() {
+            return match self.verify_unsafe_function_body(initial_state) {
+                Ok(()) => self.pass_result("all assertions discharged"),
+                Err(err) => err,
+            };
+        }
         let mut pending: BTreeMap<ControlPoint, Vec<State>> = BTreeMap::new();
         let mut worklist = VecDeque::new();
         self.enqueue_state(&mut pending, &mut worklist, initial_state);
@@ -413,6 +450,109 @@ impl<'tcx> Verifier<'tcx> {
         self.pass_result("all assertions discharged")
     }
 
+    fn current_function_is_unsafe(&self) -> bool {
+        self.fn_def_is_unsafe(self.function_context().def_id.to_def_id())
+    }
+
+    fn verify_unsafe_function_body(&self, state: State) -> Result<(), VerificationResult> {
+        let (mut unsafe_state, bridge) = self.enter_unsafe(state, self.report_span())?;
+        self.assume_unsafe_function_resource_reqs(&mut unsafe_state)?;
+
+        let mut pending: BTreeMap<ControlPoint, Vec<UnsafeState>> = BTreeMap::new();
+        let mut worklist = VecDeque::new();
+        self.enqueue_unsafe_state(&mut pending, &mut worklist, unsafe_state);
+
+        while let Some(ctrl) = worklist.pop_front() {
+            let Some(bucket) = pending.remove(&ctrl) else {
+                continue;
+            };
+            for mut unsafe_state in bucket {
+                let unsafe_ctrl = unsafe_state.ctrl;
+                if !self.apply_unsafe_control_point_directives(&mut unsafe_state, unsafe_ctrl)? {
+                    continue;
+                }
+
+                let data = &self.body().basic_blocks[unsafe_state.ctrl.basic_block];
+                if unsafe_state.ctrl.statement_index < data.statements.len() {
+                    let statement_index = unsafe_state.ctrl.statement_index;
+                    self.step_unsafe_statement(
+                        &mut unsafe_state,
+                        &bridge,
+                        &data.statements[statement_index],
+                    )?;
+                    self.enqueue_unsafe_state(&mut pending, &mut worklist, unsafe_state);
+                } else if matches!(data.terminator().kind, TerminatorKind::Return) {
+                    self.assert_unsafe_function_postcondition(
+                        &mut unsafe_state,
+                        data.terminator(),
+                    )?;
+                } else {
+                    for next_state in
+                        self.step_unsafe_terminator(unsafe_state, &bridge, data.terminator())?
+                    {
+                        self.enqueue_unsafe_state(&mut pending, &mut worklist, next_state);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn assume_unsafe_function_resource_reqs(
+        &self,
+        state: &mut UnsafeState,
+    ) -> Result<(), VerificationResult> {
+        let contract = self.current_contract();
+        if contract.resource_reqs.is_empty() {
+            return Ok(());
+        }
+        let view = self.unsafe_state_view(state);
+        let call_env = CallEnv::for_function(self, &view, contract)?;
+        let mut spec = state.env.clone();
+        for resource_req in &contract.resource_reqs {
+            self.assume_unsafe_resource_contract(
+                state,
+                resource_req,
+                &call_env.current,
+                &mut spec,
+                self.report_span(),
+            )?;
+        }
+        state.env = spec;
+        Ok(())
+    }
+
+    fn assert_unsafe_function_postcondition(
+        &self,
+        state: &mut UnsafeState,
+        term: &Terminator<'tcx>,
+    ) -> Result<(), VerificationResult> {
+        let contract = self.current_contract();
+        let view = self.unsafe_state_view(state);
+        let call_env = CallEnv::for_function(self, &view, contract)?;
+        let ens = self.contract_ens_formula(contract, &call_env, term.source_info.span)?;
+        self.unsafe_assert_constraint(
+            state,
+            ens,
+            term.source_info.span,
+            "postcondition failed".to_owned(),
+        )?;
+
+        let mut spec = call_env.spec.clone();
+        for resource_ens in &contract.resource_ens {
+            let resource_spec = self.consume_unsafe_resource_contract(
+                state,
+                resource_ens,
+                &call_env.current,
+                &spec,
+                term.source_info.span,
+                ResourceContractCheck::Postcondition,
+            )?;
+            spec.extend(resource_spec);
+        }
+        Ok(())
+    }
+
     fn apply_control_point_directives(
         &self,
         state: &mut State,
@@ -457,6 +597,15 @@ impl<'tcx> Verifier<'tcx> {
                     if !self.execute_lemma_call(state, lemma_call, self.control_span(ctrl))? {
                         return Ok(false);
                     }
+                }
+                ControlPointDirective::ResourceAssert(resource_assertion) => {
+                    return Err(self.unsupported_result(
+                        self.control_span(ctrl),
+                        format!(
+                            "resource assertions outside unsafe blocks are unsupported: {}",
+                            resource_assertion.assertion_span
+                        ),
+                    ));
                 }
             }
         }
@@ -883,16 +1032,19 @@ impl<'tcx> Verifier<'tcx> {
         call: UnsafeCall<'_, 'tcx>,
     ) -> Result<Vec<UnsafeState>, VerificationResult> {
         let span = call.span;
-        if let Some(def_id) = self.called_def_id(call.func)
-            && self.fn_def_is_unsafe(def_id)
-        {
-            return Err(self.unsupported_result(
-                span,
-                "unsafe function calls inside unsafe blocks are unsupported".to_owned(),
-            ));
-        }
         let callee = self.called_local_def_id(call.func);
         if let Some(local_def_id) = callee {
+            if !self.fn_def_is_unsafe(local_def_id.to_def_id())
+                && self
+                    .called_def_id(call.func)
+                    .is_some_and(|def_id| self.fn_def_is_unsafe(def_id))
+            {
+                return Err(self.unsupported_result(
+                    span,
+                    "unsafe function calls inside unsafe blocks require a local contract"
+                        .to_owned(),
+                ));
+            }
             let contract = self
                 .contracts
                 .get(&local_def_id)
@@ -910,6 +1062,18 @@ impl<'tcx> Verifier<'tcx> {
             };
             let req = self.contract_req_formula(contract, &req_env, span)?;
             self.unsafe_assert_constraint(&mut state, req, span, "precondition failed".to_owned())?;
+            let mut spec = spec;
+            for resource_req in &contract.resource_reqs {
+                let resource_spec = self.consume_unsafe_resource_contract(
+                    &mut state,
+                    resource_req,
+                    &call_env.current,
+                    &spec,
+                    span,
+                    ResourceContractCheck::Precondition,
+                )?;
+                spec.extend(resource_spec);
+            }
             let result_ty = self.place_ty(call.destination);
             let result_value = self.fresh_for_rust_ty(result_ty, "call_result")?;
             self.unsafe_write_place(
@@ -922,12 +1086,32 @@ impl<'tcx> Verifier<'tcx> {
             self.unsafe_abstract_call_mut_args(&mut state, bridge, call.args, span)?;
             let mut call_env = self.unsafe_call_env(&mut state, call.args, contract, span, spec)?;
             self.unsafe_consume_call_move_args(&mut state, bridge, call.args, span)?;
-            call_env.current.insert("result".to_owned(), result_value);
+            call_env
+                .current
+                .insert("result".to_owned(), result_value.clone());
             let ens = self.contract_ens_formula(contract, &call_env, span)?;
             if !self.assume_unsafe_path_condition(&mut state, ens) {
                 return Ok(Vec::new());
             }
+            for resource_ens in &contract.resource_ens {
+                self.assume_unsafe_resource_contract(
+                    &mut state,
+                    resource_ens,
+                    &call_env.current,
+                    &mut call_env.spec,
+                    span,
+                )?;
+            }
         } else {
+            if let Some(def_id) = self.called_def_id(call.func)
+                && self.fn_def_is_unsafe(def_id)
+            {
+                return Err(self.unsupported_result(
+                    span,
+                    "unsafe function calls inside unsafe blocks require a local contract"
+                        .to_owned(),
+                ));
+            }
             let result_ty = self.place_ty(call.destination);
             let result_value = self.fresh_for_rust_ty(result_ty, "opaque_result")?;
             self.require_unsafe_type_invariant(
@@ -1392,6 +1576,17 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 ControlPointDirective::LemmaCall(lemma_call) => {
                     self.execute_lemma_call(&mut view, lemma_call, self.control_span(ctrl))?
+                }
+                ControlPointDirective::ResourceAssert(resource_assertion) => {
+                    self.assert_unsafe_resource_pattern(
+                        state,
+                        &resource_assertion.pattern,
+                        &resource_assertion.condition,
+                        &resource_assertion.resolution,
+                        self.control_span(ctrl),
+                    )?;
+                    view = self.unsafe_state_view(state);
+                    true
                 }
             };
             state.pc = view.pc;
@@ -2387,6 +2582,808 @@ impl<'tcx> Verifier<'tcx> {
             unreachable!("initialized PointsTo match must contain a value");
         };
         Ok(value.clone())
+    }
+
+    fn assert_unsafe_resource_pattern(
+        &self,
+        state: &mut UnsafeState,
+        pattern: &TypedResourcePattern,
+        condition: &TypedExpr,
+        resolution: &ResolvedExprEnv,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        let view = self.unsafe_state_view(state);
+        let initial = ResourcePatternMatch {
+            used: BTreeSet::new(),
+            condition: Bool::from_bool(true),
+            env: HashMap::new(),
+        };
+        let matches =
+            self.match_resource_pattern(state, &view, pattern, resolution, span, vec![initial])?;
+        let mut possible = 0;
+        let mut definite = Vec::new();
+        for mut candidate in matches {
+            let mut candidate_view = view.clone();
+            candidate_view.env.extend(candidate.env.clone());
+            let where_condition = self.spec_expr_to_bool(&candidate_view, condition, resolution)?;
+            candidate.condition = bool_and(vec![candidate.condition, where_condition]).simplify();
+            if matches!(candidate.condition.as_bool(), Some(false)) {
+                continue;
+            }
+            match self.check_sat(&[state.pc.clone(), candidate.condition.clone().not()]) {
+                SatResult::Unsat => definite.push(candidate),
+                SatResult::Sat | SatResult::Unknown => {
+                    match self.check_sat(&[state.pc.clone(), candidate.condition.clone()]) {
+                        SatResult::Unsat => continue,
+                        SatResult::Sat | SatResult::Unknown => possible += 1,
+                    }
+                }
+            }
+        }
+        if definite.len() == 1 {
+            let candidate = definite.pop().expect("one definite match");
+            state.env.extend(candidate.env);
+            self.add_unsafe_path_condition(state, candidate.condition);
+            return Ok(());
+        }
+        if definite.len() > 1 || possible > 0 {
+            return Err(self.unsupported_result(
+                span,
+                "ambiguous resource assertion matching is unsupported".to_owned(),
+            ));
+        }
+        Err(self.fail_result(span, "resource assertion failed".to_owned()))
+    }
+
+    fn consume_unsafe_resource_contract(
+        &self,
+        state: &mut UnsafeState,
+        assertion: &ResourceAssertionContract,
+        current: &HashMap<String, SymValue>,
+        spec: &HashMap<String, SymValue>,
+        span: Span,
+        check: ResourceContractCheck,
+    ) -> Result<HashMap<String, SymValue>, VerificationResult> {
+        let initial = ResourcePatternMatch {
+            used: BTreeSet::new(),
+            condition: Bool::from_bool(true),
+            env: HashMap::new(),
+        };
+        let matches = self.match_contract_resource_pattern(
+            state,
+            current,
+            spec,
+            &assertion.pattern,
+            span,
+            vec![initial],
+        )?;
+        let mut possible = 0;
+        let mut definite = Vec::new();
+        for mut candidate in matches {
+            let mut candidate_spec = spec.clone();
+            candidate_spec.extend(candidate.env.clone());
+            let where_condition =
+                self.contract_expr_to_bool(current, &candidate_spec, &assertion.condition)?;
+            candidate.condition = bool_and(vec![candidate.condition, where_condition]).simplify();
+            if matches!(candidate.condition.as_bool(), Some(false)) {
+                continue;
+            }
+            match self.check_sat(&[state.pc.clone(), candidate.condition.clone().not()]) {
+                SatResult::Unsat => definite.push(candidate),
+                SatResult::Sat | SatResult::Unknown => {
+                    match self.check_sat(&[state.pc.clone(), candidate.condition.clone()]) {
+                        SatResult::Unsat => continue,
+                        SatResult::Sat | SatResult::Unknown => possible += 1,
+                    }
+                }
+            }
+        }
+        if definite.len() == 1 {
+            let candidate = definite.pop().expect("one definite match");
+            let mut used = candidate.used.into_iter().collect::<Vec<_>>();
+            used.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+            for index in used {
+                state.heap.remove(index);
+            }
+            state.env.extend(candidate.env.clone());
+            self.add_unsafe_path_condition(state, candidate.condition);
+            return Ok(candidate.env);
+        }
+        if definite.len() > 1 || possible > 0 {
+            return Err(self.unsupported_result(span, check.ambiguous_message().to_owned()));
+        }
+        Err(self.fail_result(span, check.failure_message().to_owned()))
+    }
+
+    fn assume_unsafe_resource_contract(
+        &self,
+        state: &mut UnsafeState,
+        assertion: &ResourceAssertionContract,
+        current: &HashMap<String, SymValue>,
+        spec: &mut HashMap<String, SymValue>,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        let before = spec.keys().cloned().collect::<BTreeSet<_>>();
+        self.materialize_contract_resource_pattern(state, current, spec, &assertion.pattern, span)?;
+        let condition = self.contract_expr_to_bool(current, spec, &assertion.condition)?;
+        if !self.assume_unsafe_path_condition(state, condition) {
+            state.pc = Bool::from_bool(false);
+        }
+        for (name, value) in spec.iter() {
+            if !before.contains(name) {
+                state.env.insert(name.clone(), value.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn match_contract_resource_pattern(
+        &self,
+        state: &UnsafeState,
+        current: &HashMap<String, SymValue>,
+        spec: &HashMap<String, SymValue>,
+        pattern: &TypedResourcePattern,
+        span: Span,
+        candidates: Vec<ResourcePatternMatch>,
+    ) -> Result<Vec<ResourcePatternMatch>, VerificationResult> {
+        match pattern {
+            TypedResourcePattern::Star(lhs, rhs) => {
+                let lhs_matches = self
+                    .match_contract_resource_pattern(state, current, spec, lhs, span, candidates)?;
+                self.match_contract_resource_pattern(state, current, spec, rhs, span, lhs_matches)
+            }
+            TypedResourcePattern::PointsTo { addr, ty, value } => {
+                let addr_value = self.contract_expr_to_value(current, spec, addr)?;
+                let ty_value = self.contract_expr_to_value(current, spec, ty)?;
+                let mut out = Vec::new();
+                for candidate in candidates {
+                    for (index, resource) in state.heap.iter().enumerate() {
+                        if candidate.used.contains(&index) {
+                            continue;
+                        }
+                        let Resource::PointsTo {
+                            addr: resource_addr,
+                            ty: resource_ty,
+                            value: resource_value,
+                        } = resource
+                        else {
+                            continue;
+                        };
+                        let actual_value = self.resource_option_value(
+                            resource_value.as_ref(),
+                            typed_value_pattern_ty(value),
+                        )?;
+                        let mut next_spec = spec.clone();
+                        next_spec.extend(candidate.env.clone());
+                        let mut next_env = candidate.env.clone();
+                        let value_condition = self.match_contract_value_pattern(
+                            current,
+                            &next_spec,
+                            value,
+                            &actual_value,
+                            span,
+                            &mut next_env,
+                        )?;
+                        let mut used = candidate.used.clone();
+                        used.insert(index);
+                        out.push(ResourcePatternMatch {
+                            used,
+                            condition: bool_and(vec![
+                                candidate.condition.clone(),
+                                self.eq_for_spec_ty(
+                                    &SpecTy::Usize,
+                                    &addr_value,
+                                    resource_addr,
+                                    span,
+                                )?,
+                                self.eq_for_spec_ty(&SpecTy::RustTy, &ty_value, resource_ty, span)?,
+                                value_condition,
+                            ])
+                            .simplify(),
+                            env: next_env,
+                        });
+                    }
+                }
+                Ok(out)
+            }
+            TypedResourcePattern::Alloc {
+                base,
+                size,
+                alignment,
+            } => {
+                let base = self.contract_expr_to_value(current, spec, base)?;
+                let size = self.contract_expr_to_value(current, spec, size)?;
+                let alignment = self.contract_expr_to_value(current, spec, alignment)?;
+                let mut out = Vec::new();
+                for candidate in candidates {
+                    for (index, resource) in state.heap.iter().enumerate() {
+                        if candidate.used.contains(&index) {
+                            continue;
+                        }
+                        let Resource::Alloc {
+                            base: resource_base,
+                            size: resource_size,
+                            alignment: resource_alignment,
+                        } = resource
+                        else {
+                            continue;
+                        };
+                        let mut used = candidate.used.clone();
+                        used.insert(index);
+                        out.push(ResourcePatternMatch {
+                            used,
+                            condition: bool_and(vec![
+                                candidate.condition.clone(),
+                                self.eq_for_spec_ty(&SpecTy::Usize, &base, resource_base, span)?,
+                                self.value_int_data(&size).eq(Int::from_u64(*resource_size)),
+                                self.value_int_data(&alignment)
+                                    .eq(Int::from_u64(*resource_alignment)),
+                            ])
+                            .simplify(),
+                            env: candidate.env.clone(),
+                        });
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    fn match_resource_pattern(
+        &self,
+        state: &UnsafeState,
+        view: &State,
+        pattern: &TypedResourcePattern,
+        resolution: &ResolvedExprEnv,
+        span: Span,
+        candidates: Vec<ResourcePatternMatch>,
+    ) -> Result<Vec<ResourcePatternMatch>, VerificationResult> {
+        match pattern {
+            TypedResourcePattern::Star(lhs, rhs) => {
+                let lhs_matches =
+                    self.match_resource_pattern(state, view, lhs, resolution, span, candidates)?;
+                self.match_resource_pattern(state, view, rhs, resolution, span, lhs_matches)
+            }
+            TypedResourcePattern::PointsTo { addr, ty, value } => {
+                let addr_value = self.spec_expr_to_value(view, addr, resolution)?;
+                let ty_value = self.spec_expr_to_value(view, ty, resolution)?;
+                let mut out = Vec::new();
+                for candidate in candidates {
+                    for (index, resource) in state.heap.iter().enumerate() {
+                        if candidate.used.contains(&index) {
+                            continue;
+                        }
+                        let Resource::PointsTo {
+                            addr: resource_addr,
+                            ty: resource_ty,
+                            value: resource_value,
+                        } = resource
+                        else {
+                            continue;
+                        };
+                        let actual_value = self.resource_option_value(
+                            resource_value.as_ref(),
+                            typed_value_pattern_ty(value),
+                        )?;
+                        let mut candidate_view = view.clone();
+                        candidate_view.env.extend(candidate.env.clone());
+                        let mut next_env = candidate.env.clone();
+                        let value_condition = self.match_value_pattern(
+                            &candidate_view,
+                            value,
+                            &actual_value,
+                            resolution,
+                            span,
+                            &mut next_env,
+                        )?;
+                        let mut used = candidate.used.clone();
+                        used.insert(index);
+                        out.push(ResourcePatternMatch {
+                            used,
+                            condition: bool_and(vec![
+                                candidate.condition.clone(),
+                                self.eq_for_spec_ty(
+                                    &SpecTy::Usize,
+                                    &addr_value,
+                                    resource_addr,
+                                    span,
+                                )?,
+                                self.eq_for_spec_ty(&SpecTy::RustTy, &ty_value, resource_ty, span)?,
+                                value_condition,
+                            ])
+                            .simplify(),
+                            env: next_env,
+                        });
+                    }
+                }
+                Ok(out)
+            }
+            TypedResourcePattern::Alloc {
+                base,
+                size,
+                alignment,
+            } => {
+                let base = self.spec_expr_to_value(view, base, resolution)?;
+                let size = self.spec_expr_to_value(view, size, resolution)?;
+                let alignment = self.spec_expr_to_value(view, alignment, resolution)?;
+                let mut out = Vec::new();
+                for candidate in candidates {
+                    for (index, resource) in state.heap.iter().enumerate() {
+                        if candidate.used.contains(&index) {
+                            continue;
+                        }
+                        let Resource::Alloc {
+                            base: resource_base,
+                            size: resource_size,
+                            alignment: resource_alignment,
+                        } = resource
+                        else {
+                            continue;
+                        };
+                        let mut used = candidate.used.clone();
+                        used.insert(index);
+                        out.push(ResourcePatternMatch {
+                            used,
+                            condition: bool_and(vec![
+                                candidate.condition.clone(),
+                                self.eq_for_spec_ty(&SpecTy::Usize, &base, resource_base, span)?,
+                                self.value_int_data(&size).eq(Int::from_u64(*resource_size)),
+                                self.value_int_data(&alignment)
+                                    .eq(Int::from_u64(*resource_alignment)),
+                            ])
+                            .simplify(),
+                            env: candidate.env.clone(),
+                        });
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    fn resource_option_value(
+        &self,
+        value: Option<&SymValue>,
+        option_ty: &SpecTy,
+    ) -> Result<SymValue, VerificationResult> {
+        let Some(inner_ty) = option_inner_spec_ty(option_ty) else {
+            return Err(self.unsupported_result(
+                self.report_span(),
+                "PointsTo value pattern must have type Option<T>".to_owned(),
+            ));
+        };
+        match value {
+            Some(value) => self.construct_option_some(inner_ty, value.clone()),
+            None => self.construct_option_none(inner_ty),
+        }
+    }
+
+    fn match_value_pattern(
+        &self,
+        view: &State,
+        pattern: &TypedValuePattern,
+        actual: &SymValue,
+        resolution: &ResolvedExprEnv,
+        span: Span,
+        env: &mut HashMap<String, SymValue>,
+    ) -> Result<Bool, VerificationResult> {
+        match pattern {
+            TypedValuePattern::Bind { name, ty } => {
+                if let Some(value) = env.get(name) {
+                    return self.eq_for_spec_ty(ty, value, actual, span);
+                }
+                env.insert(name.clone(), actual.clone());
+                Ok(Bool::from_bool(true))
+            }
+            TypedValuePattern::Expr(expr) => {
+                let mut pattern_view = view.clone();
+                pattern_view.env.extend(env.clone());
+                let expected = self.spec_expr_to_value(&pattern_view, expr, resolution)?;
+                self.eq_for_spec_ty(&expr.ty, &expected, actual, span)
+            }
+            TypedValuePattern::SeqLit { ty, items } => {
+                let mut values = Vec::with_capacity(items.len());
+                let mut conditions = Vec::with_capacity(items.len() + 1);
+                for (index, item) in items.iter().enumerate() {
+                    let item_value = self.project_field(actual.clone(), ty, index, span)?;
+                    conditions.push(self.match_value_pattern(
+                        view,
+                        item,
+                        &item_value,
+                        resolution,
+                        span,
+                        env,
+                    )?);
+                    values.push(item_value);
+                }
+                conditions.push(self.eq_for_spec_ty(
+                    ty,
+                    &self.seq_literal_value(&values),
+                    actual,
+                    span,
+                )?);
+                Ok(bool_and(conditions))
+            }
+            TypedValuePattern::StructLit { ty, fields } => {
+                let mut values = Vec::with_capacity(fields.len());
+                let mut conditions = Vec::with_capacity(fields.len() + 1);
+                for (index, field) in fields.iter().enumerate() {
+                    let field_value = self.project_field(actual.clone(), ty, index, span)?;
+                    conditions.push(self.match_value_pattern(
+                        view,
+                        field,
+                        &field_value,
+                        resolution,
+                        span,
+                        env,
+                    )?);
+                    values.push(field_value);
+                }
+                let expected = self.construct_composite(ty, &values)?;
+                conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
+                Ok(bool_and(conditions))
+            }
+            TypedValuePattern::CtorCall {
+                ty,
+                ctor_index,
+                args,
+            } => {
+                let encoding = self.composite_encoding(ty)?;
+                let mut values = Vec::with_capacity(args.len());
+                let mut conditions = Vec::with_capacity(args.len() + 1);
+                for (index, arg) in args.iter().enumerate() {
+                    let arg_value = self.decode_composite_ctor_field(
+                        &encoding,
+                        *ctor_index,
+                        actual,
+                        index,
+                        span,
+                    )?;
+                    conditions.push(
+                        self.match_value_pattern(view, arg, &arg_value, resolution, span, env)?,
+                    );
+                    values.push(arg_value);
+                }
+                conditions.push(self.composite_tag_formula_for_encoding(
+                    &encoding,
+                    actual,
+                    *ctor_index,
+                    span,
+                )?);
+                let expected = self.construct_composite_ctor(ty, *ctor_index, &values)?;
+                conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
+                Ok(bool_and(conditions))
+            }
+        }
+    }
+
+    fn match_contract_value_pattern(
+        &self,
+        current: &HashMap<String, SymValue>,
+        spec: &HashMap<String, SymValue>,
+        pattern: &TypedValuePattern,
+        actual: &SymValue,
+        span: Span,
+        env: &mut HashMap<String, SymValue>,
+    ) -> Result<Bool, VerificationResult> {
+        match pattern {
+            TypedValuePattern::Bind { name, ty } => {
+                if let Some(value) = env.get(name).or_else(|| spec.get(name)) {
+                    return self.eq_for_spec_ty(ty, value, actual, span);
+                }
+                env.insert(name.clone(), actual.clone());
+                Ok(Bool::from_bool(true))
+            }
+            TypedValuePattern::Expr(expr) => {
+                let mut pattern_spec = spec.clone();
+                pattern_spec.extend(env.clone());
+                let expected = self.contract_expr_to_value(current, &pattern_spec, expr)?;
+                self.eq_for_spec_ty(&expr.ty, &expected, actual, span)
+            }
+            TypedValuePattern::SeqLit { ty, items } => {
+                let mut values = Vec::with_capacity(items.len());
+                let mut conditions = Vec::with_capacity(items.len() + 1);
+                for (index, item) in items.iter().enumerate() {
+                    let item_value = self.project_field(actual.clone(), ty, index, span)?;
+                    conditions.push(self.match_contract_value_pattern(
+                        current,
+                        spec,
+                        item,
+                        &item_value,
+                        span,
+                        env,
+                    )?);
+                    values.push(item_value);
+                }
+                conditions.push(self.eq_for_spec_ty(
+                    ty,
+                    &self.seq_literal_value(&values),
+                    actual,
+                    span,
+                )?);
+                Ok(bool_and(conditions))
+            }
+            TypedValuePattern::StructLit { ty, fields } => {
+                let mut values = Vec::with_capacity(fields.len());
+                let mut conditions = Vec::with_capacity(fields.len() + 1);
+                for (index, field) in fields.iter().enumerate() {
+                    let field_value = self.project_field(actual.clone(), ty, index, span)?;
+                    conditions.push(self.match_contract_value_pattern(
+                        current,
+                        spec,
+                        field,
+                        &field_value,
+                        span,
+                        env,
+                    )?);
+                    values.push(field_value);
+                }
+                let expected = self.construct_composite(ty, &values)?;
+                conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
+                Ok(bool_and(conditions))
+            }
+            TypedValuePattern::CtorCall {
+                ty,
+                ctor_index,
+                args,
+            } => {
+                let encoding = self.composite_encoding(ty)?;
+                let mut values = Vec::with_capacity(args.len());
+                let mut conditions = Vec::with_capacity(args.len() + 1);
+                for (index, arg) in args.iter().enumerate() {
+                    let arg_value = self.decode_composite_ctor_field(
+                        &encoding,
+                        *ctor_index,
+                        actual,
+                        index,
+                        span,
+                    )?;
+                    conditions.push(
+                        self.match_contract_value_pattern(
+                            current, spec, arg, &arg_value, span, env,
+                        )?,
+                    );
+                    values.push(arg_value);
+                }
+                conditions.push(self.composite_tag_formula_for_encoding(
+                    &encoding,
+                    actual,
+                    *ctor_index,
+                    span,
+                )?);
+                let expected = self.construct_composite_ctor(ty, *ctor_index, &values)?;
+                conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
+                Ok(bool_and(conditions))
+            }
+        }
+    }
+
+    fn materialize_contract_resource_pattern(
+        &self,
+        state: &mut UnsafeState,
+        current: &HashMap<String, SymValue>,
+        spec: &mut HashMap<String, SymValue>,
+        pattern: &TypedResourcePattern,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        match pattern {
+            TypedResourcePattern::Star(lhs, rhs) => {
+                self.materialize_contract_resource_pattern(state, current, spec, lhs, span)?;
+                self.materialize_contract_resource_pattern(state, current, spec, rhs, span)
+            }
+            TypedResourcePattern::PointsTo { addr, ty, value } => {
+                let addr = self.contract_expr_to_value(current, spec, addr)?;
+                let ty = self.contract_expr_to_value(current, spec, ty)?;
+                let value =
+                    self.materialize_points_to_contract_value(current, spec, value, span)?;
+                let addr_int = self.value_int_data(&addr);
+                self.add_unsafe_path_condition(state, addr_int.eq(Int::from_i64(0)).not());
+                state.heap.push(Resource::PointsTo { addr, ty, value });
+                Ok(())
+            }
+            TypedResourcePattern::Alloc {
+                base,
+                size,
+                alignment,
+            } => {
+                let base = self.contract_expr_to_value(current, spec, base)?;
+                let size = self.contract_expr_to_value(current, spec, size)?;
+                let alignment = self.contract_expr_to_value(current, spec, alignment)?;
+                let Some(size) = self
+                    .value_int_data(&size)
+                    .as_i64()
+                    .and_then(|value| u64::try_from(value).ok())
+                else {
+                    return Err(self.unsupported_result(
+                        span,
+                        "resource postcondition Alloc size must be a concrete usize".to_owned(),
+                    ));
+                };
+                let Some(alignment) = self
+                    .value_int_data(&alignment)
+                    .as_i64()
+                    .and_then(|value| u64::try_from(value).ok())
+                else {
+                    return Err(self.unsupported_result(
+                        span,
+                        "resource postcondition Alloc alignment must be a concrete usize"
+                            .to_owned(),
+                    ));
+                };
+                self.add_unsafe_alloc_resource(
+                    state,
+                    &Allocation {
+                        base_addr: base,
+                        size,
+                        align: alignment,
+                    },
+                    span,
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    fn materialize_points_to_contract_value(
+        &self,
+        current: &HashMap<String, SymValue>,
+        spec: &mut HashMap<String, SymValue>,
+        pattern: &TypedValuePattern,
+        span: Span,
+    ) -> Result<Option<SymValue>, VerificationResult> {
+        let Some(inner_ty) = option_inner_spec_ty(typed_value_pattern_ty(pattern)) else {
+            return Err(self.unsupported_result(
+                span,
+                "PointsTo postcondition value must have type Option<T>".to_owned(),
+            ));
+        };
+        match pattern {
+            TypedValuePattern::CtorCall {
+                ty,
+                ctor_index,
+                args,
+            } if *ty == *typed_value_pattern_ty(pattern) => {
+                let some = self
+                    .value_encoder
+                    .enum_ctor_index("Option", "Some")
+                    .map_err(|err| self.unsupported_result(span, err))?;
+                let none = self
+                    .value_encoder
+                    .enum_ctor_index("Option", "None")
+                    .map_err(|err| self.unsupported_result(span, err))?;
+                if *ctor_index == some {
+                    let Some(arg) = args.first() else {
+                        return Err(self.unsupported_result(
+                            span,
+                            "Option::Some resource value requires one argument".to_owned(),
+                        ));
+                    };
+                    return Ok(Some(self.materialize_contract_value_pattern(
+                        current, spec, arg, &inner_ty, span,
+                    )?));
+                }
+                if *ctor_index == none {
+                    return Ok(None);
+                }
+            }
+            TypedValuePattern::Expr(expr) => {
+                if let TypedExprKind::CtorCall {
+                    ctor_index, args, ..
+                } = &expr.kind
+                {
+                    let some = self
+                        .value_encoder
+                        .enum_ctor_index("Option", "Some")
+                        .map_err(|err| self.unsupported_result(span, err))?;
+                    let none = self
+                        .value_encoder
+                        .enum_ctor_index("Option", "None")
+                        .map_err(|err| self.unsupported_result(span, err))?;
+                    if *ctor_index == some {
+                        let Some(arg) = args.first() else {
+                            return Err(self.unsupported_result(
+                                span,
+                                "Option::Some resource value requires one argument".to_owned(),
+                            ));
+                        };
+                        return Ok(Some(self.contract_expr_to_value(current, spec, arg)?));
+                    }
+                    if *ctor_index == none {
+                        return Ok(None);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Err(self.unsupported_result(
+            span,
+            "resource postcondition PointsTo value must be Option::Some(...) or Option::None"
+                .to_owned(),
+        ))
+    }
+
+    fn materialize_contract_value_pattern(
+        &self,
+        current: &HashMap<String, SymValue>,
+        spec: &mut HashMap<String, SymValue>,
+        pattern: &TypedValuePattern,
+        expected: &SpecTy,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        match pattern {
+            TypedValuePattern::Bind { name, ty } => {
+                let value = self.fresh_for_spec_ty(ty, name)?;
+                spec.insert(name.clone(), value.clone());
+                Ok(value)
+            }
+            TypedValuePattern::Expr(expr) => self.contract_expr_to_value(current, spec, expr),
+            TypedValuePattern::SeqLit { ty, items } => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.materialize_contract_value_pattern(
+                        current,
+                        spec,
+                        item,
+                        typed_value_pattern_ty(item),
+                        span,
+                    )?);
+                }
+                let value = self.seq_literal_value(&values);
+                self.assert_materialized_value_ty(expected, ty, span)?;
+                Ok(value)
+            }
+            TypedValuePattern::StructLit { ty, fields } => {
+                let mut values = Vec::with_capacity(fields.len());
+                for field in fields {
+                    values.push(self.materialize_contract_value_pattern(
+                        current,
+                        spec,
+                        field,
+                        typed_value_pattern_ty(field),
+                        span,
+                    )?);
+                }
+                self.assert_materialized_value_ty(expected, ty, span)?;
+                self.construct_composite(ty, &values)
+            }
+            TypedValuePattern::CtorCall {
+                ty,
+                ctor_index,
+                args,
+            } => {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.materialize_contract_value_pattern(
+                        current,
+                        spec,
+                        arg,
+                        typed_value_pattern_ty(arg),
+                        span,
+                    )?);
+                }
+                self.assert_materialized_value_ty(expected, ty, span)?;
+                self.construct_composite_ctor(ty, *ctor_index, &values)
+            }
+        }
+    }
+
+    fn assert_materialized_value_ty(
+        &self,
+        expected: &SpecTy,
+        actual: &SpecTy,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        if expected == actual {
+            Ok(())
+        } else {
+            Err(self.unsupported_result(
+                span,
+                format!(
+                    "resource postcondition value type mismatch: expected {:?}, found {:?}",
+                    expected, actual
+                ),
+            ))
+        }
     }
 
     fn write_matching_points_to(
@@ -5164,63 +6161,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn rust_ty_key_text_for_rust_ty(&self, ty: Ty<'tcx>) -> String {
-        match ty.kind() {
-            TyKind::Bool => "bool".to_owned(),
-            TyKind::Int(kind) => match kind {
-                ty::IntTy::I8 => "i8".to_owned(),
-                ty::IntTy::I16 => "i16".to_owned(),
-                ty::IntTy::I32 => "i32".to_owned(),
-                ty::IntTy::I64 => "i64".to_owned(),
-                ty::IntTy::I128 => "i128".to_owned(),
-                ty::IntTy::Isize => "isize".to_owned(),
-            },
-            TyKind::Uint(kind) => match kind {
-                ty::UintTy::U8 => "u8".to_owned(),
-                ty::UintTy::U16 => "u16".to_owned(),
-                ty::UintTy::U32 => "u32".to_owned(),
-                ty::UintTy::U64 => "u64".to_owned(),
-                ty::UintTy::U128 => "u128".to_owned(),
-                ty::UintTy::Usize => "usize".to_owned(),
-            },
-            TyKind::RawPtr(pointee, mutability) => {
-                let kind = if mutability.is_mut() { "mut" } else { "const" };
-                format!("*{kind} {}", self.rust_ty_key_text_for_rust_ty(*pointee))
-            }
-            TyKind::Ref(_, inner, mutability) => {
-                let inner = self.rust_ty_key_text_for_rust_ty(*inner);
-                if mutability.is_mut() {
-                    format!("&mut {inner}")
-                } else {
-                    format!("&{inner}")
-                }
-            }
-            TyKind::Tuple(fields) => {
-                let fields = fields
-                    .iter()
-                    .map(|field| self.rust_ty_key_text_for_rust_ty(field))
-                    .collect::<Vec<_>>();
-                match fields.as_slice() {
-                    [] => "()".to_owned(),
-                    [field] => format!("({field},)"),
-                    _ => format!("({})", fields.join(", ")),
-                }
-            }
-            TyKind::Adt(adt_def, args) => {
-                let mut text = self.tcx.def_path_str(adt_def.did());
-                let type_args = args
-                    .types()
-                    .map(|arg| self.rust_ty_key_text_for_rust_ty(arg))
-                    .collect::<Vec<_>>();
-                if !type_args.is_empty() {
-                    text.push('<');
-                    text.push_str(&type_args.join(", "));
-                    text.push('>');
-                }
-                text
-            }
-            TyKind::Param(param) => param.name.to_string(),
-            _ => format!("{ty:?}"),
-        }
+        checked_rust_ty_key_text_for_rust_ty(self.tcx, ty).unwrap_or_else(|_| format!("{ty:?}"))
     }
 
     fn fresh_for_spec_ty(&self, ty: &SpecTy, hint: &str) -> Result<SymValue, VerificationResult> {
@@ -6239,7 +7180,15 @@ fn collect_directive_prepass_pure_fn_refs(
 ) {
     if let Some(contract) = &prepass.function_contract {
         collect_normalized_predicate_pure_fn_refs(&contract.req, out);
+        for resource_req in &contract.resource_reqs {
+            collect_typed_resource_pattern_pure_fn_refs(&resource_req.pattern, out);
+            collect_typed_expr_pure_fn_refs(&resource_req.condition, out);
+        }
         collect_typed_expr_pure_fn_refs(&contract.ens, out);
+        for resource_ens in &contract.resource_ens {
+            collect_typed_resource_pattern_pure_fn_refs(&resource_ens.pattern, out);
+            collect_typed_expr_pure_fn_refs(&resource_ens.condition, out);
+        }
     }
     for loop_contract in prepass.loop_contracts.by_header.values() {
         collect_typed_expr_pure_fn_refs(&loop_contract.invariant, out);
@@ -6256,6 +7205,10 @@ fn collect_directive_prepass_pure_fn_refs(
                 }
                 ControlPointDirective::Assume(assumption) => {
                     collect_typed_expr_pure_fn_refs(&assumption.assumption, out);
+                }
+                ControlPointDirective::ResourceAssert(resource_assertion) => {
+                    collect_typed_resource_pattern_pure_fn_refs(&resource_assertion.pattern, out);
+                    collect_typed_expr_pure_fn_refs(&resource_assertion.condition, out);
                 }
                 ControlPointDirective::LemmaCall(call) => {
                     for arg in &call.args {
@@ -6276,6 +7229,49 @@ fn collect_directive_prepass_pure_fn_refs(
         };
         collect_normalized_predicate_pure_fn_refs(&lemma.req, out);
         collect_typed_expr_pure_fn_refs(&lemma.ens, out);
+    }
+}
+
+fn collect_typed_resource_pattern_pure_fn_refs(
+    pattern: &TypedResourcePattern,
+    out: &mut BTreeSet<String>,
+) {
+    match pattern {
+        TypedResourcePattern::Star(lhs, rhs) => {
+            collect_typed_resource_pattern_pure_fn_refs(lhs, out);
+            collect_typed_resource_pattern_pure_fn_refs(rhs, out);
+        }
+        TypedResourcePattern::PointsTo { addr, ty, value } => {
+            collect_typed_expr_pure_fn_refs(addr, out);
+            collect_typed_expr_pure_fn_refs(ty, out);
+            collect_typed_value_pattern_pure_fn_refs(value, out);
+        }
+        TypedResourcePattern::Alloc {
+            base,
+            size,
+            alignment,
+        } => {
+            collect_typed_expr_pure_fn_refs(base, out);
+            collect_typed_expr_pure_fn_refs(size, out);
+            collect_typed_expr_pure_fn_refs(alignment, out);
+        }
+    }
+}
+
+fn collect_typed_value_pattern_pure_fn_refs(
+    pattern: &TypedValuePattern,
+    out: &mut BTreeSet<String>,
+) {
+    match pattern {
+        TypedValuePattern::Bind { .. } => {}
+        TypedValuePattern::Expr(expr) => collect_typed_expr_pure_fn_refs(expr, out),
+        TypedValuePattern::SeqLit { items, .. }
+        | TypedValuePattern::StructLit { fields: items, .. }
+        | TypedValuePattern::CtorCall { args: items, .. } => {
+            for item in items {
+                collect_typed_value_pattern_pure_fn_refs(item, out);
+            }
+        }
     }
 }
 
@@ -6430,6 +7426,23 @@ fn spec_ty_contains_mut_ref(ty: &SpecTy) -> bool {
     }
 }
 
+fn option_inner_spec_ty(ty: &SpecTy) -> Option<SpecTy> {
+    match ty {
+        SpecTy::Enum { name, args } if name == "Option" && args.len() == 1 => Some(args[0].clone()),
+        _ => None,
+    }
+}
+
+fn typed_value_pattern_ty(pattern: &TypedValuePattern) -> &SpecTy {
+    match pattern {
+        TypedValuePattern::Bind { ty, .. }
+        | TypedValuePattern::SeqLit { ty, .. }
+        | TypedValuePattern::StructLit { ty, .. }
+        | TypedValuePattern::CtorCall { ty, .. } => ty,
+        TypedValuePattern::Expr(expr) => &expr.ty,
+    }
+}
+
 fn span_text(tcx: TyCtxt<'_>, span: Span) -> String {
     tcx.sess.source_map().span_to_diagnostic_string(span)
 }
@@ -6536,8 +7549,10 @@ mod tests {
                     condition: bool_true.clone(),
                 },
                 req_span: "fixture.rs:1:1".to_owned(),
+                resource_reqs: Vec::new(),
                 ens: bool_true,
                 ens_span: "fixture.rs:1:1".to_owned(),
+                resource_ens: Vec::new(),
                 result: SpecTy::Bool,
             }),
             unsafe_blocks: Vec::new(),
