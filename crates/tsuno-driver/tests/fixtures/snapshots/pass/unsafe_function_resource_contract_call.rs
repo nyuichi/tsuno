@@ -1,8 +1,7 @@
 unsafe fn set_to_expected(p: *mut i32)
 //@ let expected = 42i32;
-//@ req {p}.prov == Option::Some(Provenance { base: {p}.addr })
-//@ resource req *p |-> Option::Some(?old) * Alloc({p}.addr, 4usize, 4usize) where old == 0i32;
-//@ resource ens *p |-> Option::Some(?v) * Alloc({p}.addr, 4usize, 4usize) where v == expected;
+//@ resource req *p |-> Option::Some(?old) where old == 0i32;
+//@ resource ens *p |-> Option::Some(?v) where v == expected;
 {
     *p = 42i32;
 }
