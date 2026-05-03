@@ -1,5 +1,6 @@
 unsafe fn choose_ptr(p: *mut i32) -> *mut i32
 //@ resource req *p |-> Option::Some(7i32);
+//@ ens result.addr == {p}.addr && result.prov == {p}.prov && result.ty == {p}.ty
 //@ resource ens *result |-> Option::Some(?v) where v == 7i32;
 {
     p

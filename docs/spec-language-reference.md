@@ -516,7 +516,14 @@ bridge rules for ownership-bearing heap values. `exit_unsafe` converts bridged
 local resources back to the safe state:
 `PointsTo(base, {type local_ty}, Some(value))` becomes the local's safe model
 value, while a missing `PointsTo` or `PointsTo(..., None)` leaves the safe local
-without an initialized model value.
+without an initialized model value. A `PointsTo` resource used for this
+safe-state reflection is consumed. After all bridged locals have been reflected,
+the unsafe heap must be empty; any remaining `PointsTo` or `DeallocToken`
+resource is reported as an unsafe exit error. This rule prevents linear unsafe
+resources from being silently discarded when control returns to safe code.
+Reflection may use path-condition equalities, so a resource such as
+`PointsTo(result.addr, {type T}, Some(v))` can be reflected to a bridged local
+when the unsafe path condition proves `result.addr == base`.
 
 Branching inside an unsafe block keeps separate unsafe states for the feasible
 paths. Unsafe heap resources are not merged at unsafe control-flow joins.
@@ -559,7 +566,9 @@ specified resources into the function's initial unsafe heap and assumes its
 postcondition matching is exact: each resource pattern must match exactly one
 set of heap resources after its `where` condition is applied. The matched
 resources are consumed at return because no unsafe heap is reflected to a caller
-during callee-body verification.
+during callee-body verification. After those postcondition resources and the
+callee's own bridged local resources have been consumed, the final unsafe heap
+must be empty.
 
 At an unsafe call site, each `resource req` is checked against the caller's
 unsafe heap and consumes exactly the matched resources. Each `resource ens`
@@ -584,11 +593,12 @@ unsafe fn keep_i32_cell(p: Ptr)
 
 An unsafe lemma body is verified. Its `resource req` clauses materialize the
 initial unsafe heap, and its `resource ens` clauses are checked against the final
-unsafe heap. Calling an unsafe lemma from unsafe code applies the same resource
-contract behavior as an unsafe function call: resource preconditions are
-consumed from the caller heap and resource postconditions are materialized back
-into it. Unsafe lemma calls are supported inside both unsafe blocks and unsafe
-function bodies.
+unsafe heap. After the lemma's `resource ens` clauses are consumed, its final
+unsafe heap must be empty. Calling an unsafe lemma from unsafe code applies the
+same resource contract behavior as an unsafe function call: resource
+preconditions are consumed from the caller heap and resource postconditions are
+materialized back into it. Unsafe lemma calls are supported inside both unsafe
+blocks and unsafe function bodies.
 
 Inside unsafe blocks and unsafe function bodies, ordinary `//@ let`,
 `//@ assert`, `//@ assume`, and lemma-call directives are supported when they

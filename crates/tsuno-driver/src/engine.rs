@@ -484,6 +484,7 @@ impl<'tcx> Verifier<'tcx> {
                 } else if matches!(data.terminator().kind, TerminatorKind::Return) {
                     self.assert_unsafe_function_postcondition(
                         &mut unsafe_state,
+                        &bridge,
                         data.terminator(),
                     )?;
                 } else {
@@ -525,6 +526,7 @@ impl<'tcx> Verifier<'tcx> {
     fn assert_unsafe_function_postcondition(
         &self,
         state: &mut UnsafeState,
+        bridge: &UnsafeBridge,
         term: &Terminator<'tcx>,
     ) -> Result<(), VerificationResult> {
         let contract = self.current_contract();
@@ -550,6 +552,12 @@ impl<'tcx> Verifier<'tcx> {
             )?;
             spec.extend(resource_spec);
         }
+        self.reflect_unsafe_bridge_locals(state, bridge, term.source_info.span)?;
+        self.assert_unsafe_heap_empty(
+            state,
+            term.source_info.span,
+            "unsafe function return leaves unconsumed heap resources",
+        )?;
         Ok(())
     }
 
@@ -1528,7 +1536,7 @@ impl<'tcx> Verifier<'tcx> {
         let mut next_states = Vec::new();
         for bucket in exits.into_values() {
             for unsafe_state in bucket {
-                next_states.push(self.exit_unsafe(unsafe_state, &bridge));
+                next_states.push(self.exit_unsafe(unsafe_state, &bridge, unsafe_span)?);
             }
         }
         Ok(next_states)
@@ -1648,21 +1656,51 @@ impl<'tcx> Verifier<'tcx> {
         Ok((unsafe_state, bridge))
     }
 
-    fn exit_unsafe(&self, mut unsafe_state: UnsafeState, bridge: &UnsafeBridge) -> State {
+    fn exit_unsafe(
+        &self,
+        mut unsafe_state: UnsafeState,
+        bridge: &UnsafeBridge,
+        span: Span,
+    ) -> Result<State, VerificationResult> {
+        self.reflect_unsafe_bridge_locals(&mut unsafe_state, bridge, span)?;
+        self.assert_unsafe_heap_empty(
+            &unsafe_state,
+            span,
+            "unsafe exit leaves unreflected heap resources",
+        )?;
+        Ok(State {
+            pc: unsafe_state.pc,
+            store: unsafe_state.store,
+            allocs: unsafe_state.allocs,
+            env: unsafe_state.env,
+            ctrl: unsafe_state.ctrl,
+        })
+    }
+
+    fn reflect_unsafe_bridge_locals(
+        &self,
+        unsafe_state: &mut UnsafeState,
+        bridge: &UnsafeBridge,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
         for local in &bridge.locals {
             let ty = self.local_rust_ty_model_value(*local);
-            let points_to = unsafe_state
-                .allocs
-                .get(local)
-                .and_then(|alloc| {
-                    self.points_to_index_for_ty_value(&unsafe_state, &alloc.base_addr, &ty)
-                })
-                .map(|index| &unsafe_state.heap[index]);
+            let index = if let Some(alloc) = unsafe_state.allocs.get(local) {
+                self.maybe_unique_matching_points_to_index_for_ty_value(
+                    unsafe_state,
+                    &alloc.base_addr,
+                    &ty,
+                    span,
+                )?
+            } else {
+                None
+            };
+            let points_to = index.map(|index| unsafe_state.heap.remove(index));
             match points_to {
                 Some(Resource::PointsTo {
                     value: Some(value), ..
                 }) => {
-                    unsafe_state.store.insert(*local, value.clone());
+                    unsafe_state.store.insert(*local, value);
                 }
                 Some(Resource::PointsTo { value: None, .. }) | None => {
                     unsafe_state.store.remove(local);
@@ -1672,12 +1710,19 @@ impl<'tcx> Verifier<'tcx> {
                 }
             }
         }
-        State {
-            pc: unsafe_state.pc,
-            store: unsafe_state.store,
-            allocs: unsafe_state.allocs,
-            env: unsafe_state.env,
-            ctrl: unsafe_state.ctrl,
+        Ok(())
+    }
+
+    fn assert_unsafe_heap_empty(
+        &self,
+        state: &UnsafeState,
+        span: Span,
+        message: &str,
+    ) -> Result<(), VerificationResult> {
+        if state.heap.is_empty() {
+            Ok(())
+        } else {
+            Err(self.fail_result(span, message.to_owned()))
         }
     }
 
@@ -2424,6 +2469,54 @@ impl<'tcx> Verifier<'tcx> {
         }
         debug_assert_eq!(possible, 0);
         Err(self.missing_points_to_result(span, require_initialized))
+    }
+
+    fn maybe_unique_matching_points_to_index_for_ty_value(
+        &self,
+        state: &UnsafeState,
+        addr: &SymValue,
+        ty: &SymValue,
+        span: Span,
+    ) -> Result<Option<usize>, VerificationResult> {
+        let mut possible = 0;
+        let mut definite = Vec::new();
+        for (index, resource) in state.heap.iter().enumerate() {
+            let Resource::PointsTo {
+                addr: resource_addr,
+                ty: resource_ty,
+                ..
+            } = resource
+            else {
+                continue;
+            };
+            if resource_ty != ty {
+                continue;
+            }
+            let addr_matches = self.eq_for_spec_ty(&SpecTy::Usize, addr, resource_addr, span)?;
+            let condition = addr_matches.simplify();
+            if matches!(condition.as_bool(), Some(false)) {
+                continue;
+            }
+            match self.check_sat(&[state.pc.clone(), condition.not()]) {
+                SatResult::Unsat => definite.push(index),
+                SatResult::Sat | SatResult::Unknown => {
+                    match self.check_sat(&[state.pc.clone(), condition]) {
+                        SatResult::Unsat => continue,
+                        SatResult::Sat | SatResult::Unknown => possible += 1,
+                    }
+                }
+            }
+        }
+        if definite.len() == 1 {
+            return Ok(Some(definite[0]));
+        }
+        if definite.len() > 1 || possible > 0 {
+            return Err(self.unsupported_result(
+                span,
+                "ambiguous PointsTo resource matching is unsupported".to_owned(),
+            ));
+        }
+        Ok(None)
     }
 
     fn read_matching_points_to(
@@ -3548,6 +3641,14 @@ impl<'tcx> Verifier<'tcx> {
                 )?;
                 spec.extend(resource_spec);
             }
+            self.assert_unsafe_heap_empty(
+                &final_state,
+                self.report_span(),
+                &format!(
+                    "lemma `{}` return leaves unconsumed heap resources",
+                    lemma.name
+                ),
+            )?;
         }
         Ok(())
     }
