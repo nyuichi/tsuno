@@ -4,9 +4,9 @@ expression: result
 ---
 status: Some(1)
 stdout:
-FAIL rejects_stack_dealloc_token_reify
-  raw assertion failed
-  src/main.rs:7:13: 7:18
+UNSUPPORTED rejects_raw_assert_outside_unsafe
+  raw assertions outside unsafe blocks are unsupported: src/main.rs:2:1: 2:53
+  src/main.rs:3:9: 3:11
 PASS main
   all assertions discharged
 

@@ -16,9 +16,9 @@ pub enum DirectiveKind {
     Inv,
     Assert,
     Assume,
-    ResourceAssert,
-    ResourceReq,
-    ResourceEns,
+    RawAssert,
+    RawReq,
+    RawEns,
     LemmaCall,
 }
 
@@ -31,9 +31,9 @@ impl DirectiveKind {
             Self::Inv => "inv",
             Self::Assert => "assert",
             Self::Assume => "assume",
-            Self::ResourceAssert => "resource assert",
-            Self::ResourceReq => "resource req",
-            Self::ResourceEns => "resource ens",
+            Self::RawAssert => "raw assert",
+            Self::RawReq => "raw req",
+            Self::RawEns => "raw ens",
             Self::LemmaCall => "lemma_call",
         }
     }
@@ -68,7 +68,7 @@ pub struct FunctionDirective {
 pub enum DirectivePayload {
     Predicate(spec::Expr),
     Let { name: String, value: spec::Expr },
-    ResourceAssert(ResourceAssertion),
+    RawAssert(RawAssertion),
     LemmaCall(spec::Expr),
 }
 
@@ -77,15 +77,15 @@ impl FunctionDirective {
         match &self.payload {
             DirectivePayload::Predicate(expr) | DirectivePayload::LemmaCall(expr) => expr,
             DirectivePayload::Let { value, .. } => value,
-            DirectivePayload::ResourceAssert(_) => {
-                panic!("resource assertion directive has no single expression")
+            DirectivePayload::RawAssert(_) => {
+                panic!("raw assertion directive has no single expression")
             }
         }
     }
 
-    pub fn resource_assertion(&self) -> Option<&ResourceAssertion> {
+    pub fn raw_assertion(&self) -> Option<&RawAssertion> {
         match &self.payload {
-            DirectivePayload::ResourceAssert(assertion) => Some(assertion),
+            DirectivePayload::RawAssert(assertion) => Some(assertion),
             _ => None,
         }
     }
@@ -99,14 +99,14 @@ impl FunctionDirective {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResourceAssertion {
-    pub pattern: ResourcePattern,
+pub struct RawAssertion {
+    pub pattern: RawPattern,
     pub condition: spec::Expr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResourcePattern {
-    Star(Box<ResourcePattern>, Box<ResourcePattern>),
+pub enum RawPattern {
+    Star(Box<RawPattern>, Box<RawPattern>),
     PointsTo {
         addr: spec::Expr,
         ty: spec::Expr,
@@ -240,9 +240,9 @@ fn parse_directive_payload(
     }
     if matches!(
         kind,
-        DirectiveKind::ResourceAssert | DirectiveKind::ResourceReq | DirectiveKind::ResourceEns
+        DirectiveKind::RawAssert | DirectiveKind::RawReq | DirectiveKind::RawEns
     ) {
-        return parse_resource_assert_directive(text, span);
+        return parse_raw_assert_directive(text, span);
     }
     let parsed = match kind {
         DirectiveKind::Assert | DirectiveKind::Assume => {
@@ -258,33 +258,27 @@ fn parse_directive_payload(
         .map(DirectivePayload::Predicate)
 }
 
-fn parse_resource_assert_directive(
-    text: &str,
-    span: Span,
-) -> Result<DirectivePayload, DirectiveError> {
-    parse_resource_assertion(text, span).map(DirectivePayload::ResourceAssert)
+fn parse_raw_assert_directive(text: &str, span: Span) -> Result<DirectivePayload, DirectiveError> {
+    parse_raw_assertion(text, span).map(DirectivePayload::RawAssert)
 }
 
-pub fn parse_resource_assertion(
-    text: &str,
-    span: Span,
-) -> Result<ResourceAssertion, DirectiveError> {
+pub fn parse_raw_assertion(text: &str, span: Span) -> Result<RawAssertion, DirectiveError> {
     let text = text.trim().strip_suffix(';').unwrap_or(text.trim()).trim();
-    let (pattern, condition) = split_resource_assert_where(text);
-    let pattern = parse_resource_pattern(pattern, span)?;
+    let (pattern, condition) = split_raw_assert_where(text);
+    let pattern = parse_raw_pattern(pattern, span)?;
     let condition = match condition {
-        Some(condition) => parse_resource_expr(condition, span)?,
+        Some(condition) => parse_raw_assert_expr(condition, span)?,
         None => spec::Expr::Bool(true),
     };
-    Ok(ResourceAssertion { pattern, condition })
+    Ok(RawAssertion { pattern, condition })
 }
 
-fn parse_resource_pattern(text: &str, span: Span) -> Result<ResourcePattern, DirectiveError> {
+fn parse_raw_pattern(text: &str, span: Span) -> Result<RawPattern, DirectiveError> {
     let text = strip_enclosing_parens(text.trim());
     if let Some(index) = top_level_star(text) {
-        let lhs = parse_resource_pattern(&text[..index], span)?;
-        let rhs = parse_resource_pattern(&text[index + 1..], span)?;
-        return Ok(ResourcePattern::Star(Box::new(lhs), Box::new(rhs)));
+        let lhs = parse_raw_pattern(&text[..index], span)?;
+        let rhs = parse_raw_pattern(&text[index + 1..], span)?;
+        return Ok(RawPattern::Star(Box::new(lhs), Box::new(rhs)));
     }
     if let Some(index) = top_level_points_to_arrow(text) {
         return parse_points_to_sugar(&text[..index], &text[index + "|->".len()..], span);
@@ -294,12 +288,12 @@ fn parse_resource_pattern(text: &str, span: Span) -> Result<ResourcePattern, Dir
         if args.len() != 3 {
             return Err(DirectiveError {
                 span,
-                message: "`PointsTo` resource pattern expects three arguments".to_owned(),
+                message: "`PointsTo` raw pattern expects three arguments".to_owned(),
             });
         }
-        return Ok(ResourcePattern::PointsTo {
-            addr: parse_resource_expr(args[0], span)?,
-            ty: parse_resource_expr(args[1], span)?,
+        return Ok(RawPattern::PointsTo {
+            addr: parse_raw_assert_expr(args[0], span)?,
+            ty: parse_raw_assert_expr(args[1], span)?,
             value: parse_value_pattern(args[2], span)?,
         });
     }
@@ -308,47 +302,42 @@ fn parse_resource_pattern(text: &str, span: Span) -> Result<ResourcePattern, Dir
         if args.len() != 3 {
             return Err(DirectiveError {
                 span,
-                message: "`DeallocToken` resource pattern expects three arguments".to_owned(),
+                message: "`DeallocToken` raw pattern expects three arguments".to_owned(),
             });
         }
-        return Ok(ResourcePattern::DeallocToken {
-            base: parse_resource_expr(args[0], span)?,
-            size: parse_resource_expr(args[1], span)?,
-            alignment: parse_resource_expr(args[2], span)?,
+        return Ok(RawPattern::DeallocToken {
+            base: parse_raw_assert_expr(args[0], span)?,
+            size: parse_raw_assert_expr(args[1], span)?,
+            alignment: parse_raw_assert_expr(args[2], span)?,
         });
     }
     Err(DirectiveError {
         span,
-        message: "resource assertion must be a `PointsTo`, `DeallocToken`, or `*` pattern"
-            .to_owned(),
+        message: "raw assertion must be a `PointsTo`, `DeallocToken`, or `*` pattern".to_owned(),
     })
 }
 
-fn parse_points_to_sugar(
-    lhs: &str,
-    rhs: &str,
-    span: Span,
-) -> Result<ResourcePattern, DirectiveError> {
+fn parse_points_to_sugar(lhs: &str, rhs: &str, span: Span) -> Result<RawPattern, DirectiveError> {
     let lhs = strip_enclosing_parens(lhs.trim());
     let Some(pointer) = lhs.strip_prefix('*').map(str::trim) else {
         return Err(DirectiveError {
             span,
-            message: "`|->` resource pattern must have the form `*ptr |-> value`".to_owned(),
+            message: "`|->` raw pattern must have the form `*ptr |-> value`".to_owned(),
         });
     };
     if !is_ident(pointer) {
         return Err(DirectiveError {
             span,
-            message: "`|->` resource pattern pointer must be a Rust local name".to_owned(),
+            message: "`|->` raw pattern pointer must be a Rust local name".to_owned(),
         });
     }
-    Ok(ResourcePattern::PointsToSugar {
+    Ok(RawPattern::PointsToSugar {
         pointer: pointer.to_owned(),
         value: parse_value_pattern(rhs, span)?,
     })
 }
 
-fn split_resource_assert_where(text: &str) -> (&str, Option<&str>) {
+fn split_raw_assert_where(text: &str) -> (&str, Option<&str>) {
     let mut depth = 0usize;
     for (index, _) in text.match_indices("where") {
         for ch in text[..index].chars() {
@@ -377,7 +366,7 @@ fn split_resource_assert_where(text: &str) -> (&str, Option<&str>) {
 
 fn parse_value_pattern(text: &str, span: Span) -> Result<ValuePattern, DirectiveError> {
     let (rewritten, binders) = rewrite_pattern_binders(text, span)?;
-    let expr = parse_resource_expr(&rewritten, span)?;
+    let expr = parse_raw_assert_expr(&rewritten, span)?;
     Ok(expr_to_value_pattern(expr, &binders).0)
 }
 
@@ -396,13 +385,13 @@ fn rewrite_pattern_binders(
         let Some((_, first)) = chars.peek().copied() else {
             return Err(DirectiveError {
                 span,
-                message: "resource pattern binder must be `?ident`".to_owned(),
+                message: "raw pattern binder must be `?ident`".to_owned(),
             });
         };
         if !(first == '_' || first.is_ascii_alphabetic()) {
             return Err(DirectiveError {
                 span,
-                message: "resource pattern binder must be `?ident`".to_owned(),
+                message: "raw pattern binder must be `?ident`".to_owned(),
             });
         }
         let mut name = String::new();
@@ -414,7 +403,7 @@ fn rewrite_pattern_binders(
                 break;
             }
         }
-        let placeholder = format!("__tsuno_resource_binder_{}", binders.len());
+        let placeholder = format!("__tsuno_raw_binder_{}", binders.len());
         rewritten.push_str(&placeholder);
         binders.push((placeholder, name));
     }
@@ -536,10 +525,10 @@ fn value_pattern_to_expr(pattern: ValuePattern) -> Option<spec::Expr> {
     }
 }
 
-fn parse_resource_expr(text: &str, span: Span) -> Result<spec::Expr, DirectiveError> {
-    spec::parse_source_expr("resource assert", text.trim()).map_err(|err| DirectiveError {
+fn parse_raw_assert_expr(text: &str, span: Span) -> Result<spec::Expr, DirectiveError> {
+    spec::parse_source_expr("raw assert", text.trim()).map_err(|err| DirectiveError {
         span,
-        message: render_parse_error(DirectiveKind::ResourceAssert, err),
+        message: render_parse_error(DirectiveKind::RawAssert, err),
     })
 }
 
@@ -628,7 +617,7 @@ fn split_top_level_args(text: &str, span: Span) -> Result<Vec<&str>, DirectiveEr
     if args.iter().any(|arg| arg.is_empty()) {
         return Err(DirectiveError {
             span,
-            message: "resource pattern arguments must not be empty".to_owned(),
+            message: "raw pattern arguments must not be empty".to_owned(),
         });
     }
     Ok(args)
@@ -835,7 +824,7 @@ fn statement_directive_entries(
                 Some(
                     DirectiveKind::Assert
                         | DirectiveKind::Assume
-                        | DirectiveKind::ResourceAssert
+                        | DirectiveKind::RawAssert
                         | DirectiveKind::Let
                 )
             )
@@ -982,8 +971,8 @@ fn contract_comment_kind(text: &str) -> Option<DirectiveKind> {
     directive_kind_prefix(
         text,
         &[
-            DirectiveKind::ResourceReq,
-            DirectiveKind::ResourceEns,
+            DirectiveKind::RawReq,
+            DirectiveKind::RawEns,
             DirectiveKind::Req,
             DirectiveKind::Ens,
             DirectiveKind::Let,
@@ -1447,7 +1436,7 @@ fn classify_statement_directive(text: &str) -> Option<DirectiveKind> {
         &[
             DirectiveKind::Assert,
             DirectiveKind::Assume,
-            DirectiveKind::ResourceAssert,
+            DirectiveKind::RawAssert,
             DirectiveKind::Let,
         ],
     )
@@ -1459,7 +1448,7 @@ fn matches_reserved_statement_directive(text: &str) -> bool {
         &[
             DirectiveKind::Assert,
             DirectiveKind::Assume,
-            DirectiveKind::ResourceAssert,
+            DirectiveKind::RawAssert,
             DirectiveKind::Inv,
             DirectiveKind::Req,
             DirectiveKind::Ens,
