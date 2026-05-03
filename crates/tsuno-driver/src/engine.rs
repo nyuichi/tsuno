@@ -113,7 +113,7 @@ struct FunctionContext<'tcx> {
 
 enum VerifierContext<'tcx> {
     Ghost,
-    Function(FunctionContext<'tcx>),
+    Function(Box<FunctionContext<'tcx>>),
 }
 
 pub struct Verifier<'tcx> {
@@ -184,6 +184,15 @@ struct RawPatternMatch {
     used: BTreeSet<usize>,
     condition: Bool,
     env: HashMap<String, SymValue>,
+}
+
+struct ContractPredicateAssertion<'a> {
+    predicate: &'a NormalizedPredicate,
+    current: &'a HashMap<String, SymValue>,
+    spec: &'a HashMap<String, SymValue>,
+    span: Span,
+    diagnostic_span: String,
+    message: String,
 }
 
 struct UnsafeCall<'mir, 'tcx> {
@@ -375,14 +384,14 @@ impl<'tcx> Verifier<'tcx> {
         } = prepass;
         let contract = function_contract.expect("successful function prepass must yield contract");
         self.contracts.insert(def_id, contract.clone());
-        self.context = VerifierContext::Function(FunctionContext {
+        self.context = VerifierContext::Function(Box::new(FunctionContext {
             def_id,
             body,
             contract,
             loop_contracts,
             control_point_directives,
             unsafe_blocks,
-        });
+        }));
 
         let initial_state = match self.initial_state() {
             Ok(Some(state)) => state,
@@ -3653,12 +3662,14 @@ impl<'tcx> Verifier<'tcx> {
                 let state_spec = state.env.clone();
                 let spec = self.assert_contract_predicate_constraint(
                     &mut state,
-                    expr,
-                    current,
-                    &state_spec,
-                    self.report_span(),
-                    format!("lemma `{}`", lemma.name),
-                    format!("lemma `{}` assertion failed", lemma.name),
+                    ContractPredicateAssertion {
+                        predicate: expr,
+                        current,
+                        spec: &state_spec,
+                        span: self.report_span(),
+                        diagnostic_span: format!("lemma `{}`", lemma.name),
+                        message: format!("lemma `{}` assertion failed", lemma.name),
+                    },
                 )?;
                 state.env = spec;
                 self.execute_lemma_stmts(lemma, current, state, rest)
@@ -3680,12 +3691,14 @@ impl<'tcx> Verifier<'tcx> {
                 let env = self.lemma_env_from_contract_args(args, current, &state.env, callee)?;
                 let spec = self.assert_contract_predicate_constraint(
                     &mut state,
-                    &callee.req,
-                    &env.current,
-                    &env.spec,
-                    self.report_span(),
-                    format!("lemma `{}`", lemma.name),
-                    format!("lemma `{}` precondition failed", callee.name),
+                    ContractPredicateAssertion {
+                        predicate: &callee.req,
+                        current: &env.current,
+                        spec: &env.spec,
+                        span: self.report_span(),
+                        diagnostic_span: format!("lemma `{}`", lemma.name),
+                        message: format!("lemma `{}` precondition failed", callee.name),
+                    },
                 )?;
                 let ens = self.contract_expr_to_bool(&env.current, &spec, &callee.ens)?;
                 if !self.assume_path_condition(&mut state, ens) {
@@ -3979,12 +3992,14 @@ impl<'tcx> Verifier<'tcx> {
         let env = self.lemma_env_from_state_exprs(state, &call.args, &call.resolution, lemma)?;
         let spec = self.assert_contract_predicate_constraint(
             state,
-            &lemma.req,
-            &env.current,
-            &env.spec,
-            span,
-            call.span_text.clone(),
-            format!("lemma `{}` precondition failed", lemma.name),
+            ContractPredicateAssertion {
+                predicate: &lemma.req,
+                current: &env.current,
+                spec: &env.spec,
+                span,
+                diagnostic_span: call.span_text.clone(),
+                message: format!("lemma `{}` precondition failed", lemma.name),
+            },
         )?;
         let ens = self.contract_expr_to_bool(&env.current, &spec, &lemma.ens)?;
         Ok(self.assume_path_condition(state, ens))
@@ -4008,12 +4023,14 @@ impl<'tcx> Verifier<'tcx> {
         } else {
             let spec = self.assert_contract_predicate_constraint(
                 &mut view,
-                &lemma.req,
-                &env.current,
-                &env.spec,
-                span,
-                call.span_text.clone(),
-                format!("lemma `{}` precondition failed", lemma.name),
+                ContractPredicateAssertion {
+                    predicate: &lemma.req,
+                    current: &env.current,
+                    spec: &env.spec,
+                    span,
+                    diagnostic_span: call.span_text.clone(),
+                    message: format!("lemma `{}` precondition failed", lemma.name),
+                },
             )?;
             let ens = self.contract_expr_to_bool(&env.current, &spec, &lemma.ens)?;
             if !self.assume_path_condition(&mut view, ens) {
@@ -5544,16 +5561,22 @@ impl<'tcx> Verifier<'tcx> {
     fn assert_contract_predicate_constraint(
         &self,
         state: &mut State,
-        predicate: &NormalizedPredicate,
-        current: &HashMap<String, SymValue>,
-        spec: &HashMap<String, SymValue>,
-        span: Span,
-        diagnostic_span: String,
-        message: String,
+        assertion: ContractPredicateAssertion<'_>,
     ) -> Result<HashMap<String, SymValue>, VerificationResult> {
-        let spec = self.bind_contract_spec_values(current, spec, &predicate.bindings)?;
-        let constraint = self.contract_expr_to_bool(current, &spec, &predicate.condition)?;
-        self.assert_predicate_constraint(state, constraint, span, diagnostic_span, message)?;
+        let spec = self.bind_contract_spec_values(
+            assertion.current,
+            assertion.spec,
+            &assertion.predicate.bindings,
+        )?;
+        let constraint =
+            self.contract_expr_to_bool(assertion.current, &spec, &assertion.predicate.condition)?;
+        self.assert_predicate_constraint(
+            state,
+            constraint,
+            assertion.span,
+            assertion.diagnostic_span,
+            assertion.message,
+        )?;
         Ok(spec)
     }
 
