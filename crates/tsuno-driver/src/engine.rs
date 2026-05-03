@@ -43,10 +43,9 @@ use z3::{Config, Context, RecFuncDecl, SatResult, Solver, Sort, SortKind};
 use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
     FunctionContract, LemmaCallContract, LoopContract, LoopContracts, NormalizedBinding,
-    NormalizedPredicate, ProgramPrepass, ResolvedExprEnv, ResourceAssertionContract,
-    TypedGhostMatchArm, TypedGhostStmt, TypedLemmaDef, TypedPureFnDef, TypedResourcePattern,
-    TypedValuePattern, rust_ty_key_text_for_rust_ty as checked_rust_ty_key_text_for_rust_ty,
-    spec_ty_for_rust_ty,
+    NormalizedPredicate, ProgramPrepass, RawAssertionContract, ResolvedExprEnv, TypedGhostMatchArm,
+    TypedGhostStmt, TypedLemmaDef, TypedPureFnDef, TypedRawPattern, TypedValuePattern,
+    rust_ty_key_text_for_rust_ty as checked_rust_ty_key_text_for_rust_ty, spec_ty_for_rust_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
@@ -114,7 +113,7 @@ struct FunctionContext<'tcx> {
 
 enum VerifierContext<'tcx> {
     Ghost,
-    Function(FunctionContext<'tcx>),
+    Function(Box<FunctionContext<'tcx>>),
 }
 
 pub struct Verifier<'tcx> {
@@ -135,12 +134,12 @@ struct UnsafeState {
     store: BTreeMap<Local, SymValue>,
     allocs: BTreeMap<Local, Allocation>,
     env: HashMap<String, SymValue>,
-    heap: Vec<Resource>,
+    heap: Vec<RawResource>,
     ctrl: ControlPoint,
 }
 
 #[derive(Debug, Clone)]
-enum Resource {
+enum RawResource {
     PointsTo {
         addr: SymValue,
         ty: SymValue,
@@ -159,32 +158,41 @@ struct UnsafeBridge {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ResourceContractCheck {
+enum RawContractCheck {
     Precondition,
     Postcondition,
 }
 
-impl ResourceContractCheck {
+impl RawContractCheck {
     fn ambiguous_message(self) -> &'static str {
         match self {
-            Self::Precondition => "ambiguous resource precondition matching is unsupported",
-            Self::Postcondition => "ambiguous resource postcondition matching is unsupported",
+            Self::Precondition => "ambiguous raw precondition matching is unsupported",
+            Self::Postcondition => "ambiguous raw postcondition matching is unsupported",
         }
     }
 
     fn failure_message(self) -> &'static str {
         match self {
-            Self::Precondition => "resource precondition failed",
-            Self::Postcondition => "resource postcondition failed",
+            Self::Precondition => "raw precondition failed",
+            Self::Postcondition => "raw postcondition failed",
         }
     }
 }
 
 #[derive(Debug, Clone)]
-struct ResourcePatternMatch {
+struct RawPatternMatch {
     used: BTreeSet<usize>,
     condition: Bool,
     env: HashMap<String, SymValue>,
+}
+
+struct ContractPredicateAssertion<'a> {
+    predicate: &'a NormalizedPredicate,
+    current: &'a HashMap<String, SymValue>,
+    spec: &'a HashMap<String, SymValue>,
+    span: Span,
+    diagnostic_span: String,
+    message: String,
 }
 
 struct UnsafeCall<'mir, 'tcx> {
@@ -376,14 +384,14 @@ impl<'tcx> Verifier<'tcx> {
         } = prepass;
         let contract = function_contract.expect("successful function prepass must yield contract");
         self.contracts.insert(def_id, contract.clone());
-        self.context = VerifierContext::Function(FunctionContext {
+        self.context = VerifierContext::Function(Box::new(FunctionContext {
             def_id,
             body,
             contract,
             loop_contracts,
             control_point_directives,
             unsafe_blocks,
-        });
+        }));
 
         let initial_state = match self.initial_state() {
             Ok(Some(state)) => state,
@@ -456,7 +464,7 @@ impl<'tcx> Verifier<'tcx> {
 
     fn verify_unsafe_function_body(&self, state: State) -> Result<(), VerificationResult> {
         let (mut unsafe_state, bridge) = self.enter_unsafe(state, self.report_span())?;
-        self.assume_unsafe_function_resource_reqs(&mut unsafe_state)?;
+        self.assume_unsafe_function_raw_reqs(&mut unsafe_state)?;
 
         let mut pending: BTreeMap<ControlPoint, Vec<UnsafeState>> = BTreeMap::new();
         let mut worklist = VecDeque::new();
@@ -499,21 +507,21 @@ impl<'tcx> Verifier<'tcx> {
         Ok(())
     }
 
-    fn assume_unsafe_function_resource_reqs(
+    fn assume_unsafe_function_raw_reqs(
         &self,
         state: &mut UnsafeState,
     ) -> Result<(), VerificationResult> {
         let contract = self.current_contract();
-        if contract.resource_reqs.is_empty() {
+        if contract.raw_reqs.is_empty() {
             return Ok(());
         }
         let view = self.unsafe_state_view(state);
         let call_env = CallEnv::for_function(self, &view, contract)?;
         let mut spec = state.env.clone();
-        for resource_req in &contract.resource_reqs {
-            self.assume_unsafe_resource_contract(
+        for raw_req in &contract.raw_reqs {
+            self.assume_unsafe_raw_contract(
                 state,
-                resource_req,
+                raw_req,
                 &call_env.current,
                 &mut spec,
                 self.report_span(),
@@ -541,16 +549,16 @@ impl<'tcx> Verifier<'tcx> {
         )?;
 
         let mut spec = call_env.spec.clone();
-        for resource_ens in &contract.resource_ens {
-            let resource_spec = self.consume_unsafe_resource_contract(
+        for raw_ens in &contract.raw_ens {
+            let raw_spec = self.consume_unsafe_raw_contract(
                 state,
-                resource_ens,
+                raw_ens,
                 &call_env.current,
                 &spec,
                 term.source_info.span,
-                ResourceContractCheck::Postcondition,
+                RawContractCheck::Postcondition,
             )?;
-            spec.extend(resource_spec);
+            spec.extend(raw_spec);
         }
         self.reflect_unsafe_bridge_locals(state, bridge, term.source_info.span)?;
         self.assert_unsafe_heap_empty(
@@ -606,12 +614,12 @@ impl<'tcx> Verifier<'tcx> {
                         return Ok(false);
                     }
                 }
-                ControlPointDirective::ResourceAssert(resource_assertion) => {
+                ControlPointDirective::RawAssert(raw_assertion) => {
                     return Err(self.unsupported_result(
                         self.control_span(ctrl),
                         format!(
-                            "resource assertions outside unsafe blocks are unsupported: {}",
-                            resource_assertion.assertion_span
+                            "raw assertions outside unsafe blocks are unsupported: {}",
+                            raw_assertion.assertion_span
                         ),
                     ));
                 }
@@ -1082,16 +1090,16 @@ impl<'tcx> Verifier<'tcx> {
             let req = self.contract_req_formula(contract, &req_env, span)?;
             self.unsafe_assert_constraint(&mut state, req, span, "precondition failed".to_owned())?;
             let mut spec = spec;
-            for resource_req in &contract.resource_reqs {
-                let resource_spec = self.consume_unsafe_resource_contract(
+            for raw_req in &contract.raw_reqs {
+                let raw_spec = self.consume_unsafe_raw_contract(
                     &mut state,
-                    resource_req,
+                    raw_req,
                     &call_env.current,
                     &spec,
                     span,
-                    ResourceContractCheck::Precondition,
+                    RawContractCheck::Precondition,
                 )?;
-                spec.extend(resource_spec);
+                spec.extend(raw_spec);
             }
             let result_ty = self.place_ty(call.destination);
             let result_value = self.fresh_for_rust_ty(result_ty, "call_result")?;
@@ -1112,10 +1120,10 @@ impl<'tcx> Verifier<'tcx> {
             if !self.assume_unsafe_path_condition(&mut state, ens) {
                 return Ok(Vec::new());
             }
-            for resource_ens in &contract.resource_ens {
-                self.assume_unsafe_resource_contract(
+            for raw_ens in &contract.raw_ens {
+                self.assume_unsafe_raw_contract(
                     &mut state,
-                    resource_ens,
+                    raw_ens,
                     &call_env.current,
                     &mut call_env.spec,
                     span,
@@ -1598,12 +1606,12 @@ impl<'tcx> Verifier<'tcx> {
                     view = self.unsafe_state_view(state);
                     true
                 }
-                ControlPointDirective::ResourceAssert(resource_assertion) => {
-                    self.assert_unsafe_resource_pattern(
+                ControlPointDirective::RawAssert(raw_assertion) => {
+                    self.assert_unsafe_raw_pattern(
                         state,
-                        &resource_assertion.pattern,
-                        &resource_assertion.condition,
-                        &resource_assertion.resolution,
+                        &raw_assertion.pattern,
+                        &raw_assertion.condition,
+                        &raw_assertion.resolution,
                         self.control_span(ctrl),
                     )?;
                     view = self.unsafe_state_view(state);
@@ -1697,15 +1705,15 @@ impl<'tcx> Verifier<'tcx> {
             };
             let points_to = index.map(|index| unsafe_state.heap.remove(index));
             match points_to {
-                Some(Resource::PointsTo {
+                Some(RawResource::PointsTo {
                     value: Some(value), ..
                 }) => {
                     unsafe_state.store.insert(*local, value);
                 }
-                Some(Resource::PointsTo { value: None, .. }) | None => {
+                Some(RawResource::PointsTo { value: None, .. }) | None => {
                     unsafe_state.store.remove(local);
                 }
-                Some(Resource::DeallocToken { .. }) => {
+                Some(RawResource::DeallocToken { .. }) => {
                     unreachable!("points_to_index returned a deallocation token")
                 }
             }
@@ -1776,14 +1784,12 @@ impl<'tcx> Verifier<'tcx> {
         let local_alloc = state.allocs.remove(&local);
         let ty = self.local_rust_ty_model_value(local);
         state.heap.retain(|resource| match resource {
-            Resource::PointsTo {
-                addr,
-                ty: resource_ty,
-                ..
+            RawResource::PointsTo {
+                addr, ty: raw_ty, ..
             } => local_alloc
                 .as_ref()
-                .is_none_or(|alloc| *addr != alloc.base_addr || *resource_ty != ty),
-            Resource::DeallocToken { .. } => true,
+                .is_none_or(|alloc| *addr != alloc.base_addr || *raw_ty != ty),
+            RawResource::DeallocToken { .. } => true,
         });
     }
 
@@ -1799,14 +1805,14 @@ impl<'tcx> Verifier<'tcx> {
         };
         let ty = self.local_rust_ty_model_value(local);
         if let Some(index) = self.points_to_index_for_ty_value(state, &alloc.base_addr, &ty) {
-            if let Resource::PointsTo { value: slot, .. } = &mut state.heap[index] {
+            if let RawResource::PointsTo { value: slot, .. } = &mut state.heap[index] {
                 *slot = Some(value);
             }
             return Ok(());
         }
 
         let addr = alloc.base_addr;
-        state.heap.push(Resource::PointsTo {
+        state.heap.push(RawResource::PointsTo {
             addr: addr.clone(),
             ty,
             value: Some(value.clone()),
@@ -2429,9 +2435,9 @@ impl<'tcx> Verifier<'tcx> {
         let mut possible = 0;
         let mut definite = Vec::new();
         for (index, resource) in state.heap.iter().enumerate() {
-            let Resource::PointsTo {
-                addr: resource_addr,
-                ty: resource_ty,
+            let RawResource::PointsTo {
+                addr: raw_addr,
+                ty: raw_ty,
                 value,
             } = resource
             else {
@@ -2440,10 +2446,10 @@ impl<'tcx> Verifier<'tcx> {
             if require_initialized && value.is_none() {
                 continue;
             }
-            if resource_ty != ty {
+            if raw_ty != ty {
                 continue;
             }
-            let addr_matches = self.eq_for_spec_ty(&SpecTy::Usize, addr, resource_addr, span)?;
+            let addr_matches = self.eq_for_spec_ty(&SpecTy::Usize, addr, raw_addr, span)?;
             let condition = addr_matches.simplify();
             if matches!(condition.as_bool(), Some(false)) {
                 continue;
@@ -2481,18 +2487,18 @@ impl<'tcx> Verifier<'tcx> {
         let mut possible = 0;
         let mut definite = Vec::new();
         for (index, resource) in state.heap.iter().enumerate() {
-            let Resource::PointsTo {
-                addr: resource_addr,
-                ty: resource_ty,
+            let RawResource::PointsTo {
+                addr: raw_addr,
+                ty: raw_ty,
                 ..
             } = resource
             else {
                 continue;
             };
-            if resource_ty != ty {
+            if raw_ty != ty {
                 continue;
             }
-            let addr_matches = self.eq_for_spec_ty(&SpecTy::Usize, addr, resource_addr, span)?;
+            let addr_matches = self.eq_for_spec_ty(&SpecTy::Usize, addr, raw_addr, span)?;
             let condition = addr_matches.simplify();
             if matches!(condition.as_bool(), Some(false)) {
                 continue;
@@ -2527,7 +2533,7 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
         let index = self.unique_matching_points_to_index(state, addr, ty, true, span)?;
-        let Resource::PointsTo {
+        let RawResource::PointsTo {
             value: Some(value), ..
         } = &state.heap[index]
         else {
@@ -2536,22 +2542,22 @@ impl<'tcx> Verifier<'tcx> {
         Ok(value.clone())
     }
 
-    fn assert_unsafe_resource_pattern(
+    fn assert_unsafe_raw_pattern(
         &self,
         state: &mut UnsafeState,
-        pattern: &TypedResourcePattern,
+        pattern: &TypedRawPattern,
         condition: &TypedExpr,
         resolution: &ResolvedExprEnv,
         span: Span,
     ) -> Result<(), VerificationResult> {
         let view = self.unsafe_state_view(state);
-        let initial = ResourcePatternMatch {
+        let initial = RawPatternMatch {
             used: BTreeSet::new(),
             condition: Bool::from_bool(true),
             env: HashMap::new(),
         };
         let matches =
-            self.match_resource_pattern(state, &view, pattern, resolution, span, vec![initial])?;
+            self.match_raw_pattern(state, &view, pattern, resolution, span, vec![initial])?;
         let mut possible = 0;
         let mut definite = Vec::new();
         for mut candidate in matches {
@@ -2581,27 +2587,27 @@ impl<'tcx> Verifier<'tcx> {
         if definite.len() > 1 || possible > 0 {
             return Err(self.unsupported_result(
                 span,
-                "ambiguous resource assertion matching is unsupported".to_owned(),
+                "ambiguous raw assertion matching is unsupported".to_owned(),
             ));
         }
-        Err(self.fail_result(span, "resource assertion failed".to_owned()))
+        Err(self.fail_result(span, "raw assertion failed".to_owned()))
     }
 
-    fn consume_unsafe_resource_contract(
+    fn consume_unsafe_raw_contract(
         &self,
         state: &mut UnsafeState,
-        assertion: &ResourceAssertionContract,
+        assertion: &RawAssertionContract,
         current: &HashMap<String, SymValue>,
         spec: &HashMap<String, SymValue>,
         span: Span,
-        check: ResourceContractCheck,
+        check: RawContractCheck,
     ) -> Result<HashMap<String, SymValue>, VerificationResult> {
-        let initial = ResourcePatternMatch {
+        let initial = RawPatternMatch {
             used: BTreeSet::new(),
             condition: Bool::from_bool(true),
             env: HashMap::new(),
         };
-        let matches = self.match_contract_resource_pattern(
+        let matches = self.match_contract_raw_pattern(
             state,
             current,
             spec,
@@ -2647,16 +2653,16 @@ impl<'tcx> Verifier<'tcx> {
         Err(self.fail_result(span, check.failure_message().to_owned()))
     }
 
-    fn assume_unsafe_resource_contract(
+    fn assume_unsafe_raw_contract(
         &self,
         state: &mut UnsafeState,
-        assertion: &ResourceAssertionContract,
+        assertion: &RawAssertionContract,
         current: &HashMap<String, SymValue>,
         spec: &mut HashMap<String, SymValue>,
         span: Span,
     ) -> Result<(), VerificationResult> {
         let before = spec.keys().cloned().collect::<BTreeSet<_>>();
-        self.materialize_contract_resource_pattern(state, current, spec, &assertion.pattern, span)?;
+        self.materialize_contract_raw_pattern(state, current, spec, &assertion.pattern, span)?;
         let condition = self.contract_expr_to_bool(current, spec, &assertion.condition)?;
         if !self.assume_unsafe_path_condition(state, condition) {
             state.pc = Bool::from_bool(false);
@@ -2669,22 +2675,22 @@ impl<'tcx> Verifier<'tcx> {
         Ok(())
     }
 
-    fn match_contract_resource_pattern(
+    fn match_contract_raw_pattern(
         &self,
         state: &UnsafeState,
         current: &HashMap<String, SymValue>,
         spec: &HashMap<String, SymValue>,
-        pattern: &TypedResourcePattern,
+        pattern: &TypedRawPattern,
         span: Span,
-        candidates: Vec<ResourcePatternMatch>,
-    ) -> Result<Vec<ResourcePatternMatch>, VerificationResult> {
+        candidates: Vec<RawPatternMatch>,
+    ) -> Result<Vec<RawPatternMatch>, VerificationResult> {
         match pattern {
-            TypedResourcePattern::Star(lhs, rhs) => {
-                let lhs_matches = self
-                    .match_contract_resource_pattern(state, current, spec, lhs, span, candidates)?;
-                self.match_contract_resource_pattern(state, current, spec, rhs, span, lhs_matches)
+            TypedRawPattern::Star(lhs, rhs) => {
+                let lhs_matches =
+                    self.match_contract_raw_pattern(state, current, spec, lhs, span, candidates)?;
+                self.match_contract_raw_pattern(state, current, spec, rhs, span, lhs_matches)
             }
-            TypedResourcePattern::PointsTo { addr, ty, value } => {
+            TypedRawPattern::PointsTo { addr, ty, value } => {
                 let addr_value = self.contract_expr_to_value(current, spec, addr)?;
                 let ty_value = self.contract_expr_to_value(current, spec, ty)?;
                 let mut out = Vec::new();
@@ -2693,18 +2699,16 @@ impl<'tcx> Verifier<'tcx> {
                         if candidate.used.contains(&index) {
                             continue;
                         }
-                        let Resource::PointsTo {
-                            addr: resource_addr,
-                            ty: resource_ty,
-                            value: resource_value,
+                        let RawResource::PointsTo {
+                            addr: raw_addr,
+                            ty: raw_ty,
+                            value: raw_value,
                         } = resource
                         else {
                             continue;
                         };
-                        let actual_value = self.resource_option_value(
-                            resource_value.as_ref(),
-                            typed_value_pattern_ty(value),
-                        )?;
+                        let actual_value = self
+                            .raw_option_value(raw_value.as_ref(), typed_value_pattern_ty(value))?;
                         let mut next_spec = spec.clone();
                         next_spec.extend(candidate.env.clone());
                         let mut next_env = candidate.env.clone();
@@ -2718,17 +2722,12 @@ impl<'tcx> Verifier<'tcx> {
                         )?;
                         let mut used = candidate.used.clone();
                         used.insert(index);
-                        out.push(ResourcePatternMatch {
+                        out.push(RawPatternMatch {
                             used,
                             condition: bool_and(vec![
                                 candidate.condition.clone(),
-                                self.eq_for_spec_ty(
-                                    &SpecTy::Usize,
-                                    &addr_value,
-                                    resource_addr,
-                                    span,
-                                )?,
-                                self.eq_for_spec_ty(&SpecTy::RustTy, &ty_value, resource_ty, span)?,
+                                self.eq_for_spec_ty(&SpecTy::Usize, &addr_value, raw_addr, span)?,
+                                self.eq_for_spec_ty(&SpecTy::RustTy, &ty_value, raw_ty, span)?,
                                 value_condition,
                             ])
                             .simplify(),
@@ -2738,7 +2737,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(out)
             }
-            TypedResourcePattern::DeallocToken {
+            TypedRawPattern::DeallocToken {
                 base,
                 size,
                 alignment,
@@ -2752,24 +2751,24 @@ impl<'tcx> Verifier<'tcx> {
                         if candidate.used.contains(&index) {
                             continue;
                         }
-                        let Resource::DeallocToken {
-                            base: resource_base,
-                            size: resource_size,
-                            alignment: resource_alignment,
+                        let RawResource::DeallocToken {
+                            base: raw_base,
+                            size: raw_size,
+                            alignment: raw_alignment,
                         } = resource
                         else {
                             continue;
                         };
                         let mut used = candidate.used.clone();
                         used.insert(index);
-                        out.push(ResourcePatternMatch {
+                        out.push(RawPatternMatch {
                             used,
                             condition: bool_and(vec![
                                 candidate.condition.clone(),
-                                self.eq_for_spec_ty(&SpecTy::Usize, &base, resource_base, span)?,
-                                self.value_int_data(&size).eq(Int::from_u64(*resource_size)),
+                                self.eq_for_spec_ty(&SpecTy::Usize, &base, raw_base, span)?,
+                                self.value_int_data(&size).eq(Int::from_u64(*raw_size)),
                                 self.value_int_data(&alignment)
-                                    .eq(Int::from_u64(*resource_alignment)),
+                                    .eq(Int::from_u64(*raw_alignment)),
                             ])
                             .simplify(),
                             env: candidate.env.clone(),
@@ -2781,22 +2780,22 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn match_resource_pattern(
+    fn match_raw_pattern(
         &self,
         state: &UnsafeState,
         view: &State,
-        pattern: &TypedResourcePattern,
+        pattern: &TypedRawPattern,
         resolution: &ResolvedExprEnv,
         span: Span,
-        candidates: Vec<ResourcePatternMatch>,
-    ) -> Result<Vec<ResourcePatternMatch>, VerificationResult> {
+        candidates: Vec<RawPatternMatch>,
+    ) -> Result<Vec<RawPatternMatch>, VerificationResult> {
         match pattern {
-            TypedResourcePattern::Star(lhs, rhs) => {
+            TypedRawPattern::Star(lhs, rhs) => {
                 let lhs_matches =
-                    self.match_resource_pattern(state, view, lhs, resolution, span, candidates)?;
-                self.match_resource_pattern(state, view, rhs, resolution, span, lhs_matches)
+                    self.match_raw_pattern(state, view, lhs, resolution, span, candidates)?;
+                self.match_raw_pattern(state, view, rhs, resolution, span, lhs_matches)
             }
-            TypedResourcePattern::PointsTo { addr, ty, value } => {
+            TypedRawPattern::PointsTo { addr, ty, value } => {
                 let addr_value = self.spec_expr_to_value(view, addr, resolution)?;
                 let ty_value = self.spec_expr_to_value(view, ty, resolution)?;
                 let mut out = Vec::new();
@@ -2805,18 +2804,16 @@ impl<'tcx> Verifier<'tcx> {
                         if candidate.used.contains(&index) {
                             continue;
                         }
-                        let Resource::PointsTo {
-                            addr: resource_addr,
-                            ty: resource_ty,
-                            value: resource_value,
+                        let RawResource::PointsTo {
+                            addr: raw_addr,
+                            ty: raw_ty,
+                            value: raw_value,
                         } = resource
                         else {
                             continue;
                         };
-                        let actual_value = self.resource_option_value(
-                            resource_value.as_ref(),
-                            typed_value_pattern_ty(value),
-                        )?;
+                        let actual_value = self
+                            .raw_option_value(raw_value.as_ref(), typed_value_pattern_ty(value))?;
                         let mut candidate_view = view.clone();
                         candidate_view.env.extend(candidate.env.clone());
                         let mut next_env = candidate.env.clone();
@@ -2830,17 +2827,12 @@ impl<'tcx> Verifier<'tcx> {
                         )?;
                         let mut used = candidate.used.clone();
                         used.insert(index);
-                        out.push(ResourcePatternMatch {
+                        out.push(RawPatternMatch {
                             used,
                             condition: bool_and(vec![
                                 candidate.condition.clone(),
-                                self.eq_for_spec_ty(
-                                    &SpecTy::Usize,
-                                    &addr_value,
-                                    resource_addr,
-                                    span,
-                                )?,
-                                self.eq_for_spec_ty(&SpecTy::RustTy, &ty_value, resource_ty, span)?,
+                                self.eq_for_spec_ty(&SpecTy::Usize, &addr_value, raw_addr, span)?,
+                                self.eq_for_spec_ty(&SpecTy::RustTy, &ty_value, raw_ty, span)?,
                                 value_condition,
                             ])
                             .simplify(),
@@ -2850,7 +2842,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(out)
             }
-            TypedResourcePattern::DeallocToken {
+            TypedRawPattern::DeallocToken {
                 base,
                 size,
                 alignment,
@@ -2864,24 +2856,24 @@ impl<'tcx> Verifier<'tcx> {
                         if candidate.used.contains(&index) {
                             continue;
                         }
-                        let Resource::DeallocToken {
-                            base: resource_base,
-                            size: resource_size,
-                            alignment: resource_alignment,
+                        let RawResource::DeallocToken {
+                            base: raw_base,
+                            size: raw_size,
+                            alignment: raw_alignment,
                         } = resource
                         else {
                             continue;
                         };
                         let mut used = candidate.used.clone();
                         used.insert(index);
-                        out.push(ResourcePatternMatch {
+                        out.push(RawPatternMatch {
                             used,
                             condition: bool_and(vec![
                                 candidate.condition.clone(),
-                                self.eq_for_spec_ty(&SpecTy::Usize, &base, resource_base, span)?,
-                                self.value_int_data(&size).eq(Int::from_u64(*resource_size)),
+                                self.eq_for_spec_ty(&SpecTy::Usize, &base, raw_base, span)?,
+                                self.value_int_data(&size).eq(Int::from_u64(*raw_size)),
                                 self.value_int_data(&alignment)
-                                    .eq(Int::from_u64(*resource_alignment)),
+                                    .eq(Int::from_u64(*raw_alignment)),
                             ])
                             .simplify(),
                             env: candidate.env.clone(),
@@ -2893,7 +2885,7 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn resource_option_value(
+    fn raw_option_value(
         &self,
         value: Option<&SymValue>,
         option_ty: &SpecTy,
@@ -3110,30 +3102,30 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn materialize_contract_resource_pattern(
+    fn materialize_contract_raw_pattern(
         &self,
         state: &mut UnsafeState,
         current: &HashMap<String, SymValue>,
         spec: &mut HashMap<String, SymValue>,
-        pattern: &TypedResourcePattern,
+        pattern: &TypedRawPattern,
         span: Span,
     ) -> Result<(), VerificationResult> {
         match pattern {
-            TypedResourcePattern::Star(lhs, rhs) => {
-                self.materialize_contract_resource_pattern(state, current, spec, lhs, span)?;
-                self.materialize_contract_resource_pattern(state, current, spec, rhs, span)
+            TypedRawPattern::Star(lhs, rhs) => {
+                self.materialize_contract_raw_pattern(state, current, spec, lhs, span)?;
+                self.materialize_contract_raw_pattern(state, current, spec, rhs, span)
             }
-            TypedResourcePattern::PointsTo { addr, ty, value } => {
+            TypedRawPattern::PointsTo { addr, ty, value } => {
                 let addr = self.contract_expr_to_value(current, spec, addr)?;
                 let ty = self.contract_expr_to_value(current, spec, ty)?;
                 let value =
                     self.materialize_points_to_contract_value(current, spec, value, span)?;
                 let addr_int = self.value_int_data(&addr);
                 self.add_unsafe_path_condition(state, addr_int.eq(Int::from_i64(0)).not());
-                state.heap.push(Resource::PointsTo { addr, ty, value });
+                state.heap.push(RawResource::PointsTo { addr, ty, value });
                 Ok(())
             }
-            TypedResourcePattern::DeallocToken {
+            TypedRawPattern::DeallocToken {
                 base,
                 size,
                 alignment,
@@ -3161,7 +3153,7 @@ impl<'tcx> Verifier<'tcx> {
                         "DeallocToken alignment must be a concrete usize".to_owned(),
                     ));
                 };
-                state.heap.push(Resource::DeallocToken {
+                state.heap.push(RawResource::DeallocToken {
                     base,
                     size,
                     alignment,
@@ -3202,7 +3194,7 @@ impl<'tcx> Verifier<'tcx> {
                     let Some(arg) = args.first() else {
                         return Err(self.unsupported_result(
                             span,
-                            "Option::Some resource value requires one argument".to_owned(),
+                            "Option::Some raw pattern value requires one argument".to_owned(),
                         ));
                     };
                     return Ok(Some(self.materialize_contract_value_pattern(
@@ -3230,7 +3222,7 @@ impl<'tcx> Verifier<'tcx> {
                         let Some(arg) = args.first() else {
                             return Err(self.unsupported_result(
                                 span,
-                                "Option::Some resource value requires one argument".to_owned(),
+                                "Option::Some raw pattern value requires one argument".to_owned(),
                             ));
                         };
                         return Ok(Some(self.contract_expr_to_value(current, spec, arg)?));
@@ -3244,8 +3236,7 @@ impl<'tcx> Verifier<'tcx> {
         }
         Err(self.unsupported_result(
             span,
-            "resource postcondition PointsTo value must be Option::Some(...) or Option::None"
-                .to_owned(),
+            "raw postcondition PointsTo value must be Option::Some(...) or Option::None".to_owned(),
         ))
     }
 
@@ -3326,7 +3317,7 @@ impl<'tcx> Verifier<'tcx> {
             Err(self.unsupported_result(
                 span,
                 format!(
-                    "resource postcondition value type mismatch: expected {:?}, found {:?}",
+                    "raw postcondition value type mismatch: expected {:?}, found {:?}",
                     expected, actual
                 ),
             ))
@@ -3343,17 +3334,17 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<(), VerificationResult> {
         let index = self.unique_matching_points_to_index(state, addr, ty, false, span)?;
-        let local = if let Resource::PointsTo {
-            addr: resource_addr,
-            ty: resource_ty,
+        let local = if let RawResource::PointsTo {
+            addr: raw_addr,
+            ty: raw_ty,
             ..
         } = &state.heap[index]
         {
-            self.bridge_local_for_points_to(state, bridge, resource_addr, resource_ty)
+            self.bridge_local_for_points_to(state, bridge, raw_addr, raw_ty)
         } else {
             unreachable!("points-to match must be PointsTo");
         };
-        if let Resource::PointsTo { value: slot, .. } = &mut state.heap[index] {
+        if let RawResource::PointsTo { value: slot, .. } = &mut state.heap[index] {
             *slot = Some(value.clone());
         }
         if let Some(local) = local {
@@ -3371,11 +3362,11 @@ impl<'tcx> Verifier<'tcx> {
         state.heap.iter().position(|resource| {
             matches!(
                 resource,
-                Resource::PointsTo {
-                    addr: resource_addr,
-                    ty: resource_ty,
+                RawResource::PointsTo {
+                    addr: raw_addr,
+                    ty: raw_ty,
                     ..
-                } if resource_addr == addr && resource_ty == ty
+                } if raw_addr == addr && raw_ty == ty
             )
         })
     }
@@ -3386,7 +3377,7 @@ impl<'tcx> Verifier<'tcx> {
         };
         let ty = self.local_rust_ty_model_value(local);
         if let Some(index) = self.points_to_index_for_ty_value(state, &alloc.base_addr, &ty)
-            && let Resource::PointsTo { value, .. } = &mut state.heap[index]
+            && let RawResource::PointsTo { value, .. } = &mut state.heap[index]
         {
             *value = None;
         }
@@ -3609,10 +3600,10 @@ impl<'tcx> Verifier<'tcx> {
                 return Ok(());
             }
         }
-        for resource_req in &lemma.resource_reqs {
-            self.assume_unsafe_resource_contract(
+        for raw_req in &lemma.raw_reqs {
+            self.assume_unsafe_raw_contract(
                 &mut state,
-                resource_req,
+                raw_req,
                 &current,
                 &mut spec,
                 self.report_span(),
@@ -3630,16 +3621,16 @@ impl<'tcx> Verifier<'tcx> {
                 self.report_span(),
                 format!("lemma `{}` postcondition failed", lemma.name),
             )?;
-            for resource_ens in &lemma.resource_ens {
-                let resource_spec = self.consume_unsafe_resource_contract(
+            for raw_ens in &lemma.raw_ens {
+                let raw_spec = self.consume_unsafe_raw_contract(
                     &mut final_state,
-                    resource_ens,
+                    raw_ens,
                     &final_exec.current,
                     &spec,
                     self.report_span(),
-                    ResourceContractCheck::Postcondition,
+                    RawContractCheck::Postcondition,
                 )?;
-                spec.extend(resource_spec);
+                spec.extend(raw_spec);
             }
             self.assert_unsafe_heap_empty(
                 &final_state,
@@ -3671,12 +3662,14 @@ impl<'tcx> Verifier<'tcx> {
                 let state_spec = state.env.clone();
                 let spec = self.assert_contract_predicate_constraint(
                     &mut state,
-                    expr,
-                    current,
-                    &state_spec,
-                    self.report_span(),
-                    format!("lemma `{}`", lemma.name),
-                    format!("lemma `{}` assertion failed", lemma.name),
+                    ContractPredicateAssertion {
+                        predicate: expr,
+                        current,
+                        spec: &state_spec,
+                        span: self.report_span(),
+                        diagnostic_span: format!("lemma `{}`", lemma.name),
+                        message: format!("lemma `{}` assertion failed", lemma.name),
+                    },
                 )?;
                 state.env = spec;
                 self.execute_lemma_stmts(lemma, current, state, rest)
@@ -3698,12 +3691,14 @@ impl<'tcx> Verifier<'tcx> {
                 let env = self.lemma_env_from_contract_args(args, current, &state.env, callee)?;
                 let spec = self.assert_contract_predicate_constraint(
                     &mut state,
-                    &callee.req,
-                    &env.current,
-                    &env.spec,
-                    self.report_span(),
-                    format!("lemma `{}`", lemma.name),
-                    format!("lemma `{}` precondition failed", callee.name),
+                    ContractPredicateAssertion {
+                        predicate: &callee.req,
+                        current: &env.current,
+                        spec: &env.spec,
+                        span: self.report_span(),
+                        diagnostic_span: format!("lemma `{}`", lemma.name),
+                        message: format!("lemma `{}` precondition failed", callee.name),
+                    },
                 )?;
                 let ens = self.contract_expr_to_bool(&env.current, &spec, &callee.ens)?;
                 if !self.assume_path_condition(&mut state, ens) {
@@ -3997,12 +3992,14 @@ impl<'tcx> Verifier<'tcx> {
         let env = self.lemma_env_from_state_exprs(state, &call.args, &call.resolution, lemma)?;
         let spec = self.assert_contract_predicate_constraint(
             state,
-            &lemma.req,
-            &env.current,
-            &env.spec,
-            span,
-            call.span_text.clone(),
-            format!("lemma `{}` precondition failed", lemma.name),
+            ContractPredicateAssertion {
+                predicate: &lemma.req,
+                current: &env.current,
+                spec: &env.spec,
+                span,
+                diagnostic_span: call.span_text.clone(),
+                message: format!("lemma `{}` precondition failed", lemma.name),
+            },
         )?;
         let ens = self.contract_expr_to_bool(&env.current, &spec, &lemma.ens)?;
         Ok(self.assume_path_condition(state, ens))
@@ -4026,12 +4023,14 @@ impl<'tcx> Verifier<'tcx> {
         } else {
             let spec = self.assert_contract_predicate_constraint(
                 &mut view,
-                &lemma.req,
-                &env.current,
-                &env.spec,
-                span,
-                call.span_text.clone(),
-                format!("lemma `{}` precondition failed", lemma.name),
+                ContractPredicateAssertion {
+                    predicate: &lemma.req,
+                    current: &env.current,
+                    spec: &env.spec,
+                    span,
+                    diagnostic_span: call.span_text.clone(),
+                    message: format!("lemma `{}` precondition failed", lemma.name),
+                },
             )?;
             let ens = self.contract_expr_to_bool(&env.current, &spec, &lemma.ens)?;
             if !self.assume_path_condition(&mut view, ens) {
@@ -4059,16 +4058,16 @@ impl<'tcx> Verifier<'tcx> {
             span,
             format!("lemma `{}` precondition failed", lemma.name),
         )?;
-        for resource_req in &lemma.resource_reqs {
-            let resource_spec = self.consume_unsafe_resource_contract(
+        for raw_req in &lemma.raw_reqs {
+            let raw_spec = self.consume_unsafe_raw_contract(
                 state,
-                resource_req,
+                raw_req,
                 &env.current,
                 &spec,
                 span,
-                ResourceContractCheck::Precondition,
+                RawContractCheck::Precondition,
             )?;
-            spec.extend(resource_spec);
+            spec.extend(raw_spec);
         }
         let ens = self.contract_expr_to_bool(&env.current, &spec, &lemma.ens)?;
         if !self.assume_unsafe_path_condition(state, ens) {
@@ -4076,14 +4075,8 @@ impl<'tcx> Verifier<'tcx> {
             return Ok(());
         }
         let mut spec = spec;
-        for resource_ens in &lemma.resource_ens {
-            self.assume_unsafe_resource_contract(
-                state,
-                resource_ens,
-                &env.current,
-                &mut spec,
-                span,
-            )?;
+        for raw_ens in &lemma.raw_ens {
+            self.assume_unsafe_raw_contract(state, raw_ens, &env.current, &mut spec, span)?;
         }
         state.env = spec;
         Ok(())
@@ -5568,16 +5561,22 @@ impl<'tcx> Verifier<'tcx> {
     fn assert_contract_predicate_constraint(
         &self,
         state: &mut State,
-        predicate: &NormalizedPredicate,
-        current: &HashMap<String, SymValue>,
-        spec: &HashMap<String, SymValue>,
-        span: Span,
-        diagnostic_span: String,
-        message: String,
+        assertion: ContractPredicateAssertion<'_>,
     ) -> Result<HashMap<String, SymValue>, VerificationResult> {
-        let spec = self.bind_contract_spec_values(current, spec, &predicate.bindings)?;
-        let constraint = self.contract_expr_to_bool(current, &spec, &predicate.condition)?;
-        self.assert_predicate_constraint(state, constraint, span, diagnostic_span, message)?;
+        let spec = self.bind_contract_spec_values(
+            assertion.current,
+            assertion.spec,
+            &assertion.predicate.bindings,
+        )?;
+        let constraint =
+            self.contract_expr_to_bool(assertion.current, &spec, &assertion.predicate.condition)?;
+        self.assert_predicate_constraint(
+            state,
+            constraint,
+            assertion.span,
+            assertion.diagnostic_span,
+            assertion.message,
+        )?;
         Ok(spec)
     }
 
@@ -7459,14 +7458,14 @@ fn collect_directive_prepass_pure_fn_refs(
 ) {
     if let Some(contract) = &prepass.function_contract {
         collect_normalized_predicate_pure_fn_refs(&contract.req, out);
-        for resource_req in &contract.resource_reqs {
-            collect_typed_resource_pattern_pure_fn_refs(&resource_req.pattern, out);
-            collect_typed_expr_pure_fn_refs(&resource_req.condition, out);
+        for raw_req in &contract.raw_reqs {
+            collect_typed_raw_pattern_pure_fn_refs(&raw_req.pattern, out);
+            collect_typed_expr_pure_fn_refs(&raw_req.condition, out);
         }
         collect_typed_expr_pure_fn_refs(&contract.ens, out);
-        for resource_ens in &contract.resource_ens {
-            collect_typed_resource_pattern_pure_fn_refs(&resource_ens.pattern, out);
-            collect_typed_expr_pure_fn_refs(&resource_ens.condition, out);
+        for raw_ens in &contract.raw_ens {
+            collect_typed_raw_pattern_pure_fn_refs(&raw_ens.pattern, out);
+            collect_typed_expr_pure_fn_refs(&raw_ens.condition, out);
         }
     }
     for loop_contract in prepass.loop_contracts.by_header.values() {
@@ -7485,9 +7484,9 @@ fn collect_directive_prepass_pure_fn_refs(
                 ControlPointDirective::Assume(assumption) => {
                     collect_typed_expr_pure_fn_refs(&assumption.assumption, out);
                 }
-                ControlPointDirective::ResourceAssert(resource_assertion) => {
-                    collect_typed_resource_pattern_pure_fn_refs(&resource_assertion.pattern, out);
-                    collect_typed_expr_pure_fn_refs(&resource_assertion.condition, out);
+                ControlPointDirective::RawAssert(raw_assertion) => {
+                    collect_typed_raw_pattern_pure_fn_refs(&raw_assertion.pattern, out);
+                    collect_typed_expr_pure_fn_refs(&raw_assertion.condition, out);
                 }
                 ControlPointDirective::LemmaCall(call) => {
                     for arg in &call.args {
@@ -7507,33 +7506,30 @@ fn collect_directive_prepass_pure_fn_refs(
             continue;
         };
         collect_normalized_predicate_pure_fn_refs(&lemma.req, out);
-        for resource_req in &lemma.resource_reqs {
-            collect_typed_resource_pattern_pure_fn_refs(&resource_req.pattern, out);
-            collect_typed_expr_pure_fn_refs(&resource_req.condition, out);
+        for raw_req in &lemma.raw_reqs {
+            collect_typed_raw_pattern_pure_fn_refs(&raw_req.pattern, out);
+            collect_typed_expr_pure_fn_refs(&raw_req.condition, out);
         }
         collect_typed_expr_pure_fn_refs(&lemma.ens, out);
-        for resource_ens in &lemma.resource_ens {
-            collect_typed_resource_pattern_pure_fn_refs(&resource_ens.pattern, out);
-            collect_typed_expr_pure_fn_refs(&resource_ens.condition, out);
+        for raw_ens in &lemma.raw_ens {
+            collect_typed_raw_pattern_pure_fn_refs(&raw_ens.pattern, out);
+            collect_typed_expr_pure_fn_refs(&raw_ens.condition, out);
         }
     }
 }
 
-fn collect_typed_resource_pattern_pure_fn_refs(
-    pattern: &TypedResourcePattern,
-    out: &mut BTreeSet<String>,
-) {
+fn collect_typed_raw_pattern_pure_fn_refs(pattern: &TypedRawPattern, out: &mut BTreeSet<String>) {
     match pattern {
-        TypedResourcePattern::Star(lhs, rhs) => {
-            collect_typed_resource_pattern_pure_fn_refs(lhs, out);
-            collect_typed_resource_pattern_pure_fn_refs(rhs, out);
+        TypedRawPattern::Star(lhs, rhs) => {
+            collect_typed_raw_pattern_pure_fn_refs(lhs, out);
+            collect_typed_raw_pattern_pure_fn_refs(rhs, out);
         }
-        TypedResourcePattern::PointsTo { addr, ty, value } => {
+        TypedRawPattern::PointsTo { addr, ty, value } => {
             collect_typed_expr_pure_fn_refs(addr, out);
             collect_typed_expr_pure_fn_refs(ty, out);
             collect_typed_value_pattern_pure_fn_refs(value, out);
         }
-        TypedResourcePattern::DeallocToken {
+        TypedRawPattern::DeallocToken {
             base,
             size,
             alignment,
@@ -7836,10 +7832,10 @@ mod tests {
                     condition: bool_true.clone(),
                 },
                 req_span: "fixture.rs:1:1".to_owned(),
-                resource_reqs: Vec::new(),
+                raw_reqs: Vec::new(),
                 ens: bool_true,
                 ens_span: "fixture.rs:1:1".to_owned(),
-                resource_ens: Vec::new(),
+                raw_ens: Vec::new(),
                 result: SpecTy::Bool,
             }),
             unsafe_blocks: Vec::new(),

@@ -1,4 +1,4 @@
-use crate::directive::{ResourceAssertion, parse_resource_assertion};
+use crate::directive::{RawAssertion, parse_raw_assertion};
 use rustc_span::DUMMY_SP;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,9 +295,9 @@ pub struct LemmaDef {
     pub type_params: Vec<String>,
     pub params: Vec<PureFnParam>,
     pub req: Expr,
-    pub resource_reqs: Vec<ResourceAssertion>,
+    pub raw_reqs: Vec<RawAssertion>,
     pub ens: Expr,
-    pub resource_ens: Vec<ResourceAssertion>,
+    pub raw_ens: Vec<RawAssertion>,
     pub body: Vec<GhostStmt>,
 }
 
@@ -1698,24 +1698,24 @@ impl<'a> GhostBlockParser<'a> {
         params: Vec<PureFnParam>,
     ) -> Result<LemmaDef, ParseError> {
         let mut req = None;
-        let mut resource_reqs = Vec::new();
+        let mut raw_reqs = Vec::new();
         let mut ens = None;
-        let mut resource_ens = Vec::new();
+        let mut raw_ens = Vec::new();
         loop {
             self.skip_ws();
             if self.peek_char() == Some('{') {
                 break;
             }
-            if self.starts_with_keyword("resource") {
-                self.expect_keyword("resource")?;
+            if self.starts_with_keyword("raw") {
+                self.expect_keyword("raw")?;
                 self.skip_ws();
                 if self.starts_with_keyword("req") {
                     self.expect_keyword("req")?;
-                    resource_reqs.push(self.parse_line_resource_assertion("lemma resource req")?);
+                    raw_reqs.push(self.parse_line_raw_assertion("lemma raw req")?);
                     continue;
                 }
                 self.expect_keyword("ens")?;
-                resource_ens.push(self.parse_line_resource_assertion("lemma resource ens")?);
+                raw_ens.push(self.parse_line_raw_assertion("lemma raw ens")?);
                 continue;
             }
             if self.starts_with_keyword("req") {
@@ -1745,9 +1745,9 @@ impl<'a> GhostBlockParser<'a> {
             type_params,
             params,
             req: req.unwrap_or(Expr::Bool(true)),
-            resource_reqs,
+            raw_reqs,
             ens: ens.unwrap_or(Expr::Bool(true)),
-            resource_ens,
+            raw_ens,
             body,
         })
     }
@@ -1911,14 +1911,11 @@ impl<'a> GhostBlockParser<'a> {
         parse_source_expr_with_type_params(kind, text, type_params)
     }
 
-    fn parse_line_resource_assertion(
-        &mut self,
-        kind: &str,
-    ) -> Result<ResourceAssertion, ParseError> {
+    fn parse_line_raw_assertion(&mut self, kind: &str) -> Result<RawAssertion, ParseError> {
         let (text, next) = self.parse_line_expr_text(self.text, self.cursor)?;
         self.cursor = next;
-        parse_resource_assertion(text, DUMMY_SP)
-            .map_err(|err| ParseError::new(err.message.replace("//@ resource assert", kind)))
+        parse_raw_assertion(text, DUMMY_SP)
+            .map_err(|err| ParseError::new(err.message.replace("//@ raw assert", kind)))
     }
 
     fn parse_spec_ty_annotation(
@@ -2668,7 +2665,7 @@ fn add1_done(x: i32)
                         ty: SpecTy::I32,
                     }],
                     req: true_expr(),
-                    resource_reqs: vec![],
+                    raw_reqs: vec![],
                     ens: Expr::Binary {
                         op: BinaryOp::Eq,
                         lhs: Box::new(Expr::Call {
@@ -2685,7 +2682,7 @@ fn add1_done(x: i32)
                             })),
                         }),
                     },
-                    resource_ens: vec![],
+                    raw_ens: vec![],
                     body: vec![GhostStmt::Assert(Expr::Binary {
                         op: BinaryOp::Eq,
                         lhs: Box::new(Expr::Call {
@@ -2758,9 +2755,9 @@ fn refl<T>(xs: Seq<T>)
                     ty: SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned()))),
                 }],
                 req: true_expr(),
-                resource_reqs: vec![],
+                raw_reqs: vec![],
                 ens: true_expr(),
-                resource_ens: vec![],
+                raw_ens: vec![],
                 body: vec![GhostStmt::Call {
                     name: "refl".to_owned(),
                     type_args: vec![SpecTy::TypeParam("T".to_owned())],

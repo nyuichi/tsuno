@@ -2,11 +2,10 @@
 source: crates/tsuno-driver/tests/snapshot_tests.rs
 expression: result
 ---
-status: Some(1)
+status: Some(0)
 stdout:
-FAIL rejects_stack_dealloc_token_reify
-  raw assertion failed
-  src/main.rs:7:13: 7:18
+PASS unsafe_block_raw_assert_points_to_sugar_single_tuple
+  all assertions discharged
 PASS main
   all assertions discharged
 

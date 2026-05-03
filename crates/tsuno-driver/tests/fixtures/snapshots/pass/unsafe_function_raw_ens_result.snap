@@ -2,11 +2,12 @@
 source: crates/tsuno-driver/tests/snapshot_tests.rs
 expression: result
 ---
-status: Some(1)
+status: Some(0)
 stdout:
-FAIL rejects_stack_dealloc_token_reify
-  raw assertion failed
-  src/main.rs:7:13: 7:18
+PASS choose_ptr
+  all assertions discharged
+PASS unsafe_function_raw_ens_result
+  all assertions discharged
 PASS main
   all assertions discharged
 

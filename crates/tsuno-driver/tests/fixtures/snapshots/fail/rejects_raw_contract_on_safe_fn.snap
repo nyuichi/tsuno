@@ -1,0 +1,11 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+expression: result
+---
+status: Some(1)
+stdout:
+UNSUPPORTED safe_with_raw_contract
+  raw function contracts are only supported on unsafe functions
+  src/main.rs:1:1: 1:39
+
+stderr:
