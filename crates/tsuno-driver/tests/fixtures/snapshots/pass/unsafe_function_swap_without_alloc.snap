@@ -1,0 +1,14 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+expression: result
+---
+status: Some(0)
+stdout:
+PASS swap_i32
+  all assertions discharged
+PASS unsafe_function_swap_without_alloc
+  all assertions discharged
+PASS main
+  all assertions discharged
+
+stderr:

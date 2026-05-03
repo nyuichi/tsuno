@@ -451,30 +451,38 @@ PointsTo(addr: usize, ty: RustTy, value: Option<T>)
 allocation identifier. `Provenance { base }` identifies the allocation that a
 pointer is derived from, while `Ptr.addr` is the byte address accessed by the
 pointer. `Alloc` records the live allocation range and alignment for that base.
+It is used for allocation lifetime, deallocation, and layout-sensitive API
+specifications; ordinary raw reads and writes use or update `PointsTo`
+resources directly.
 
-`PointsTo` is a typed-cell resource. `PointsTo(addr, ty, Some(v))` means that
-`addr` is non-null, aligned for `ty`, and contains one initialized value valid
-for the same spec model type that the safe-state engine uses for the Rust type
-represented by `ty`. For example, a raw pointer is modeled as `Ptr`, a shared
-reference as `Ref<T>`, and a mutable reference as `Mut<T>` in both safe and
-unsafe states. `PointsTo(addr, ty, None)` means that the typed cell exists but
-is not initialized. The initial model does not represent byte-level ownership or
-physical pointer-sized layouts separately from typed cells.
+`PointsTo` is a typed-cell resource and a dereferenceability witness for that
+typed cell. `PointsTo(addr, ty, Some(v))` entails:
+
+- `addr` is non-null.
+- `addr` is aligned for `layout(ty)`.
+- the `layout(ty)` footprint at `addr` is live storage.
+- `v` is valid for the same spec model type that the safe-state engine uses for
+  the Rust type represented by `ty`.
+
+For example, a raw pointer is modeled as `Ptr`, a shared reference as `Ref<T>`,
+and a mutable reference as `Mut<T>` in both safe and unsafe states.
+`PointsTo(addr, ty, None)` entails the same non-nullness, alignment, and live
+storage facts, but the typed cell is not initialized as `ty`. The initial model
+does not represent byte-level ownership or physical pointer-sized layouts
+separately from typed cells.
 
 Unsafe states must be resource-well-formed: if two `PointsTo` resources are
 simultaneously present, their Rust layout footprints must not overlap. The
 footprint of `PointsTo(addr, ty, _)` is the byte range
 `addr..addr + layout(ty).size`, using rustc's layout for `ty`.
 
-A raw pointer dereference of type `T` requires all of the following:
-
-- `Ptr.ty == {type T}`.
-- `Ptr.prov == Some(Provenance { base })`.
-- `Alloc(base, size, alignment)` exists.
-- `Ptr.addr..Ptr.addr + layout(T).size` is within `base..base + size`.
-- `Ptr.addr` is non-null and aligned for `T`.
-- `PointsTo(Ptr.addr, {type T}, Some(v))` exists for reads, and
-  `PointsTo(Ptr.addr, {type T}, _)` exists for writes.
+A raw pointer read `*p: T` requires
+`PointsTo(p.addr, {type T}, Some(v))`, preserves that resource, and produces
+`v`. A raw pointer assignment `*p = x` requires
+`PointsTo(p.addr, {type T}, _)` and `Valid(T, x)`, and updates the resource to
+`PointsTo(p.addr, {type T}, Some(x))`. Raw pointer assignment for types with
+`Drop` is currently unsupported. Moving out through a raw pointer dereference is
+also unsupported; `ptr::read` will be specified separately as an unsafe API.
 
 The safe-to-unsafe bridge is explicit. `enter_unsafe` converts each live safe
 local allocation to `Alloc(base, size, alignment)` using rustc's layout size and
@@ -543,9 +551,8 @@ declared as ghost items with `unsafe fn`, spec parameters, optional ordinary
 ```rust
 /*@
 unsafe fn keep_i32_cell(p: Ptr)
-  req p.prov == Option::Some(Provenance { base: p.addr })
-  resource req PointsTo(p.addr, {type i32}, Option::Some(?old)) * Alloc(p.addr, 4usize, 4usize)
-  resource ens PointsTo(p.addr, {type i32}, Option::Some(?v)) * Alloc(p.addr, 4usize, 4usize) where v == old
+  resource req PointsTo(p.addr, {type i32}, Option::Some(?old))
+  resource ens PointsTo(p.addr, {type i32}, Option::Some(?v)) where v == old
 {
 }
 */
@@ -565,7 +572,7 @@ only affect the symbolic path condition or the directive environment, as they do
 in safe code. Unsafe code also supports resource assertions:
 
 ```rust
-//@ resource assert PointsTo({p}.addr, {type i32}, Option::Some(42i32)) * Alloc({p}.addr, 4usize, 4usize);
+//@ resource assert PointsTo({p}.addr, {type i32}, Option::Some(42i32));
 //@ resource assert PointsTo({p}.addr, {type i32}, Option::Some(?v)) where v > 0i32;
 //@ resource assert *p |-> Option::Some(?v) where v > 0i32;
 ```

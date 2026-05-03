@@ -1,13 +1,12 @@
 ---
 source: crates/tsuno-driver/tests/snapshot_tests.rs
-assertion_line: 85
-expression: snapshot_output(output)
+expression: result
 ---
 status: Some(1)
 stdout:
-FAIL rejects_null_raw_pointer_read
+FAIL read_i32
   raw pointer dereference requires an initialized PointsTo resource
-  src/main.rs:5:18: 5:20
+  src/main.rs:4:14: 4:16
 PASS main
   all assertions discharged
 

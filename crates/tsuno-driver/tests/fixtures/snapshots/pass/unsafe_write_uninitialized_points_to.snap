@@ -1,0 +1,12 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+expression: result
+---
+status: Some(0)
+stdout:
+PASS init_i32
+  all assertions discharged
+PASS main
+  all assertions discharged
+
+stderr:
