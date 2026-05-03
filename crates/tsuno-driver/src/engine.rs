@@ -146,7 +146,7 @@ enum Resource {
         ty: SymValue,
         value: Option<SymValue>,
     },
-    Alloc {
+    DeallocToken {
         base: SymValue,
         size: u64,
         alignment: u64,
@@ -1638,7 +1638,7 @@ impl<'tcx> Verifier<'tcx> {
         let mut bridge = UnsafeBridge::default();
 
         for (local, alloc) in reified_allocs {
-            self.add_unsafe_alloc_resource(&mut unsafe_state, &alloc, span)?;
+            self.add_unsafe_allocation_facts(&mut unsafe_state, &alloc, span)?;
             bridge.locals.insert(local);
             if let Some(value) = unsafe_state.store.get(&local).cloned() {
                 self.write_local_points_to(&mut unsafe_state, local, value, span)?;
@@ -1667,8 +1667,8 @@ impl<'tcx> Verifier<'tcx> {
                 Some(Resource::PointsTo { value: None, .. }) | None => {
                     unsafe_state.store.remove(local);
                 }
-                Some(Resource::Alloc { .. }) => {
-                    unreachable!("points_to_index returned an allocation")
+                Some(Resource::DeallocToken { .. }) => {
+                    unreachable!("points_to_index returned a deallocation token")
                 }
             }
         }
@@ -1712,23 +1712,18 @@ impl<'tcx> Verifier<'tcx> {
                 );
             }
         }
-        self.add_unsafe_alloc_resource(state, &alloc, span)?;
+        self.add_unsafe_allocation_facts(state, &alloc, span)?;
         state.allocs.insert(local, alloc);
         Ok(())
     }
 
-    fn add_unsafe_alloc_resource(
+    fn add_unsafe_allocation_facts(
         &self,
         state: &mut UnsafeState,
         alloc: &Allocation,
         span: Span,
     ) -> Result<(), VerificationResult> {
         self.add_unsafe_path_condition(state, self.allocation_bounds_formula(alloc, span)?);
-        state.heap.push(Resource::Alloc {
-            base: alloc.base_addr.clone(),
-            size: alloc.size,
-            alignment: alloc.align,
-        });
         Ok(())
     }
 
@@ -1743,9 +1738,7 @@ impl<'tcx> Verifier<'tcx> {
             } => local_alloc
                 .as_ref()
                 .is_none_or(|alloc| *addr != alloc.base_addr || *resource_ty != ty),
-            Resource::Alloc { base, .. } => local_alloc
-                .as_ref()
-                .is_none_or(|alloc| *base != alloc.base_addr),
+            Resource::DeallocToken { .. } => true,
         });
     }
 
@@ -2652,7 +2645,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(out)
             }
-            TypedResourcePattern::Alloc {
+            TypedResourcePattern::DeallocToken {
                 base,
                 size,
                 alignment,
@@ -2666,7 +2659,7 @@ impl<'tcx> Verifier<'tcx> {
                         if candidate.used.contains(&index) {
                             continue;
                         }
-                        let Resource::Alloc {
+                        let Resource::DeallocToken {
                             base: resource_base,
                             size: resource_size,
                             alignment: resource_alignment,
@@ -2764,7 +2757,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(out)
             }
-            TypedResourcePattern::Alloc {
+            TypedResourcePattern::DeallocToken {
                 base,
                 size,
                 alignment,
@@ -2778,7 +2771,7 @@ impl<'tcx> Verifier<'tcx> {
                         if candidate.used.contains(&index) {
                             continue;
                         }
-                        let Resource::Alloc {
+                        let Resource::DeallocToken {
                             base: resource_base,
                             size: resource_size,
                             alignment: resource_alignment,
@@ -3047,7 +3040,7 @@ impl<'tcx> Verifier<'tcx> {
                 state.heap.push(Resource::PointsTo { addr, ty, value });
                 Ok(())
             }
-            TypedResourcePattern::Alloc {
+            TypedResourcePattern::DeallocToken {
                 base,
                 size,
                 alignment,
@@ -3062,7 +3055,7 @@ impl<'tcx> Verifier<'tcx> {
                 else {
                     return Err(self.unsupported_result(
                         span,
-                        "resource postcondition Alloc size must be a concrete usize".to_owned(),
+                        "DeallocToken size must be a concrete usize".to_owned(),
                     ));
                 };
                 let Some(alignment) = self
@@ -3072,19 +3065,14 @@ impl<'tcx> Verifier<'tcx> {
                 else {
                     return Err(self.unsupported_result(
                         span,
-                        "resource postcondition Alloc alignment must be a concrete usize"
-                            .to_owned(),
+                        "DeallocToken alignment must be a concrete usize".to_owned(),
                     ));
                 };
-                self.add_unsafe_alloc_resource(
-                    state,
-                    &Allocation {
-                        base_addr: base,
-                        size,
-                        align: alignment,
-                    },
-                    span,
-                )?;
+                state.heap.push(Resource::DeallocToken {
+                    base,
+                    size,
+                    alignment,
+                });
                 Ok(())
             }
         }
@@ -7444,7 +7432,7 @@ fn collect_typed_resource_pattern_pure_fn_refs(
             collect_typed_expr_pure_fn_refs(ty, out);
             collect_typed_value_pattern_pure_fn_refs(value, out);
         }
-        TypedResourcePattern::Alloc {
+        TypedResourcePattern::DeallocToken {
             base,
             size,
             alignment,

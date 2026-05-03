@@ -1,0 +1,14 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+expression: result
+---
+status: Some(0)
+stdout:
+PASS keep_dealloc_token
+  all assertions discharged
+PASS calls_dealloc_token_contract
+  all assertions discharged
+PASS main
+  all assertions discharged
+
+stderr:

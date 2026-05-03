@@ -443,17 +443,21 @@ the unsafe block converts the updated resources back into safe Rust state.
 The initial unsafe heap model is address-based and has only two resource forms:
 
 ```text
-Alloc(base: usize, size: usize, alignment: usize)
+DeallocToken(base: usize, size: usize, alignment: usize)
 PointsTo(addr: usize, ty: RustTy, value: Option<T>)
 ```
 
-`Alloc(base, size, alignment)` is keyed by `base`; there is no separate
-allocation identifier. `Provenance { base }` identifies the allocation that a
-pointer is derived from, while `Ptr.addr` is the byte address accessed by the
-pointer. `Alloc` records the live allocation range and alignment for that base.
-It is used for allocation lifetime, deallocation, and layout-sensitive API
-specifications; ordinary raw reads and writes use or update `PointsTo`
-resources directly.
+`Provenance { base }` identifies the allocation that a pointer is derived from,
+while `Ptr.addr` is the byte address accessed by the pointer. There is no
+separate allocation identifier in the current model; allocation identity is
+represented by the allocation's base address.
+
+`DeallocToken(base, size, alignment)` is a linear deallocation capability for
+the allocation whose base address and deallocation layout are described by the
+token. It is not a dereferenceability witness, and ordinary raw reads and writes
+do not require it. It is intended to be consumed only by deallocation APIs.
+The current token has an implicit global allocator; future versions may extend
+the token with an explicit allocator argument, such as `Global`.
 
 `PointsTo` is a typed-cell resource and a dereferenceability witness for that
 typed cell. `PointsTo(addr, ty, Some(v))` entails:
@@ -484,15 +488,35 @@ A raw pointer read `*p: T` requires
 `Drop` is currently unsupported. Moving out through a raw pointer dereference is
 also unsupported; `ptr::read` will be specified separately as an unsafe API.
 
+The intended contract for a future typed deallocation API is:
+
+```text
+dealloc<T>(p)
+requires:
+  DeallocToken(p.addr, layout(T).size, layout(T).align)
+  * PointsTo(p.addr, {type T}, Option::None)
+ensures:
+  emp
+```
+
+The `PointsTo(..., Option::None)` precondition says that the typed cell is live
+and uninitialized as `T`; the `DeallocToken` precondition says that the caller
+owns the right to deallocate that allocation with the matching layout. Both
+resources are consumed. `emp` is used here as the usual separation-logic empty
+heap notation; in the current resource contract syntax this is represented by
+omitting a `resource ens` clause.
+
 The safe-to-unsafe bridge is explicit. `enter_unsafe` converts each live safe
-local allocation to `Alloc(base, size, alignment)` using rustc's layout size and
-ABI alignment. If the local currently has a safe model value, it also creates
-`PointsTo(base, {type local_ty}, Some(value))`; if the local has been moved out
+local that currently has a safe model value to
+`PointsTo(base, {type local_ty}, Some(value))`. If the local has been moved out
 or otherwise has no safe model value, it creates no initialized typed cell for
-that local. `exit_unsafe` converts bridged local resources back to the safe
-state: `PointsTo(base, {type local_ty}, Some(value))` becomes the local's safe
-model value, while a missing `PointsTo` or `PointsTo(..., None)` leaves the safe
-local without an initialized model value.
+that local. Stack and local allocations do not produce `DeallocToken` resources;
+such tokens come from resource contracts, unsafe API specifications, or future
+bridge rules for ownership-bearing heap values. `exit_unsafe` converts bridged
+local resources back to the safe state:
+`PointsTo(base, {type local_ty}, Some(value))` becomes the local's safe model
+value, while a missing `PointsTo` or `PointsTo(..., None)` leaves the safe local
+without an initialized model value.
 
 Branching inside an unsafe block keeps separate unsafe states for the feasible
 paths. Unsafe heap resources are not merged at unsafe control-flow joins.
@@ -580,8 +604,9 @@ in safe code. Unsafe code also supports resource assertions:
 A resource assertion checks a `ResourcePattern`. The initial resource patterns
 are `PointsTo(addr_expr, rust_ty_expr, option_value_expr)`,
 the shorthand `*ptr |-> option_value_pattern`,
-`Alloc(base_expr, size_expr, alignment_expr)`, and separating conjunction
-`left * right`; parentheses may be used freely to group resource patterns.
+`DeallocToken(base_expr, size_expr, alignment_expr)`, and separating
+conjunction `left * right`; parentheses may be used freely to group resource
+patterns.
 `*ptr |-> value` is accepted only when `ptr` is a Rust local, function
 parameter, or allowed `result` binding whose type is a raw pointer `*const T` or
 `*mut T`; it is desugared before unsafe execution to
