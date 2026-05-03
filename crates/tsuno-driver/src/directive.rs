@@ -116,7 +116,7 @@ pub enum ResourcePattern {
         pointer: String,
         value: ValuePattern,
     },
-    Alloc {
+    DeallocToken {
         base: spec::Expr,
         size: spec::Expr,
         alignment: spec::Expr,
@@ -303,15 +303,15 @@ fn parse_resource_pattern(text: &str, span: Span) -> Result<ResourcePattern, Dir
             value: parse_value_pattern(args[2], span)?,
         });
     }
-    if let Some(args) = atom_args(text, "Alloc") {
+    if let Some(args) = atom_args(text, "DeallocToken") {
         let args = split_top_level_args(args, span)?;
         if args.len() != 3 {
             return Err(DirectiveError {
                 span,
-                message: "`Alloc` resource pattern expects three arguments".to_owned(),
+                message: "`DeallocToken` resource pattern expects three arguments".to_owned(),
             });
         }
-        return Ok(ResourcePattern::Alloc {
+        return Ok(ResourcePattern::DeallocToken {
             base: parse_resource_expr(args[0], span)?,
             size: parse_resource_expr(args[1], span)?,
             alignment: parse_resource_expr(args[2], span)?,
@@ -319,7 +319,8 @@ fn parse_resource_pattern(text: &str, span: Span) -> Result<ResourcePattern, Dir
     }
     Err(DirectiveError {
         span,
-        message: "resource assertion must be a `PointsTo`, `Alloc`, or `*` pattern".to_owned(),
+        message: "resource assertion must be a `PointsTo`, `DeallocToken`, or `*` pattern"
+            .to_owned(),
     })
 }
 

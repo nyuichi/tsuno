@@ -105,7 +105,7 @@ pub enum TypedResourcePattern {
         ty: TypedExpr,
         value: TypedValuePattern,
     },
-    Alloc {
+    DeallocToken {
         base: TypedExpr,
         size: TypedExpr,
         alignment: TypedExpr,
@@ -5124,7 +5124,7 @@ fn resolve_resource_pattern_env_into(
             )?;
             Ok(())
         }
-        ResourcePattern::Alloc {
+        ResourcePattern::DeallocToken {
             base,
             size,
             alignment,
@@ -5329,7 +5329,7 @@ fn infer_resource_pattern_types_into(
             }
             Ok(())
         }
-        ResourcePattern::Alloc {
+        ResourcePattern::DeallocToken {
             base,
             size,
             alignment,
@@ -5544,11 +5544,11 @@ fn typed_lemma_resource_pattern(
         ResourcePattern::PointsToSugar { .. } => Err(
             "`|->` resource sugar in unsafe lemmas is unsupported; use `PointsTo(...)`".to_owned(),
         ),
-        ResourcePattern::Alloc {
+        ResourcePattern::DeallocToken {
             base,
             size,
             alignment,
-        } => Ok(TypedResourcePattern::Alloc {
+        } => Ok(TypedResourcePattern::DeallocToken {
             base: typed_contract_resource_expr(
                 base,
                 pure_fns,
@@ -5720,11 +5720,11 @@ fn typed_contract_resource_pattern<'tcx>(
             )?;
             Ok(TypedResourcePattern::PointsTo { addr, ty, value })
         }
-        ResourcePattern::Alloc {
+        ResourcePattern::DeallocToken {
             base,
             size,
             alignment,
-        } => Ok(TypedResourcePattern::Alloc {
+        } => Ok(TypedResourcePattern::DeallocToken {
             base: typed_contract_resource_expr(
                 base,
                 pure_fns,
@@ -6038,7 +6038,7 @@ fn infer_contract_resource_pattern_types(
             result_ty,
             inferred,
         ),
-        ResourcePattern::Alloc {
+        ResourcePattern::DeallocToken {
             base,
             size,
             alignment,
@@ -6217,7 +6217,7 @@ fn typed_resource_pattern_into(
             };
             Ok(TypedResourcePattern::PointsTo { addr, ty, value })
         }
-        ResourcePattern::Alloc {
+        ResourcePattern::DeallocToken {
             base,
             size,
             alignment,
@@ -6230,7 +6230,7 @@ fn typed_resource_pattern_into(
                 ctx.local_tys,
                 inferred,
             )?;
-            ensure_resource_expr_ty(&base, &SpecTy::Usize, "Alloc base")?;
+            ensure_resource_expr_ty(&base, &SpecTy::Usize, "DeallocToken base")?;
             let size = typed_resource_expr(
                 size,
                 ctx.pure_fns,
@@ -6239,7 +6239,7 @@ fn typed_resource_pattern_into(
                 ctx.local_tys,
                 inferred,
             )?;
-            ensure_resource_expr_ty(&size, &SpecTy::Usize, "Alloc size")?;
+            ensure_resource_expr_ty(&size, &SpecTy::Usize, "DeallocToken size")?;
             let alignment = typed_resource_expr(
                 alignment,
                 ctx.pure_fns,
@@ -6248,8 +6248,8 @@ fn typed_resource_pattern_into(
                 ctx.local_tys,
                 inferred,
             )?;
-            ensure_resource_expr_ty(&alignment, &SpecTy::Usize, "Alloc alignment")?;
-            Ok(TypedResourcePattern::Alloc {
+            ensure_resource_expr_ty(&alignment, &SpecTy::Usize, "DeallocToken alignment")?;
+            Ok(TypedResourcePattern::DeallocToken {
                 base,
                 size,
                 alignment,
@@ -8472,7 +8472,7 @@ fn validate_function_contract_resource_pattern_prepass(
                 spec_scope,
             )
         }
-        ResourcePattern::Alloc {
+        ResourcePattern::DeallocToken {
             base,
             size,
             alignment,

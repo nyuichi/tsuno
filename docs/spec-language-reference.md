@@ -443,48 +443,87 @@ the unsafe block converts the updated resources back into safe Rust state.
 The initial unsafe heap model is address-based and has only two resource forms:
 
 ```text
-Alloc(base: usize, size: usize, alignment: usize)
+DeallocToken(base: usize, size: usize, alignment: usize)
 PointsTo(addr: usize, ty: RustTy, value: Option<T>)
 ```
 
-`Alloc(base, size, alignment)` is keyed by `base`; there is no separate
-allocation identifier. `Provenance { base }` identifies the allocation that a
-pointer is derived from, while `Ptr.addr` is the byte address accessed by the
-pointer. `Alloc` records the live allocation range and alignment for that base.
+`Provenance { base }` identifies the allocation that a pointer is derived from,
+while `Ptr.addr` is the byte address accessed by the pointer. There is no
+separate allocation identifier in the current model; allocation identity is
+represented by the allocation's base address.
 
-`PointsTo` is a typed-cell resource. `PointsTo(addr, ty, Some(v))` means that
-`addr` is non-null, aligned for `ty`, and contains one initialized value valid
-for the same spec model type that the safe-state engine uses for the Rust type
-represented by `ty`. For example, a raw pointer is modeled as `Ptr`, a shared
-reference as `Ref<T>`, and a mutable reference as `Mut<T>` in both safe and
-unsafe states. `PointsTo(addr, ty, None)` means that the typed cell exists but
-is not initialized. The initial model does not represent byte-level ownership or
-physical pointer-sized layouts separately from typed cells.
+`DeallocToken(base, size, alignment)` is a linear deallocation capability for
+the allocation whose base address and deallocation layout are described by the
+token. It is not a dereferenceability witness, and ordinary raw reads and writes
+do not require it. It is intended to be consumed only by deallocation APIs.
+The current token has an implicit global allocator; future versions may extend
+the token with an explicit allocator argument, such as `Global`.
+
+`PointsTo` is a typed-cell resource and a dereferenceability witness for that
+typed cell. `PointsTo(addr, ty, Some(v))` entails:
+
+- `addr` is non-null.
+- `addr` is aligned for `layout(ty)`.
+- the `layout(ty)` footprint at `addr` is live storage.
+- `v` is valid for the same spec model type that the safe-state engine uses for
+  the Rust type represented by `ty`.
+
+For example, a raw pointer is modeled as `Ptr`, a shared reference as `Ref<T>`,
+and a mutable reference as `Mut<T>` in both safe and unsafe states.
+`PointsTo(addr, ty, None)` entails the same non-nullness, alignment, and live
+storage facts, but the typed cell is not initialized as `ty`. The initial model
+does not represent byte-level ownership or physical pointer-sized layouts
+separately from typed cells.
 
 Unsafe states must be resource-well-formed: if two `PointsTo` resources are
 simultaneously present, their Rust layout footprints must not overlap. The
 footprint of `PointsTo(addr, ty, _)` is the byte range
 `addr..addr + layout(ty).size`, using rustc's layout for `ty`.
 
-A raw pointer dereference of type `T` requires all of the following:
+A raw pointer read `*p: T` requires
+`PointsTo(p.addr, {type T}, Some(v))`, preserves that resource, and produces
+`v`. A raw pointer assignment `*p = x` requires
+`PointsTo(p.addr, {type T}, _)` and `Valid(T, x)`, and updates the resource to
+`PointsTo(p.addr, {type T}, Some(x))`. Raw pointer assignment for types with
+`Drop` is currently unsupported. Moving out through a raw pointer dereference is
+also unsupported; `ptr::read` will be specified separately as an unsafe API.
 
-- `Ptr.ty == {type T}`.
-- `Ptr.prov == Some(Provenance { base })`.
-- `Alloc(base, size, alignment)` exists.
-- `Ptr.addr..Ptr.addr + layout(T).size` is within `base..base + size`.
-- `Ptr.addr` is non-null and aligned for `T`.
-- `PointsTo(Ptr.addr, {type T}, Some(v))` exists for reads, and
-  `PointsTo(Ptr.addr, {type T}, _)` exists for writes.
+The intended contract for a future typed deallocation API is:
+
+```text
+dealloc<T>(p)
+requires:
+  DeallocToken(p.addr, layout(T).size, layout(T).align)
+  * PointsTo(p.addr, {type T}, Option::None)
+ensures:
+  emp
+```
+
+The `PointsTo(..., Option::None)` precondition says that the typed cell is live
+and uninitialized as `T`; the `DeallocToken` precondition says that the caller
+owns the right to deallocate that allocation with the matching layout. Both
+resources are consumed. `emp` is used here as the usual separation-logic empty
+heap notation; in the current resource contract syntax this is represented by
+omitting a `resource ens` clause.
 
 The safe-to-unsafe bridge is explicit. `enter_unsafe` converts each live safe
-local allocation to `Alloc(base, size, alignment)` using rustc's layout size and
-ABI alignment. If the local currently has a safe model value, it also creates
-`PointsTo(base, {type local_ty}, Some(value))`; if the local has been moved out
+local that currently has a safe model value to
+`PointsTo(base, {type local_ty}, Some(value))`. If the local has been moved out
 or otherwise has no safe model value, it creates no initialized typed cell for
-that local. `exit_unsafe` converts bridged local resources back to the safe
-state: `PointsTo(base, {type local_ty}, Some(value))` becomes the local's safe
-model value, while a missing `PointsTo` or `PointsTo(..., None)` leaves the safe
-local without an initialized model value.
+that local. Stack and local allocations do not produce `DeallocToken` resources;
+such tokens come from resource contracts, unsafe API specifications, or future
+bridge rules for ownership-bearing heap values. `exit_unsafe` converts bridged
+local resources back to the safe state:
+`PointsTo(base, {type local_ty}, Some(value))` becomes the local's safe model
+value, while a missing `PointsTo` or `PointsTo(..., None)` leaves the safe local
+without an initialized model value. A `PointsTo` resource used for this
+safe-state reflection is consumed. After all bridged locals have been reflected,
+the unsafe heap must be empty; any remaining `PointsTo` or `DeallocToken`
+resource is reported as an unsafe exit error. This rule prevents linear unsafe
+resources from being silently discarded when control returns to safe code.
+Reflection may use path-condition equalities, so a resource such as
+`PointsTo(result.addr, {type T}, Some(v))` can be reflected to a bridged local
+when the unsafe path condition proves `result.addr == base`.
 
 Branching inside an unsafe block keeps separate unsafe states for the feasible
 paths. Unsafe heap resources are not merged at unsafe control-flow joins.
@@ -527,7 +566,9 @@ specified resources into the function's initial unsafe heap and assumes its
 postcondition matching is exact: each resource pattern must match exactly one
 set of heap resources after its `where` condition is applied. The matched
 resources are consumed at return because no unsafe heap is reflected to a caller
-during callee-body verification.
+during callee-body verification. After those postcondition resources and the
+callee's own bridged local resources have been consumed, the final unsafe heap
+must be empty.
 
 At an unsafe call site, each `resource req` is checked against the caller's
 unsafe heap and consumes exactly the matched resources. Each `resource ens`
@@ -543,9 +584,8 @@ declared as ghost items with `unsafe fn`, spec parameters, optional ordinary
 ```rust
 /*@
 unsafe fn keep_i32_cell(p: Ptr)
-  req p.prov == Option::Some(Provenance { base: p.addr })
-  resource req PointsTo(p.addr, {type i32}, Option::Some(?old)) * Alloc(p.addr, 4usize, 4usize)
-  resource ens PointsTo(p.addr, {type i32}, Option::Some(?v)) * Alloc(p.addr, 4usize, 4usize) where v == old
+  resource req PointsTo(p.addr, {type i32}, Option::Some(?old))
+  resource ens PointsTo(p.addr, {type i32}, Option::Some(?v)) where v == old
 {
 }
 */
@@ -553,11 +593,12 @@ unsafe fn keep_i32_cell(p: Ptr)
 
 An unsafe lemma body is verified. Its `resource req` clauses materialize the
 initial unsafe heap, and its `resource ens` clauses are checked against the final
-unsafe heap. Calling an unsafe lemma from unsafe code applies the same resource
-contract behavior as an unsafe function call: resource preconditions are
-consumed from the caller heap and resource postconditions are materialized back
-into it. Unsafe lemma calls are supported inside both unsafe blocks and unsafe
-function bodies.
+unsafe heap. After the lemma's `resource ens` clauses are consumed, its final
+unsafe heap must be empty. Calling an unsafe lemma from unsafe code applies the
+same resource contract behavior as an unsafe function call: resource
+preconditions are consumed from the caller heap and resource postconditions are
+materialized back into it. Unsafe lemma calls are supported inside both unsafe
+blocks and unsafe function bodies.
 
 Inside unsafe blocks and unsafe function bodies, ordinary `//@ let`,
 `//@ assert`, `//@ assume`, and lemma-call directives are supported when they
@@ -565,7 +606,7 @@ only affect the symbolic path condition or the directive environment, as they do
 in safe code. Unsafe code also supports resource assertions:
 
 ```rust
-//@ resource assert PointsTo({p}.addr, {type i32}, Option::Some(42i32)) * Alloc({p}.addr, 4usize, 4usize);
+//@ resource assert PointsTo({p}.addr, {type i32}, Option::Some(42i32));
 //@ resource assert PointsTo({p}.addr, {type i32}, Option::Some(?v)) where v > 0i32;
 //@ resource assert *p |-> Option::Some(?v) where v > 0i32;
 ```
@@ -573,8 +614,9 @@ in safe code. Unsafe code also supports resource assertions:
 A resource assertion checks a `ResourcePattern`. The initial resource patterns
 are `PointsTo(addr_expr, rust_ty_expr, option_value_expr)`,
 the shorthand `*ptr |-> option_value_pattern`,
-`Alloc(base_expr, size_expr, alignment_expr)`, and separating conjunction
-`left * right`; parentheses may be used freely to group resource patterns.
+`DeallocToken(base_expr, size_expr, alignment_expr)`, and separating
+conjunction `left * right`; parentheses may be used freely to group resource
+patterns.
 `*ptr |-> value` is accepted only when `ptr` is a Rust local, function
 parameter, or allowed `result` binding whose type is a raw pointer `*const T` or
 `*mut T`; it is desugared before unsafe execution to

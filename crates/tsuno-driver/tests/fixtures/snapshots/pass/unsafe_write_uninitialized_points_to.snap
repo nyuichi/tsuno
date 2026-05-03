@@ -2,13 +2,10 @@
 source: crates/tsuno-driver/tests/snapshot_tests.rs
 expression: result
 ---
-status: Some(1)
+status: Some(0)
 stdout:
-PASS overwrite_points_to
+PASS init_i32
   all assertions discharged
-FAIL rejects_consumed_unsafe_resource_req_assert
-  resource assertion failed
-  src/main.rs:15:13: 15:18
 PASS main
   all assertions discharged
 

@@ -1,8 +1,7 @@
 /*@
 unsafe fn keep_i32_cell(p: Ptr)
-  req p.prov == Option::Some(Provenance { base: p.addr })
-  resource req PointsTo(p.addr, {type i32}, Option::Some(?old)) * Alloc(p.addr, 4usize, 4usize)
-  resource ens PointsTo(p.addr, {type i32}, Option::Some(?v)) * Alloc(p.addr, 4usize, 4usize) where v == old
+  resource req PointsTo(p.addr, {type i32}, Option::Some(?old))
+  resource ens PointsTo(p.addr, {type i32}, Option::Some(?v)) where v == old
 {
 }
 */

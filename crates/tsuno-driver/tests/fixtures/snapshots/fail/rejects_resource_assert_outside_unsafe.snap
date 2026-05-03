@@ -5,7 +5,7 @@ expression: snapshot_output(output)
 status: Some(1)
 stdout:
 UNSUPPORTED rejects_resource_assert_outside_unsafe
-  resource assertions outside unsafe blocks are unsupported: src/main.rs:2:1: 2:51
+  resource assertions outside unsafe blocks are unsupported: src/main.rs:2:1: 2:58
   src/main.rs:3:9: 3:11
 PASS main
   all assertions discharged

@@ -1,0 +1,11 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+expression: result
+---
+status: Some(1)
+stdout:
+FAIL prepass
+  lemma `leaves_i32_cell` return leaves unconsumed heap resources
+  no-location
+
+stderr:

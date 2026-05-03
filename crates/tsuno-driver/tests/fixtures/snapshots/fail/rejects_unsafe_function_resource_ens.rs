@@ -1,6 +1,6 @@
 unsafe fn leaves_value_unchanged(p: *mut i32)
-//@ resource req *p |-> Option::Some(0i32) * Alloc({p}.addr, 4usize, 4usize);
-//@ resource ens *p |-> Option::Some(42i32) * Alloc({p}.addr, 4usize, 4usize);
+//@ resource req *p |-> Option::Some(0i32);
+//@ resource ens *p |-> Option::Some(42i32);
 {
 }
 

@@ -4,11 +4,11 @@ expression: result
 ---
 status: Some(1)
 stdout:
-PASS overwrite_points_to
+PASS produce_dealloc_token
   all assertions discharged
-FAIL rejects_consumed_unsafe_resource_req_assert
-  resource assertion failed
-  src/main.rs:15:13: 15:18
+FAIL rejects_unsafe_block_leftover_dealloc_token
+  unsafe exit leaves unreflected heap resources
+  src/main.rs:11:5: 14:6
 PASS main
   all assertions discharged
 

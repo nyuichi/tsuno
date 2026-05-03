@@ -3,7 +3,7 @@ fn unsafe_block_resource_assert() {
     let p = &raw mut x;
 
     unsafe {
-        //@ resource assert (PointsTo({p}.addr, {type i32}, Option::Some(42i32)) * (Alloc({p}.addr, 4usize, 4usize)));
+        //@ resource assert PointsTo({p}.addr, {type i32}, Option::Some(42i32));
         let _keep = p;
     }
 }
