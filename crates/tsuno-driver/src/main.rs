@@ -15,7 +15,6 @@ mod prepass;
 mod report;
 mod solver;
 mod spec;
-mod value;
 
 use std::env;
 

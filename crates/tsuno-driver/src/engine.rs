@@ -49,13 +49,12 @@ use crate::prepass::{
     spec_ty_for_rust_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
-use crate::solver::Solver;
+use crate::solver::{
+    CompositeCtorView, IntValueBinaryOp, IntValuePredicateOp, OptionCtorKind, Solver, SymValue,
+};
 use crate::spec::{
     BinaryOp, RustTyKey, SpecTy, TypedExpr, TypedExprKind, TypedMatchBinding, UnaryOp,
     option_spec_ty, provenance_spec_ty, ptr_spec_ty,
-};
-use crate::value::{
-    CompositeCtorView, IntValueBinaryOp, IntValuePredicateOp, OptionCtorKind, SymValue,
 };
 
 const GHOST_LOAD_TIMEOUT: Duration = Duration::from_millis(1_000);
@@ -318,10 +317,6 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn reset_solver_state(&self) {
-        self.solver.reset();
-    }
-
     pub fn load_ghost_function(
         &mut self,
         pure_fn: &TypedPureFnDef,
@@ -360,7 +355,7 @@ impl<'tcx> Verifier<'tcx> {
         body: Body<'tcx>,
         prepass: DirectivePrepass,
     ) -> VerificationResult {
-        self.reset_solver_state();
+        self.solver.reset();
         let DirectivePrepass {
             loop_contracts,
             control_point_directives,
