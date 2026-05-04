@@ -227,7 +227,7 @@ fn parse_resource_assert_directive(
         })
 }
 
-pub fn parse_resource_assertion(text: &str) -> Result<ResourceAssertion, ParseError> {
+fn parse_resource_assertion(text: &str) -> Result<ResourceAssertion, ParseError> {
     let text = text.trim().strip_suffix(';').unwrap_or(text.trim()).trim();
     let (pattern, condition) = split_resource_assert_where(text);
     let pattern = parse_resource_pattern(pattern)?;
@@ -1428,7 +1428,7 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 #[derive(Debug, Clone)]
-pub struct SpecComment {
+struct SpecComment {
     pub text: String,
     pub line_no: usize,
     pub line_text: String,
@@ -1437,7 +1437,7 @@ pub struct SpecComment {
     pub start_offset: usize,
 }
 
-pub fn is_ghost_item_block(text: &str) -> bool {
+fn is_ghost_item_block(text: &str) -> bool {
     let trimmed = text.trim_start();
     trimmed.starts_with("fn ")
         || trimmed.starts_with("unsafe fn ")
@@ -1445,7 +1445,7 @@ pub fn is_ghost_item_block(text: &str) -> bool {
         || trimmed.starts_with("struct ")
 }
 
-pub fn is_complete_ghost_item_comment(text: &str) -> bool {
+fn is_complete_ghost_item_comment(text: &str) -> bool {
     let mut depth = 0usize;
     let mut saw_brace = false;
     for ch in text.chars() {
@@ -1461,7 +1461,7 @@ pub fn is_complete_ghost_item_comment(text: &str) -> bool {
     saw_brace && depth == 0
 }
 
-pub fn collect_spec_comments(source: &str) -> Vec<SpecComment> {
+fn collect_spec_comments(source: &str) -> Vec<SpecComment> {
     let physical_lines: Vec<_> = source.lines().collect();
     let mut comments = Vec::new();
     let mut index = 0;
@@ -1534,7 +1534,7 @@ pub fn collect_spec_comments(source: &str) -> Vec<SpecComment> {
     comments
 }
 
-pub fn spec_comment_group_text(group: &[SpecComment]) -> String {
+fn spec_comment_group_text(group: &[SpecComment]) -> String {
     group
         .iter()
         .map(|comment| comment.text.as_str())
@@ -1542,12 +1542,35 @@ pub fn spec_comment_group_text(group: &[SpecComment]) -> String {
         .join("\n")
 }
 
+pub fn collect_ghost_blocks(source: &str) -> Result<Vec<GhostBlock>, ParseError> {
+    let mut blocks = Vec::new();
+    let mut ghost_item = Vec::new();
+    for comment in collect_spec_comments(source) {
+        if ghost_item.is_empty() {
+            if !is_ghost_item_block(&comment.text) {
+                continue;
+            }
+            ghost_item.push(comment);
+        } else {
+            ghost_item.push(comment);
+        }
+
+        let block = spec_comment_group_text(&ghost_item);
+        if !is_complete_ghost_item_comment(&block) {
+            continue;
+        }
+        blocks.push(parse_ghost_block(&block)?);
+        ghost_item.clear();
+    }
+    Ok(blocks)
+}
+
 #[cfg(test)]
-pub fn parse_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
+fn parse_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
     parse_source_expr(kind, text)
 }
 
-pub fn parse_source_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
+fn parse_source_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
     parse_source_expr_with_type_params(kind, text, &[])
 }
 
@@ -1559,7 +1582,7 @@ fn parse_source_expr_with_type_params(
     parse_raw_expr_with_type_params(kind, text.trim(), type_params)
 }
 
-pub fn parse_statement_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
+fn parse_statement_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
     let text = text.trim();
     let Some(text) = text.strip_suffix(';') else {
         return Err(ParseError::new(format!(
@@ -1570,7 +1593,7 @@ pub fn parse_statement_expr(kind: &str, text: &str) -> Result<Expr, ParseError> 
 }
 
 #[cfg(test)]
-pub fn parse_raw_expr(_kind: &str, text: &str) -> Result<Expr, ParseError> {
+fn parse_raw_expr(_kind: &str, text: &str) -> Result<Expr, ParseError> {
     parse_raw_expr_with_type_params(_kind, text, &[])
 }
 
@@ -2481,11 +2504,11 @@ impl Parser {
 }
 
 #[cfg(test)]
-pub fn parse_pure_fn_block(text: &str) -> Result<Vec<PureFnDef>, ParseError> {
+fn parse_pure_fn_block(text: &str) -> Result<Vec<PureFnDef>, ParseError> {
     Ok(parse_ghost_block(text)?.pure_fns)
 }
 
-pub fn parse_ghost_block(text: &str) -> Result<GhostBlock, ParseError> {
+fn parse_ghost_block(text: &str) -> Result<GhostBlock, ParseError> {
     let mut parser = GhostBlockParser::new(text);
     let mut block = GhostBlock::default();
     while parser.skip_ws() {
@@ -3910,10 +3933,10 @@ fn len(xs: List<i32>) -> i32 {
 /*@   ens true */
 //@ {}
 "#;
-        let comments = super::collect_spec_comments(source);
-        let block = super::spec_comment_group_text(&comments);
-        let parsed = parse_ghost_block(&block);
-        assert!(parsed.is_ok(), "{block}\n{parsed:?}");
+        let blocks = super::collect_ghost_blocks(source).expect("ghost blocks");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].lemmas[0].name, "line_comment_lemma");
+        assert_eq!(blocks[1].lemmas[0].name, "mixed_comment_lemma");
     }
 }
 

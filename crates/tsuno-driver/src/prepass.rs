@@ -3,8 +3,7 @@ use std::ops::ControlFlow;
 
 use crate::directive::{
     CollectedFunctionDirectives, DirectiveAttach, DirectiveError, DirectiveKind, FunctionDirective,
-    collect_function_directives, collect_spec_comments, is_complete_ghost_item_comment,
-    is_ghost_item_block, parse_ghost_block, spec_comment_group_text,
+    collect_function_directives, collect_ghost_blocks,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
@@ -8299,31 +8298,15 @@ fn collect_ghost_items_in_source(
     pure_fns: &mut Vec<PureFnDef>,
     lemmas: &mut Vec<LemmaDef>,
 ) -> Result<(), LoopPrepassError> {
-    let mut ghost_item = Vec::new();
-    for comment in collect_spec_comments(source) {
-        if ghost_item.is_empty() {
-            if !is_ghost_item_block(&comment.text) {
-                continue;
-            }
-            ghost_item.push(comment);
-        } else {
-            ghost_item.push(comment);
-        }
-
-        let block = spec_comment_group_text(&ghost_item);
-        if !is_complete_ghost_item_comment(&block) {
-            continue;
-        }
-        let parsed = parse_ghost_block(&block).map_err(|err| LoopPrepassError {
-            span: error_span,
-            display_span: None,
-            message: err.to_string(),
-        })?;
+    for parsed in collect_ghost_blocks(source).map_err(|err| LoopPrepassError {
+        span: error_span,
+        display_span: None,
+        message: err.to_string(),
+    })? {
         enums.extend(parsed.enums);
         structs.extend(parsed.structs);
         pure_fns.extend(parsed.pure_fns);
         lemmas.extend(parsed.lemmas);
-        ghost_item.clear();
     }
     Ok(())
 }
