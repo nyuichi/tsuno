@@ -1,11 +1,30 @@
+//! Verification solver backend for Z3 state, spec values, constructors, and invariants.
+
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::str::FromStr;
+use std::sync::Once;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
-use crate::spec::{BinaryOp, EnumDef, RustTyKey, SpecTy, StructTy, UnaryOp, ptr_spec_ty};
+use crate::spec::{
+    BinaryOp, EnumDef, RustTyKey, SpecTy, StructTy, UnaryOp, option_spec_ty, ptr_spec_ty,
+};
 use z3::ast::{self, Ast, Bool, Dynamic, Int, Seq as Z3Seq};
-use z3::{DeclKind, FuncDecl, Pattern, Solver, Sort, Symbol};
+use z3::{
+    Config, Context, DeclKind, FuncDecl, Pattern, RecFuncDecl, SatResult, Solver as Z3Solver, Sort,
+    SortKind, Symbol,
+};
+
+const SOLVER_TIMEOUT_MS: u32 = 1_000;
+
+static Z3_INIT: Once = Once::new();
+
+thread_local! {
+    static Z3_SOLVER: RefCell<Z3Solver> = RefCell::new(build_z3_solver());
+}
 
 /*
 Value encoding overview
@@ -108,8 +127,9 @@ or tag terms; there is no global eta/extensionality axiom for tuples, refs, or
 plain structs.
 
 Pure functions are encoded in `engine.rs` on top of these symbols using
-`RecFuncDecl`. This file only defines the value-level constructor/tag/invariant
-encoding that those recursive definitions refer to.
+`RecFuncDecl`. This file owns the verification solver backend: Z3 solver
+lifecycle, value-level constructor/tag/invariant encoding, and built-in value
+conversions that those recursive definitions refer to.
 */
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,13 +152,13 @@ impl SymValue {
 }
 
 #[derive(Debug)]
-pub(crate) struct TypeEncoding {
-    pub(crate) kind: TypeEncodingKind,
-    pub(crate) sort: Sort,
+struct TypeEncoding {
+    kind: TypeEncodingKind,
+    sort: Sort,
 }
 
 #[derive(Debug)]
-pub(crate) enum TypeEncodingKind {
+enum TypeEncodingKind {
     Bool,
     Int,
     Opaque,
@@ -147,16 +167,16 @@ pub(crate) enum TypeEncodingKind {
 }
 
 #[derive(Debug)]
-pub(crate) struct PrimitiveEncoding {
-    pub(crate) boxed: FuncDecl,
-    pub(crate) unboxed: FuncDecl,
+struct PrimitiveEncoding {
+    boxed: FuncDecl,
+    unboxed: FuncDecl,
 }
 
 #[derive(Debug)]
-pub(crate) struct CompositeEncoding {
-    pub(crate) tag_function: FuncDecl,
-    pub(crate) constructors: Vec<Rc<ConstructorEncoding>>,
-    pub(crate) invariant: Option<Rc<FuncDecl>>,
+struct CompositeEncoding {
+    tag_function: FuncDecl,
+    constructors: Vec<Rc<ConstructorEncoding>>,
+    invariant: Option<Rc<FuncDecl>>,
 }
 
 #[derive(Debug)]
@@ -172,8 +192,49 @@ struct EnumFamilyCtorEncoding {
     tag_value: u32,
 }
 
+struct BuiltinNatDecls {
+    nat_to_int: RecFuncDecl,
+    int_to_nat: RecFuncDecl,
+}
+
+pub(crate) struct DirectCtorFields {
+    pub(crate) ctor_index: usize,
+    pub(crate) fields: Vec<(SpecTy, SymValue)>,
+}
+
+pub(crate) struct CompositeCtorView {
+    pub(crate) tag: Bool,
+    pub(crate) fields: Vec<(SpecTy, SymValue)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OptionCtorKind {
+    None,
+    Some,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntValueBinaryOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntValuePredicateOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+pub(crate) struct IntValueResult {
+    pub(crate) term: Int,
+    pub(crate) value: SymValue,
+}
+
 impl CompositeEncoding {
-    pub(crate) fn single_constructor(&self) -> Result<&ConstructorEncoding, String> {
+    fn single_constructor(&self) -> Result<&ConstructorEncoding, String> {
         match self.constructors.as_slice() {
             [ctor] => Ok(ctor.as_ref()),
             ctors => Err(format!(
@@ -185,23 +246,23 @@ impl CompositeEncoding {
 }
 
 #[derive(Debug)]
-pub(crate) struct ConstructorEncoding {
-    pub(crate) name: String,
-    pub(crate) symbol: FuncDecl,
-    pub(crate) fields: Vec<FieldEncoding>,
-    pub(crate) tag: Int,
+struct ConstructorEncoding {
+    name: String,
+    symbol: FuncDecl,
+    fields: Vec<FieldEncoding>,
+    tag: Int,
 }
 
 #[derive(Debug)]
-pub(crate) struct FieldEncoding {
-    pub(crate) inverse: FuncDecl,
-    pub(crate) ty: SpecTy,
+struct FieldEncoding {
+    inverse: FuncDecl,
+    ty: SpecTy,
 }
 
 type CtorFields = Vec<(String, SpecTy)>;
 type CtorSpecs = Vec<(String, CtorFields)>;
 
-pub(crate) struct ValueEncoder {
+pub(crate) struct Solver {
     pointer_width_bits: u64,
     value_sort: Sort,
     seq_value_sort: Sort,
@@ -216,10 +277,13 @@ pub(crate) struct ValueEncoder {
     asserted_type_axioms: RefCell<BTreeSet<SpecTy>>,
     rust_ty_values: RefCell<BTreeMap<RustTyKey, SymValue>>,
     asserted_rust_ty_distinct: RefCell<BTreeSet<(RustTyKey, RustTyKey)>>,
+    builtin_nat_decls: RefCell<Option<Rc<BuiltinNatDecls>>>,
+    pure_fn_decls: RefCell<BTreeMap<String, RecFuncDecl>>,
 }
 
-impl ValueEncoder {
+impl Solver {
     pub(crate) fn new(pointer_width_bits: u64) -> Self {
+        rebuild_z3_solver();
         let value_sort = Sort::uninterpreted(Symbol::String("value".to_owned()));
         let seq_value_sort = Sort::seq(&value_sort);
         let bool_encoding = Rc::new(PrimitiveEncoding {
@@ -246,13 +310,17 @@ impl ValueEncoder {
             asserted_type_axioms: RefCell::new(BTreeSet::new()),
             rust_ty_values: RefCell::new(BTreeMap::new()),
             asserted_rust_ty_distinct: RefCell::new(BTreeSet::new()),
+            builtin_nat_decls: RefCell::new(None),
+            pure_fn_decls: RefCell::new(BTreeMap::new()),
         }
     }
 
-    pub(crate) fn reset_solver_state(&self) {
+    pub(crate) fn reset(&self) {
+        reset_z3_solver();
         self.primitive_axioms_asserted.set(false);
         self.asserted_type_axioms.borrow_mut().clear();
         self.asserted_rust_ty_distinct.borrow_mut().clear();
+        self.builtin_nat_decls.replace(None);
     }
 
     pub(crate) fn register_enum_def(&self, def: EnumDef) {
@@ -274,15 +342,293 @@ impl ValueEncoder {
             .ok_or_else(|| format!("unknown constructor `{enum_name}::{ctor_name}`"))
     }
 
+    pub(crate) fn option_ctor_kind(
+        &self,
+        ctor_index: usize,
+    ) -> Result<Option<OptionCtorKind>, String> {
+        if ctor_index == self.enum_ctor_index("Option", "None")? {
+            return Ok(Some(OptionCtorKind::None));
+        }
+        if ctor_index == self.enum_ctor_index("Option", "Some")? {
+            return Ok(Some(OptionCtorKind::Some));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn named_invariant_formula(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+    ) -> Result<Bool, String> {
+        with_z3_solver(|solver| self.named_invariant_formula_with_z3(ty, value, solver))
+    }
+
+    pub(crate) fn nat_to_int_term(&self, value: &SymValue) -> Result<Int, String> {
+        with_z3_solver(|solver| self.nat_to_int_term_with_z3(value, solver))
+    }
+
+    pub(crate) fn int_to_nat_value(&self, value: &Int) -> Result<SymValue, String> {
+        with_z3_solver(|solver| self.int_to_nat_value_with_z3(value, solver))
+    }
+
+    pub(crate) fn concrete_nat_value(&self, n: u64) -> Result<SymValue, String> {
+        with_z3_solver(|solver| self.concrete_nat_value_with_z3(n, solver))
+    }
+
+    pub(crate) fn rust_ty_value(&self, key: &RustTyKey) -> SymValue {
+        with_z3_solver(|solver| self.rust_ty_value_with_z3(key, solver))
+    }
+
+    pub(crate) fn eq_for_spec_ty(
+        &self,
+        ty: &SpecTy,
+        lhs: &SymValue,
+        rhs: &SymValue,
+    ) -> Result<Bool, String> {
+        with_z3_solver(|solver| self.eq_for_spec_ty_with_z3(ty, lhs, rhs, solver))
+    }
+
+    pub(crate) fn lower_eq_value(
+        &self,
+        ty: &SpecTy,
+        lhs: &SymValue,
+        rhs: &SymValue,
+        negated: bool,
+    ) -> Result<SymValue, String> {
+        with_z3_solver(|solver| self.lower_eq_value_with_z3(ty, lhs, rhs, negated, solver))
+    }
+
+    pub(crate) fn lower_binary_value(
+        &self,
+        op: BinaryOp,
+        lhs_ty: &SpecTy,
+        lhs: &SymValue,
+        rhs: &SymValue,
+    ) -> Result<SymValue, String> {
+        with_z3_solver(|solver| self.lower_binary_value_with_z3(op, lhs_ty, lhs, rhs, solver))
+    }
+
+    pub(crate) fn lower_binary_predicate(
+        &self,
+        op: BinaryOp,
+        lhs_ty: &SpecTy,
+        lhs: &SymValue,
+        rhs: &SymValue,
+    ) -> Result<Option<Bool>, String> {
+        with_z3_solver(|solver| self.lower_binary_predicate_with_z3(op, lhs_ty, lhs, rhs, solver))
+    }
+
+    pub(crate) fn construct_composite(
+        &self,
+        ty: &SpecTy,
+        fields: &[SymValue],
+    ) -> Result<SymValue, String> {
+        with_z3_solver(|solver| self.construct_composite_with_z3(ty, fields, solver))
+    }
+
+    pub(crate) fn construct_composite_ctor(
+        &self,
+        ty: &SpecTy,
+        ctor_index: usize,
+        fields: &[SymValue],
+    ) -> Result<SymValue, String> {
+        with_z3_solver(|solver| {
+            self.construct_composite_ctor_with_z3(ty, ctor_index, fields, solver)
+        })
+    }
+
+    pub(crate) fn checked_result_tuple_value(
+        &self,
+        result_ty: SpecTy,
+        result_value: SymValue,
+        overflow_value: SymValue,
+    ) -> Result<SymValue, String> {
+        with_z3_solver(|solver| {
+            self.checked_result_tuple_value_with_z3(result_ty, result_value, overflow_value, solver)
+        })
+    }
+
+    pub(crate) fn fresh_for_spec_ty(
+        &self,
+        ty: &SpecTy,
+        hint: &str,
+        fresh_name: &mut impl FnMut(&str) -> String,
+    ) -> Result<SymValue, String> {
+        with_z3_solver(|solver| self.fresh_for_spec_ty_with_z3(ty, hint, solver, fresh_name))
+    }
+
+    pub(crate) fn project_field(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+        index: usize,
+    ) -> Result<SymValue, String> {
+        with_z3_solver(|solver| self.project_field_with_z3(ty, value, index, solver))
+    }
+
+    pub(crate) fn project_composite_ctor_field_for_ty(
+        &self,
+        ty: &SpecTy,
+        ctor_index: usize,
+        value: &SymValue,
+        index: usize,
+    ) -> Result<SymValue, String> {
+        with_z3_solver(|solver| {
+            self.project_composite_ctor_field_for_ty_with_z3(ty, ctor_index, value, index, solver)
+        })
+    }
+
+    pub(crate) fn composite_ctor_view_for_ty(
+        &self,
+        ty: &SpecTy,
+        ctor_index: usize,
+        value: &SymValue,
+    ) -> Result<CompositeCtorView, String> {
+        with_z3_solver(|solver| {
+            self.composite_ctor_view_for_ty_with_z3(ty, ctor_index, value, solver)
+        })
+    }
+
+    pub(crate) fn direct_composite_fields_for_ty(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+    ) -> Result<Option<Vec<SymValue>>, String> {
+        with_z3_solver(|solver| self.direct_composite_fields_for_ty_with_z3(ty, value, solver))
+    }
+
+    pub(crate) fn direct_composite_ctor_fields_for_ty(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+    ) -> Result<Option<DirectCtorFields>, String> {
+        with_z3_solver(|solver| self.direct_composite_ctor_fields_for_ty_with_z3(ty, value, solver))
+    }
+
+    pub(crate) fn tag_formula_for_ty(
+        &self,
+        ty: &SpecTy,
+        ctor_index: usize,
+        value: &SymValue,
+    ) -> Result<Bool, String> {
+        with_z3_solver(|solver| self.tag_formula_for_ty_with_z3(ty, ctor_index, value, solver))
+    }
+
+    pub(crate) fn ground_ctor_index(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+    ) -> Result<Option<usize>, String> {
+        with_z3_solver(|solver| self.ground_ctor_index_with_z3(ty, value, solver))
+    }
+
+    pub(crate) fn check_assumptions(&self, assumptions: &[Bool]) -> SatResult {
+        with_z3_solver(|solver| solver.check_assumptions(assumptions))
+    }
+
+    pub(crate) fn bool_marker(&self, name: impl Into<Symbol>) -> Bool {
+        Bool::new_const(name)
+    }
+
+    pub(crate) fn simplify_bool(value: &Bool) -> Bool {
+        value.simplify()
+    }
+
+    pub(crate) fn simplify_int(value: &Int) -> Int {
+        value.simplify()
+    }
+
+    pub(crate) fn bool_contains_marker(expr: &Bool, marker: &str) -> bool {
+        if expr.is_const() {
+            return expr.decl().name() == marker;
+        }
+        expr.children().into_iter().any(|child| {
+            child
+                .as_bool()
+                .filter(|_| child.sort_kind() == SortKind::Bool)
+                .map(|child| Self::bool_contains_marker(&child, marker))
+                .unwrap_or(false)
+        })
+    }
+
+    pub(crate) fn declare_pure_fn(
+        &self,
+        name: &str,
+        param_tys: &[SpecTy],
+        result_ty: &SpecTy,
+    ) -> Result<(), String> {
+        with_z3_solver(|solver| {
+            let domain_sorts = param_tys
+                .iter()
+                .map(|ty| self.sort_for_ty_with_z3(ty, solver))
+                .collect::<Result<Vec<_>, _>>()?;
+            let domain_refs = domain_sorts.iter().collect::<Vec<_>>();
+            let result_sort = self.sort_for_ty_with_z3(result_ty, solver)?;
+            let decl = RecFuncDecl::new(format!("pure_fn_{name}"), &domain_refs, &result_sort);
+            let inserted = self
+                .pure_fn_decls
+                .borrow_mut()
+                .insert(name.to_owned(), decl)
+                .is_none();
+            assert!(inserted, "duplicate pure function decl `{name}`");
+            Ok(())
+        })
+    }
+
+    pub(crate) fn pure_fn_params(
+        &self,
+        func: &str,
+        params: &[(String, SpecTy)],
+        fresh_name: &mut impl FnMut(&str) -> String,
+    ) -> Result<Vec<(String, SymValue)>, String> {
+        with_z3_solver(|solver| {
+            let mut values = Vec::with_capacity(params.len());
+            for (name, ty) in params {
+                let sort = self.sort_for_ty_with_z3(ty, solver)?;
+                let value = SymValue::new(Dynamic::new_const(
+                    fresh_name(&format!("pure_{func}_{name}")),
+                    &sort,
+                ));
+                values.push((name.clone(), value));
+            }
+            Ok(values)
+        })
+    }
+
+    pub(crate) fn define_pure_fn(
+        &self,
+        name: &str,
+        args: &[SymValue],
+        body: &SymValue,
+    ) -> Result<(), String> {
+        let decls = self.pure_fn_decls.borrow();
+        let decl = decls
+            .get(name)
+            .ok_or_else(|| format!("unknown pure function `{name}`"))?;
+        let args = args.iter().map(SymValue::ast).collect::<Vec<_>>();
+        decl.add_def(&args, body.dynamic());
+        Ok(())
+    }
+
+    pub(crate) fn apply_pure_fn(
+        &self,
+        name: &str,
+        args: &[SymValue],
+    ) -> Result<Option<SymValue>, String> {
+        let decls = self.pure_fn_decls.borrow();
+        let Some(decl) = decls.get(name) else {
+            return Ok(None);
+        };
+        let args = args.iter().map(SymValue::ast).collect::<Vec<_>>();
+        Ok(Some(SymValue::new(decl.apply(&args))))
+    }
+
+    #[cfg(test)]
     pub(crate) fn value_sort(&self) -> &Sort {
         &self.value_sort
     }
 
-    pub(crate) fn type_encoding(
-        &self,
-        ty: &SpecTy,
-        solver: &Solver,
-    ) -> Result<Rc<TypeEncoding>, String> {
+    fn type_encoding(&self, ty: &SpecTy, solver: &Z3Solver) -> Result<Rc<TypeEncoding>, String> {
         self.ensure_primitive_axioms(solver);
         let cached = { self.type_encodings.borrow().get(ty).cloned() };
         if let Some(encoding) = cached {
@@ -301,10 +647,14 @@ impl ValueEncoder {
         Ok(encoding)
     }
 
-    pub(crate) fn composite_encoding(
+    fn sort_for_ty_with_z3(&self, ty: &SpecTy, solver: &Z3Solver) -> Result<Sort, String> {
+        Ok(self.type_encoding(ty, solver)?.sort.clone())
+    }
+
+    fn composite_encoding(
         &self,
         ty: &SpecTy,
-        solver: &Solver,
+        solver: &Z3Solver,
     ) -> Result<Rc<CompositeEncoding>, String> {
         let encoding = self.type_encoding(ty, solver)?;
         match &encoding.kind {
@@ -313,13 +663,28 @@ impl ValueEncoder {
         }
     }
 
-    pub(crate) fn named_invariant(
+    fn named_invariant(
         &self,
         ty: &SpecTy,
-        solver: &Solver,
+        solver: &Z3Solver,
     ) -> Result<Option<Rc<FuncDecl>>, String> {
         let composite = self.composite_encoding(ty, solver)?;
         Ok(composite.invariant.clone())
+    }
+
+    fn named_invariant_formula_with_z3(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+        solver: &Z3Solver,
+    ) -> Result<Bool, String> {
+        let invariant = self
+            .named_invariant(ty, solver)?
+            .ok_or_else(|| format!("missing named invariant for {ty:?}"))?;
+        Ok(invariant
+            .apply(&[value.ast()])
+            .as_bool()
+            .expect("named invariant predicate"))
     }
 
     pub(crate) fn wrap_bool(&self, value: &Bool) -> SymValue {
@@ -328,6 +693,21 @@ impl ValueEncoder {
 
     pub(crate) fn wrap_int(&self, value: &Int) -> SymValue {
         SymValue::new(self.int_encoding.boxed.apply(&[value]))
+    }
+
+    pub(crate) fn overflow_value_for_in_range(&self, in_range: Bool) -> SymValue {
+        self.wrap_bool(&in_range.not())
+    }
+
+    pub(crate) fn scalar_int_value(&self, value: &Int) -> SymValue {
+        self.wrap_int(value)
+    }
+
+    pub(crate) fn offset_int_value(&self, base: &SymValue, offset: u64) -> SymValue {
+        if offset == 0 {
+            return base.clone();
+        }
+        self.wrap_int(&(self.int_term(base) + Int::from_u64(offset)))
     }
 
     pub(crate) fn empty_seq_value(&self) -> SymValue {
@@ -371,6 +751,33 @@ impl ValueEncoder {
         ))
     }
 
+    fn nat_to_int_term_with_z3(&self, value: &SymValue, solver: &Z3Solver) -> Result<Int, String> {
+        if let Some(n) = self.try_concrete_nat_usize(value, solver)? {
+            return Ok(Int::from_u64(n));
+        }
+        let decls = self.builtin_nat_decls(solver)?;
+        decls
+            .nat_to_int
+            .apply(&[value.ast()])
+            .as_int()
+            .ok_or_else(|| "builtin_nat_to_int must return Int".to_owned())
+    }
+
+    fn int_to_nat_value_with_z3(&self, value: &Int, solver: &Z3Solver) -> Result<SymValue, String> {
+        let decls = self.builtin_nat_decls(solver)?;
+        Ok(SymValue::new(decls.int_to_nat.apply(&[value])))
+    }
+
+    fn concrete_nat_value_with_z3(&self, n: u64, solver: &Z3Solver) -> Result<SymValue, String> {
+        let nat_ty = Self::nat_spec_ty();
+        let (zero, succ) = self.nat_ctor_indices(solver)?;
+        let mut value = self.construct_composite_ctor_with_z3(&nat_ty, zero, &[], solver)?;
+        for _ in 0..n {
+            value = self.construct_composite_ctor_with_z3(&nat_ty, succ, &[value], solver)?;
+        }
+        Ok(value)
+    }
+
     fn ground_seq_nth(ast: &Dynamic, index: usize) -> Option<Dynamic> {
         match ast.decl().kind() {
             DeclKind::SEQ_UNIT => ast.children().first().cloned().filter(|_| index == 0),
@@ -403,11 +810,119 @@ impl ValueEncoder {
         }
     }
 
+    fn builtin_nat_decls(&self, solver: &Z3Solver) -> Result<Rc<BuiltinNatDecls>, String> {
+        if let Some(decls) = self.builtin_nat_decls.borrow().as_ref().cloned() {
+            return Ok(decls);
+        }
+
+        let nat_ty = Self::nat_spec_ty();
+        let nat_composite = self.composite_encoding(&nat_ty, solver)?;
+        let (zero_index, zero_ctor) = nat_composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| ctor.fields.is_empty())
+            .ok_or_else(|| "Nat is missing `Zero`".to_owned())?;
+        let (succ_index, succ_ctor) = nat_composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| ctor.fields.len() == 1)
+            .ok_or_else(|| "Nat is missing `Succ`".to_owned())?;
+
+        let nat_to_int = RecFuncDecl::new("builtin_nat_to_int", &[&self.value_sort], &Sort::int());
+        let int_to_nat = RecFuncDecl::new("builtin_int_to_nat", &[&Sort::int()], &self.value_sort);
+
+        let int_arg = Int::new_const("builtin_int_to_nat_arg");
+        let zero_value = zero_ctor.symbol.apply(&[]);
+        let int_minus_one = int_arg.clone() - Int::from_i64(1);
+        let succ_tail = int_to_nat.apply(&[&int_minus_one]);
+        let succ_value = succ_ctor.symbol.apply(&[&succ_tail]);
+        let int_to_nat_body = int_arg.le(0).ite(&zero_value, &succ_value);
+        int_to_nat.add_def(&[&int_arg], &int_to_nat_body);
+
+        let nat_arg = Dynamic::new_const("builtin_nat_to_int_arg", &self.value_sort);
+        let nat_value = SymValue::new(nat_arg.clone());
+        let zero_case = self.tag_formula(&nat_composite, zero_index, &nat_value)?;
+        let succ_field =
+            self.project_composite_ctor_field(&nat_composite, succ_index, &nat_value, 0)?;
+        let succ_int = nat_to_int
+            .apply(&[succ_field.ast()])
+            .as_int()
+            .ok_or_else(|| "builtin_nat_to_int must return Int".to_owned())?;
+        let nat_to_int_body = zero_case.ite(&Int::from_i64(0), &(Int::from_i64(1) + succ_int));
+        nat_to_int.add_def(&[&nat_arg], &nat_to_int_body);
+
+        let decls = Rc::new(BuiltinNatDecls {
+            nat_to_int,
+            int_to_nat,
+        });
+        self.builtin_nat_decls.replace(Some(decls.clone()));
+        Ok(decls)
+    }
+
+    fn nat_spec_ty() -> SpecTy {
+        SpecTy::Enum {
+            name: "Nat".to_owned(),
+            args: vec![],
+        }
+    }
+
+    fn nat_ctor_indices(&self, solver: &Z3Solver) -> Result<(usize, usize), String> {
+        let composite = self.composite_encoding(&Self::nat_spec_ty(), solver)?;
+        let zero = composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| ctor.fields.is_empty())
+            .map(|(index, _)| index)
+            .ok_or_else(|| "Nat is missing `Zero`".to_owned())?;
+        let succ = composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| ctor.fields.len() == 1)
+            .map(|(index, _)| index)
+            .ok_or_else(|| "Nat is missing `Succ`".to_owned())?;
+        Ok((zero, succ))
+    }
+
+    fn try_concrete_nat_usize(
+        &self,
+        value: &SymValue,
+        solver: &Z3Solver,
+    ) -> Result<Option<u64>, String> {
+        let nat_ty = Self::nat_spec_ty();
+        let composite = self.composite_encoding(&nat_ty, solver)?;
+        let (zero, succ) = self.nat_ctor_indices(solver)?;
+        match Self::ground_ctor_index_for_composite(&composite, value) {
+            Some(index) if index == zero => Ok(Some(0)),
+            Some(index) if index == succ => {
+                let tail = self.project_composite_ctor_field(&composite, succ, value, 0)?;
+                Ok(self.try_concrete_nat_usize(&tail, solver)?.map(|n| n + 1))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn ground_ctor_index_for_composite(
+        composite: &CompositeEncoding,
+        value: &SymValue,
+    ) -> Option<usize> {
+        let decl_name = value.dynamic().decl().name();
+        composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| decl_name == ctor.symbol.name())
+            .map(|(index, _)| index)
+    }
+
     pub(crate) fn bool_value(&self, value: bool) -> SymValue {
         self.wrap_bool(&Bool::from_bool(value))
     }
 
-    pub(crate) fn rust_ty_value(&self, key: &RustTyKey, solver: &Solver) -> SymValue {
+    fn rust_ty_value_with_z3(&self, key: &RustTyKey, solver: &Z3Solver) -> SymValue {
         let value = {
             let mut values = self.rust_ty_values.borrow_mut();
             values
@@ -483,12 +998,12 @@ impl ValueEncoder {
         }
     }
 
-    pub(crate) fn eq_for_spec_ty(
+    fn eq_for_spec_ty_with_z3(
         &self,
         ty: &SpecTy,
         lhs: &SymValue,
         rhs: &SymValue,
-        solver: &Solver,
+        solver: &Z3Solver,
     ) -> Result<Bool, String> {
         if let Some(equal) = self.try_ground_eq_for_spec_ty(ty, lhs, rhs)? {
             return Ok(Bool::from_bool(equal));
@@ -633,7 +1148,7 @@ impl ValueEncoder {
         ty: &SpecTy,
         lhs: &SymValue,
         rhs: &SymValue,
-        solver: &Solver,
+        solver: &Z3Solver,
     ) -> Result<Option<Bool>, String> {
         let encoding = self.unasserted_type_encoding(ty)?;
         let TypeEncodingKind::Composite(composite) = &encoding.kind else {
@@ -673,7 +1188,7 @@ impl ValueEncoder {
             .zip(rhs_children)
             .map(|((field, lhs_child), rhs_child)| (field, lhs_child, rhs_child))
         {
-            fields.push(self.eq_for_spec_ty(
+            fields.push(self.eq_for_spec_ty_with_z3(
                 &field.ty,
                 &SymValue::new(lhs_child),
                 &SymValue::new(rhs_child),
@@ -690,17 +1205,74 @@ impl ValueEncoder {
         }
     }
 
-    pub(crate) fn lower_binary_value(
+    pub(crate) fn lower_bool_not_value(&self, value: &SymValue) -> SymValue {
+        self.wrap_bool(&self.bool_term(value).not())
+    }
+
+    pub(crate) fn lower_int_neg_value(&self, value: &SymValue) -> IntValueResult {
+        let term = Int::from_i64(0) - self.int_term(value);
+        let value = self.wrap_int(&term);
+        IntValueResult { term, value }
+    }
+
+    pub(crate) fn lower_int_binary_value(
+        &self,
+        op: IntValueBinaryOp,
+        lhs: &SymValue,
+        rhs: &SymValue,
+    ) -> IntValueResult {
+        let term = match op {
+            IntValueBinaryOp::Add => self.int_term(lhs) + self.int_term(rhs),
+            IntValueBinaryOp::Sub => self.int_term(lhs) - self.int_term(rhs),
+            IntValueBinaryOp::Mul => self.int_term(lhs) * self.int_term(rhs),
+        };
+        let value = self.wrap_int(&term);
+        IntValueResult { term, value }
+    }
+
+    fn lower_eq_value_with_z3(
+        &self,
+        ty: &SpecTy,
+        lhs: &SymValue,
+        rhs: &SymValue,
+        negated: bool,
+        solver: &Z3Solver,
+    ) -> Result<SymValue, String> {
+        let eq = self.eq_for_spec_ty_with_z3(ty, lhs, rhs, solver)?;
+        let formula = if negated { eq.not() } else { eq };
+        Ok(self.wrap_bool(&formula))
+    }
+
+    pub(crate) fn lower_int_predicate_value(
+        &self,
+        op: IntValuePredicateOp,
+        lhs: &SymValue,
+        rhs: &SymValue,
+    ) -> SymValue {
+        let lhs = self.int_term(lhs);
+        let rhs = self.int_term(rhs);
+        let formula = match op {
+            IntValuePredicateOp::Lt => lhs.lt(rhs),
+            IntValuePredicateOp::Le => lhs.le(rhs),
+            IntValuePredicateOp::Gt => lhs.gt(rhs),
+            IntValuePredicateOp::Ge => lhs.ge(rhs),
+        };
+        self.wrap_bool(&formula)
+    }
+
+    fn lower_binary_value_with_z3(
         &self,
         op: BinaryOp,
         lhs_ty: &SpecTy,
         lhs: &SymValue,
         rhs: &SymValue,
-        solver: &Solver,
+        solver: &Z3Solver,
     ) -> Result<SymValue, String> {
         Ok(match op {
-            BinaryOp::Eq => self.wrap_bool(&self.eq_for_spec_ty(lhs_ty, lhs, rhs, solver)?),
-            BinaryOp::Ne => self.wrap_bool(&self.eq_for_spec_ty(lhs_ty, lhs, rhs, solver)?.not()),
+            BinaryOp::Eq => self.wrap_bool(&self.eq_for_spec_ty_with_z3(lhs_ty, lhs, rhs, solver)?),
+            BinaryOp::Ne => {
+                self.wrap_bool(&self.eq_for_spec_ty_with_z3(lhs_ty, lhs, rhs, solver)?.not())
+            }
             BinaryOp::And => {
                 self.wrap_bool(&Bool::and(&[&self.bool_term(lhs), &self.bool_term(rhs)]))
             }
@@ -722,21 +1294,47 @@ impl ValueEncoder {
         })
     }
 
-    pub(crate) fn construct_composite(
+    fn lower_binary_predicate_with_z3(
+        &self,
+        op: BinaryOp,
+        lhs_ty: &SpecTy,
+        lhs: &SymValue,
+        rhs: &SymValue,
+        solver: &Z3Solver,
+    ) -> Result<Option<Bool>, String> {
+        Ok(Some(match op {
+            BinaryOp::Eq => self.eq_for_spec_ty_with_z3(lhs_ty, lhs, rhs, solver)?,
+            BinaryOp::Ne => self.eq_for_spec_ty_with_z3(lhs_ty, lhs, rhs, solver)?.not(),
+            BinaryOp::Lt => self.int_term(lhs).lt(self.int_term(rhs)),
+            BinaryOp::Le => self.int_term(lhs).le(self.int_term(rhs)),
+            BinaryOp::Gt => self.int_term(lhs).gt(self.int_term(rhs)),
+            BinaryOp::Ge => self.int_term(lhs).ge(self.int_term(rhs)),
+            BinaryOp::And
+            | BinaryOp::Or
+            | BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Concat => {
+                return Ok(None);
+            }
+        }))
+    }
+
+    fn construct_composite_with_z3(
         &self,
         ty: &SpecTy,
         fields: &[SymValue],
-        solver: &Solver,
+        solver: &Z3Solver,
     ) -> Result<SymValue, String> {
-        self.construct_composite_ctor(ty, 0, fields, solver)
+        self.construct_composite_ctor_with_z3(ty, 0, fields, solver)
     }
 
-    pub(crate) fn construct_composite_ctor(
+    fn construct_composite_ctor_with_z3(
         &self,
         ty: &SpecTy,
         ctor_index: usize,
         fields: &[SymValue],
-        solver: &Solver,
+        solver: &Z3Solver,
     ) -> Result<SymValue, String> {
         let composite = self.composite_encoding(ty, solver)?;
         let ctor = composite
@@ -755,7 +1353,7 @@ impl ValueEncoder {
         Ok(SymValue::new(ctor.symbol.apply(&args)))
     }
 
-    pub(crate) fn construct_composite_ctor_without_axioms(
+    fn construct_composite_ctor_without_axioms(
         &self,
         ty: &SpecTy,
         ctor_index: usize,
@@ -781,18 +1379,63 @@ impl ValueEncoder {
         Ok(SymValue::new(ctor.symbol.apply(&args)))
     }
 
-    pub(crate) fn project_field(
+    pub(crate) fn construct_option_none(&self, inner: SpecTy) -> Result<SymValue, String> {
+        let ctor_index = self.enum_ctor_index("Option", "None")?;
+        self.construct_composite_ctor_without_axioms(&option_spec_ty(inner), ctor_index, &[])
+    }
+
+    pub(crate) fn construct_option_some(
+        &self,
+        inner: SpecTy,
+        value: SymValue,
+    ) -> Result<SymValue, String> {
+        let ctor_index = self.enum_ctor_index("Option", "Some")?;
+        self.construct_composite_ctor_without_axioms(&option_spec_ty(inner), ctor_index, &[value])
+    }
+
+    fn checked_result_tuple_value_with_z3(
+        &self,
+        result_ty: SpecTy,
+        result_value: SymValue,
+        overflow_value: SymValue,
+        solver: &Z3Solver,
+    ) -> Result<SymValue, String> {
+        self.construct_composite_with_z3(
+            &SpecTy::Tuple(vec![result_ty, SpecTy::Bool]),
+            &[result_value, overflow_value],
+            solver,
+        )
+    }
+
+    fn fresh_for_spec_ty_with_z3(
+        &self,
+        ty: &SpecTy,
+        hint: &str,
+        solver: &Z3Solver,
+        fresh_name: &mut impl FnMut(&str) -> String,
+    ) -> Result<SymValue, String> {
+        if matches!(ty, SpecTy::Enum { .. }) {
+            return Ok(SymValue::new(Dynamic::new_const(
+                fresh_name(hint),
+                &self.value_sort,
+            )));
+        }
+        let encoding = self.type_encoding(ty, solver)?;
+        self.fresh_for_encoding(&encoding, hint, solver, fresh_name)
+    }
+
+    fn project_field_with_z3(
         &self,
         ty: &SpecTy,
         value: &SymValue,
         index: usize,
-        solver: &Solver,
+        solver: &Z3Solver,
     ) -> Result<SymValue, String> {
         let composite = self.composite_encoding(ty, solver)?;
         self.project_composite_field(&composite, value, index)
     }
 
-    pub(crate) fn project_composite_field(
+    fn project_composite_field(
         &self,
         composite: &CompositeEncoding,
         value: &SymValue,
@@ -801,7 +1444,7 @@ impl ValueEncoder {
         self.project_composite_ctor_field(composite, 0, value, index)
     }
 
-    pub(crate) fn project_composite_ctor_field(
+    fn project_composite_ctor_field(
         &self,
         composite: &CompositeEncoding,
         ctor_index: usize,
@@ -825,7 +1468,109 @@ impl ValueEncoder {
         Ok(SymValue::new(field.inverse.apply(&[value.ast()])))
     }
 
-    pub(crate) fn tag_formula(
+    fn project_composite_ctor_field_for_ty_with_z3(
+        &self,
+        ty: &SpecTy,
+        ctor_index: usize,
+        value: &SymValue,
+        index: usize,
+        solver: &Z3Solver,
+    ) -> Result<SymValue, String> {
+        let composite = self.composite_encoding(ty, solver)?;
+        self.project_composite_ctor_field(&composite, ctor_index, value, index)
+    }
+
+    fn composite_ctor_view_for_ty_with_z3(
+        &self,
+        ty: &SpecTy,
+        ctor_index: usize,
+        value: &SymValue,
+        solver: &Z3Solver,
+    ) -> Result<CompositeCtorView, String> {
+        let composite = self.composite_encoding(ty, solver)?;
+        let ctor = composite
+            .constructors
+            .get(ctor_index)
+            .ok_or_else(|| format!("constructor index {ctor_index} out of range"))?;
+        let tag = self.tag_formula(&composite, ctor_index, value)?;
+        let fields = ctor
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(field_index, field)| {
+                Ok((
+                    field.ty.clone(),
+                    self.project_composite_ctor_field(&composite, ctor_index, value, field_index)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(CompositeCtorView { tag, fields })
+    }
+
+    fn direct_composite_fields(
+        &self,
+        composite: &CompositeEncoding,
+        value: &SymValue,
+    ) -> Result<Option<Vec<SymValue>>, String> {
+        let ctor = composite.single_constructor()?;
+        if value.dynamic().decl().name() != ctor.symbol.name() {
+            return Ok(None);
+        }
+        let children = value.dynamic().children();
+        if children.len() != ctor.fields.len() {
+            return Ok(None);
+        }
+        Ok(Some(children.into_iter().map(SymValue::new).collect()))
+    }
+
+    fn direct_composite_fields_for_ty_with_z3(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+        solver: &Z3Solver,
+    ) -> Result<Option<Vec<SymValue>>, String> {
+        let composite = self.composite_encoding(ty, solver)?;
+        self.direct_composite_fields(&composite, value)
+    }
+
+    fn direct_composite_ctor_fields(
+        &self,
+        composite: &CompositeEncoding,
+        value: &SymValue,
+    ) -> Result<Option<DirectCtorFields>, String> {
+        let Some((ctor_index, ctor)) = composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| value.dynamic().decl().name() == ctor.symbol.name())
+        else {
+            return Ok(None);
+        };
+        let fields = ctor
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(field_index, field)| {
+                Ok((
+                    field.ty.clone(),
+                    self.project_composite_ctor_field(composite, ctor_index, value, field_index)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Some(DirectCtorFields { ctor_index, fields }))
+    }
+
+    fn direct_composite_ctor_fields_for_ty_with_z3(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+        solver: &Z3Solver,
+    ) -> Result<Option<DirectCtorFields>, String> {
+        let composite = self.composite_encoding(ty, solver)?;
+        self.direct_composite_ctor_fields(&composite, value)
+    }
+
+    fn tag_formula(
         &self,
         composite: &CompositeEncoding,
         ctor_index: usize,
@@ -852,6 +1597,62 @@ impl ValueEncoder {
             .as_int()
             .expect("tag result")
             .eq(&ctor.tag))
+    }
+
+    fn tag_formula_for_ty_with_z3(
+        &self,
+        ty: &SpecTy,
+        ctor_index: usize,
+        value: &SymValue,
+        solver: &Z3Solver,
+    ) -> Result<Bool, String> {
+        let composite = self.composite_encoding(ty, solver)?;
+        self.tag_formula(&composite, ctor_index, value)
+    }
+
+    fn ground_ctor_index_with_z3(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+        solver: &Z3Solver,
+    ) -> Result<Option<usize>, String> {
+        let composite = self.composite_encoding(ty, solver)?;
+        Ok(Self::ground_ctor_index_for_composite(&composite, value))
+    }
+
+    fn fresh_for_encoding(
+        &self,
+        encoding: &TypeEncoding,
+        hint: &str,
+        solver: &Z3Solver,
+        fresh_name: &mut impl FnMut(&str) -> String,
+    ) -> Result<SymValue, String> {
+        match &encoding.kind {
+            TypeEncodingKind::Bool => Ok(self.wrap_bool(&Bool::new_const(fresh_name(hint)))),
+            TypeEncodingKind::Int => Ok(self.wrap_int(&Int::new_const(fresh_name(hint)))),
+            TypeEncodingKind::Opaque => Ok(SymValue::new(Dynamic::new_const(
+                fresh_name(hint),
+                &self.value_sort,
+            ))),
+            TypeEncodingKind::Seq => Ok(SymValue::new(Dynamic::from(Z3Seq::new_const(
+                fresh_name(hint),
+                &self.value_sort,
+            )))),
+            TypeEncodingKind::Composite(composite) => {
+                let ctor = composite.single_constructor()?;
+                let mut fields = Vec::with_capacity(ctor.fields.len());
+                for (index, field) in ctor.fields.iter().enumerate() {
+                    fields.push(self.fresh_for_spec_ty_with_z3(
+                        &field.ty,
+                        &format!("{hint}_{index}"),
+                        solver,
+                        fresh_name,
+                    )?);
+                }
+                let args = fields.iter().map(SymValue::ast).collect::<Vec<_>>();
+                Ok(SymValue::new(ctor.symbol.apply(&args)))
+            }
+        }
     }
 
     pub(crate) fn int_bounds(&self, ty: &SpecTy) -> Result<Option<(Int, Int)>, String> {
@@ -1116,7 +1917,7 @@ impl ValueEncoder {
         &self,
         ty: &SpecTy,
         encoding: &TypeEncoding,
-        solver: &Solver,
+        solver: &Z3Solver,
     ) -> Result<(), String> {
         match &encoding.kind {
             TypeEncodingKind::Bool
@@ -1133,7 +1934,7 @@ impl ValueEncoder {
         }
     }
 
-    fn ensure_primitive_axioms(&self, solver: &Solver) {
+    fn ensure_primitive_axioms(&self, solver: &Z3Solver) {
         let _ = solver;
         if self.primitive_axioms_asserted.get() {
             return;
@@ -1144,7 +1945,7 @@ impl ValueEncoder {
     fn assert_composite_axioms(
         &self,
         composite: &CompositeEncoding,
-        solver: &Solver,
+        solver: &Z3Solver,
     ) -> Result<(), String> {
         for ctor in &composite.constructors {
             let args = ctor
@@ -1199,7 +2000,7 @@ impl ValueEncoder {
         &self,
         ty: &SpecTy,
         composite: &CompositeEncoding,
-        solver: &Solver,
+        solver: &Z3Solver,
     ) -> Result<(), String> {
         let Some(invariant) = &composite.invariant else {
             return Ok(());
@@ -1269,7 +2070,7 @@ impl ValueEncoder {
 
     fn assert_patterned_forall(
         &self,
-        solver: &Solver,
+        solver: &Z3Solver,
         bounds: &[&dyn Ast],
         pattern_term: &dyn Ast,
         body: &Bool,
@@ -1286,7 +2087,7 @@ impl ValueEncoder {
         &self,
         ty: &SpecTy,
         value: &SymValue,
-        solver: &Solver,
+        solver: &Z3Solver,
     ) -> Result<Option<Bool>, String> {
         match ty {
             SpecTy::Bool => Ok(None),
@@ -1630,261 +2431,395 @@ fn bool_implies(lhs: Bool, rhs: Bool) -> Bool {
     lhs.implies(rhs)
 }
 
+fn init_z3() {
+    Z3_INIT.call_once(|| {
+        z3::set_global_param("model", "true");
+        z3::set_global_param("smt.auto_config", "false");
+        z3::set_global_param("smt.mbqi", "false");
+    });
+}
+
+fn build_z3_solver() -> Z3Solver {
+    init_z3();
+    let solver = Z3Solver::new();
+    let mut params = z3::Params::new();
+    params.set_u32("timeout", SOLVER_TIMEOUT_MS);
+    solver.set_params(&params);
+    solver
+}
+
+pub(crate) fn rebuild_z3_solver() {
+    Z3_SOLVER.with(|solver| {
+        *solver.borrow_mut() = build_z3_solver();
+    });
+}
+
+fn reset_z3_solver() {
+    with_z3_solver(|solver| solver.reset());
+}
+
+pub(crate) fn with_z3_solver<T>(f: impl FnOnce(&Z3Solver) -> T) -> T {
+    Z3_SOLVER.with(|solver| f(&solver.borrow()))
+}
+
+pub(crate) fn with_z3_context<T>(f: impl FnOnce() -> T + Send + Sync) -> T
+where
+    T: Send + Sync,
+{
+    z3::with_z3_config(&Config::new(), f)
+}
+
+pub(crate) fn with_z3_deadline<T>(budget: Duration, f: impl FnOnce() -> T) -> (T, bool) {
+    let ctx = Context::thread_local();
+    let handle = ctx.handle();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    thread::scope(|scope| {
+        let watchdog = scope.spawn(move || {
+            if done_rx.recv_timeout(budget).is_err() {
+                handle.interrupt();
+                true
+            } else {
+                false
+            }
+        });
+        let result = f();
+        let _ = done_tx.send(());
+        let timed_out = watchdog.join().expect("watchdog thread");
+        (result, timed_out)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::spec::{StructFieldTy, StructTy};
     use z3::{SatResult, SortKind};
 
+    fn with_test_solver<T>(f: impl FnOnce(&Solver, &Z3Solver) -> T) -> T {
+        let solver = Solver::new(64);
+        with_z3_solver(|z3_solver| f(&solver, z3_solver))
+    }
+
+    #[test]
+    fn thread_local_solver_distinguishes_sat_from_unsat() {
+        rebuild_z3_solver();
+        let x = Int::new_const("x");
+        let sat = with_z3_solver(|solver| {
+            solver.push();
+            solver.assert(x.eq(1));
+            let result = solver.check();
+            solver.pop(1);
+            result
+        });
+        assert_eq!(sat, SatResult::Sat);
+
+        let unsat = with_z3_solver(|solver| {
+            solver.push();
+            solver.assert(x.eq(1));
+            solver.assert(x.eq(2));
+            let result = solver.check();
+            solver.pop(1);
+            result
+        });
+        assert_eq!(unsat, SatResult::Unsat);
+    }
+
+    #[test]
+    fn z3_context_solver_distinguishes_sat_from_unsat() {
+        let result = with_z3_context(|| {
+            rebuild_z3_solver();
+            let x = Int::new_const("x");
+            let sat = with_z3_solver(|solver| {
+                solver.push();
+                solver.assert(x.eq(1));
+                let result = solver.check();
+                solver.pop(1);
+                result
+            });
+            let unsat = with_z3_solver(|solver| {
+                solver.push();
+                solver.assert(x.eq(1));
+                solver.assert(x.eq(2));
+                let result = solver.check();
+                solver.pop(1);
+                result
+            });
+            (sat, unsat)
+        });
+        assert_eq!(result.0, SatResult::Sat);
+        assert_eq!(result.1, SatResult::Unsat);
+    }
+
     #[test]
     fn encodes_all_types_in_shared_value_sort() {
-        let solver = Solver::new();
-        let encoder = ValueEncoder::new(64);
+        with_test_solver(|solver, z3_solver| {
+            let bool_encoding = solver
+                .type_encoding(&SpecTy::Bool, z3_solver)
+                .expect("bool encoding");
+            let int_encoding = solver
+                .type_encoding(&SpecTy::I32, z3_solver)
+                .expect("int encoding");
+            let tuple_encoding = solver
+                .type_encoding(&SpecTy::Tuple(vec![SpecTy::Bool, SpecTy::I32]), z3_solver)
+                .expect("tuple encoding");
+            let struct_encoding = solver
+                .type_encoding(
+                    &SpecTy::Struct(StructTy {
+                        name: "Pair".to_owned(),
+                        fields: vec![
+                            StructFieldTy {
+                                name: "flag".to_owned(),
+                                ty: SpecTy::Bool,
+                            },
+                            StructFieldTy {
+                                name: "count".to_owned(),
+                                ty: SpecTy::I32,
+                            },
+                        ],
+                    }),
+                    z3_solver,
+                )
+                .expect("struct encoding");
 
-        let bool_encoding = encoder
-            .type_encoding(&SpecTy::Bool, &solver)
-            .expect("bool encoding");
-        let int_encoding = encoder
-            .type_encoding(&SpecTy::I32, &solver)
-            .expect("int encoding");
-        let tuple_encoding = encoder
-            .type_encoding(&SpecTy::Tuple(vec![SpecTy::Bool, SpecTy::I32]), &solver)
-            .expect("tuple encoding");
-        let struct_encoding = encoder
-            .type_encoding(
-                &SpecTy::Struct(StructTy {
-                    name: "Pair".to_owned(),
-                    fields: vec![
-                        StructFieldTy {
-                            name: "flag".to_owned(),
-                            ty: SpecTy::Bool,
-                        },
-                        StructFieldTy {
-                            name: "count".to_owned(),
-                            ty: SpecTy::I32,
-                        },
-                    ],
-                }),
-                &solver,
-            )
-            .expect("struct encoding");
-
-        assert!(matches!(bool_encoding.kind, TypeEncodingKind::Bool));
-        assert!(matches!(int_encoding.kind, TypeEncodingKind::Int));
-        assert!(matches!(
-            tuple_encoding.kind,
-            TypeEncodingKind::Composite(_)
-        ));
-        assert!(matches!(
-            struct_encoding.kind,
-            TypeEncodingKind::Composite(_)
-        ));
-        assert_eq!(encoder.value_sort().kind(), SortKind::Uninterpreted);
+            assert!(matches!(bool_encoding.kind, TypeEncodingKind::Bool));
+            assert!(matches!(int_encoding.kind, TypeEncodingKind::Int));
+            assert!(matches!(
+                tuple_encoding.kind,
+                TypeEncodingKind::Composite(_)
+            ));
+            assert!(matches!(
+                struct_encoding.kind,
+                TypeEncodingKind::Composite(_)
+            ));
+            assert_eq!(solver.value_sort().kind(), SortKind::Uninterpreted);
+        });
     }
 
     #[test]
     fn composite_constructors_are_uninterpreted_function_symbols() {
-        let solver = Solver::new();
-        let encoder = ValueEncoder::new(64);
-        let _ = encoder
-            .type_encoding(&SpecTy::Bool, &solver)
-            .expect("bool encoding");
-        let _ = encoder
-            .type_encoding(&SpecTy::I32, &solver)
-            .expect("int encoding");
-        let tuple_encoding = encoder
-            .composite_encoding(&SpecTy::Tuple(vec![SpecTy::Bool, SpecTy::I32]), &solver)
-            .expect("tuple encoding");
-        let tuple_ctor = tuple_encoding
-            .single_constructor()
-            .expect("single constructor");
+        with_test_solver(|solver, z3_solver| {
+            let _ = solver
+                .type_encoding(&SpecTy::Bool, z3_solver)
+                .expect("bool encoding");
+            let _ = solver
+                .type_encoding(&SpecTy::I32, z3_solver)
+                .expect("int encoding");
+            let tuple_encoding = solver
+                .composite_encoding(&SpecTy::Tuple(vec![SpecTy::Bool, SpecTy::I32]), z3_solver)
+                .expect("tuple encoding");
+            let tuple_ctor = tuple_encoding
+                .single_constructor()
+                .expect("single constructor");
 
-        assert_eq!(tuple_encoding.constructors.len(), 1);
-        assert_eq!(tuple_ctor.name, "mk_tuple_bool_i32");
-        assert_eq!(tuple_ctor.fields.len(), 2);
+            assert_eq!(tuple_encoding.constructors.len(), 1);
+            assert_eq!(tuple_ctor.name, "mk_tuple_bool_i32");
+            assert_eq!(tuple_ctor.fields.len(), 2);
 
-        let tuple_value = tuple_ctor.symbol.apply(&[
-            &encoder.bool_encoding.boxed.apply(&[&Bool::from_bool(true)]),
-            &encoder.int_encoding.boxed.apply(&[&Int::from_i64(3)]),
-        ]);
-        assert_eq!(tuple_value.decl().name(), tuple_ctor.name);
-        assert_eq!(tuple_value.children().len(), 2);
-        assert_eq!(tuple_value.get_sort().kind(), SortKind::Uninterpreted);
+            let tuple_value = tuple_ctor.symbol.apply(&[
+                &solver.bool_encoding.boxed.apply(&[&Bool::from_bool(true)]),
+                &solver.int_encoding.boxed.apply(&[&Int::from_i64(3)]),
+            ]);
+            assert_eq!(tuple_value.decl().name(), tuple_ctor.name);
+            assert_eq!(tuple_value.children().len(), 2);
+            assert_eq!(tuple_value.get_sort().kind(), SortKind::Uninterpreted);
+        });
     }
 
     #[test]
     fn primitive_terms_unwrap_boxed_values_syntactically() {
-        let solver = Solver::new();
-        let encoder = ValueEncoder::new(64);
-        let _ = encoder
-            .type_encoding(&SpecTy::Bool, &solver)
-            .expect("bool encoding");
-        let _ = encoder
-            .type_encoding(&SpecTy::I32, &solver)
-            .expect("int encoding");
-        let boxed_bool = encoder.bool_value(true);
-        assert_eq!(encoder.bool_term(&boxed_bool).to_string(), "true");
+        with_test_solver(|solver, z3_solver| {
+            let _ = solver
+                .type_encoding(&SpecTy::Bool, z3_solver)
+                .expect("bool encoding");
+            let _ = solver
+                .type_encoding(&SpecTy::I32, z3_solver)
+                .expect("int encoding");
+            let boxed_bool = solver.bool_value(true);
+            assert_eq!(solver.bool_term(&boxed_bool).to_string(), "true");
 
-        let boxed_int = encoder.int_value(42);
-        assert_eq!(encoder.int_term(&boxed_int).to_string(), "42");
+            let boxed_int = solver.int_value(42);
+            assert_eq!(solver.int_term(&boxed_int).to_string(), "42");
+        });
     }
 
     #[test]
     fn primitive_encodings_keep_solver_consistent() {
-        z3::set_global_param("smt.auto_config", "false");
-        z3::set_global_param("smt.mbqi", "false");
+        with_test_solver(|solver, z3_solver| {
+            let _ = solver
+                .type_encoding(&SpecTy::Bool, z3_solver)
+                .expect("bool encoding");
+            let _ = solver
+                .type_encoding(&SpecTy::I32, z3_solver)
+                .expect("int encoding");
 
-        let solver = Solver::new();
-        let mut params = z3::Params::new();
-        params.set_u32("timeout", 1_000);
-        solver.set_params(&params);
+            assert_eq!(z3_solver.check(), SatResult::Sat);
+        });
+    }
 
-        let encoder = ValueEncoder::new(64);
-        let _ = encoder
-            .type_encoding(&SpecTy::Bool, &solver)
-            .expect("bool encoding");
-        let _ = encoder
-            .type_encoding(&SpecTy::I32, &solver)
-            .expect("int encoding");
+    #[test]
+    fn pure_function_declarations_are_owned_by_solver() {
+        let solver = Solver::new(64);
+        solver
+            .declare_pure_fn("id", &[SpecTy::I32], &SpecTy::I32)
+            .expect("declare pure function");
+        let mut next = 0;
+        let params = solver
+            .pure_fn_params("id", &[("x".to_owned(), SpecTy::I32)], &mut |hint| {
+                next += 1;
+                format!("{hint}_{next}")
+            })
+            .expect("pure function params");
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].0, "x");
+        solver
+            .define_pure_fn("id", &[params[0].1.clone()], &params[0].1)
+            .expect("define pure function");
 
-        assert_eq!(solver.check(), SatResult::Sat);
+        let value = solver
+            .apply_pure_fn("id", &[solver.int_value(5)])
+            .expect("apply pure function")
+            .expect("known pure function");
+        assert_eq!(value.dynamic().decl().name().to_string(), "pure_fn_id");
+        assert!(
+            solver
+                .apply_pure_fn("unknown", &[])
+                .expect("unknown pure function")
+                .is_none()
+        );
     }
 
     #[test]
     fn sequence_literal_lengths_stay_ground() {
-        let encoder = ValueEncoder::new(64);
-        let seq = encoder.seq_literal_value(&[encoder.int_value(0), encoder.int_value(1)]);
-        let length = encoder.seq_len_int(&seq).expect("sequence length");
+        let solver = Solver::new(64);
+        let seq = solver.seq_literal_value(&[solver.int_value(0), solver.int_value(1)]);
+        let length = solver.seq_len_int(&seq).expect("sequence length");
         assert_eq!(length.as_i64(), Some(2));
     }
 
     #[test]
     fn ground_sequence_equality_ignores_concat_shape() {
-        let solver = Solver::new();
-        let encoder = ValueEncoder::new(64);
+        let solver = Solver::new(64);
         let seq_ty = SpecTy::Seq(Box::new(SpecTy::I32));
-        let lhs_tail = encoder
+        let lhs_tail = solver
             .lower_binary_value(
                 BinaryOp::Concat,
                 &seq_ty,
-                &encoder.seq_literal_value(&[encoder.int_value(0)]),
-                &encoder.seq_literal_value(&[]),
-                &solver,
+                &solver.seq_literal_value(&[solver.int_value(0)]),
+                &solver.seq_literal_value(&[]),
             )
             .expect("tail concat");
-        let lhs = encoder
+        let lhs = solver
             .lower_binary_value(
                 BinaryOp::Concat,
                 &seq_ty,
-                &encoder.seq_literal_value(&[encoder.int_value(1)]),
+                &solver.seq_literal_value(&[solver.int_value(1)]),
                 &lhs_tail,
-                &solver,
             )
             .expect("lhs concat");
-        let rhs = encoder.seq_literal_value(&[encoder.int_value(1), encoder.int_value(0)]);
-        let equal = encoder
-            .eq_for_spec_ty(&seq_ty, &lhs, &rhs, &solver)
+        let rhs = solver.seq_literal_value(&[solver.int_value(1), solver.int_value(0)]);
+        let equal = solver
+            .eq_for_spec_ty(&seq_ty, &lhs, &rhs)
             .expect("sequence equality");
         assert_eq!(equal.as_bool(), Some(true));
     }
 
     #[test]
     fn known_structural_composites_project_and_tag_syntactically() {
-        let solver = Solver::new();
-        let encoder = ValueEncoder::new(64);
-        let _ = encoder
-            .type_encoding(&SpecTy::Bool, &solver)
-            .expect("bool encoding");
-        let _ = encoder
-            .type_encoding(&SpecTy::I32, &solver)
-            .expect("int encoding");
-        let tuple_encoding = encoder
-            .composite_encoding(&SpecTy::Tuple(vec![SpecTy::Bool, SpecTy::I32]), &solver)
-            .expect("tuple encoding");
-        let tuple_ctor = tuple_encoding
-            .single_constructor()
-            .expect("single constructor");
-        let flag = Bool::new_const("flag");
-        let count = Int::new_const("count");
-        let tuple = tuple_ctor.symbol.apply(&[
-            &encoder.bool_encoding.boxed.apply(&[&flag]),
-            &encoder.int_encoding.boxed.apply(&[&count]),
-        ]);
+        with_test_solver(|solver, z3_solver| {
+            let _ = solver
+                .type_encoding(&SpecTy::Bool, z3_solver)
+                .expect("bool encoding");
+            let _ = solver
+                .type_encoding(&SpecTy::I32, z3_solver)
+                .expect("int encoding");
+            let tuple_encoding = solver
+                .composite_encoding(&SpecTy::Tuple(vec![SpecTy::Bool, SpecTy::I32]), z3_solver)
+                .expect("tuple encoding");
+            let tuple_ctor = tuple_encoding
+                .single_constructor()
+                .expect("single constructor");
+            let flag = Bool::new_const("flag");
+            let count = Int::new_const("count");
+            let tuple = tuple_ctor.symbol.apply(&[
+                &solver.bool_encoding.boxed.apply(&[&flag]),
+                &solver.int_encoding.boxed.apply(&[&count]),
+            ]);
 
-        assert_eq!(
-            encoder
-                .project_composite_field(&tuple_encoding, &SymValue::new(tuple.clone()), 0)
-                .expect("flag field")
-                .dynamic(),
-            &encoder.bool_encoding.boxed.apply(&[&flag])
-        );
-        assert_eq!(
-            encoder
-                .project_composite_field(&tuple_encoding, &SymValue::new(tuple.clone()), 1)
-                .expect("count field")
-                .dynamic(),
-            &encoder.int_encoding.boxed.apply(&[&count])
-        );
+            assert_eq!(
+                solver
+                    .project_composite_field(&tuple_encoding, &SymValue::new(tuple.clone()), 0)
+                    .expect("flag field")
+                    .dynamic(),
+                &solver.bool_encoding.boxed.apply(&[&flag])
+            );
+            assert_eq!(
+                solver
+                    .project_composite_field(&tuple_encoding, &SymValue::new(tuple.clone()), 1)
+                    .expect("count field")
+                    .dynamic(),
+                &solver.int_encoding.boxed.apply(&[&count])
+            );
 
-        assert_eq!(
-            encoder
-                .tag_formula(&tuple_encoding, 0, &SymValue::new(tuple))
-                .expect("tuple tag")
-                .simplify()
-                .as_bool(),
-            Some(true)
-        );
+            assert_eq!(
+                solver
+                    .tag_formula(&tuple_encoding, 0, &SymValue::new(tuple))
+                    .expect("tuple tag")
+                    .simplify()
+                    .as_bool(),
+                Some(true)
+            );
+        });
     }
 
     #[test]
     fn opaque_structural_composites_do_not_gain_eta_axioms() {
-        let solver = Solver::new();
-        let encoder = ValueEncoder::new(64);
-        let _ = encoder
-            .type_encoding(&SpecTy::Bool, &solver)
-            .expect("bool encoding");
-        let _ = encoder
-            .type_encoding(&SpecTy::I32, &solver)
-            .expect("int encoding");
-        let tuple_encoding = encoder
-            .composite_encoding(&SpecTy::Tuple(vec![SpecTy::Bool, SpecTy::I32]), &solver)
-            .expect("tuple encoding");
-        let tuple_ctor = tuple_encoding
-            .single_constructor()
-            .expect("single constructor");
-        let opaque_tuple = Dynamic::new_const("opaque_tuple", encoder.value_sort());
-        let reconstructed = tuple_ctor.symbol.apply(&[
-            &tuple_ctor.fields[0].inverse.apply(&[&opaque_tuple]),
-            &tuple_ctor.fields[1].inverse.apply(&[&opaque_tuple]),
-        ]);
+        with_test_solver(|solver, z3_solver| {
+            let _ = solver
+                .type_encoding(&SpecTy::Bool, z3_solver)
+                .expect("bool encoding");
+            let _ = solver
+                .type_encoding(&SpecTy::I32, z3_solver)
+                .expect("int encoding");
+            let tuple_encoding = solver
+                .composite_encoding(&SpecTy::Tuple(vec![SpecTy::Bool, SpecTy::I32]), z3_solver)
+                .expect("tuple encoding");
+            let tuple_ctor = tuple_encoding
+                .single_constructor()
+                .expect("single constructor");
+            let opaque_tuple = Dynamic::new_const("opaque_tuple", solver.value_sort());
+            let reconstructed = tuple_ctor.symbol.apply(&[
+                &tuple_ctor.fields[0].inverse.apply(&[&opaque_tuple]),
+                &tuple_ctor.fields[1].inverse.apply(&[&opaque_tuple]),
+            ]);
 
-        solver.push();
-        solver.assert(reconstructed.eq(&opaque_tuple).not());
-        assert_eq!(solver.check(), SatResult::Sat);
-        solver.pop(1);
+            z3_solver.push();
+            z3_solver.assert(reconstructed.eq(&opaque_tuple).not());
+            assert_eq!(z3_solver.check(), SatResult::Sat);
+            z3_solver.pop(1);
+        });
     }
 
     #[test]
     fn composite_symbols_follow_verifast_style_naming() {
-        let solver = Solver::new();
-        let encoder = ValueEncoder::new(64);
-        let tuple_encoding = encoder
-            .composite_encoding(&SpecTy::Tuple(vec![SpecTy::Bool, SpecTy::I32]), &solver)
-            .expect("tuple encoding");
-        let tuple_ctor = tuple_encoding
-            .single_constructor()
-            .expect("single constructor");
+        with_test_solver(|solver, z3_solver| {
+            let tuple_encoding = solver
+                .composite_encoding(&SpecTy::Tuple(vec![SpecTy::Bool, SpecTy::I32]), z3_solver)
+                .expect("tuple encoding");
+            let tuple_ctor = tuple_encoding
+                .single_constructor()
+                .expect("single constructor");
 
-        let tag_name = tuple_encoding.tag_function.name();
-        assert!(tag_name.starts_with("ctortag"));
-        assert!(
-            tag_name["ctortag".len()..]
-                .chars()
-                .all(|ch| ch.is_ascii_digit())
-        );
+            let tag_name = tuple_encoding.tag_function.name();
+            assert!(tag_name.starts_with("ctortag"));
+            assert!(
+                tag_name["ctortag".len()..]
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit())
+            );
 
-        for field in &tuple_ctor.fields {
-            assert!(field.inverse.name().starts_with("ctorinv"));
-        }
+            for field in &tuple_ctor.fields {
+                assert!(field.inverse.name().starts_with("ctorinv"));
+            }
+        });
     }
 }

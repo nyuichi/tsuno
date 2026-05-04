@@ -1,5 +1,7 @@
 #![feature(rustc_private)]
 
+//! rustc_driver integration that runs prepass and verification for the wrapped crate.
+
 extern crate rustc_ast;
 extern crate rustc_driver;
 extern crate rustc_hir;
@@ -11,8 +13,8 @@ mod directive;
 mod engine;
 mod prepass;
 mod report;
+mod solver;
 mod spec;
-mod value;
 
 use std::env;
 

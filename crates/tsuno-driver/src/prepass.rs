@@ -1,18 +1,22 @@
+//! HIR/MIR prepass that resolves directives into typed verification input.
+
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::ControlFlow;
 
 use crate::directive::{
     CollectedFunctionDirectives, DirectiveAttach, DirectiveError, DirectiveKind, FunctionDirective,
-    RawAssertion, RawPattern, ValuePattern, collect_function_directives,
+    collect_function_directives, collect_ghost_blocks, collect_non_ghost_spec_comments,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
-    EnumDef, Expr, GhostMatchArm, LemmaDef, MatchBinding, MatchPattern, PureFnDef, RustTyKey,
-    RustTypeExpr, SpecTy, StructDef, StructFieldTy, StructTy, TypedExpr, TypedExprKind,
-    TypedMatchArm, TypedMatchBinding, option_spec_ty, parse_ghost_block, ptr_spec_ty,
+    EnumDef, Expr, GhostMatchArm, LemmaDef, MatchBinding, MatchPattern, PureFnDef, RawAssertion,
+    RawPattern, RustTyKey, RustTypeExpr, SpecTy, StructDef, StructFieldTy, StructTy, TypedExpr,
+    TypedExprKind, TypedMatchArm, TypedMatchBinding, ValuePattern, option_spec_ty, ptr_spec_ty,
 };
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::{BlockCheckMode, Expr as HirExpr, ExprKind, HirId, Pat, PatKind, UnsafeSource};
+use rustc_hir::{
+    BlockCheckMode, Expr as HirExpr, ExprKind, HirId, ItemKind, Pat, PatKind, UnsafeSource,
+};
 use rustc_middle::mir::{BasicBlock, Body, Local, PlaceElem, StatementKind, TerminatorKind};
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::def_id::LocalDefId;
@@ -375,6 +379,7 @@ fn compute_raw_global_ghost_prepass<'tcx>(
     tcx: TyCtxt<'tcx>,
     anchor_span: Span,
 ) -> Result<RawGlobalGhostPrepass, LoopPrepassError> {
+    validate_global_spec_comment_positions(tcx)?;
     let sources = collect_global_ghost_sources(tcx, anchor_span);
 
     let mut enum_defs = Vec::new();
@@ -456,6 +461,45 @@ fn compute_raw_global_ghost_prepass<'tcx>(
         pure_fn_order,
         lemma_order,
     })
+}
+
+fn validate_global_spec_comment_positions<'tcx>(tcx: TyCtxt<'tcx>) -> Result<(), LoopPrepassError> {
+    let mut files: HashMap<_, (String, Vec<(usize, usize)>)> = HashMap::new();
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
+        let loc = tcx.sess.source_map().lookup_char_pos(item.span.lo());
+        let Some(source) = loc.file.src.as_deref() else {
+            continue;
+        };
+        let entry = files
+            .entry(loc.file.start_pos)
+            .or_insert_with(|| (source.to_owned(), Vec::new()));
+        if matches!(item.kind, ItemKind::Fn { .. }) {
+            let start = item.span.lo().0.saturating_sub(loc.file.start_pos.0) as usize;
+            let end = item.span.hi().0.saturating_sub(loc.file.start_pos.0) as usize;
+            entry.1.push((start, end));
+        }
+    }
+
+    for (source, function_ranges) in files.into_values() {
+        for comment in collect_non_ghost_spec_comments(&source) {
+            let in_function = function_ranges
+                .iter()
+                .any(|(start, end)| *start <= comment.start_offset && comment.start_offset < *end);
+            if !in_function {
+                return Err(LoopPrepassError {
+                    span: DUMMY_SP,
+                    display_span: None,
+                    message: format!(
+                        "spec comment is not attached to a function contract, ghost item, ghost command, or loop invariant: {}",
+                        comment.line_text
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn type_global_ghost_prepass(
@@ -7833,9 +7877,9 @@ fn type_lemmas(
             message: format!("lemma `{}` req: {message}", lemma.name),
         })?;
         let mut body_infer_scope = infer_scope.clone();
-        for raw_req in &lemma.raw_reqs {
+        for resource_req in &lemma.raw_reqs {
             infer_contract_raw_assertion(
-                raw_req,
+                resource_req,
                 pure_fns,
                 enum_defs,
                 &mut body_infer_scope,
@@ -8272,31 +8316,15 @@ fn collect_ghost_items_in_source(
     pure_fns: &mut Vec<PureFnDef>,
     lemmas: &mut Vec<LemmaDef>,
 ) -> Result<(), LoopPrepassError> {
-    let mut ghost_item = Vec::new();
-    for comment in crate::spec::collect_spec_comments(source) {
-        if ghost_item.is_empty() {
-            if !crate::spec::is_ghost_item_block(&comment.text) {
-                continue;
-            }
-            ghost_item.push(comment);
-        } else {
-            ghost_item.push(comment);
-        }
-
-        let block = crate::spec::spec_comment_group_text(&ghost_item);
-        if !crate::spec::is_complete_ghost_item_comment(&block) {
-            continue;
-        }
-        let parsed = parse_ghost_block(&block).map_err(|err| LoopPrepassError {
-            span: error_span,
-            display_span: None,
-            message: err.to_string(),
-        })?;
+    for parsed in collect_ghost_blocks(source).map_err(|err| LoopPrepassError {
+        span: error_span,
+        display_span: None,
+        message: err.to_string(),
+    })? {
         enums.extend(parsed.enums);
         structs.extend(parsed.structs);
         pure_fns.extend(parsed.pure_fns);
         lemmas.extend(parsed.lemmas);
-        ghost_item.clear();
     }
     Ok(())
 }

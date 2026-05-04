@@ -1,3 +1,5 @@
+//! User-facing verification results and CLI report rendering.
+
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,5 +1,7 @@
 #![allow(clippy::result_large_err)]
 
+//! Verification engine for MIR execution, contracts, resources, and solver checks.
+
 // Supported Rust types are reflected into the spec language and encoded in Z3 as follows:
 //
 // | Rust type                          | spec type           | Z3 representation           | invariant |
@@ -19,13 +21,9 @@
 //   present. Raw `Ptr` values may still have no provenance.
 // - Structs with `Drop`, generic structs, and recursive structs are unsupported.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::rc::Rc;
 use std::str::FromStr;
-use std::sync::Once;
-use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
 
 use rustc_hir::def_id::{DefId, LocalDefId};
@@ -37,8 +35,8 @@ use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::source_map::Spanned;
 use rustc_span::{DUMMY_SP, Span};
-use z3::ast::{Ast, Bool, Dynamic, Int, Seq as Z3Seq};
-use z3::{Config, Context, RecFuncDecl, SatResult, Solver, Sort, SortKind};
+use z3::SatResult;
+use z3::ast::{Bool, Int};
 
 use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
@@ -48,20 +46,16 @@ use crate::prepass::{
     rust_ty_key_text_for_rust_ty as checked_rust_ty_key_text_for_rust_ty, spec_ty_for_rust_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
+use crate::solver::{
+    CompositeCtorView, IntValueBinaryOp, IntValuePredicateOp, OptionCtorKind, Solver, SymValue,
+    with_z3_context, with_z3_deadline,
+};
 use crate::spec::{
     BinaryOp, RustTyKey, SpecTy, TypedExpr, TypedExprKind, TypedMatchBinding, UnaryOp,
     option_spec_ty, provenance_spec_ty, ptr_spec_ty,
 };
-use crate::value::{CompositeEncoding, SymValue, TypeEncoding, TypeEncodingKind, ValueEncoder};
 
-const SOLVER_TIMEOUT_MS: u32 = 1_000;
 const GHOST_LOAD_TIMEOUT: Duration = Duration::from_millis(1_000);
-
-thread_local! {
-    static GLOBAL_SOLVER: RefCell<Solver> = RefCell::new(build_solver());
-}
-
-static Z3_INIT: Once = Once::new();
 
 #[derive(Clone, Copy)]
 struct UnsafeCallbackArg<T>(T);
@@ -97,9 +91,10 @@ struct Allocation {
     align: u64,
 }
 
-struct BuiltinNatDecls {
-    nat_to_int: RecFuncDecl,
-    int_to_nat: RecFuncDecl,
+struct AssertionFailure {
+    span: Span,
+    diagnostic_span: String,
+    message: String,
 }
 
 struct FunctionContext<'tcx> {
@@ -121,11 +116,9 @@ pub struct Verifier<'tcx> {
     context: VerifierContext<'tcx>,
     contracts: HashMap<LocalDefId, FunctionContract>,
     pure_fns: HashMap<String, TypedPureFnDef>,
-    pure_fn_decls: HashMap<String, RecFuncDecl>,
     lemmas: HashMap<String, TypedLemmaDef>,
-    builtin_nat_decls: RefCell<Option<Rc<BuiltinNatDecls>>>,
     next_sym: Cell<usize>,
-    value_encoder: ValueEncoder,
+    solver: Solver,
 }
 
 #[derive(Debug, Clone)]
@@ -134,12 +127,12 @@ struct UnsafeState {
     store: BTreeMap<Local, SymValue>,
     allocs: BTreeMap<Local, Allocation>,
     env: HashMap<String, SymValue>,
-    heap: Vec<RawResource>,
+    heap: Vec<Resource>,
     ctrl: ControlPoint,
 }
 
 #[derive(Debug, Clone)]
-enum RawResource {
+enum Resource {
     PointsTo {
         addr: SymValue,
         ty: SymValue,
@@ -158,12 +151,12 @@ struct UnsafeBridge {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum RawContractCheck {
+enum ResourceContractCheck {
     Precondition,
     Postcondition,
 }
 
-impl RawContractCheck {
+impl ResourceContractCheck {
     fn ambiguous_message(self) -> &'static str {
         match self {
             Self::Precondition => "ambiguous raw precondition matching is unsupported",
@@ -186,15 +179,6 @@ struct RawPatternMatch {
     env: HashMap<String, SymValue>,
 }
 
-struct ContractPredicateAssertion<'a> {
-    predicate: &'a NormalizedPredicate,
-    current: &'a HashMap<String, SymValue>,
-    spec: &'a HashMap<String, SymValue>,
-    span: Span,
-    diagnostic_span: String,
-    message: String,
-}
-
 struct UnsafeCall<'mir, 'tcx> {
     func: &'mir Operand<'tcx>,
     args: &'mir [Spanned<Operand<'tcx>>],
@@ -211,12 +195,12 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
     } = program;
     let tcx_capture = UnsafeCallbackArg(tcx);
     let ghosts_capture = UnsafeCallbackArg(&ghosts);
-    let prepass_error = z3::with_z3_config(&Config::new(), move || {
+    let prepass_error = with_z3_context(move || {
         let tcx = tcx_capture.get();
         let ghosts = ghosts_capture.get();
         let mut verifier = Verifier::new(tcx, HashMap::new());
         for enum_def in ghosts.enums.values() {
-            verifier.value_encoder.register_enum_def(enum_def.clone());
+            verifier.solver.register_enum_def(enum_def.clone());
         }
         for pure_fn in &ghosts.typed_pure_fns {
             if let Err(error) = verifier.load_ghost_function(pure_fn) {
@@ -253,13 +237,13 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
         );
         let def_id = function.def_id;
         let prepass = function.prepass;
-        let result = z3::with_z3_config(&Config::new(), move || {
+        let result = with_z3_context(move || {
             let tcx = tcx_capture.get();
             let ghosts = ghosts_capture.get();
             let contracts = contracts_capture.get().clone();
             let mut verifier = Verifier::new(tcx, contracts);
             for enum_def in ghosts.enums.values() {
-                verifier.value_encoder.register_enum_def(enum_def.clone());
+                verifier.solver.register_enum_def(enum_def.clone());
             }
             for pure_fn in &needed_pure_fns {
                 if let Err(error) = verifier.load_ghost_function(pure_fn) {
@@ -281,17 +265,14 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
 
 impl<'tcx> Verifier<'tcx> {
     pub fn new(tcx: TyCtxt<'tcx>, contracts: HashMap<LocalDefId, FunctionContract>) -> Self {
-        rebuild_solver();
         Self {
             tcx,
             context: VerifierContext::Ghost,
             contracts,
             pure_fns: HashMap::new(),
-            pure_fn_decls: HashMap::new(),
             lemmas: HashMap::new(),
-            builtin_nat_decls: RefCell::new(None),
             next_sym: Cell::new(0),
-            value_encoder: ValueEncoder::new(tcx.data_layout.pointer_size().bits()),
+            solver: Solver::new(tcx.data_layout.pointer_size().bits()),
         }
     }
 
@@ -332,11 +313,6 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn reset_solver_state(&self) {
-        reset_solver();
-        self.value_encoder.reset_solver_state();
-    }
-
     pub fn load_ghost_function(
         &mut self,
         pure_fn: &TypedPureFnDef,
@@ -375,7 +351,7 @@ impl<'tcx> Verifier<'tcx> {
         body: Body<'tcx>,
         prepass: DirectivePrepass,
     ) -> VerificationResult {
-        self.reset_solver_state();
+        self.solver.reset();
         let DirectivePrepass {
             loop_contracts,
             control_point_directives,
@@ -518,10 +494,10 @@ impl<'tcx> Verifier<'tcx> {
         let view = self.unsafe_state_view(state);
         let call_env = CallEnv::for_function(self, &view, contract)?;
         let mut spec = state.env.clone();
-        for raw_req in &contract.raw_reqs {
-            self.assume_unsafe_raw_contract(
+        for resource_req in &contract.raw_reqs {
+            self.assume_unsafe_resource_contract(
                 state,
-                raw_req,
+                resource_req,
                 &call_env.current,
                 &mut spec,
                 self.report_span(),
@@ -550,15 +526,15 @@ impl<'tcx> Verifier<'tcx> {
 
         let mut spec = call_env.spec.clone();
         for raw_ens in &contract.raw_ens {
-            let raw_spec = self.consume_unsafe_raw_contract(
+            let resource_spec = self.consume_unsafe_resource_contract(
                 state,
                 raw_ens,
                 &call_env.current,
                 &spec,
                 term.source_info.span,
-                RawContractCheck::Postcondition,
+                ResourceContractCheck::Postcondition,
             )?;
-            spec.extend(raw_spec);
+            spec.extend(resource_spec);
         }
         self.reflect_unsafe_bridge_locals(state, bridge, term.source_info.span)?;
         self.assert_unsafe_heap_empty(
@@ -594,9 +570,11 @@ impl<'tcx> Verifier<'tcx> {
                         state,
                         &assertion.assertion,
                         &assertion.resolution,
-                        self.control_span(ctrl),
-                        assertion.assertion_span.clone(),
-                        "assertion failed".to_owned(),
+                        AssertionFailure {
+                            span: self.control_span(ctrl),
+                            diagnostic_span: assertion.assertion_span.clone(),
+                            message: "assertion failed".to_owned(),
+                        },
                     )?;
                 }
                 ControlPointDirective::Assume(assumption) => {
@@ -757,12 +735,14 @@ impl<'tcx> Verifier<'tcx> {
                     let contract = self.current_contract();
                     let env = CallEnv::for_function(self, &state, contract)?;
                     let ens = self.contract_ens_formula(contract, &env, term.source_info.span)?;
-                    self.assert_predicate_constraint(
+                    self.assert_constraint(
                         &mut state,
                         ens,
-                        term.source_info.span,
-                        contract.ens_span.clone(),
-                        "postcondition failed".to_owned(),
+                        AssertionFailure {
+                            span: term.source_info.span,
+                            diagnostic_span: contract.ens_span.clone(),
+                            message: "postcondition failed".to_owned(),
+                        },
                     )?;
                 }
                 let live_locals: Vec<_> = state.store.keys().copied().collect();
@@ -781,20 +761,25 @@ impl<'tcx> Verifier<'tcx> {
                     let branch = match discr.ty(self.body(), self.tcx).kind() {
                         TyKind::Bool => {
                             if value == 0 {
-                                self.value_is_true(&discr_value).not()
+                                self.solver.bool_term(&discr_value).not()
                             } else {
-                                self.value_is_true(&discr_value)
+                                self.solver.bool_term(&discr_value)
                             }
                         }
-                        _ => self.eq_for_spec_ty(
-                            &self.spec_ty_for_place_ty(
-                                discr.ty(&self.body().local_decls, self.tcx),
-                                term.source_info.span,
-                            )?,
-                            &discr_value,
-                            &self.value_int(value as i64),
-                            term.source_info.span,
-                        )?,
+                        _ => {
+                            let span = term.source_info.span;
+                            self.solver_result(
+                                span,
+                                self.solver.eq_for_spec_ty(
+                                    &self.spec_ty_for_place_ty(
+                                        discr.ty(&self.body().local_decls, self.tcx),
+                                        span,
+                                    )?,
+                                    &discr_value,
+                                    &self.solver.int_value(value as i64),
+                                ),
+                            )?
+                        }
                     };
                     seen_conditions.push(branch.clone());
                     if let Some(next) =
@@ -824,16 +809,18 @@ impl<'tcx> Verifier<'tcx> {
                 ..
             } => {
                 let cond_value = self.eval_operand(&mut state, cond, term.source_info.span)?;
-                let mut formula = self.value_is_true(&cond_value);
+                let mut formula = self.solver.bool_term(&cond_value);
                 if !*expected {
                     formula = formula.not();
                 }
                 self.assert_constraint(
                     &mut state,
                     formula,
-                    term.source_info.span,
-                    span_text(self.tcx, term.source_info.span),
-                    format!("assertion failed: {msg:?}"),
+                    AssertionFailure {
+                        span: term.source_info.span,
+                        diagnostic_span: span_text(self.tcx, term.source_info.span),
+                        message: format!("assertion failed: {msg:?}"),
+                    },
                 )?;
                 self.goto_target(state, *target, term.source_info.span)
             }
@@ -897,7 +884,7 @@ impl<'tcx> Verifier<'tcx> {
             } => {
                 let cond_value =
                     self.unsafe_eval_operand(&mut state, bridge, cond, term.source_info.span)?;
-                let mut formula = self.value_is_true(&cond_value);
+                let mut formula = self.solver.bool_term(&cond_value);
                 if !*expected {
                     formula = formula.not();
                 }
@@ -936,20 +923,25 @@ impl<'tcx> Verifier<'tcx> {
                     let branch = match discr.ty(self.body(), self.tcx).kind() {
                         TyKind::Bool => {
                             if value == 0 {
-                                self.value_is_true(&discr_value).not()
+                                self.solver.bool_term(&discr_value).not()
                             } else {
-                                self.value_is_true(&discr_value)
+                                self.solver.bool_term(&discr_value)
                             }
                         }
-                        _ => self.eq_for_spec_ty(
-                            &self.spec_ty_for_place_ty(
-                                discr.ty(&self.body().local_decls, self.tcx),
-                                term.source_info.span,
-                            )?,
-                            &discr_value,
-                            &self.value_int(value as i64),
-                            term.source_info.span,
-                        )?,
+                        _ => {
+                            let span = term.source_info.span;
+                            self.solver_result(
+                                span,
+                                self.solver.eq_for_spec_ty(
+                                    &self.spec_ty_for_place_ty(
+                                        discr.ty(&self.body().local_decls, self.tcx),
+                                        span,
+                                    )?,
+                                    &discr_value,
+                                    &self.solver.int_value(value as i64),
+                                ),
+                            )?
+                        }
                     };
                     seen_conditions.push(branch.clone());
                     if let Some(mut next) =
@@ -1014,12 +1006,14 @@ impl<'tcx> Verifier<'tcx> {
                 spec: spec.clone(),
             };
             let req = self.contract_req_formula(contract, &req_env, span)?;
-            self.assert_predicate_constraint(
+            self.assert_constraint(
                 &mut state,
                 req,
-                span,
-                contract.req_span.clone(),
-                "precondition failed".to_owned(),
+                AssertionFailure {
+                    span,
+                    diagnostic_span: contract.req_span.clone(),
+                    message: "precondition failed".to_owned(),
+                },
             )?;
             let result_ty = self.place_ty(destination);
             let result_value = self.fresh_for_rust_ty(result_ty, "call_result")?;
@@ -1090,16 +1084,16 @@ impl<'tcx> Verifier<'tcx> {
             let req = self.contract_req_formula(contract, &req_env, span)?;
             self.unsafe_assert_constraint(&mut state, req, span, "precondition failed".to_owned())?;
             let mut spec = spec;
-            for raw_req in &contract.raw_reqs {
-                let raw_spec = self.consume_unsafe_raw_contract(
+            for resource_req in &contract.raw_reqs {
+                let resource_spec = self.consume_unsafe_resource_contract(
                     &mut state,
-                    raw_req,
+                    resource_req,
                     &call_env.current,
                     &spec,
                     span,
-                    RawContractCheck::Precondition,
+                    ResourceContractCheck::Precondition,
                 )?;
-                spec.extend(raw_spec);
+                spec.extend(resource_spec);
             }
             let result_ty = self.place_ty(call.destination);
             let result_value = self.fresh_for_rust_ty(result_ty, "call_result")?;
@@ -1121,7 +1115,7 @@ impl<'tcx> Verifier<'tcx> {
                 return Ok(Vec::new());
             }
             for raw_ens in &contract.raw_ens {
-                self.assume_unsafe_raw_contract(
+                self.assume_unsafe_resource_contract(
                     &mut state,
                     raw_ens,
                     &call_env.current,
@@ -1269,12 +1263,14 @@ impl<'tcx> Verifier<'tcx> {
                 &loop_contract.invariant,
                 &loop_contract.resolution,
             )?;
-            self.assert_predicate_constraint(
+            self.assert_constraint(
                 &mut state,
                 invariant.clone(),
-                span,
-                loop_contract.invariant_span.clone(),
-                "loop invariant does not hold".to_owned(),
+                AssertionFailure {
+                    span,
+                    diagnostic_span: loop_contract.invariant_span.clone(),
+                    message: "loop invariant does not hold".to_owned(),
+                },
             )?;
             let invariant = self.spec_expr_to_bool(
                 &state,
@@ -1290,7 +1286,10 @@ impl<'tcx> Verifier<'tcx> {
                 if !self.assume_path_condition(&mut abstract_state, invariant) {
                     return Ok(None);
                 }
-                abstract_state.pc = bool_and(vec![abstract_state.pc, self.loop_marker(target)]);
+                abstract_state.pc = Solver::simplify_bool(&bool_and(vec![
+                    abstract_state.pc,
+                    self.loop_marker(target),
+                ]));
                 abstract_state.ctrl = ControlPoint {
                     basic_block: target,
                     statement_index: 0,
@@ -1381,11 +1380,10 @@ impl<'tcx> Verifier<'tcx> {
             let merged_value =
                 self.fresh_for_rust_ty(ty, &format!("merge_{}", local.as_usize()))?;
             for (state, incoming) in states.iter().zip(incoming_values.drain(..)) {
-                let equality = self.eq_for_spec_ty(
-                    &spec_ty,
-                    &merged_value,
-                    &incoming,
+                let equality = self.solver_result(
                     self.control_span(state.ctrl),
+                    self.solver
+                        .eq_for_spec_ty(&spec_ty, &merged_value, &incoming),
                 )?;
                 self.add_path_condition(&mut merged, state.pc.clone().implies(equality));
             }
@@ -1461,7 +1459,7 @@ impl<'tcx> Verifier<'tcx> {
             }
         }
 
-        merged.pc = merged.pc.simplify();
+        merged.pc = Solver::simplify_bool(&merged.pc);
         Ok(Some(merged))
     }
 
@@ -1587,9 +1585,11 @@ impl<'tcx> Verifier<'tcx> {
                         &mut view,
                         &assertion.assertion,
                         &assertion.resolution,
-                        self.control_span(ctrl),
-                        assertion.assertion_span.clone(),
-                        "assertion failed".to_owned(),
+                        AssertionFailure {
+                            span: self.control_span(ctrl),
+                            diagnostic_span: assertion.assertion_span.clone(),
+                            message: "assertion failed".to_owned(),
+                        },
                     )?;
                     true
                 }
@@ -1705,15 +1705,15 @@ impl<'tcx> Verifier<'tcx> {
             };
             let points_to = index.map(|index| unsafe_state.heap.remove(index));
             match points_to {
-                Some(RawResource::PointsTo {
+                Some(Resource::PointsTo {
                     value: Some(value), ..
                 }) => {
                     unsafe_state.store.insert(*local, value);
                 }
-                Some(RawResource::PointsTo { value: None, .. }) | None => {
+                Some(Resource::PointsTo { value: None, .. }) | None => {
                     unsafe_state.store.remove(local);
                 }
-                Some(RawResource::DeallocToken { .. }) => {
+                Some(Resource::DeallocToken { .. }) => {
                     unreachable!("points_to_index returned a deallocation token")
                 }
             }
@@ -1784,12 +1784,14 @@ impl<'tcx> Verifier<'tcx> {
         let local_alloc = state.allocs.remove(&local);
         let ty = self.local_rust_ty_model_value(local);
         state.heap.retain(|resource| match resource {
-            RawResource::PointsTo {
-                addr, ty: raw_ty, ..
+            Resource::PointsTo {
+                addr,
+                ty: resource_ty,
+                ..
             } => local_alloc
                 .as_ref()
-                .is_none_or(|alloc| *addr != alloc.base_addr || *raw_ty != ty),
-            RawResource::DeallocToken { .. } => true,
+                .is_none_or(|alloc| *addr != alloc.base_addr || *resource_ty != ty),
+            Resource::DeallocToken { .. } => true,
         });
     }
 
@@ -1805,19 +1807,19 @@ impl<'tcx> Verifier<'tcx> {
         };
         let ty = self.local_rust_ty_model_value(local);
         if let Some(index) = self.points_to_index_for_ty_value(state, &alloc.base_addr, &ty) {
-            if let RawResource::PointsTo { value: slot, .. } = &mut state.heap[index] {
+            if let Resource::PointsTo { value: slot, .. } = &mut state.heap[index] {
                 *slot = Some(value);
             }
             return Ok(());
         }
 
         let addr = alloc.base_addr;
-        state.heap.push(RawResource::PointsTo {
+        state.heap.push(Resource::PointsTo {
             addr: addr.clone(),
             ty,
             value: Some(value.clone()),
         });
-        let addr_int = self.value_int_data(&addr);
+        let addr_int = self.solver.int_term(&addr);
         self.add_unsafe_path_condition(state, addr_int.eq(Int::from_i64(0)).not());
         let ty = self.body().local_decls[local].ty;
         let (_, align) = self.layout_size_align_bytes(ty, span)?;
@@ -2066,43 +2068,52 @@ impl<'tcx> Verifier<'tcx> {
         let lhs_value = self.unsafe_eval_operand(state, bridge, lhs, span)?;
         let rhs_value = self.unsafe_eval_operand(state, bridge, rhs, span)?;
         let result_ty = lhs.ty(&self.body().local_decls, self.tcx);
-        let tuple_ty = SpecTy::Tuple(vec![
-            self.spec_ty_for_place_ty(result_ty, span)?,
-            SpecTy::Bool,
-        ]);
+        let result_spec_ty = self.spec_ty_for_place_ty(result_ty, span)?;
         let result_value = match op {
             BinOp::Add | BinOp::AddWithOverflow => {
-                let int_value = self.value_int_data(&lhs_value) + self.value_int_data(&rhs_value);
+                let result = self.solver.lower_int_binary_value(
+                    IntValueBinaryOp::Add,
+                    &lhs_value,
+                    &rhs_value,
+                );
                 self.require_unsafe_int_invariant(
                     state,
                     result_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                self.value_encoder.wrap_int(&int_value)
+                result.value
             }
             BinOp::Sub | BinOp::SubWithOverflow => {
-                let int_value = self.value_int_data(&lhs_value) - self.value_int_data(&rhs_value);
+                let result = self.solver.lower_int_binary_value(
+                    IntValueBinaryOp::Sub,
+                    &lhs_value,
+                    &rhs_value,
+                );
                 self.require_unsafe_int_invariant(
                     state,
                     result_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                self.value_encoder.wrap_int(&int_value)
+                result.value
             }
             BinOp::Mul | BinOp::MulWithOverflow => {
-                let int_value = self.value_int_data(&lhs_value) * self.value_int_data(&rhs_value);
+                let result = self.solver.lower_int_binary_value(
+                    IntValueBinaryOp::Mul,
+                    &lhs_value,
+                    &rhs_value,
+                );
                 self.require_unsafe_int_invariant(
                     state,
                     result_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                self.value_encoder.wrap_int(&int_value)
+                result.value
             }
             other => {
                 return Err(self.unsupported_result(
@@ -2112,7 +2123,11 @@ impl<'tcx> Verifier<'tcx> {
             }
         };
         let overflow_value = self.overflow_value_for_result(result_ty, &result_value, span)?;
-        self.construct_composite(&tuple_ty, &[result_value, overflow_value])
+        self.solver_result(
+            span,
+            self.solver
+                .checked_result_tuple_value(result_spec_ty, result_value, overflow_value),
+        )
     }
 
     fn lower_unsafe_binary_value(
@@ -2127,59 +2142,72 @@ impl<'tcx> Verifier<'tcx> {
         let lhs_spec_ty = self.spec_ty_for_place_ty(lhs_ty, span)?;
         match op {
             BinOp::Add => {
-                let value = self.value_int_data(lhs) + self.value_int_data(rhs);
+                let result = self
+                    .solver
+                    .lower_int_binary_value(IntValueBinaryOp::Add, lhs, rhs);
                 self.require_unsafe_int_invariant(
                     state,
                     lhs_ty,
-                    &value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_encoder.wrap_int(&value))
+                Ok(result.value)
             }
             BinOp::Sub => {
-                let value = self.value_int_data(lhs) - self.value_int_data(rhs);
+                let result = self
+                    .solver
+                    .lower_int_binary_value(IntValueBinaryOp::Sub, lhs, rhs);
                 self.require_unsafe_int_invariant(
                     state,
                     lhs_ty,
-                    &value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_encoder.wrap_int(&value))
+                Ok(result.value)
             }
             BinOp::Mul => {
-                let value = self.value_int_data(lhs) * self.value_int_data(rhs);
+                let result = self
+                    .solver
+                    .lower_int_binary_value(IntValueBinaryOp::Mul, lhs, rhs);
                 self.require_unsafe_int_invariant(
                     state,
                     lhs_ty,
-                    &value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_encoder.wrap_int(&value))
+                Ok(result.value)
             }
-            BinOp::Eq => Ok(self.value_encoder.wrap_bool(&self.eq_for_spec_ty(
-                &lhs_spec_ty,
-                lhs,
-                rhs,
+            BinOp::Eq => self.solver_result(
                 span,
-            )?)),
-            BinOp::Ne => Ok(self
-                .value_encoder
-                .wrap_bool(&self.eq_for_spec_ty(&lhs_spec_ty, lhs, rhs, span)?.not())),
-            BinOp::Lt => Ok(self
-                .value_encoder
-                .wrap_bool(&self.value_int_data(lhs).lt(self.value_int_data(rhs)))),
-            BinOp::Le => Ok(self
-                .value_encoder
-                .wrap_bool(&self.value_int_data(lhs).le(self.value_int_data(rhs)))),
-            BinOp::Gt => Ok(self
-                .value_encoder
-                .wrap_bool(&self.value_int_data(lhs).gt(self.value_int_data(rhs)))),
-            BinOp::Ge => Ok(self
-                .value_encoder
-                .wrap_bool(&self.value_int_data(lhs).ge(self.value_int_data(rhs)))),
+                self.solver.lower_eq_value(&lhs_spec_ty, lhs, rhs, false),
+            ),
+            BinOp::Ne => self.solver_result(
+                span,
+                self.solver.lower_eq_value(&lhs_spec_ty, lhs, rhs, true),
+            ),
+            BinOp::Lt => {
+                Ok(self
+                    .solver
+                    .lower_int_predicate_value(IntValuePredicateOp::Lt, lhs, rhs))
+            }
+            BinOp::Le => {
+                Ok(self
+                    .solver
+                    .lower_int_predicate_value(IntValuePredicateOp::Le, lhs, rhs))
+            }
+            BinOp::Gt => {
+                Ok(self
+                    .solver
+                    .lower_int_predicate_value(IntValuePredicateOp::Gt, lhs, rhs))
+            }
+            BinOp::Ge => {
+                Ok(self
+                    .solver
+                    .lower_int_predicate_value(IntValuePredicateOp::Ge, lhs, rhs))
+            }
             other => {
                 Err(self.unsupported_result(span, format!("unsupported binary operator {other:?}")))
             }
@@ -2195,19 +2223,17 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
         match op {
-            UnOp::Not => Ok(self
-                .value_encoder
-                .wrap_bool(&self.value_is_true(value).not())),
+            UnOp::Not => Ok(self.solver.lower_bool_not_value(value)),
             UnOp::Neg => {
-                let int_value = Int::from_i64(0) - self.value_int_data(value);
+                let result = self.solver.lower_int_neg_value(value);
                 self.require_unsafe_int_invariant(
                     state,
                     operand_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_encoder.wrap_int(&int_value))
+                Ok(result.value)
             }
             other => {
                 Err(self.unsupported_result(span, format!("unsupported unary operator {other:?}")))
@@ -2435,9 +2461,9 @@ impl<'tcx> Verifier<'tcx> {
         let mut possible = 0;
         let mut definite = Vec::new();
         for (index, resource) in state.heap.iter().enumerate() {
-            let RawResource::PointsTo {
-                addr: raw_addr,
-                ty: raw_ty,
+            let Resource::PointsTo {
+                addr: resource_addr,
+                ty: resource_ty,
                 value,
             } = resource
             else {
@@ -2446,11 +2472,15 @@ impl<'tcx> Verifier<'tcx> {
             if require_initialized && value.is_none() {
                 continue;
             }
-            if raw_ty != ty {
+            if resource_ty != ty {
                 continue;
             }
-            let addr_matches = self.eq_for_spec_ty(&SpecTy::Usize, addr, raw_addr, span)?;
-            let condition = addr_matches.simplify();
+            let addr_matches = self.solver_result(
+                span,
+                self.solver
+                    .eq_for_spec_ty(&SpecTy::Usize, addr, resource_addr),
+            )?;
+            let condition = Solver::simplify_bool(&addr_matches);
             if matches!(condition.as_bool(), Some(false)) {
                 continue;
             }
@@ -2487,19 +2517,23 @@ impl<'tcx> Verifier<'tcx> {
         let mut possible = 0;
         let mut definite = Vec::new();
         for (index, resource) in state.heap.iter().enumerate() {
-            let RawResource::PointsTo {
-                addr: raw_addr,
-                ty: raw_ty,
+            let Resource::PointsTo {
+                addr: resource_addr,
+                ty: resource_ty,
                 ..
             } = resource
             else {
                 continue;
             };
-            if raw_ty != ty {
+            if resource_ty != ty {
                 continue;
             }
-            let addr_matches = self.eq_for_spec_ty(&SpecTy::Usize, addr, raw_addr, span)?;
-            let condition = addr_matches.simplify();
+            let addr_matches = self.solver_result(
+                span,
+                self.solver
+                    .eq_for_spec_ty(&SpecTy::Usize, addr, resource_addr),
+            )?;
+            let condition = Solver::simplify_bool(&addr_matches);
             if matches!(condition.as_bool(), Some(false)) {
                 continue;
             }
@@ -2533,7 +2567,7 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
         let index = self.unique_matching_points_to_index(state, addr, ty, true, span)?;
-        let RawResource::PointsTo {
+        let Resource::PointsTo {
             value: Some(value), ..
         } = &state.heap[index]
         else {
@@ -2564,7 +2598,8 @@ impl<'tcx> Verifier<'tcx> {
             let mut candidate_view = view.clone();
             candidate_view.env.extend(candidate.env.clone());
             let where_condition = self.spec_expr_to_bool(&candidate_view, condition, resolution)?;
-            candidate.condition = bool_and(vec![candidate.condition, where_condition]).simplify();
+            candidate.condition =
+                Solver::simplify_bool(&bool_and(vec![candidate.condition, where_condition]));
             if matches!(candidate.condition.as_bool(), Some(false)) {
                 continue;
             }
@@ -2593,14 +2628,14 @@ impl<'tcx> Verifier<'tcx> {
         Err(self.fail_result(span, "raw assertion failed".to_owned()))
     }
 
-    fn consume_unsafe_raw_contract(
+    fn consume_unsafe_resource_contract(
         &self,
         state: &mut UnsafeState,
         assertion: &RawAssertionContract,
         current: &HashMap<String, SymValue>,
         spec: &HashMap<String, SymValue>,
         span: Span,
-        check: RawContractCheck,
+        check: ResourceContractCheck,
     ) -> Result<HashMap<String, SymValue>, VerificationResult> {
         let initial = RawPatternMatch {
             used: BTreeSet::new(),
@@ -2622,7 +2657,8 @@ impl<'tcx> Verifier<'tcx> {
             candidate_spec.extend(candidate.env.clone());
             let where_condition =
                 self.contract_expr_to_bool(current, &candidate_spec, &assertion.condition)?;
-            candidate.condition = bool_and(vec![candidate.condition, where_condition]).simplify();
+            candidate.condition =
+                Solver::simplify_bool(&bool_and(vec![candidate.condition, where_condition]));
             if matches!(candidate.condition.as_bool(), Some(false)) {
                 continue;
             }
@@ -2653,7 +2689,7 @@ impl<'tcx> Verifier<'tcx> {
         Err(self.fail_result(span, check.failure_message().to_owned()))
     }
 
-    fn assume_unsafe_raw_contract(
+    fn assume_unsafe_resource_contract(
         &self,
         state: &mut UnsafeState,
         assertion: &RawAssertionContract,
@@ -2699,16 +2735,18 @@ impl<'tcx> Verifier<'tcx> {
                         if candidate.used.contains(&index) {
                             continue;
                         }
-                        let RawResource::PointsTo {
-                            addr: raw_addr,
-                            ty: raw_ty,
-                            value: raw_value,
+                        let Resource::PointsTo {
+                            addr: resource_addr,
+                            ty: resource_ty,
+                            value: resource_value,
                         } = resource
                         else {
                             continue;
                         };
-                        let actual_value = self
-                            .raw_option_value(raw_value.as_ref(), typed_value_pattern_ty(value))?;
+                        let actual_value = self.resource_option_value(
+                            resource_value.as_ref(),
+                            typed_value_pattern_ty(value),
+                        )?;
                         let mut next_spec = spec.clone();
                         next_spec.extend(candidate.env.clone());
                         let mut next_env = candidate.env.clone();
@@ -2724,13 +2762,26 @@ impl<'tcx> Verifier<'tcx> {
                         used.insert(index);
                         out.push(RawPatternMatch {
                             used,
-                            condition: bool_and(vec![
+                            condition: Solver::simplify_bool(&bool_and(vec![
                                 candidate.condition.clone(),
-                                self.eq_for_spec_ty(&SpecTy::Usize, &addr_value, raw_addr, span)?,
-                                self.eq_for_spec_ty(&SpecTy::RustTy, &ty_value, raw_ty, span)?,
+                                self.solver_result(
+                                    span,
+                                    self.solver.eq_for_spec_ty(
+                                        &SpecTy::Usize,
+                                        &addr_value,
+                                        resource_addr,
+                                    ),
+                                )?,
+                                self.solver_result(
+                                    span,
+                                    self.solver.eq_for_spec_ty(
+                                        &SpecTy::RustTy,
+                                        &ty_value,
+                                        resource_ty,
+                                    ),
+                                )?,
                                 value_condition,
-                            ])
-                            .simplify(),
+                            ])),
                             env: next_env,
                         });
                     }
@@ -2751,10 +2802,10 @@ impl<'tcx> Verifier<'tcx> {
                         if candidate.used.contains(&index) {
                             continue;
                         }
-                        let RawResource::DeallocToken {
-                            base: raw_base,
-                            size: raw_size,
-                            alignment: raw_alignment,
+                        let Resource::DeallocToken {
+                            base: resource_base,
+                            size: resource_size,
+                            alignment: resource_alignment,
                         } = resource
                         else {
                             continue;
@@ -2763,14 +2814,23 @@ impl<'tcx> Verifier<'tcx> {
                         used.insert(index);
                         out.push(RawPatternMatch {
                             used,
-                            condition: bool_and(vec![
+                            condition: Solver::simplify_bool(&bool_and(vec![
                                 candidate.condition.clone(),
-                                self.eq_for_spec_ty(&SpecTy::Usize, &base, raw_base, span)?,
-                                self.value_int_data(&size).eq(Int::from_u64(*raw_size)),
-                                self.value_int_data(&alignment)
-                                    .eq(Int::from_u64(*raw_alignment)),
-                            ])
-                            .simplify(),
+                                self.solver_result(
+                                    span,
+                                    self.solver.eq_for_spec_ty(
+                                        &SpecTy::Usize,
+                                        &base,
+                                        resource_base,
+                                    ),
+                                )?,
+                                self.solver
+                                    .int_term(&size)
+                                    .eq(Int::from_u64(*resource_size)),
+                                self.solver
+                                    .int_term(&alignment)
+                                    .eq(Int::from_u64(*resource_alignment)),
+                            ])),
                             env: candidate.env.clone(),
                         });
                     }
@@ -2804,16 +2864,18 @@ impl<'tcx> Verifier<'tcx> {
                         if candidate.used.contains(&index) {
                             continue;
                         }
-                        let RawResource::PointsTo {
-                            addr: raw_addr,
-                            ty: raw_ty,
-                            value: raw_value,
+                        let Resource::PointsTo {
+                            addr: resource_addr,
+                            ty: resource_ty,
+                            value: resource_value,
                         } = resource
                         else {
                             continue;
                         };
-                        let actual_value = self
-                            .raw_option_value(raw_value.as_ref(), typed_value_pattern_ty(value))?;
+                        let actual_value = self.resource_option_value(
+                            resource_value.as_ref(),
+                            typed_value_pattern_ty(value),
+                        )?;
                         let mut candidate_view = view.clone();
                         candidate_view.env.extend(candidate.env.clone());
                         let mut next_env = candidate.env.clone();
@@ -2829,13 +2891,26 @@ impl<'tcx> Verifier<'tcx> {
                         used.insert(index);
                         out.push(RawPatternMatch {
                             used,
-                            condition: bool_and(vec![
+                            condition: Solver::simplify_bool(&bool_and(vec![
                                 candidate.condition.clone(),
-                                self.eq_for_spec_ty(&SpecTy::Usize, &addr_value, raw_addr, span)?,
-                                self.eq_for_spec_ty(&SpecTy::RustTy, &ty_value, raw_ty, span)?,
+                                self.solver_result(
+                                    span,
+                                    self.solver.eq_for_spec_ty(
+                                        &SpecTy::Usize,
+                                        &addr_value,
+                                        resource_addr,
+                                    ),
+                                )?,
+                                self.solver_result(
+                                    span,
+                                    self.solver.eq_for_spec_ty(
+                                        &SpecTy::RustTy,
+                                        &ty_value,
+                                        resource_ty,
+                                    ),
+                                )?,
                                 value_condition,
-                            ])
-                            .simplify(),
+                            ])),
                             env: next_env,
                         });
                     }
@@ -2856,10 +2931,10 @@ impl<'tcx> Verifier<'tcx> {
                         if candidate.used.contains(&index) {
                             continue;
                         }
-                        let RawResource::DeallocToken {
-                            base: raw_base,
-                            size: raw_size,
-                            alignment: raw_alignment,
+                        let Resource::DeallocToken {
+                            base: resource_base,
+                            size: resource_size,
+                            alignment: resource_alignment,
                         } = resource
                         else {
                             continue;
@@ -2868,14 +2943,23 @@ impl<'tcx> Verifier<'tcx> {
                         used.insert(index);
                         out.push(RawPatternMatch {
                             used,
-                            condition: bool_and(vec![
+                            condition: Solver::simplify_bool(&bool_and(vec![
                                 candidate.condition.clone(),
-                                self.eq_for_spec_ty(&SpecTy::Usize, &base, raw_base, span)?,
-                                self.value_int_data(&size).eq(Int::from_u64(*raw_size)),
-                                self.value_int_data(&alignment)
-                                    .eq(Int::from_u64(*raw_alignment)),
-                            ])
-                            .simplify(),
+                                self.solver_result(
+                                    span,
+                                    self.solver.eq_for_spec_ty(
+                                        &SpecTy::Usize,
+                                        &base,
+                                        resource_base,
+                                    ),
+                                )?,
+                                self.solver
+                                    .int_term(&size)
+                                    .eq(Int::from_u64(*resource_size)),
+                                self.solver
+                                    .int_term(&alignment)
+                                    .eq(Int::from_u64(*resource_alignment)),
+                            ])),
                             env: candidate.env.clone(),
                         });
                     }
@@ -2885,7 +2969,7 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn raw_option_value(
+    fn resource_option_value(
         &self,
         value: Option<&SymValue>,
         option_ty: &SpecTy,
@@ -2914,7 +2998,7 @@ impl<'tcx> Verifier<'tcx> {
         match pattern {
             TypedValuePattern::Bind { name, ty } => {
                 if let Some(value) = env.get(name) {
-                    return self.eq_for_spec_ty(ty, value, actual, span);
+                    return self.solver_result(span, self.solver.eq_for_spec_ty(ty, value, actual));
                 }
                 env.insert(name.clone(), actual.clone());
                 Ok(Bool::from_bool(true))
@@ -2923,7 +3007,10 @@ impl<'tcx> Verifier<'tcx> {
                 let mut pattern_view = view.clone();
                 pattern_view.env.extend(env.clone());
                 let expected = self.spec_expr_to_value(&pattern_view, expr, resolution)?;
-                self.eq_for_spec_ty(&expr.ty, &expected, actual, span)
+                self.solver_result(
+                    span,
+                    self.solver.eq_for_spec_ty(&expr.ty, &expected, actual),
+                )
             }
             TypedValuePattern::SeqLit { ty, items } => {
                 let mut values = Vec::with_capacity(items.len());
@@ -2940,12 +3027,16 @@ impl<'tcx> Verifier<'tcx> {
                     )?);
                     values.push(item_value);
                 }
-                conditions.push(self.eq_for_spec_ty(
-                    ty,
-                    &self.seq_literal_value(&values),
-                    actual,
-                    span,
-                )?);
+                conditions.push(
+                    self.solver_result(
+                        span,
+                        self.solver.eq_for_spec_ty(
+                            ty,
+                            &self.solver.seq_literal_value(&values),
+                            actual,
+                        ),
+                    )?,
+                );
                 Ok(bool_and(conditions))
             }
             TypedValuePattern::StructLit { ty, fields } => {
@@ -2964,7 +3055,9 @@ impl<'tcx> Verifier<'tcx> {
                     values.push(field_value);
                 }
                 let expected = self.construct_composite(ty, &values)?;
-                conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
+                conditions.push(
+                    self.solver_result(span, self.solver.eq_for_spec_ty(ty, &expected, actual))?,
+                );
                 Ok(bool_and(conditions))
             }
             TypedValuePattern::CtorCall {
@@ -2972,30 +3065,21 @@ impl<'tcx> Verifier<'tcx> {
                 ctor_index,
                 args,
             } => {
-                let encoding = self.composite_encoding(ty)?;
                 let mut values = Vec::with_capacity(args.len());
                 let mut conditions = Vec::with_capacity(args.len() + 1);
                 for (index, arg) in args.iter().enumerate() {
-                    let arg_value = self.decode_composite_ctor_field(
-                        &encoding,
-                        *ctor_index,
-                        actual,
-                        index,
-                        span,
-                    )?;
+                    let arg_value =
+                        self.decode_composite_ctor_field(ty, *ctor_index, actual, index, span)?;
                     conditions.push(
                         self.match_value_pattern(view, arg, &arg_value, resolution, span, env)?,
                     );
                     values.push(arg_value);
                 }
-                conditions.push(self.composite_tag_formula_for_encoding(
-                    &encoding,
-                    actual,
-                    *ctor_index,
-                    span,
-                )?);
+                conditions.push(self.composite_tag_formula(ty, actual, *ctor_index, span)?);
                 let expected = self.construct_composite_ctor(ty, *ctor_index, &values)?;
-                conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
+                conditions.push(
+                    self.solver_result(span, self.solver.eq_for_spec_ty(ty, &expected, actual))?,
+                );
                 Ok(bool_and(conditions))
             }
         }
@@ -3013,7 +3097,7 @@ impl<'tcx> Verifier<'tcx> {
         match pattern {
             TypedValuePattern::Bind { name, ty } => {
                 if let Some(value) = env.get(name).or_else(|| spec.get(name)) {
-                    return self.eq_for_spec_ty(ty, value, actual, span);
+                    return self.solver_result(span, self.solver.eq_for_spec_ty(ty, value, actual));
                 }
                 env.insert(name.clone(), actual.clone());
                 Ok(Bool::from_bool(true))
@@ -3022,7 +3106,10 @@ impl<'tcx> Verifier<'tcx> {
                 let mut pattern_spec = spec.clone();
                 pattern_spec.extend(env.clone());
                 let expected = self.contract_expr_to_value(current, &pattern_spec, expr)?;
-                self.eq_for_spec_ty(&expr.ty, &expected, actual, span)
+                self.solver_result(
+                    span,
+                    self.solver.eq_for_spec_ty(&expr.ty, &expected, actual),
+                )
             }
             TypedValuePattern::SeqLit { ty, items } => {
                 let mut values = Vec::with_capacity(items.len());
@@ -3039,12 +3126,16 @@ impl<'tcx> Verifier<'tcx> {
                     )?);
                     values.push(item_value);
                 }
-                conditions.push(self.eq_for_spec_ty(
-                    ty,
-                    &self.seq_literal_value(&values),
-                    actual,
-                    span,
-                )?);
+                conditions.push(
+                    self.solver_result(
+                        span,
+                        self.solver.eq_for_spec_ty(
+                            ty,
+                            &self.solver.seq_literal_value(&values),
+                            actual,
+                        ),
+                    )?,
+                );
                 Ok(bool_and(conditions))
             }
             TypedValuePattern::StructLit { ty, fields } => {
@@ -3063,7 +3154,9 @@ impl<'tcx> Verifier<'tcx> {
                     values.push(field_value);
                 }
                 let expected = self.construct_composite(ty, &values)?;
-                conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
+                conditions.push(
+                    self.solver_result(span, self.solver.eq_for_spec_ty(ty, &expected, actual))?,
+                );
                 Ok(bool_and(conditions))
             }
             TypedValuePattern::CtorCall {
@@ -3071,17 +3164,11 @@ impl<'tcx> Verifier<'tcx> {
                 ctor_index,
                 args,
             } => {
-                let encoding = self.composite_encoding(ty)?;
                 let mut values = Vec::with_capacity(args.len());
                 let mut conditions = Vec::with_capacity(args.len() + 1);
                 for (index, arg) in args.iter().enumerate() {
-                    let arg_value = self.decode_composite_ctor_field(
-                        &encoding,
-                        *ctor_index,
-                        actual,
-                        index,
-                        span,
-                    )?;
+                    let arg_value =
+                        self.decode_composite_ctor_field(ty, *ctor_index, actual, index, span)?;
                     conditions.push(
                         self.match_contract_value_pattern(
                             current, spec, arg, &arg_value, span, env,
@@ -3089,14 +3176,11 @@ impl<'tcx> Verifier<'tcx> {
                     );
                     values.push(arg_value);
                 }
-                conditions.push(self.composite_tag_formula_for_encoding(
-                    &encoding,
-                    actual,
-                    *ctor_index,
-                    span,
-                )?);
+                conditions.push(self.composite_tag_formula(ty, actual, *ctor_index, span)?);
                 let expected = self.construct_composite_ctor(ty, *ctor_index, &values)?;
-                conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
+                conditions.push(
+                    self.solver_result(span, self.solver.eq_for_spec_ty(ty, &expected, actual))?,
+                );
                 Ok(bool_and(conditions))
             }
         }
@@ -3120,9 +3204,9 @@ impl<'tcx> Verifier<'tcx> {
                 let ty = self.contract_expr_to_value(current, spec, ty)?;
                 let value =
                     self.materialize_points_to_contract_value(current, spec, value, span)?;
-                let addr_int = self.value_int_data(&addr);
+                let addr_int = self.solver.int_term(&addr);
                 self.add_unsafe_path_condition(state, addr_int.eq(Int::from_i64(0)).not());
-                state.heap.push(RawResource::PointsTo { addr, ty, value });
+                state.heap.push(Resource::PointsTo { addr, ty, value });
                 Ok(())
             }
             TypedRawPattern::DeallocToken {
@@ -3134,7 +3218,8 @@ impl<'tcx> Verifier<'tcx> {
                 let size = self.contract_expr_to_value(current, spec, size)?;
                 let alignment = self.contract_expr_to_value(current, spec, alignment)?;
                 let Some(size) = self
-                    .value_int_data(&size)
+                    .solver
+                    .int_term(&size)
                     .as_i64()
                     .and_then(|value| u64::try_from(value).ok())
                 else {
@@ -3144,7 +3229,8 @@ impl<'tcx> Verifier<'tcx> {
                     ));
                 };
                 let Some(alignment) = self
-                    .value_int_data(&alignment)
+                    .solver
+                    .int_term(&alignment)
                     .as_i64()
                     .and_then(|value| u64::try_from(value).ok())
                 else {
@@ -3153,7 +3239,7 @@ impl<'tcx> Verifier<'tcx> {
                         "DeallocToken alignment must be a concrete usize".to_owned(),
                     ));
                 };
-                state.heap.push(RawResource::DeallocToken {
+                state.heap.push(Resource::DeallocToken {
                     base,
                     size,
                     alignment,
@@ -3182,27 +3268,24 @@ impl<'tcx> Verifier<'tcx> {
                 ctor_index,
                 args,
             } if *ty == *typed_value_pattern_ty(pattern) => {
-                let some = self
-                    .value_encoder
-                    .enum_ctor_index("Option", "Some")
-                    .map_err(|err| self.unsupported_result(span, err))?;
-                let none = self
-                    .value_encoder
-                    .enum_ctor_index("Option", "None")
-                    .map_err(|err| self.unsupported_result(span, err))?;
-                if *ctor_index == some {
-                    let Some(arg) = args.first() else {
-                        return Err(self.unsupported_result(
-                            span,
-                            "Option::Some raw pattern value requires one argument".to_owned(),
-                        ));
-                    };
-                    return Ok(Some(self.materialize_contract_value_pattern(
-                        current, spec, arg, &inner_ty, span,
-                    )?));
-                }
-                if *ctor_index == none {
-                    return Ok(None);
+                match self
+                    .solver
+                    .option_ctor_kind(*ctor_index)
+                    .map_err(|err| self.unsupported_result(span, err))?
+                {
+                    Some(OptionCtorKind::Some) => {
+                        let Some(arg) = args.first() else {
+                            return Err(self.unsupported_result(
+                                span,
+                                "Option::Some resource value requires one argument".to_owned(),
+                            ));
+                        };
+                        return Ok(Some(self.materialize_contract_value_pattern(
+                            current, spec, arg, &inner_ty, span,
+                        )?));
+                    }
+                    Some(OptionCtorKind::None) => return Ok(None),
+                    None => {}
                 }
             }
             TypedValuePattern::Expr(expr) => {
@@ -3210,25 +3293,22 @@ impl<'tcx> Verifier<'tcx> {
                     ctor_index, args, ..
                 } = &expr.kind
                 {
-                    let some = self
-                        .value_encoder
-                        .enum_ctor_index("Option", "Some")
-                        .map_err(|err| self.unsupported_result(span, err))?;
-                    let none = self
-                        .value_encoder
-                        .enum_ctor_index("Option", "None")
-                        .map_err(|err| self.unsupported_result(span, err))?;
-                    if *ctor_index == some {
-                        let Some(arg) = args.first() else {
-                            return Err(self.unsupported_result(
-                                span,
-                                "Option::Some raw pattern value requires one argument".to_owned(),
-                            ));
-                        };
-                        return Ok(Some(self.contract_expr_to_value(current, spec, arg)?));
-                    }
-                    if *ctor_index == none {
-                        return Ok(None);
+                    match self
+                        .solver
+                        .option_ctor_kind(*ctor_index)
+                        .map_err(|err| self.unsupported_result(span, err))?
+                    {
+                        Some(OptionCtorKind::Some) => {
+                            let Some(arg) = args.first() else {
+                                return Err(self.unsupported_result(
+                                    span,
+                                    "Option::Some resource value requires one argument".to_owned(),
+                                ));
+                            };
+                            return Ok(Some(self.contract_expr_to_value(current, spec, arg)?));
+                        }
+                        Some(OptionCtorKind::None) => return Ok(None),
+                        None => {}
                     }
                 }
             }
@@ -3266,7 +3346,7 @@ impl<'tcx> Verifier<'tcx> {
                         span,
                     )?);
                 }
-                let value = self.seq_literal_value(&values);
+                let value = self.solver.seq_literal_value(&values);
                 self.assert_materialized_value_ty(expected, ty, span)?;
                 Ok(value)
             }
@@ -3334,17 +3414,17 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<(), VerificationResult> {
         let index = self.unique_matching_points_to_index(state, addr, ty, false, span)?;
-        let local = if let RawResource::PointsTo {
-            addr: raw_addr,
-            ty: raw_ty,
+        let local = if let Resource::PointsTo {
+            addr: resource_addr,
+            ty: resource_ty,
             ..
         } = &state.heap[index]
         {
-            self.bridge_local_for_points_to(state, bridge, raw_addr, raw_ty)
+            self.bridge_local_for_points_to(state, bridge, resource_addr, resource_ty)
         } else {
             unreachable!("points-to match must be PointsTo");
         };
-        if let RawResource::PointsTo { value: slot, .. } = &mut state.heap[index] {
+        if let Resource::PointsTo { value: slot, .. } = &mut state.heap[index] {
             *slot = Some(value.clone());
         }
         if let Some(local) = local {
@@ -3362,11 +3442,11 @@ impl<'tcx> Verifier<'tcx> {
         state.heap.iter().position(|resource| {
             matches!(
                 resource,
-                RawResource::PointsTo {
-                    addr: raw_addr,
-                    ty: raw_ty,
+                Resource::PointsTo {
+                    addr: resource_addr,
+                    ty: resource_ty,
                     ..
-                } if raw_addr == addr && raw_ty == ty
+                } if resource_addr == addr && resource_ty == ty
             )
         })
     }
@@ -3377,7 +3457,7 @@ impl<'tcx> Verifier<'tcx> {
         };
         let ty = self.local_rust_ty_model_value(local);
         if let Some(index) = self.points_to_index_for_ty_value(state, &alloc.base_addr, &ty)
-            && let RawResource::PointsTo { value, .. } = &mut state.heap[index]
+            && let Resource::PointsTo { value, .. } = &mut state.heap[index]
         {
             *value = None;
         }
@@ -3398,7 +3478,7 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
         message: String,
     ) -> Result<(), VerificationResult> {
-        let constraint = constraint.simplify();
+        let constraint = Solver::simplify_bool(&constraint);
         if let Some(value) = constraint.as_bool() {
             return match value {
                 true => {
@@ -3419,7 +3499,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn add_unsafe_path_condition(&self, state: &mut UnsafeState, constraint: Bool) {
-        state.pc = bool_and(vec![state.pc.clone(), constraint]).simplify();
+        state.pc = Solver::simplify_bool(&bool_and(vec![state.pc.clone(), constraint]));
     }
 
     fn require_unsafe_type_invariant(
@@ -3471,45 +3551,30 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn register_pure_fn(&mut self, pure_fn: &TypedPureFnDef) -> Result<(), VerificationResult> {
-        let domain_sorts = pure_fn
+        let params = pure_fn
             .params
             .iter()
-            .map(|param| {
-                self.type_encoding(&param.ty)
-                    .map(|encoding| encoding.sort.clone())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let domain_refs: Vec<_> = domain_sorts.iter().collect();
-        let result_sort = self.type_encoding(&pure_fn.body.ty)?.sort.clone();
-        let decl = RecFuncDecl::new(
-            format!("pure_fn_{}", pure_fn.name),
-            &domain_refs,
-            &result_sort,
-        );
-        let inserted = self
-            .pure_fn_decls
-            .insert(pure_fn.name.clone(), decl)
-            .is_none();
-        assert!(inserted, "duplicate pure function decl `{}`", pure_fn.name);
-        let mut current = HashMap::new();
-        let mut vars = Vec::with_capacity(pure_fn.params.len());
-        for param in &pure_fn.params {
-            let sort = self.type_encoding(&param.ty)?.sort.clone();
-            let value = SymValue::new(Dynamic::new_const(
-                self.fresh_name(&format!("pure_{}_{}", pure_fn.name, param.name)),
-                &sort,
-            ));
-            current.insert(param.name.clone(), value.clone());
-            vars.push(value);
-        }
+            .map(|param| (param.name.clone(), param.ty.clone()))
+            .collect::<Vec<_>>();
+        let param_tys = params.iter().map(|(_, ty)| ty.clone()).collect::<Vec<_>>();
+        self.solver_result_at_report_span(self.solver.declare_pure_fn(
+            &pure_fn.name,
+            &param_tys,
+            &pure_fn.body.ty,
+        ))?;
+        let params = self.solver_result_at_report_span(self.solver.pure_fn_params(
+            &pure_fn.name,
+            &params,
+            &mut |hint| self.fresh_name(hint),
+        ))?;
+        let current = params.iter().cloned().collect::<HashMap<_, _>>();
+        let vars = params
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
         let spec = HashMap::new();
         let body = self.contract_expr_to_value(&current, &spec, &pure_fn.body)?;
-        let args: Vec<&dyn Ast> = vars.iter().map(SymValue::ast).collect();
-        let decl = self
-            .pure_fn_decls
-            .get(&pure_fn.name)
-            .expect("pure function decl must be inserted before lowering the body");
-        decl.add_def(&args, body.dynamic());
+        self.solver_result_at_report_span(self.solver.define_pure_fn(&pure_fn.name, &vars, &body))?;
         Ok(())
     }
 
@@ -3553,12 +3618,14 @@ impl<'tcx> Verifier<'tcx> {
             let mut final_state = final_exec.state;
             let ens =
                 self.contract_expr_to_bool(&final_exec.current, &final_state.env, &lemma.ens)?;
-            self.assert_predicate_constraint(
+            self.assert_constraint(
                 &mut final_state,
                 ens,
-                self.report_span(),
-                format!("lemma `{}`", lemma.name),
-                format!("lemma `{}` postcondition failed", lemma.name),
+                AssertionFailure {
+                    span: self.report_span(),
+                    diagnostic_span: format!("lemma `{}`", lemma.name),
+                    message: format!("lemma `{}` postcondition failed", lemma.name),
+                },
             )?;
         }
         Ok(())
@@ -3600,10 +3667,10 @@ impl<'tcx> Verifier<'tcx> {
                 return Ok(());
             }
         }
-        for raw_req in &lemma.raw_reqs {
-            self.assume_unsafe_raw_contract(
+        for resource_req in &lemma.raw_reqs {
+            self.assume_unsafe_resource_contract(
                 &mut state,
-                raw_req,
+                resource_req,
                 &current,
                 &mut spec,
                 self.report_span(),
@@ -3622,15 +3689,15 @@ impl<'tcx> Verifier<'tcx> {
                 format!("lemma `{}` postcondition failed", lemma.name),
             )?;
             for raw_ens in &lemma.raw_ens {
-                let raw_spec = self.consume_unsafe_raw_contract(
+                let resource_spec = self.consume_unsafe_resource_contract(
                     &mut final_state,
                     raw_ens,
                     &final_exec.current,
                     &spec,
                     self.report_span(),
-                    RawContractCheck::Postcondition,
+                    ResourceContractCheck::Postcondition,
                 )?;
-                spec.extend(raw_spec);
+                spec.extend(resource_spec);
             }
             self.assert_unsafe_heap_empty(
                 &final_state,
@@ -3662,10 +3729,10 @@ impl<'tcx> Verifier<'tcx> {
                 let state_spec = state.env.clone();
                 let spec = self.assert_contract_predicate_constraint(
                     &mut state,
-                    ContractPredicateAssertion {
-                        predicate: expr,
-                        current,
-                        spec: &state_spec,
+                    expr,
+                    current,
+                    &state_spec,
+                    AssertionFailure {
                         span: self.report_span(),
                         diagnostic_span: format!("lemma `{}`", lemma.name),
                         message: format!("lemma `{}` assertion failed", lemma.name),
@@ -3691,10 +3758,10 @@ impl<'tcx> Verifier<'tcx> {
                 let env = self.lemma_env_from_contract_args(args, current, &state.env, callee)?;
                 let spec = self.assert_contract_predicate_constraint(
                     &mut state,
-                    ContractPredicateAssertion {
-                        predicate: &callee.req,
-                        current: &env.current,
-                        spec: &env.spec,
+                    &callee.req,
+                    &env.current,
+                    &env.spec,
+                    AssertionFailure {
                         span: self.report_span(),
                         diagnostic_span: format!("lemma `{}`", lemma.name),
                         message: format!("lemma `{}` precondition failed", callee.name),
@@ -3810,13 +3877,12 @@ impl<'tcx> Verifier<'tcx> {
         rest: &[TypedGhostStmt],
     ) -> Result<Vec<LemmaExecState>, VerificationResult> {
         let scrutinee_value = self.contract_expr_to_value(current, &state.env, scrutinee)?;
-        let composite = self.composite_encoding(&scrutinee.ty)?;
         let mut guard_formulas = Vec::with_capacity(arms.len());
         let mut final_states = Vec::new();
         for arm in arms {
             let mut branch_state = state.clone();
-            let guard = self.composite_tag_formula_for_encoding(
-                &composite,
+            let guard = self.composite_tag_formula(
+                &scrutinee.ty,
                 &scrutinee_value,
                 arm.ctor_index,
                 self.report_span(),
@@ -3828,15 +3894,13 @@ impl<'tcx> Verifier<'tcx> {
             let mut branch_current = current.clone();
             let mut field_values = Vec::with_capacity(arm.bindings.len());
             for (field_index, binding) in arm.bindings.iter().enumerate() {
-                let field_value = self
-                    .value_encoder
-                    .project_composite_ctor_field(
-                        &composite,
-                        arm.ctor_index,
-                        &scrutinee_value,
-                        field_index,
-                    )
-                    .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+                let field_value = self.decode_composite_ctor_field(
+                    &scrutinee.ty,
+                    arm.ctor_index,
+                    &scrutinee_value,
+                    field_index,
+                    self.report_span(),
+                )?;
                 if let TypedMatchBinding::Var { name, .. } = binding {
                     branch_current.insert(name.clone(), field_value.clone());
                 }
@@ -3847,12 +3911,11 @@ impl<'tcx> Verifier<'tcx> {
             if let TypedExprKind::Var(name) = &scrutinee.kind {
                 branch_current.insert(name.clone(), ctor_value.clone());
             }
-            let branch_eq = self.eq_for_spec_ty(
+            let branch_eq = self.solver_result_at_report_span(self.solver.eq_for_spec_ty(
                 &scrutinee.ty,
                 &scrutinee_value,
                 &ctor_value,
-                self.report_span(),
-            )?;
+            ))?;
             if !self.assume_path_condition(&mut branch_state, branch_eq) {
                 continue;
             }
@@ -3898,13 +3961,12 @@ impl<'tcx> Verifier<'tcx> {
         rest: &[TypedGhostStmt],
     ) -> Result<Vec<UnsafeLemmaExecState>, VerificationResult> {
         let scrutinee_value = self.contract_expr_to_value(current, &state.env, scrutinee)?;
-        let composite = self.composite_encoding(&scrutinee.ty)?;
         let mut guard_formulas = Vec::with_capacity(arms.len());
         let mut final_states = Vec::new();
         for arm in arms {
             let mut branch_state = state.clone();
-            let guard = self.composite_tag_formula_for_encoding(
-                &composite,
+            let guard = self.composite_tag_formula(
+                &scrutinee.ty,
                 &scrutinee_value,
                 arm.ctor_index,
                 self.report_span(),
@@ -3916,15 +3978,13 @@ impl<'tcx> Verifier<'tcx> {
             let mut branch_current = current.clone();
             let mut field_values = Vec::with_capacity(arm.bindings.len());
             for (field_index, binding) in arm.bindings.iter().enumerate() {
-                let field_value = self
-                    .value_encoder
-                    .project_composite_ctor_field(
-                        &composite,
-                        arm.ctor_index,
-                        &scrutinee_value,
-                        field_index,
-                    )
-                    .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+                let field_value = self.decode_composite_ctor_field(
+                    &scrutinee.ty,
+                    arm.ctor_index,
+                    &scrutinee_value,
+                    field_index,
+                    self.report_span(),
+                )?;
                 if let TypedMatchBinding::Var { name, .. } = binding {
                     branch_current.insert(name.clone(), field_value.clone());
                 }
@@ -3935,12 +3995,11 @@ impl<'tcx> Verifier<'tcx> {
             if let TypedExprKind::Var(name) = &scrutinee.kind {
                 branch_current.insert(name.clone(), ctor_value.clone());
             }
-            let branch_eq = self.eq_for_spec_ty(
+            let branch_eq = self.solver_result_at_report_span(self.solver.eq_for_spec_ty(
                 &scrutinee.ty,
                 &scrutinee_value,
                 &ctor_value,
-                self.report_span(),
-            )?;
+            ))?;
             if !self.assume_unsafe_path_condition(&mut branch_state, branch_eq) {
                 continue;
             }
@@ -3992,10 +4051,10 @@ impl<'tcx> Verifier<'tcx> {
         let env = self.lemma_env_from_state_exprs(state, &call.args, &call.resolution, lemma)?;
         let spec = self.assert_contract_predicate_constraint(
             state,
-            ContractPredicateAssertion {
-                predicate: &lemma.req,
-                current: &env.current,
-                spec: &env.spec,
+            &lemma.req,
+            &env.current,
+            &env.spec,
+            AssertionFailure {
                 span,
                 diagnostic_span: call.span_text.clone(),
                 message: format!("lemma `{}` precondition failed", lemma.name),
@@ -4023,10 +4082,10 @@ impl<'tcx> Verifier<'tcx> {
         } else {
             let spec = self.assert_contract_predicate_constraint(
                 &mut view,
-                ContractPredicateAssertion {
-                    predicate: &lemma.req,
-                    current: &env.current,
-                    spec: &env.spec,
+                &lemma.req,
+                &env.current,
+                &env.spec,
+                AssertionFailure {
                     span,
                     diagnostic_span: call.span_text.clone(),
                     message: format!("lemma `{}` precondition failed", lemma.name),
@@ -4058,16 +4117,16 @@ impl<'tcx> Verifier<'tcx> {
             span,
             format!("lemma `{}` precondition failed", lemma.name),
         )?;
-        for raw_req in &lemma.raw_reqs {
-            let raw_spec = self.consume_unsafe_raw_contract(
+        for resource_req in &lemma.raw_reqs {
+            let resource_spec = self.consume_unsafe_resource_contract(
                 state,
-                raw_req,
+                resource_req,
                 &env.current,
                 &spec,
                 span,
-                RawContractCheck::Precondition,
+                ResourceContractCheck::Precondition,
             )?;
-            spec.extend(raw_spec);
+            spec.extend(resource_spec);
         }
         let ens = self.contract_expr_to_bool(&env.current, &spec, &lemma.ens)?;
         if !self.assume_unsafe_path_condition(state, ens) {
@@ -4076,7 +4135,7 @@ impl<'tcx> Verifier<'tcx> {
         }
         let mut spec = spec;
         for raw_ens in &lemma.raw_ens {
-            self.assume_unsafe_raw_contract(state, raw_ens, &env.current, &mut spec, span)?;
+            self.assume_unsafe_resource_contract(state, raw_ens, &env.current, &mut spec, span)?;
         }
         state.env = spec;
         Ok(())
@@ -4177,9 +4236,11 @@ impl<'tcx> Verifier<'tcx> {
         self.assert_constraint(
             state,
             formula,
-            span,
-            span_text(self.tcx, span),
-            "mutable reference close failed".to_owned(),
+            AssertionFailure {
+                span,
+                diagnostic_span: span_text(self.tcx, span),
+                message: "mutable reference close failed".to_owned(),
+            },
         )?;
         Ok(())
     }
@@ -4346,68 +4407,79 @@ impl<'tcx> Verifier<'tcx> {
                 self.eval_checked_binary_op(state, op, lhs, rhs, span)
             }
             BinOp::Add => {
-                let int_value = self.value_int_data(&lhs_value) + self.value_int_data(&rhs_value);
+                let result = self.solver.lower_int_binary_value(
+                    IntValueBinaryOp::Add,
+                    &lhs_value,
+                    &rhs_value,
+                );
                 self.require_int_invariant(
                     state,
                     lhs_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_encoder.wrap_int(&int_value))
+                Ok(result.value)
             }
             BinOp::Sub => {
-                let int_value = self.value_int_data(&lhs_value) - self.value_int_data(&rhs_value);
+                let result = self.solver.lower_int_binary_value(
+                    IntValueBinaryOp::Sub,
+                    &lhs_value,
+                    &rhs_value,
+                );
                 self.require_int_invariant(
                     state,
                     lhs_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_encoder.wrap_int(&int_value))
+                Ok(result.value)
             }
             BinOp::Mul => {
-                let int_value = self.value_int_data(&lhs_value) * self.value_int_data(&rhs_value);
+                let result = self.solver.lower_int_binary_value(
+                    IntValueBinaryOp::Mul,
+                    &lhs_value,
+                    &rhs_value,
+                );
                 self.require_int_invariant(
                     state,
                     lhs_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_encoder.wrap_int(&int_value))
+                Ok(result.value)
             }
-            BinOp::Eq => Ok(self.value_encoder.wrap_bool(&self.eq_for_spec_ty(
-                &lhs_spec_ty,
+            BinOp::Eq => self.solver_result(
+                span,
+                self.solver
+                    .lower_eq_value(&lhs_spec_ty, &lhs_value, &rhs_value, false),
+            ),
+            BinOp::Ne => self.solver_result(
+                span,
+                self.solver
+                    .lower_eq_value(&lhs_spec_ty, &lhs_value, &rhs_value, true),
+            ),
+            BinOp::Lt => Ok(self.solver.lower_int_predicate_value(
+                IntValuePredicateOp::Lt,
                 &lhs_value,
                 &rhs_value,
-                span,
-            )?)),
-            BinOp::Ne => Ok(self.value_encoder.wrap_bool(
-                &self
-                    .eq_for_spec_ty(&lhs_spec_ty, &lhs_value, &rhs_value, span)?
-                    .not(),
             )),
-            BinOp::Lt => Ok(self.value_encoder.wrap_bool(
-                &self
-                    .value_int_data(&lhs_value)
-                    .lt(self.value_int_data(&rhs_value)),
+            BinOp::Le => Ok(self.solver.lower_int_predicate_value(
+                IntValuePredicateOp::Le,
+                &lhs_value,
+                &rhs_value,
             )),
-            BinOp::Le => Ok(self.value_encoder.wrap_bool(
-                &self
-                    .value_int_data(&lhs_value)
-                    .le(self.value_int_data(&rhs_value)),
+            BinOp::Gt => Ok(self.solver.lower_int_predicate_value(
+                IntValuePredicateOp::Gt,
+                &lhs_value,
+                &rhs_value,
             )),
-            BinOp::Gt => Ok(self.value_encoder.wrap_bool(
-                &self
-                    .value_int_data(&lhs_value)
-                    .gt(self.value_int_data(&rhs_value)),
-            )),
-            BinOp::Ge => Ok(self.value_encoder.wrap_bool(
-                &self
-                    .value_int_data(&lhs_value)
-                    .ge(self.value_int_data(&rhs_value)),
+            BinOp::Ge => Ok(self.solver.lower_int_predicate_value(
+                IntValuePredicateOp::Ge,
+                &lhs_value,
+                &rhs_value,
             )),
             other => {
                 Err(self.unsupported_result(span, format!("unsupported binary operator {other:?}")))
@@ -4427,43 +4499,52 @@ impl<'tcx> Verifier<'tcx> {
         let lhs_value = self.eval_operand(state, lhs, span)?;
         let rhs_value = self.eval_operand(state, rhs, span)?;
         let result_ty = lhs.ty(&self.body().local_decls, self.tcx);
-        let tuple_ty = SpecTy::Tuple(vec![
-            self.spec_ty_for_place_ty(result_ty, span)?,
-            SpecTy::Bool,
-        ]);
+        let result_spec_ty = self.spec_ty_for_place_ty(result_ty, span)?;
         let result_value = match op {
             BinOp::Add | BinOp::AddWithOverflow => {
-                let int_value = self.value_int_data(&lhs_value) + self.value_int_data(&rhs_value);
+                let result = self.solver.lower_int_binary_value(
+                    IntValueBinaryOp::Add,
+                    &lhs_value,
+                    &rhs_value,
+                );
                 self.require_int_invariant(
                     state,
                     result_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                self.value_encoder.wrap_int(&int_value)
+                result.value
             }
             BinOp::Sub | BinOp::SubWithOverflow => {
-                let int_value = self.value_int_data(&lhs_value) - self.value_int_data(&rhs_value);
+                let result = self.solver.lower_int_binary_value(
+                    IntValueBinaryOp::Sub,
+                    &lhs_value,
+                    &rhs_value,
+                );
                 self.require_int_invariant(
                     state,
                     result_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                self.value_encoder.wrap_int(&int_value)
+                result.value
             }
             BinOp::Mul | BinOp::MulWithOverflow => {
-                let int_value = self.value_int_data(&lhs_value) * self.value_int_data(&rhs_value);
+                let result = self.solver.lower_int_binary_value(
+                    IntValueBinaryOp::Mul,
+                    &lhs_value,
+                    &rhs_value,
+                );
                 self.require_int_invariant(
                     state,
                     result_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                self.value_encoder.wrap_int(&int_value)
+                result.value
             }
             other => {
                 return Err(self.unsupported_result(
@@ -4473,7 +4554,11 @@ impl<'tcx> Verifier<'tcx> {
             }
         };
         let overflow_value = self.overflow_value_for_result(result_ty, &result_value, span)?;
-        self.construct_composite(&tuple_ty, &[result_value, overflow_value])
+        self.solver_result(
+            span,
+            self.solver
+                .checked_result_tuple_value(result_spec_ty, result_value, overflow_value),
+        )
     }
 
     fn eval_unary_op(
@@ -4486,19 +4571,17 @@ impl<'tcx> Verifier<'tcx> {
         let value = self.eval_operand(state, operand, span)?;
         let operand_ty = operand.ty(&self.body().local_decls, self.tcx);
         let result = match op {
-            UnOp::Not => Ok(self
-                .value_encoder
-                .wrap_bool(&self.value_is_true(&value).not())),
+            UnOp::Not => Ok(self.solver.lower_bool_not_value(&value)),
             UnOp::Neg => {
-                let int_value = Int::from_i64(0) - self.value_int_data(&value);
+                let result = self.solver.lower_int_neg_value(&value);
                 self.require_int_invariant(
                     state,
                     operand_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_encoder.wrap_int(&int_value))
+                Ok(result.value)
             }
             other => {
                 Err(self.unsupported_result(span, format!("unsupported unary operator {other:?}")))
@@ -4580,7 +4663,7 @@ impl<'tcx> Verifier<'tcx> {
                             "failed to evaluate boolean constant".to_owned(),
                         )
                     })?;
-                Ok(self.value_bool(value.try_to_bool().map_err(|_| {
+                Ok(self.solver.bool_value(value.try_to_bool().map_err(|_| {
                     self.unsupported_result(span, "failed to evaluate boolean constant".to_owned())
                 })?))
             }
@@ -4859,69 +4942,39 @@ impl<'tcx> Verifier<'tcx> {
                     let rhs = self.spec_expr_to_bool(state, rhs, resolved)?;
                     Ok(Bool::or(&[&lhs, &rhs]))
                 }
-                BinaryOp::Eq => {
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge => {
                     let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
                     let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
-                    self.eq_for_spec_ty(
-                        &lhs.ty,
-                        &lhs_value,
-                        &rhs_value,
-                        self.control_span(state.ctrl),
-                    )
-                }
-                BinaryOp::Ne => {
-                    let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
-                    let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
-                    Ok(self
-                        .eq_for_spec_ty(
-                            &lhs.ty,
-                            &lhs_value,
-                            &rhs_value,
-                            self.control_span(state.ctrl),
-                        )?
-                        .not())
-                }
-                BinaryOp::Lt => {
-                    let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
-                    let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
-                    Ok(self
-                        .value_int_data(&lhs_value)
-                        .lt(self.value_int_data(&rhs_value)))
-                }
-                BinaryOp::Le => {
-                    let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
-                    let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
-                    Ok(self
-                        .value_int_data(&lhs_value)
-                        .le(self.value_int_data(&rhs_value)))
-                }
-                BinaryOp::Gt => {
-                    let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
-                    let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
-                    Ok(self
-                        .value_int_data(&lhs_value)
-                        .gt(self.value_int_data(&rhs_value)))
-                }
-                BinaryOp::Ge => {
-                    let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
-                    let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
-                    Ok(self
-                        .value_int_data(&lhs_value)
-                        .ge(self.value_int_data(&rhs_value)))
+                    self.solver
+                        .lower_binary_predicate(*op, &lhs.ty, &lhs_value, &rhs_value)
+                        .map_err(|err| self.unsupported_result(self.control_span(state.ctrl), err))?
+                        .ok_or_else(|| {
+                            self.unsupported_result(
+                                self.control_span(state.ctrl),
+                                "spec expression used where `bool` was required".to_owned(),
+                            )
+                        })
                 }
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
                     let value = self.spec_expr_to_value(state, expr, resolved)?;
-                    Ok(self.value_is_true(&value))
+                    Ok(self.solver.bool_term(&value))
                 }
                 BinaryOp::Concat => Err(self.unsupported_result(
                     self.control_span(state.ctrl),
                     "sequence value used where `bool` was required".to_owned(),
                 )),
             },
-            TypedExprKind::Match { .. } => {
-                Ok(self.value_is_true(&self.spec_expr_to_value(state, expr, resolved)?))
-            }
-            _ => Ok(self.value_is_true(&self.spec_expr_to_value(state, expr, resolved)?)),
+            TypedExprKind::Match { .. } => Ok(self
+                .solver
+                .bool_term(&self.spec_expr_to_value(state, expr, resolved)?)),
+            _ => Ok(self
+                .solver
+                .bool_term(&self.spec_expr_to_value(state, expr, resolved)?)),
         }
     }
 
@@ -4932,17 +4985,17 @@ impl<'tcx> Verifier<'tcx> {
         resolved: &ResolvedExprEnv,
     ) -> Result<SymValue, VerificationResult> {
         match &expr.kind {
-            TypedExprKind::Bool(value) => Ok(self.value_bool(*value)),
+            TypedExprKind::Bool(value) => Ok(self.solver.bool_value(*value)),
             TypedExprKind::Int(value) => {
                 self.value_decimal_int(&value.digits, self.control_span(state.ctrl))
             }
-            TypedExprKind::RustType(key) => Ok(self.rust_ty_value(key)),
+            TypedExprKind::RustType(key) => Ok(self.solver.rust_ty_value(key)),
             TypedExprKind::SeqLit(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
                     values.push(self.spec_expr_to_value(state, item, resolved)?);
                 }
-                Ok(self.seq_literal_value(&values))
+                Ok(self.solver.seq_literal_value(&values))
             }
             TypedExprKind::StructLit { fields } => {
                 let mut values = Vec::with_capacity(fields.len());
@@ -5002,23 +5055,22 @@ impl<'tcx> Verifier<'tcx> {
             TypedExprKind::Index { base, index } => {
                 let value = self.spec_expr_to_value(state, base, resolved)?;
                 let index_value = self.spec_expr_to_value(state, index, resolved)?;
+                let span = self.control_span(state.ctrl);
                 let index_int =
-                    self.nat_to_int_term(&index_value, self.control_span(state.ctrl))?;
-                self.seq_nth_value(&value, &index_int, self.control_span(state.ctrl))
+                    self.solver_result(span, self.solver.nat_to_int_term(&index_value))?;
+                self.solver_result(span, self.solver.seq_nth_value(&value, &index_int))
             }
             TypedExprKind::Unary { op, arg } => {
                 let value = self.spec_expr_to_value(state, arg, resolved)?;
-                Ok(self.lower_unary_value(*op, &value))
+                Ok(self.solver.lower_unary_value(*op, &value))
             }
             TypedExprKind::Binary { op, lhs, rhs } => {
                 let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
                 let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
-                self.lower_binary_value(
-                    *op,
-                    &lhs.ty,
-                    &lhs_value,
-                    &rhs_value,
+                self.solver_result(
                     self.control_span(state.ctrl),
+                    self.solver
+                        .lower_binary_value(*op, &lhs.ty, &lhs_value, &rhs_value),
                 )
             }
         }
@@ -5047,59 +5099,39 @@ impl<'tcx> Verifier<'tcx> {
                     let rhs = self.contract_expr_to_bool(current, spec, rhs)?;
                     Ok(Bool::or(&[&lhs, &rhs]))
                 }
-                BinaryOp::Eq => {
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge => {
                     let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
                     let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
-                    self.eq_for_spec_ty(&lhs.ty, &lhs_value, &rhs_value, self.report_span())
-                }
-                BinaryOp::Ne => {
-                    let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
-                    let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
-                    Ok(self
-                        .eq_for_spec_ty(&lhs.ty, &lhs_value, &rhs_value, self.report_span())?
-                        .not())
-                }
-                BinaryOp::Lt => {
-                    let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
-                    let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
-                    Ok(self
-                        .value_int_data(&lhs_value)
-                        .lt(self.value_int_data(&rhs_value)))
-                }
-                BinaryOp::Le => {
-                    let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
-                    let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
-                    Ok(self
-                        .value_int_data(&lhs_value)
-                        .le(self.value_int_data(&rhs_value)))
-                }
-                BinaryOp::Gt => {
-                    let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
-                    let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
-                    Ok(self
-                        .value_int_data(&lhs_value)
-                        .gt(self.value_int_data(&rhs_value)))
-                }
-                BinaryOp::Ge => {
-                    let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
-                    let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
-                    Ok(self
-                        .value_int_data(&lhs_value)
-                        .ge(self.value_int_data(&rhs_value)))
+                    self.solver
+                        .lower_binary_predicate(*op, &lhs.ty, &lhs_value, &rhs_value)
+                        .map_err(|err| self.unsupported_result(self.report_span(), err))?
+                        .ok_or_else(|| {
+                            self.unsupported_result(
+                                self.report_span(),
+                                "spec expression used where `bool` was required".to_owned(),
+                            )
+                        })
                 }
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
                     let value = self.contract_expr_to_value(current, spec, expr)?;
-                    Ok(self.value_is_true(&value))
+                    Ok(self.solver.bool_term(&value))
                 }
                 BinaryOp::Concat => Err(self.unsupported_result(
                     self.report_span(),
                     "sequence value used where `bool` was required".to_owned(),
                 )),
             },
-            TypedExprKind::Match { .. } => {
-                Ok(self.value_is_true(&self.contract_expr_to_value(current, spec, expr)?))
-            }
-            _ => Ok(self.value_is_true(&self.contract_expr_to_value(current, spec, expr)?)),
+            TypedExprKind::Match { .. } => Ok(self
+                .solver
+                .bool_term(&self.contract_expr_to_value(current, spec, expr)?)),
+            _ => Ok(self
+                .solver
+                .bool_term(&self.contract_expr_to_value(current, spec, expr)?)),
         }
     }
 
@@ -5110,15 +5142,15 @@ impl<'tcx> Verifier<'tcx> {
         expr: &TypedExpr,
     ) -> Result<SymValue, VerificationResult> {
         match &expr.kind {
-            TypedExprKind::Bool(value) => Ok(self.value_bool(*value)),
+            TypedExprKind::Bool(value) => Ok(self.solver.bool_value(*value)),
             TypedExprKind::Int(value) => self.value_decimal_int(&value.digits, self.report_span()),
-            TypedExprKind::RustType(key) => Ok(self.rust_ty_value(key)),
+            TypedExprKind::RustType(key) => Ok(self.solver.rust_ty_value(key)),
             TypedExprKind::SeqLit(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
                     values.push(self.contract_expr_to_value(current, spec, item)?);
                 }
-                Ok(self.seq_literal_value(&values))
+                Ok(self.solver.seq_literal_value(&values))
             }
             TypedExprKind::StructLit { fields } => {
                 let mut values = Vec::with_capacity(fields.len());
@@ -5176,17 +5208,22 @@ impl<'tcx> Verifier<'tcx> {
             TypedExprKind::Index { base, index } => {
                 let value = self.contract_expr_to_value(current, spec, base)?;
                 let index_value = self.contract_expr_to_value(current, spec, index)?;
-                let index_int = self.nat_to_int_term(&index_value, self.report_span())?;
-                self.seq_nth_value(&value, &index_int, self.report_span())
+                let span = self.report_span();
+                let index_int =
+                    self.solver_result(span, self.solver.nat_to_int_term(&index_value))?;
+                self.solver_result(span, self.solver.seq_nth_value(&value, &index_int))
             }
             TypedExprKind::Unary { op, arg } => {
                 let value = self.contract_expr_to_value(current, spec, arg)?;
-                Ok(self.lower_unary_value(*op, &value))
+                Ok(self.solver.lower_unary_value(*op, &value))
             }
             TypedExprKind::Binary { op, lhs, rhs } => {
                 let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
                 let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
-                self.lower_binary_value(*op, &lhs.ty, &lhs_value, &rhs_value, self.report_span())
+                self.solver_result_at_report_span(
+                    self.solver
+                        .lower_binary_value(*op, &lhs.ty, &lhs_value, &rhs_value),
+                )
             }
         }
     }
@@ -5200,27 +5237,24 @@ impl<'tcx> Verifier<'tcx> {
         default: Option<&TypedExpr>,
     ) -> Result<SymValue, VerificationResult> {
         let scrutinee_value = self.contract_expr_to_value(current, spec, scrutinee)?;
-        let composite = self.composite_encoding(&scrutinee.ty)?;
         let mut branches = Vec::with_capacity(arms.len());
         for arm in arms {
             let mut arm_current = current.clone();
             for (field_index, binding) in arm.bindings.iter().enumerate() {
                 if let TypedMatchBinding::Var { name, .. } = binding {
-                    let field_value = self
-                        .value_encoder
-                        .project_composite_ctor_field(
-                            &composite,
-                            arm.ctor_index,
-                            &scrutinee_value,
-                            field_index,
-                        )
-                        .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+                    let field_value = self.decode_composite_ctor_field(
+                        &scrutinee.ty,
+                        arm.ctor_index,
+                        &scrutinee_value,
+                        field_index,
+                        self.report_span(),
+                    )?;
                     arm_current.insert(name.clone(), field_value);
                 }
             }
             let body = self.contract_expr_to_value(&arm_current, spec, &arm.body)?;
-            let guard = self.composite_tag_formula_for_encoding(
-                &composite,
+            let guard = self.composite_tag_formula(
+                &scrutinee.ty,
                 &scrutinee_value,
                 arm.ctor_index,
                 self.report_span(),
@@ -5258,11 +5292,8 @@ impl<'tcx> Verifier<'tcx> {
         if let Some(value) = self.try_eval_ground_pure_call(func, &values, span)? {
             return Ok(value);
         }
-        let Some(decl) = self.pure_fn_decls.get(func) else {
-            return Err(self.unsupported_result(span, format!("unknown pure function `{func}`")));
-        };
-        let args: Vec<&dyn Ast> = values.iter().map(SymValue::ast).collect();
-        Ok(SymValue::new(decl.apply(&args)))
+        self.solver_result(span, self.solver.apply_pure_fn(func, &values))?
+            .ok_or_else(|| self.unsupported_result(span, format!("unknown pure function `{func}`")))
     }
 
     fn try_eval_ground_pure_call(
@@ -5295,13 +5326,18 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<Option<SymValue>, VerificationResult> {
         match (func, values) {
             ("seq_len", [value]) => {
-                let length = self.seq_len_int(value, span)?;
-                if let Some(length) = length.simplify().as_i64()
+                let length = self.solver_result(span, self.solver.seq_len_int(value))?;
+                if let Some(length) = Solver::simplify_int(&length).as_i64()
                     && length >= 0
                 {
-                    return Ok(Some(self.concrete_nat_value(length as u64)?));
+                    return Ok(Some(self.solver_result_at_report_span(
+                        self.solver.concrete_nat_value(length as u64),
+                    )?));
                 }
-                Ok(Some(self.int_to_nat_value(&length, span)?))
+                Ok(Some(self.solver_result(
+                    span,
+                    self.solver.int_to_nat_value(&length),
+                )?))
             }
             ("seq_len", _) => Err(self.unsupported_result(
                 span,
@@ -5318,9 +5354,9 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Option<SymValue>, VerificationResult> {
         Ok(match &expr.kind {
-            TypedExprKind::Bool(value) => Some(self.value_bool(*value)),
+            TypedExprKind::Bool(value) => Some(self.solver.bool_value(*value)),
             TypedExprKind::Int(value) => Some(self.value_decimal_int(&value.digits, span)?),
-            TypedExprKind::RustType(key) => Some(self.rust_ty_value(key)),
+            TypedExprKind::RustType(key) => Some(self.solver.rust_ty_value(key)),
             TypedExprKind::SeqLit(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
@@ -5329,7 +5365,7 @@ impl<'tcx> Verifier<'tcx> {
                     };
                     values.push(value);
                 }
-                Some(self.seq_literal_value(&values))
+                Some(self.solver.seq_literal_value(&values))
             }
             TypedExprKind::StructLit { fields } => {
                 let mut values = Vec::with_capacity(fields.len());
@@ -5365,12 +5401,15 @@ impl<'tcx> Verifier<'tcx> {
                 if let Some(value) = self.try_eval_ground_pure_call(func, &values, span)? {
                     Some(value)
                 } else {
-                    let Some(decl) = self.pure_fn_decls.get(func) else {
-                        return Err(self
-                            .unsupported_result(span, format!("unknown pure function `{func}`")));
-                    };
-                    let args: Vec<&dyn Ast> = values.iter().map(SymValue::ast).collect();
-                    Some(SymValue::new(decl.apply(&args)))
+                    Some(
+                        self.solver_result(span, self.solver.apply_pure_fn(func, &values))?
+                            .ok_or_else(|| {
+                                self.unsupported_result(
+                                    span,
+                                    format!("unknown pure function `{func}`"),
+                                )
+                            })?,
+                    )
                 }
             }
             TypedExprKind::Match {
@@ -5382,25 +5421,25 @@ impl<'tcx> Verifier<'tcx> {
                 else {
                     return Ok(None);
                 };
-                let Some(ctor_index) =
-                    self.ground_ctor_index(&scrutinee.ty, &scrutinee_value, span)?
+                let Some(ctor_index) = self.solver_result(
+                    span,
+                    self.solver
+                        .ground_ctor_index(&scrutinee.ty, &scrutinee_value),
+                )?
                 else {
                     return Ok(None);
                 };
                 if let Some(arm) = arms.iter().find(|arm| arm.ctor_index == ctor_index) {
-                    let composite = self.composite_encoding(&scrutinee.ty)?;
                     let mut arm_env = env.clone();
                     for (field_index, binding) in arm.bindings.iter().enumerate() {
                         if let TypedMatchBinding::Var { name, .. } = binding {
-                            let field_value = self
-                                .value_encoder
-                                .project_composite_ctor_field(
-                                    &composite,
-                                    ctor_index,
-                                    &scrutinee_value,
-                                    field_index,
-                                )
-                                .map_err(|err| self.unsupported_result(span, err))?;
+                            let field_value = self.decode_composite_ctor_field(
+                                &scrutinee.ty,
+                                ctor_index,
+                                &scrutinee_value,
+                                field_index,
+                                span,
+                            )?;
                             arm_env.insert(name.clone(), field_value);
                         }
                     }
@@ -5430,14 +5469,15 @@ impl<'tcx> Verifier<'tcx> {
                 let Some(index_value) = self.try_eval_ground_pure_expr(index, env, span)? else {
                     return Ok(None);
                 };
-                let index_int = self.nat_to_int_term(&index_value, span)?;
-                Some(self.seq_nth_value(&value, &index_int, span)?)
+                let index_int =
+                    self.solver_result(span, self.solver.nat_to_int_term(&index_value))?;
+                Some(self.solver_result(span, self.solver.seq_nth_value(&value, &index_int))?)
             }
             TypedExprKind::Unary { op, arg } => {
                 let Some(value) = self.try_eval_ground_pure_expr(arg, env, span)? else {
                     return Ok(None);
                 };
-                Some(self.lower_unary_value(*op, &value))
+                Some(self.solver.lower_unary_value(*op, &value))
             }
             TypedExprKind::Binary { op, lhs, rhs } => {
                 let Some(lhs_value) = self.try_eval_ground_pure_expr(lhs, env, span)? else {
@@ -5446,37 +5486,24 @@ impl<'tcx> Verifier<'tcx> {
                 let Some(rhs_value) = self.try_eval_ground_pure_expr(rhs, env, span)? else {
                     return Ok(None);
                 };
-                Some(self.lower_binary_value(*op, &lhs.ty, &lhs_value, &rhs_value, span)?)
+                Some(
+                    self.solver_result(
+                        span,
+                        self.solver
+                            .lower_binary_value(*op, &lhs.ty, &lhs_value, &rhs_value),
+                    )?,
+                )
             }
         })
-    }
-
-    fn ground_ctor_index(
-        &self,
-        ty: &SpecTy,
-        value: &SymValue,
-        span: Span,
-    ) -> Result<Option<usize>, VerificationResult> {
-        let composite = self.composite_encoding(ty)?;
-        let decl_name = value.dynamic().decl().name();
-        for (ctor_index, ctor) in composite.constructors.iter().enumerate() {
-            if decl_name == ctor.symbol.name() {
-                return Ok(Some(ctor_index));
-            }
-        }
-        let _ = span;
-        Ok(None)
     }
 
     fn assert_constraint(
         &self,
         state: &mut State,
         constraint: Bool,
-        span: Span,
-        diagnostic_span: String,
-        message: String,
+        failure: AssertionFailure,
     ) -> Result<(), VerificationResult> {
-        let constraint = constraint.simplify();
+        let constraint = Solver::simplify_bool(&constraint);
         if let Some(value) = constraint.as_bool() {
             return match value {
                 true => {
@@ -5486,8 +5513,8 @@ impl<'tcx> Verifier<'tcx> {
                 false => Err(VerificationResult {
                     function: self.report_function(),
                     status: VerificationStatus::Fail,
-                    span: diagnostic_span,
-                    message,
+                    span: failure.diagnostic_span,
+                    message: failure.message,
                 }),
             };
         }
@@ -5495,14 +5522,16 @@ impl<'tcx> Verifier<'tcx> {
             SatResult::Sat => Err(VerificationResult {
                 function: self.report_function(),
                 status: VerificationStatus::Fail,
-                span: diagnostic_span,
-                message,
+                span: failure.diagnostic_span,
+                message: failure.message,
             }),
             SatResult::Unsat => {
                 self.add_path_condition(state, constraint);
                 Ok(())
             }
-            SatResult::Unknown => Err(self.unknown_solver_result(span, "checking an assertion")),
+            SatResult::Unknown => {
+                Err(self.unknown_solver_result(failure.span, "checking an assertion"))
+            }
         }
     }
 
@@ -5533,50 +5562,29 @@ impl<'tcx> Verifier<'tcx> {
         Ok(bound)
     }
 
-    fn assert_predicate_constraint(
-        &self,
-        state: &mut State,
-        constraint: Bool,
-        span: Span,
-        diagnostic_span: String,
-        message: String,
-    ) -> Result<(), VerificationResult> {
-        self.assert_constraint(state, constraint, span, diagnostic_span, message)
-    }
-
     fn assert_spec_predicate_constraint(
         &self,
         state: &mut State,
         predicate: &NormalizedPredicate,
         resolved: &ResolvedExprEnv,
-        span: Span,
-        diagnostic_span: String,
-        message: String,
+        failure: AssertionFailure,
     ) -> Result<(), VerificationResult> {
         self.bind_state_spec_values(state, &predicate.bindings, resolved)?;
         let constraint = self.spec_expr_to_bool(state, &predicate.condition, resolved)?;
-        self.assert_predicate_constraint(state, constraint, span, diagnostic_span, message)
+        self.assert_constraint(state, constraint, failure)
     }
 
     fn assert_contract_predicate_constraint(
         &self,
         state: &mut State,
-        assertion: ContractPredicateAssertion<'_>,
+        predicate: &NormalizedPredicate,
+        current: &HashMap<String, SymValue>,
+        spec: &HashMap<String, SymValue>,
+        failure: AssertionFailure,
     ) -> Result<HashMap<String, SymValue>, VerificationResult> {
-        let spec = self.bind_contract_spec_values(
-            assertion.current,
-            assertion.spec,
-            &assertion.predicate.bindings,
-        )?;
-        let constraint =
-            self.contract_expr_to_bool(assertion.current, &spec, &assertion.predicate.condition)?;
-        self.assert_predicate_constraint(
-            state,
-            constraint,
-            assertion.span,
-            assertion.diagnostic_span,
-            assertion.message,
-        )?;
+        let spec = self.bind_contract_spec_values(current, spec, &predicate.bindings)?;
+        let constraint = self.contract_expr_to_bool(current, &spec, &predicate.condition)?;
+        self.assert_constraint(state, constraint, failure)?;
         Ok(spec)
     }
 
@@ -5631,7 +5639,7 @@ impl<'tcx> Verifier<'tcx> {
     // are satisfiable is optional and was the main source of spurious `unknown`s
     // once recursive prelude definitions were loaded.
     fn assume_path_condition(&self, state: &mut State, constraint: Bool) -> bool {
-        let constraint = constraint.simplify();
+        let constraint = Solver::simplify_bool(&constraint);
         match constraint.as_bool() {
             Some(true) => {
                 self.add_path_condition(state, constraint);
@@ -5646,7 +5654,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn assume_unsafe_path_condition(&self, state: &mut UnsafeState, constraint: Bool) -> bool {
-        let constraint = constraint.simplify();
+        let constraint = Solver::simplify_bool(&constraint);
         match constraint.as_bool() {
             Some(true) => {
                 self.add_unsafe_path_condition(state, constraint);
@@ -5661,7 +5669,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn assume_checked_path_condition(&self, state: &mut State, constraint: Bool) -> bool {
-        let constraint = constraint.simplify();
+        let constraint = Solver::simplify_bool(&constraint);
         if let Some(value) = constraint.as_bool() {
             if value {
                 self.add_path_condition(state, constraint);
@@ -5714,7 +5722,7 @@ impl<'tcx> Verifier<'tcx> {
         constraint: Bool,
         _span: Span,
     ) -> Result<Option<State>, VerificationResult> {
-        let constraint = constraint.simplify();
+        let constraint = Solver::simplify_bool(&constraint);
         if let Some(value) = constraint.as_bool() {
             if value {
                 self.add_path_condition(&mut state, constraint);
@@ -5741,7 +5749,7 @@ impl<'tcx> Verifier<'tcx> {
         constraint: Bool,
         _span: Span,
     ) -> Result<Option<UnsafeState>, VerificationResult> {
-        let constraint = constraint.simplify();
+        let constraint = Solver::simplify_bool(&constraint);
         if let Some(value) = constraint.as_bool() {
             if value {
                 self.add_unsafe_path_condition(&mut state, constraint);
@@ -5763,12 +5771,15 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn add_path_condition(&self, state: &mut State, constraint: Bool) {
-        state.pc = bool_and(vec![state.pc.clone(), constraint]).simplify();
+        state.pc = Solver::simplify_bool(&bool_and(vec![state.pc.clone(), constraint]));
     }
 
     fn check_sat(&self, assumptions: &[Bool]) -> SatResult {
-        let assumptions = assumptions.iter().map(Bool::simplify).collect::<Vec<_>>();
-        with_solver(|solver| solver.check_assumptions(&assumptions))
+        let assumptions = assumptions
+            .iter()
+            .map(Solver::simplify_bool)
+            .collect::<Vec<_>>();
+        self.solver.check_assumptions(&assumptions)
     }
 
     fn abstract_call_mut_args(
@@ -5855,21 +5866,12 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn loop_marker(&self, header: BasicBlock) -> Bool {
-        Bool::new_const(format!("loop_{}", header.index()))
+        self.solver.bool_marker(format!("loop_{}", header.index()))
     }
 
     fn has_loop_marker(&self, expr: &Bool, header: BasicBlock) -> bool {
         let marker = format!("loop_{}", header.index());
-        if expr.is_const() {
-            return expr.decl().name() == marker;
-        }
-        expr.children().into_iter().any(|child| {
-            child
-                .as_bool()
-                .filter(|_| child.sort_kind() == SortKind::Bool)
-                .map(|child| self.has_loop_marker(&child, header))
-                .unwrap_or(false)
-        })
+        Solver::bool_contains_marker(expr, &marker)
     }
 
     fn called_local_def_id(&self, func: &Operand<'tcx>) -> Option<LocalDefId> {
@@ -5932,91 +5934,25 @@ impl<'tcx> Verifier<'tcx> {
             .find(|unsafe_span| span_contains(*unsafe_span, span))
     }
 
-    fn value_int(&self, value: i64) -> SymValue {
-        self.value_encoder.int_value(value)
-    }
-
     fn value_decimal_int(&self, digits: &str, span: Span) -> Result<SymValue, VerificationResult> {
-        self.value_encoder.decimal_int_value(digits).map_err(|_| {
+        self.solver.decimal_int_value(digits).map_err(|_| {
             self.unsupported_result(span, format!("invalid integer literal `{digits}`"))
         })
     }
 
-    fn value_bool(&self, value: bool) -> SymValue {
-        self.value_encoder.bool_value(value)
-    }
-
-    fn rust_ty_value(&self, key: &RustTyKey) -> SymValue {
-        with_solver(|solver| self.value_encoder.rust_ty_value(key, solver))
-    }
-
-    fn value_is_true(&self, value: &SymValue) -> Bool {
-        self.value_encoder.bool_term(value)
-    }
-
-    fn value_int_data(&self, value: &SymValue) -> Int {
-        self.value_encoder.int_term(value)
-    }
-
-    fn seq_literal_value(&self, items: &[SymValue]) -> SymValue {
-        self.value_encoder.seq_literal_value(items)
-    }
-
-    fn seq_len_int(&self, value: &SymValue, span: Span) -> Result<Int, VerificationResult> {
-        self.value_encoder
-            .seq_len_int(value)
-            .map_err(|err| self.unsupported_result(span, err))
-    }
-
-    fn seq_nth_value(
+    fn solver_result<T>(
         &self,
-        value: &SymValue,
-        index: &Int,
         span: Span,
-    ) -> Result<SymValue, VerificationResult> {
-        self.value_encoder
-            .seq_nth_value(value, index)
-            .map_err(|err| self.unsupported_result(span, err))
+        result: Result<T, String>,
+    ) -> Result<T, VerificationResult> {
+        result.map_err(|err| self.unsupported_result(span, err))
     }
 
-    fn eq_for_spec_ty(
+    fn solver_result_at_report_span<T>(
         &self,
-        ty: &SpecTy,
-        lhs: &SymValue,
-        rhs: &SymValue,
-        span: Span,
-    ) -> Result<Bool, VerificationResult> {
-        with_solver(|solver| self.value_encoder.eq_for_spec_ty(ty, lhs, rhs, solver))
-            .map_err(|err| self.unsupported_result(span, err))
-    }
-
-    fn lower_unary_value(&self, op: UnaryOp, value: &SymValue) -> SymValue {
-        self.value_encoder.lower_unary_value(op, value)
-    }
-
-    fn lower_binary_value(
-        &self,
-        op: BinaryOp,
-        lhs_ty: &SpecTy,
-        lhs: &SymValue,
-        rhs: &SymValue,
-        span: Span,
-    ) -> Result<SymValue, VerificationResult> {
-        with_solver(|solver| {
-            self.value_encoder
-                .lower_binary_value(op, lhs_ty, lhs, rhs, solver)
-        })
-        .map_err(|err| self.unsupported_result(span, err))
-    }
-
-    fn type_encoding(&self, ty: &SpecTy) -> Result<Rc<TypeEncoding>, VerificationResult> {
-        with_solver(|solver| self.value_encoder.type_encoding(ty, solver))
-            .map_err(|err| self.unsupported_result(self.report_span(), err))
-    }
-
-    fn composite_encoding(&self, ty: &SpecTy) -> Result<Rc<CompositeEncoding>, VerificationResult> {
-        with_solver(|solver| self.value_encoder.composite_encoding(ty, solver))
-            .map_err(|err| self.unsupported_result(self.report_span(), err))
+        result: Result<T, String>,
+    ) -> Result<T, VerificationResult> {
+        self.solver_result(self.report_span(), result)
     }
 
     fn construct_composite(
@@ -6024,8 +5960,7 @@ impl<'tcx> Verifier<'tcx> {
         ty: &SpecTy,
         fields: &[SymValue],
     ) -> Result<SymValue, VerificationResult> {
-        with_solver(|solver| self.value_encoder.construct_composite(ty, fields, solver))
-            .map_err(|err| self.unsupported_result(self.report_span(), err))
+        self.solver_result_at_report_span(self.solver.construct_composite(ty, fields))
     }
 
     fn construct_composite_ctor(
@@ -6034,22 +5969,9 @@ impl<'tcx> Verifier<'tcx> {
         ctor_index: usize,
         fields: &[SymValue],
     ) -> Result<SymValue, VerificationResult> {
-        with_solver(|solver| {
-            self.value_encoder
-                .construct_composite_ctor(ty, ctor_index, fields, solver)
-        })
-        .map_err(|err| self.unsupported_result(self.report_span(), err))
-    }
-
-    fn construct_composite_ctor_without_axioms(
-        &self,
-        ty: &SpecTy,
-        ctor_index: usize,
-        fields: &[SymValue],
-    ) -> Result<SymValue, VerificationResult> {
-        self.value_encoder
-            .construct_composite_ctor_without_axioms(ty, ctor_index, fields)
-            .map_err(|err| self.unsupported_result(self.report_span(), err))
+        self.solver_result_at_report_span(
+            self.solver.construct_composite_ctor(ty, ctor_index, fields),
+        )
     }
 
     fn fresh_for_rust_ty(&self, ty: Ty<'tcx>, hint: &str) -> Result<SymValue, VerificationResult> {
@@ -6175,7 +6097,11 @@ impl<'tcx> Verifier<'tcx> {
         if lhs.size != rhs.size || lhs.align != rhs.align {
             return Ok(Bool::from_bool(false));
         }
-        self.eq_for_spec_ty(&SpecTy::Usize, &lhs.base_addr, &rhs.base_addr, span)
+        self.solver_result(
+            span,
+            self.solver
+                .eq_for_spec_ty(&SpecTy::Usize, &lhs.base_addr, &rhs.base_addr),
+        )
     }
 
     fn allocation_distinct_formula(
@@ -6185,7 +6111,11 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Bool, VerificationResult> {
         Ok(self
-            .eq_for_spec_ty(&SpecTy::Usize, &lhs.base_addr, &rhs.base_addr, span)?
+            .solver_result(
+                span,
+                self.solver
+                    .eq_for_spec_ty(&SpecTy::Usize, &lhs.base_addr, &rhs.base_addr),
+            )?
             .not())
     }
 
@@ -6199,19 +6129,19 @@ impl<'tcx> Verifier<'tcx> {
             formulas.push(base_in_range);
         }
         let (_, usize_max) = self.pointer_sized_int_bounds(false)?;
-        let end = self.value_int_data(&alloc.base_addr) + Int::from_u64(alloc.size);
+        let end = self.solver.int_term(&alloc.base_addr) + Int::from_u64(alloc.size);
         formulas.push(end.le(usize_max));
         if alloc.align > 1 {
-            let base = self.value_int_data(&alloc.base_addr);
+            let base = self.solver.int_term(&alloc.base_addr);
             formulas.push(base.modulo(Int::from_u64(alloc.align)).eq(0));
         }
         Ok(bool_and(formulas))
     }
 
     fn allocation_non_overlapping_formula(&self, alloc: &Allocation, other: &Allocation) -> Bool {
-        let alloc_base = self.value_int_data(&alloc.base_addr);
+        let alloc_base = self.solver.int_term(&alloc.base_addr);
         let alloc_end = alloc_base.clone() + Int::from_u64(alloc.size);
-        let other_base = self.value_int_data(&other.base_addr);
+        let other_base = self.solver.int_term(&other.base_addr);
         let other_end = other_base.clone() + Int::from_u64(other.size);
         Bool::or(&[&alloc_end.le(&other_base), &other_end.le(alloc_base)])
     }
@@ -6328,11 +6258,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn add_addr_offset(&self, base: SymValue, offset: u64) -> SymValue {
-        if offset == 0 {
-            return base;
-        }
-        self.value_encoder
-            .wrap_int(&(self.value_int_data(&base) + Int::from_u64(offset)))
+        self.solver.offset_int_value(&base, offset)
     }
 
     fn layout_for_ty(
@@ -6392,11 +6318,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn construct_option_none(&self, inner: SpecTy) -> Result<SymValue, VerificationResult> {
-        let ctor_index = self
-            .value_encoder
-            .enum_ctor_index("Option", "None")
-            .map_err(|err| self.unsupported_result(self.report_span(), err))?;
-        self.construct_composite_ctor_without_axioms(&option_spec_ty(inner), ctor_index, &[])
+        self.solver_result_at_report_span(self.solver.construct_option_none(inner))
     }
 
     fn construct_option_some(
@@ -6404,15 +6326,11 @@ impl<'tcx> Verifier<'tcx> {
         inner: SpecTy,
         value: SymValue,
     ) -> Result<SymValue, VerificationResult> {
-        let ctor_index = self
-            .value_encoder
-            .enum_ctor_index("Option", "Some")
-            .map_err(|err| self.unsupported_result(self.report_span(), err))?;
-        self.construct_composite_ctor_without_axioms(&option_spec_ty(inner), ctor_index, &[value])
+        self.solver_result_at_report_span(self.solver.construct_option_some(inner, value))
     }
 
     fn rust_ty_model_value(&self, ty: Ty<'tcx>) -> SymValue {
-        self.rust_ty_value(&self.rust_ty_key_for_rust_ty(ty))
+        self.solver.rust_ty_value(&self.rust_ty_key_for_rust_ty(ty))
     }
 
     fn local_rust_ty_model_value(&self, local: Local) -> SymValue {
@@ -6458,48 +6376,11 @@ impl<'tcx> Verifier<'tcx> {
             }
             _ => {}
         }
-        if matches!(ty, SpecTy::Enum { .. }) {
-            return Ok(SymValue::new(Dynamic::new_const(
-                self.fresh_name(hint),
-                self.value_encoder.value_sort(),
-            )));
-        }
-        let encoding = self.type_encoding(ty)?;
-        self.fresh_for_encoding(&encoding, hint)
-    }
-
-    fn fresh_for_encoding(
-        &self,
-        encoding: &TypeEncoding,
-        hint: &str,
-    ) -> Result<SymValue, VerificationResult> {
-        match &encoding.kind {
-            TypeEncodingKind::Bool => Ok(self
-                .value_encoder
-                .wrap_bool(&Bool::new_const(self.fresh_name(hint)))),
-            TypeEncodingKind::Int => Ok(self
-                .value_encoder
-                .wrap_int(&Int::new_const(self.fresh_name(hint)))),
-            TypeEncodingKind::Opaque => Ok(SymValue::new(Dynamic::new_const(
-                self.fresh_name(hint),
-                self.value_encoder.value_sort(),
-            ))),
-            TypeEncodingKind::Seq => Ok(SymValue::new(Dynamic::from(Z3Seq::new_const(
-                self.fresh_name(hint),
-                self.value_encoder.value_sort(),
-            )))),
-            TypeEncodingKind::Composite(composite) => {
-                let ctor = composite
-                    .single_constructor()
-                    .map_err(|err| self.unsupported_result(self.report_span(), err))?;
-                let mut fields = Vec::with_capacity(ctor.fields.len());
-                for (index, field) in ctor.fields.iter().enumerate() {
-                    fields.push(self.fresh_for_spec_ty(&field.ty, &format!("{hint}_{index}"))?);
-                }
-                let args = fields.iter().map(SymValue::ast).collect::<Vec<_>>();
-                Ok(SymValue::new(ctor.symbol.apply(&args)))
-            }
-        }
+        self.solver_result_at_report_span(self.solver.fresh_for_spec_ty(
+            ty,
+            hint,
+            &mut |field_hint| self.fresh_name(field_hint),
+        ))
     }
 
     fn project_field(
@@ -6509,11 +6390,7 @@ impl<'tcx> Verifier<'tcx> {
         index: usize,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        with_solver(|solver| {
-            self.value_encoder
-                .project_field(parent_ty, &value, index, solver)
-        })
-        .map_err(|err| self.unsupported_result(span, err))
+        self.solver_result(span, self.solver.project_field(parent_ty, &value, index))
     }
 
     fn ref_deref(
@@ -6522,8 +6399,7 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let encoding = self.composite_encoding(&SpecTy::Ref(Box::new(inner_ty.clone())))?;
-        self.decode_composite_field(&encoding, value, 0, span)
+        self.decode_composite_field(&SpecTy::Ref(Box::new(inner_ty.clone())), value, 0, span)
     }
 
     fn ref_ptr(
@@ -6532,8 +6408,7 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let encoding = self.composite_encoding(&SpecTy::Ref(Box::new(inner_ty.clone())))?;
-        self.decode_composite_field(&encoding, value, 1, span)
+        self.decode_composite_field(&SpecTy::Ref(Box::new(inner_ty.clone())), value, 1, span)
     }
 
     fn mut_cur(
@@ -6542,8 +6417,7 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let encoding = self.composite_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
-        self.decode_composite_field(&encoding, value, 0, span)
+        self.decode_composite_field(&SpecTy::Mut(Box::new(inner_ty.clone())), value, 0, span)
     }
 
     fn mut_fin(
@@ -6552,8 +6426,7 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let encoding = self.composite_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
-        self.decode_composite_field(&encoding, value, 1, span)
+        self.decode_composite_field(&SpecTy::Mut(Box::new(inner_ty.clone())), value, 1, span)
     }
 
     fn mut_ptr(
@@ -6562,18 +6435,15 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let encoding = self.composite_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
-        self.decode_composite_field(&encoding, value, 2, span)
+        self.decode_composite_field(&SpecTy::Mut(Box::new(inner_ty.clone())), value, 2, span)
     }
 
     fn ptr_addr(&self, value: &SymValue, span: Span) -> Result<SymValue, VerificationResult> {
-        let encoding = self.composite_encoding(&ptr_spec_ty())?;
-        self.decode_composite_field(&encoding, value, 0, span)
+        self.decode_composite_field(&ptr_spec_ty(), value, 0, span)
     }
 
     fn ptr_prov(&self, value: &SymValue, span: Span) -> Result<SymValue, VerificationResult> {
-        let encoding = self.composite_encoding(&ptr_spec_ty())?;
-        self.decode_composite_field(&encoding, value, 1, span)
+        self.decode_composite_field(&ptr_spec_ty(), value, 1, span)
     }
 
     fn reference_ptr_formula(
@@ -6584,7 +6454,11 @@ impl<'tcx> Verifier<'tcx> {
         let prov = self.ptr_prov(ptr, span)?;
         let none = self.construct_option_none(provenance_spec_ty())?;
         let has_prov = self
-            .eq_for_spec_ty(&option_spec_ty(provenance_spec_ty()), &prov, &none, span)?
+            .solver_result(
+                span,
+                self.solver
+                    .eq_for_spec_ty(&option_spec_ty(provenance_spec_ty()), &prov, &none),
+            )?
             .not();
         Ok(bool_and(vec![
             self.resolve_formula_for_spec_ty(&ptr_spec_ty(), ptr, span)?,
@@ -6602,159 +6476,6 @@ impl<'tcx> Verifier<'tcx> {
         let prov = self.ptr_prov(value, span)?;
         let ty = self.rust_ty_model_value(pointee_ty);
         self.construct_ptr(addr, prov, ty)
-    }
-
-    fn builtin_nat_decls(&self, span: Span) -> Result<Rc<BuiltinNatDecls>, VerificationResult> {
-        if let Some(decls) = self.builtin_nat_decls.borrow().as_ref().cloned() {
-            return Ok(decls);
-        }
-        let decls = with_solver(|solver| {
-            let nat_ty = SpecTy::Enum {
-                name: "Nat".to_owned(),
-                args: vec![],
-            };
-            let nat_composite = self.value_encoder.composite_encoding(&nat_ty, solver)?;
-            let (zero_index, zero_ctor) = nat_composite
-                .constructors
-                .iter()
-                .enumerate()
-                .find(|(_, ctor)| ctor.fields.is_empty())
-                .ok_or_else(|| "Nat is missing `Zero`".to_owned())?;
-            let (succ_index, succ_ctor) = nat_composite
-                .constructors
-                .iter()
-                .enumerate()
-                .find(|(_, ctor)| ctor.fields.len() == 1)
-                .ok_or_else(|| "Nat is missing `Succ`".to_owned())?;
-
-            let nat_to_int = RecFuncDecl::new(
-                "builtin_nat_to_int",
-                &[self.value_encoder.value_sort()],
-                &Sort::int(),
-            );
-            let int_to_nat = RecFuncDecl::new(
-                "builtin_int_to_nat",
-                &[&Sort::int()],
-                self.value_encoder.value_sort(),
-            );
-
-            let int_arg = Int::new_const(self.fresh_name("builtin_int_to_nat_arg"));
-            let zero_value = zero_ctor.symbol.apply(&[]);
-            let int_minus_one = int_arg.clone() - Int::from_i64(1);
-            let succ_tail = int_to_nat.apply(&[&int_minus_one]);
-            let succ_value = succ_ctor.symbol.apply(&[&succ_tail]);
-            let int_to_nat_body = int_arg.le(0).ite(&zero_value, &succ_value);
-            int_to_nat.add_def(&[&int_arg], &int_to_nat_body);
-
-            let nat_arg = Dynamic::new_const(
-                self.fresh_name("builtin_nat_to_int_arg"),
-                self.value_encoder.value_sort(),
-            );
-            let nat_value = SymValue::new(nat_arg.clone());
-            let zero_case =
-                self.value_encoder
-                    .tag_formula(&nat_composite, zero_index, &nat_value)?;
-            let succ_field = self.value_encoder.project_composite_ctor_field(
-                &nat_composite,
-                succ_index,
-                &nat_value,
-                0,
-            )?;
-            let succ_int = nat_to_int
-                .apply(&[succ_field.ast()])
-                .as_int()
-                .ok_or_else(|| "builtin_nat_to_int must return Int".to_owned())?;
-            let nat_to_int_body = zero_case.ite(&Int::from_i64(0), &(Int::from_i64(1) + succ_int));
-            nat_to_int.add_def(&[&nat_arg], &nat_to_int_body);
-
-            Ok(Rc::new(BuiltinNatDecls {
-                nat_to_int,
-                int_to_nat,
-            }))
-        })
-        .map_err(|err: String| self.unsupported_result(span, err))?;
-        self.builtin_nat_decls.replace(Some(decls.clone()));
-        Ok(decls)
-    }
-
-    fn nat_to_int_term(&self, value: &SymValue, span: Span) -> Result<Int, VerificationResult> {
-        if let Some(n) = self.try_concrete_nat_usize(value, span)? {
-            return Ok(Int::from_u64(n));
-        }
-        let decls = self.builtin_nat_decls(span)?;
-        decls
-            .nat_to_int
-            .apply(&[value.ast()])
-            .as_int()
-            .ok_or_else(|| {
-                self.unsupported_result(span, "builtin_nat_to_int must return Int".to_owned())
-            })
-    }
-
-    fn int_to_nat_value(&self, value: &Int, span: Span) -> Result<SymValue, VerificationResult> {
-        let decls = self.builtin_nat_decls(span)?;
-        Ok(SymValue::new(decls.int_to_nat.apply(&[value])))
-    }
-
-    fn nat_spec_ty() -> SpecTy {
-        SpecTy::Enum {
-            name: "Nat".to_owned(),
-            args: vec![],
-        }
-    }
-
-    fn nat_ctor_indices(&self) -> Result<(usize, usize), VerificationResult> {
-        let composite = self.composite_encoding(&Self::nat_spec_ty())?;
-        let zero = composite
-            .constructors
-            .iter()
-            .enumerate()
-            .find(|(_, ctor)| ctor.fields.is_empty())
-            .map(|(index, _)| index)
-            .ok_or_else(|| {
-                self.unsupported_result(self.report_span(), "Nat is missing `Zero`".to_owned())
-            })?;
-        let succ = composite
-            .constructors
-            .iter()
-            .enumerate()
-            .find(|(_, ctor)| ctor.fields.len() == 1)
-            .map(|(index, _)| index)
-            .ok_or_else(|| {
-                self.unsupported_result(self.report_span(), "Nat is missing `Succ`".to_owned())
-            })?;
-        Ok((zero, succ))
-    }
-
-    fn try_concrete_nat_usize(
-        &self,
-        value: &SymValue,
-        span: Span,
-    ) -> Result<Option<u64>, VerificationResult> {
-        let nat_ty = Self::nat_spec_ty();
-        let (zero, succ) = self.nat_ctor_indices()?;
-        match self.ground_ctor_index(&nat_ty, value, span)? {
-            Some(index) if index == zero => Ok(Some(0)),
-            Some(index) if index == succ => {
-                let composite = self.composite_encoding(&nat_ty)?;
-                let tail = self
-                    .value_encoder
-                    .project_composite_ctor_field(&composite, succ, value, 0)
-                    .map_err(|err| self.unsupported_result(span, err))?;
-                Ok(self.try_concrete_nat_usize(&tail, span)?.map(|n| n + 1))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    fn concrete_nat_value(&self, n: u64) -> Result<SymValue, VerificationResult> {
-        let nat_ty = Self::nat_spec_ty();
-        let (zero, succ) = self.nat_ctor_indices()?;
-        let mut value = self.construct_composite_ctor(&nat_ty, zero, &[])?;
-        for _ in 0..n {
-            value = self.construct_composite_ctor(&nat_ty, succ, &[value])?;
-        }
-        Ok(value)
     }
 
     fn spec_ty_for_place_ty(&self, ty: Ty<'tcx>, span: Span) -> Result<SpecTy, VerificationResult> {
@@ -6921,7 +6642,7 @@ impl<'tcx> Verifier<'tcx> {
                 );
             }
         };
-        Ok(self.value_encoder.wrap_int(&int))
+        Ok(self.solver.scalar_int_value(&int))
     }
 
     fn overflow_value_for_result(
@@ -6933,10 +6654,10 @@ impl<'tcx> Verifier<'tcx> {
         let in_range = self
             .int_range_formula_for_int(
                 self.int_bounds_for_rust_ty(ty, span)?,
-                &self.value_int_data(value),
+                &self.solver.int_term(value),
             )
             .unwrap_or_else(|| Bool::from_bool(true));
-        Ok(self.value_encoder.wrap_bool(&bool_not(in_range)))
+        Ok(self.solver.overflow_value_for_in_range(in_range))
     }
 
     fn spec_ty_formula(
@@ -6960,44 +6681,36 @@ impl<'tcx> Verifier<'tcx> {
             | SpecTy::U32
             | SpecTy::U64
             | SpecTy::Usize => Ok(self.int_range_formula_for_int(
-                self.value_encoder
+                self.solver
                     .int_bounds(ty)
                     .map_err(|err| self.unsupported_result(span, err))?,
-                &self.value_int_data(value),
+                &self.solver.int_term(value),
             )),
             SpecTy::Seq(_) => Ok(None),
             SpecTy::Ref(inner) => {
-                let composite = self.composite_encoding(ty)?;
-                let deref = self.decode_composite_field(&composite, value, 0, span)?;
-                let ptr = self.decode_composite_field(&composite, value, 1, span)?;
-                let mut formulas = vec![
-                    self.composite_tag_formula_for_encoding(&composite, value, 0, span)?,
-                    self.reference_ptr_formula(&ptr, span)?,
-                ];
-                if let Some(formula) = self.spec_ty_formula(inner, &deref, span)? {
+                let view = self.composite_ctor_view(ty, value, 0, span)?;
+                let deref = &view.fields[0].1;
+                let ptr = &view.fields[1].1;
+                let mut formulas = vec![view.tag, self.reference_ptr_formula(ptr, span)?];
+                if let Some(formula) = self.spec_ty_formula(inner, deref, span)? {
                     formulas.push(formula);
                 }
                 Ok(Some(bool_and(formulas)))
             }
             SpecTy::Mut(inner) => {
-                let composite = self.composite_encoding(ty)?;
-                let current = self.decode_composite_field(&composite, value, 0, span)?;
-                let ptr = self.decode_composite_field(&composite, value, 2, span)?;
-                let mut formulas = vec![
-                    self.composite_tag_formula_for_encoding(&composite, value, 0, span)?,
-                    self.reference_ptr_formula(&ptr, span)?,
-                ];
-                if let Some(formula) = self.spec_ty_formula(inner, &current, span)? {
+                let view = self.composite_ctor_view(ty, value, 0, span)?;
+                let cur = &view.fields[0].1;
+                let ptr = &view.fields[2].1;
+                let mut formulas = vec![view.tag, self.reference_ptr_formula(ptr, span)?];
+                if let Some(formula) = self.spec_ty_formula(inner, cur, span)? {
                     formulas.push(formula);
                 }
                 Ok(Some(bool_and(formulas)))
             }
             SpecTy::Tuple(items) => {
-                let composite = self.composite_encoding(ty)?;
-                let mut formulas =
-                    vec![self.composite_tag_formula_for_encoding(&composite, value, 0, span)?];
-                for (index, field_ty) in items.iter().enumerate() {
-                    let field = self.decode_composite_field(&composite, value, index, span)?;
+                let view = self.composite_ctor_view(ty, value, 0, span)?;
+                let mut formulas = vec![view.tag];
+                for (field_ty, (_, field)) in items.iter().zip(view.fields) {
                     if let Some(formula) = self.spec_ty_formula(field_ty, &field, span)? {
                         formulas.push(formula);
                     }
@@ -7005,17 +6718,14 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(Some(bool_and(formulas)))
             }
             SpecTy::Struct(struct_ty) => {
-                let composite = self.composite_encoding(ty)?;
                 if let Some(formula) =
-                    self.direct_struct_invariant_formula(&composite, struct_ty, value, span)?
+                    self.direct_struct_invariant_formula(ty, struct_ty, value, span)?
                 {
                     return Ok(Some(formula));
                 }
-                let mut formulas =
-                    vec![self.composite_tag_formula_for_encoding(&composite, value, 0, span)?];
-                for (index, field) in struct_ty.fields.iter().enumerate() {
-                    let field_value =
-                        self.decode_composite_field(&composite, value, index, span)?;
+                let view = self.composite_ctor_view(ty, value, 0, span)?;
+                let mut formulas = vec![view.tag];
+                for (field, (_, field_value)) in struct_ty.fields.iter().zip(view.fields) {
                     if let Some(formula) = self.spec_ty_formula(&field.ty, &field_value, span)? {
                         formulas.push(formula);
                     }
@@ -7029,25 +6739,21 @@ impl<'tcx> Verifier<'tcx> {
 
     fn direct_struct_invariant_formula(
         &self,
-        composite: &CompositeEncoding,
+        ty: &SpecTy,
         struct_ty: &crate::spec::StructTy,
         value: &SymValue,
         span: Span,
     ) -> Result<Option<Bool>, VerificationResult> {
-        let Ok(ctor) = composite.single_constructor() else {
+        let Some(fields) = self
+            .solver
+            .direct_composite_fields_for_ty(ty, value)
+            .map_err(|err| self.unsupported_result(span, err))?
+        else {
             return Ok(None);
         };
-        if value.dynamic().decl().name() != ctor.symbol.name() {
-            return Ok(None);
-        }
-        let children = value.dynamic().children();
-        if children.len() != struct_ty.fields.len() {
-            return Ok(None);
-        }
         let mut formulas = Vec::new();
-        for (field, child) in struct_ty.fields.iter().zip(children) {
-            let child = SymValue::new(child);
-            if let Some(formula) = self.spec_ty_formula(&field.ty, &child, span)? {
+        for (field, field_value) in struct_ty.fields.iter().zip(fields) {
+            if let Some(formula) = self.spec_ty_formula(&field.ty, &field_value, span)? {
                 formulas.push(formula);
             }
         }
@@ -7077,46 +6783,43 @@ impl<'tcx> Verifier<'tcx> {
             | SpecTy::Usize => Ok(Bool::from_bool(true)),
             SpecTy::Seq(_) => Ok(Bool::from_bool(true)),
             SpecTy::Ref(_) => {
-                let composite = self.composite_encoding(ty)?;
-                let ptr = self.decode_composite_field(&composite, value, 1, span)?;
+                let view = self.composite_ctor_view(ty, value, 0, span)?;
+                let ptr = &view.fields[1].1;
                 Ok(bool_and(vec![
-                    self.composite_tag_formula_for_encoding(&composite, value, 0, span)?,
-                    self.reference_ptr_formula(&ptr, span)?,
+                    view.tag,
+                    self.reference_ptr_formula(ptr, span)?,
                 ]))
             }
             SpecTy::Mut(inner) => {
-                let composite = self.composite_encoding(ty)?;
-                let cur = self.decode_composite_field(&composite, value, 0, span)?;
-                let fin = self.decode_composite_field(&composite, value, 1, span)?;
-                let ptr = self.decode_composite_field(&composite, value, 2, span)?;
+                let view = self.composite_ctor_view(ty, value, 0, span)?;
+                let cur = &view.fields[0].1;
+                let fin = &view.fields[1].1;
+                let ptr = &view.fields[2].1;
                 Ok(bool_and(vec![
-                    self.composite_tag_formula_for_encoding(&composite, value, 0, span)?,
-                    self.eq_for_spec_ty(inner, &cur, &fin, span)?,
-                    self.resolve_formula_for_spec_ty(inner, &cur, span)?,
-                    self.resolve_formula_for_spec_ty(inner, &fin, span)?,
-                    self.reference_ptr_formula(&ptr, span)?,
+                    view.tag,
+                    self.solver_result(span, self.solver.eq_for_spec_ty(inner, cur, fin))?,
+                    self.resolve_formula_for_spec_ty(inner, cur, span)?,
+                    self.resolve_formula_for_spec_ty(inner, fin, span)?,
+                    self.reference_ptr_formula(ptr, span)?,
                 ]))
             }
             SpecTy::Tuple(items) => {
-                let composite = self.composite_encoding(ty)?;
+                let view = self.composite_ctor_view(ty, value, 0, span)?;
                 let mut formulas = Vec::with_capacity(items.len() + 1);
-                formulas.push(self.composite_tag_formula_for_encoding(&composite, value, 0, span)?);
-                for (index, field_ty) in items.iter().enumerate() {
-                    let field = self.decode_composite_field(&composite, value, index, span)?;
+                formulas.push(view.tag);
+                for (field_ty, (_, field)) in items.iter().zip(view.fields) {
                     formulas.push(self.resolve_formula_for_spec_ty(field_ty, &field, span)?);
                 }
                 Ok(bool_and(formulas))
             }
             SpecTy::Struct(struct_ty) => {
-                let composite = self.composite_encoding(ty)?;
                 if struct_ty.name == "Ptr" {
-                    return self.composite_tag_formula_for_encoding(&composite, value, 0, span);
+                    return self.composite_tag_formula(ty, value, 0, span);
                 }
+                let view = self.composite_ctor_view(ty, value, 0, span)?;
                 let mut formulas = Vec::with_capacity(struct_ty.fields.len() + 1);
-                formulas.push(self.composite_tag_formula_for_encoding(&composite, value, 0, span)?);
-                for (index, field) in struct_ty.fields.iter().enumerate() {
-                    let field_value =
-                        self.decode_composite_field(&composite, value, index, span)?;
+                formulas.push(view.tag);
+                for (field, (_, field_value)) in struct_ty.fields.iter().zip(view.fields) {
                     formulas.push(self.resolve_formula_for_spec_ty(
                         &field.ty,
                         &field_value,
@@ -7136,25 +6839,15 @@ impl<'tcx> Verifier<'tcx> {
         value: &SymValue,
         span: Span,
     ) -> Result<Bool, VerificationResult> {
-        let composite = self.composite_encoding(ty)?;
-        let decl_name = value.dynamic().decl().name();
-        if let Some((ctor_index, ctor)) = composite
-            .constructors
-            .iter()
-            .enumerate()
-            .find(|(_, ctor)| decl_name == ctor.symbol.name())
+        if let Some(fields) = self
+            .solver
+            .direct_composite_ctor_fields_for_ty(ty, value)
+            .map_err(|err| self.unsupported_result(span, err))?
         {
             let mut formulas =
-                vec![self.composite_tag_formula_for_encoding(&composite, value, ctor_index, span)?];
-            for (field_index, field) in ctor.fields.iter().enumerate() {
-                let field_value = self.decode_composite_ctor_field(
-                    &composite,
-                    ctor_index,
-                    value,
-                    field_index,
-                    span,
-                )?;
-                if let Some(formula) = self.spec_ty_formula(&field.ty, &field_value, span)? {
+                vec![self.composite_tag_formula(ty, value, fields.ctor_index, span)?];
+            for (field_ty, field_value) in fields.fields {
+                if let Some(formula) = self.spec_ty_formula(&field_ty, &field_value, span)? {
                     formulas.push(formula);
                 }
             }
@@ -7169,54 +6862,58 @@ impl<'tcx> Verifier<'tcx> {
         value: &SymValue,
         span: Span,
     ) -> Result<Bool, VerificationResult> {
-        with_solver(|solver| {
-            let invariant = self
-                .value_encoder
-                .named_invariant(ty, solver)?
-                .ok_or_else(|| format!("missing named invariant for {ty:?}"))?;
-            Ok(invariant
-                .apply(&[value.ast()])
-                .as_bool()
-                .expect("named invariant predicate"))
-        })
-        .map_err(|err: String| self.unsupported_result(span, err))
+        self.solver
+            .named_invariant_formula(ty, value)
+            .map_err(|err: String| self.unsupported_result(span, err))
     }
 
     fn decode_composite_field(
         &self,
-        encoding: &CompositeEncoding,
+        ty: &SpecTy,
         value: &SymValue,
         index: usize,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        self.value_encoder
-            .project_composite_field(encoding, value, index)
-            .map_err(|err| self.unsupported_result(span, err))
+        self.solver_result(span, self.solver.project_field(ty, value, index))
     }
 
     fn decode_composite_ctor_field(
         &self,
-        encoding: &CompositeEncoding,
+        ty: &SpecTy,
         ctor_index: usize,
         value: &SymValue,
         index: usize,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        self.value_encoder
-            .project_composite_ctor_field(encoding, ctor_index, value, index)
-            .map_err(|err| self.unsupported_result(span, err))
+        self.solver_result(
+            span,
+            self.solver
+                .project_composite_ctor_field_for_ty(ty, ctor_index, value, index),
+        )
     }
 
-    fn composite_tag_formula_for_encoding(
+    fn composite_ctor_view(
         &self,
-        encoding: &CompositeEncoding,
+        ty: &SpecTy,
+        value: &SymValue,
+        ctor_index: usize,
+        span: Span,
+    ) -> Result<CompositeCtorView, VerificationResult> {
+        self.solver_result(
+            span,
+            self.solver
+                .composite_ctor_view_for_ty(ty, ctor_index, value),
+        )
+    }
+
+    fn composite_tag_formula(
+        &self,
+        ty: &SpecTy,
         value: &SymValue,
         ctor_index: usize,
         span: Span,
     ) -> Result<Bool, VerificationResult> {
-        self.value_encoder
-            .tag_formula(encoding, ctor_index, value)
-            .map_err(|err| self.unsupported_result(span, err))
+        self.solver_result(span, self.solver.tag_formula_for_ty(ty, ctor_index, value))
     }
 
     fn require_type_invariant(
@@ -7232,7 +6929,15 @@ impl<'tcx> Verifier<'tcx> {
         let Some(formula) = self.spec_ty_formula(&spec_ty, value, span)? else {
             return Ok(());
         };
-        self.assert_constraint(state, formula, span, span_text(self.tcx, span), message)
+        self.assert_constraint(
+            state,
+            formula,
+            AssertionFailure {
+                span,
+                diagnostic_span: span_text(self.tcx, span),
+                message,
+            },
+        )
     }
 
     fn require_int_invariant(
@@ -7249,9 +6954,11 @@ impl<'tcx> Verifier<'tcx> {
         self.assert_constraint(
             state,
             bool_and(vec![value.ge(lower), value.le(upper)]),
-            span,
-            span_text(self.tcx, span),
-            message,
+            AssertionFailure {
+                span,
+                diagnostic_span: span_text(self.tcx, span),
+                message,
+            },
         )
     }
 
@@ -7458,9 +7165,9 @@ fn collect_directive_prepass_pure_fn_refs(
 ) {
     if let Some(contract) = &prepass.function_contract {
         collect_normalized_predicate_pure_fn_refs(&contract.req, out);
-        for raw_req in &contract.raw_reqs {
-            collect_typed_raw_pattern_pure_fn_refs(&raw_req.pattern, out);
-            collect_typed_expr_pure_fn_refs(&raw_req.condition, out);
+        for resource_req in &contract.raw_reqs {
+            collect_typed_raw_pattern_pure_fn_refs(&resource_req.pattern, out);
+            collect_typed_expr_pure_fn_refs(&resource_req.condition, out);
         }
         collect_typed_expr_pure_fn_refs(&contract.ens, out);
         for raw_ens in &contract.raw_ens {
@@ -7506,9 +7213,9 @@ fn collect_directive_prepass_pure_fn_refs(
             continue;
         };
         collect_normalized_predicate_pure_fn_refs(&lemma.req, out);
-        for raw_req in &lemma.raw_reqs {
-            collect_typed_raw_pattern_pure_fn_refs(&raw_req.pattern, out);
-            collect_typed_expr_pure_fn_refs(&raw_req.condition, out);
+        for resource_req in &lemma.raw_reqs {
+            collect_typed_raw_pattern_pure_fn_refs(&resource_req.pattern, out);
+            collect_typed_expr_pure_fn_refs(&resource_req.condition, out);
         }
         collect_typed_expr_pure_fn_refs(&lemma.ens, out);
         for raw_ens in &lemma.raw_ens {
@@ -7618,59 +7325,6 @@ fn collect_typed_expr_pure_fn_refs(expr: &TypedExpr, out: &mut BTreeSet<String>)
     }
 }
 
-fn init_z3() {
-    Z3_INIT.call_once(|| {
-        z3::set_global_param("model", "true");
-        z3::set_global_param("smt.auto_config", "false");
-        z3::set_global_param("smt.mbqi", "false");
-    });
-}
-
-fn build_solver() -> Solver {
-    init_z3();
-    let solver = Solver::new();
-    let mut params = z3::Params::new();
-    params.set_u32("timeout", SOLVER_TIMEOUT_MS);
-    solver.set_params(&params);
-    solver
-}
-
-fn rebuild_solver() {
-    GLOBAL_SOLVER.with(|solver| {
-        *solver.borrow_mut() = build_solver();
-    });
-}
-
-fn reset_solver() {
-    with_solver(|solver| {
-        solver.reset();
-    });
-}
-
-fn with_solver<T>(f: impl FnOnce(&Solver) -> T) -> T {
-    GLOBAL_SOLVER.with(|solver| f(&solver.borrow()))
-}
-
-fn with_z3_deadline<T>(budget: Duration, f: impl FnOnce() -> T) -> (T, bool) {
-    let ctx = Context::thread_local();
-    let handle = ctx.handle();
-    let (done_tx, done_rx) = mpsc::channel::<()>();
-    thread::scope(|scope| {
-        let watchdog = scope.spawn(move || {
-            if done_rx.recv_timeout(budget).is_err() {
-                handle.interrupt();
-                true
-            } else {
-                false
-            }
-        });
-        let result = f();
-        let _ = done_tx.send(());
-        let timed_out = watchdog.join().expect("watchdog thread");
-        (result, timed_out)
-    })
-}
-
 fn bool_and(exprs: Vec<Bool>) -> Bool {
     match exprs.len() {
         0 => Bool::from_bool(true),
@@ -7732,64 +7386,12 @@ fn span_text(tcx: TyCtxt<'_>, span: Span) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_needed_pure_fns, rebuild_solver, with_solver};
+    use super::collect_needed_pure_fns;
     use crate::prepass::{
         AssertionContract, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
         FunctionContract, LoopContracts, NormalizedPredicate, ResolvedExprEnv, TypedPureFnDef,
     };
     use crate::spec::{SpecTy, TypedExpr, TypedExprKind};
-    use z3::ast::Int;
-    use z3::{Config, SatResult};
-
-    #[test]
-    fn thread_local_solver_distinguishes_sat_from_unsat() {
-        rebuild_solver();
-        let x = Int::new_const("x");
-        let sat = with_solver(|solver| {
-            solver.push();
-            solver.assert(x.eq(1));
-            let result = solver.check();
-            solver.pop(1);
-            result
-        });
-        assert_eq!(sat, SatResult::Sat);
-
-        let unsat = with_solver(|solver| {
-            solver.push();
-            solver.assert(x.eq(1));
-            solver.assert(x.eq(2));
-            let result = solver.check();
-            solver.pop(1);
-            result
-        });
-        assert_eq!(unsat, SatResult::Unsat);
-    }
-
-    #[test]
-    fn with_z3_config_solver_distinguishes_sat_from_unsat() {
-        let result = z3::with_z3_config(&Config::new(), || {
-            rebuild_solver();
-            let x = Int::new_const("x");
-            let sat = with_solver(|solver| {
-                solver.push();
-                solver.assert(x.eq(1));
-                let result = solver.check();
-                solver.pop(1);
-                result
-            });
-            let unsat = with_solver(|solver| {
-                solver.push();
-                solver.assert(x.eq(1));
-                solver.assert(x.eq(2));
-                let result = solver.check();
-                solver.pop(1);
-                result
-            });
-            (sat, unsat)
-        });
-        assert_eq!(result.0, SatResult::Sat);
-        assert_eq!(result.1, SatResult::Unsat);
-    }
 
     #[test]
     fn collect_needed_pure_fns_depends_only_on_live_prepass_output() {
