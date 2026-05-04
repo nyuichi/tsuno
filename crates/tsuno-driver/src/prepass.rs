@@ -5,7 +5,7 @@ use std::ops::ControlFlow;
 
 use crate::directive::{
     CollectedFunctionDirectives, DirectiveAttach, DirectiveError, DirectiveKind, FunctionDirective,
-    collect_function_directives, collect_ghost_blocks,
+    collect_function_directives, collect_ghost_blocks, collect_non_ghost_spec_comments,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
@@ -14,7 +14,9 @@ use crate::spec::{
     TypedExprKind, TypedMatchArm, TypedMatchBinding, ValuePattern, option_spec_ty, ptr_spec_ty,
 };
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::{BlockCheckMode, Expr as HirExpr, ExprKind, HirId, Pat, PatKind, UnsafeSource};
+use rustc_hir::{
+    BlockCheckMode, Expr as HirExpr, ExprKind, HirId, ItemKind, Pat, PatKind, UnsafeSource,
+};
 use rustc_middle::mir::{BasicBlock, Body, Local, PlaceElem, StatementKind, TerminatorKind};
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::def_id::LocalDefId;
@@ -377,6 +379,7 @@ fn compute_raw_global_ghost_prepass<'tcx>(
     tcx: TyCtxt<'tcx>,
     anchor_span: Span,
 ) -> Result<RawGlobalGhostPrepass, LoopPrepassError> {
+    validate_global_spec_comment_positions(tcx)?;
     let sources = collect_global_ghost_sources(tcx, anchor_span);
 
     let mut enum_defs = Vec::new();
@@ -458,6 +461,45 @@ fn compute_raw_global_ghost_prepass<'tcx>(
         pure_fn_order,
         lemma_order,
     })
+}
+
+fn validate_global_spec_comment_positions<'tcx>(tcx: TyCtxt<'tcx>) -> Result<(), LoopPrepassError> {
+    let mut files: HashMap<_, (String, Vec<(usize, usize)>)> = HashMap::new();
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
+        let loc = tcx.sess.source_map().lookup_char_pos(item.span.lo());
+        let Some(source) = loc.file.src.as_deref() else {
+            continue;
+        };
+        let entry = files
+            .entry(loc.file.start_pos)
+            .or_insert_with(|| (source.to_owned(), Vec::new()));
+        if matches!(item.kind, ItemKind::Fn { .. }) {
+            let start = item.span.lo().0.saturating_sub(loc.file.start_pos.0) as usize;
+            let end = item.span.hi().0.saturating_sub(loc.file.start_pos.0) as usize;
+            entry.1.push((start, end));
+        }
+    }
+
+    for (source, function_ranges) in files.into_values() {
+        for comment in collect_non_ghost_spec_comments(&source) {
+            let in_function = function_ranges
+                .iter()
+                .any(|(start, end)| *start <= comment.start_offset && comment.start_offset < *end);
+            if !in_function {
+                return Err(LoopPrepassError {
+                    span: DUMMY_SP,
+                    display_span: None,
+                    message: format!(
+                        "spec comment is not attached to a function contract, ghost item, ghost command, or loop invariant: {}",
+                        comment.line_text
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn type_global_ghost_prepass(

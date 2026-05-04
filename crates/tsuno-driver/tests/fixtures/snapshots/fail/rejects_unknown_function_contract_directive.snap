@@ -1,0 +1,11 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+expression: snapshot_output(output)
+---
+status: Some(1)
+stdout:
+UNSUPPORTED rejects_unknown_function_contract_directive
+  unknown function contract directive `unknown true`
+  src/main.rs:1:1: 4:2
+
+stderr:

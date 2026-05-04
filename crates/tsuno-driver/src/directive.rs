@@ -730,7 +730,7 @@ fn contract_directive_entries(
     comments: &[SpecCommentLine],
     span: Span,
 ) -> Result<Vec<DirectiveText>, DirectiveError> {
-    let logical = logical_directive_texts(comments, contract_comment_kind);
+    let logical = contract_directive_texts(comments, span)?;
     let mut entries = Vec::new();
     for directive in logical {
         entries.extend(split_directive_text(
@@ -738,6 +738,38 @@ fn contract_directive_entries(
             contract_comment_kind,
             span,
         )?);
+    }
+    Ok(entries)
+}
+
+fn contract_directive_texts(
+    comments: &[SpecCommentLine],
+    span: Span,
+) -> Result<Vec<DirectiveText>, DirectiveError> {
+    let mut entries: Vec<DirectiveText> = Vec::new();
+    for comment in comments {
+        if let Some(kind) = contract_comment_kind(&comment.text) {
+            let text = comment.text[kind.keyword().len()..].trim().to_owned();
+            entries.push(DirectiveText {
+                kind,
+                text,
+                line_no: comment.line_no,
+                line_text: comment.line_text.clone(),
+                start_offset: comment.start_offset,
+            });
+        } else if let Some(last) = entries.last_mut() {
+            if !last.text.is_empty() {
+                last.text.push(' ');
+            }
+            last.text.push_str(comment.text.trim());
+            last.line_text.push(' ');
+            last.line_text.push_str(comment.line_text.trim());
+        } else {
+            return Err(DirectiveError {
+                span,
+                message: format!("unknown function contract directive `{}`", comment.text),
+            });
+        }
     }
     Ok(entries)
 }
@@ -1410,7 +1442,7 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 #[derive(Debug, Clone)]
-struct SpecComment {
+pub(crate) struct SpecComment {
     pub text: String,
     pub line_no: usize,
     pub line_text: String,
@@ -1551,6 +1583,10 @@ fn collect_spec_comment_blocks(source: &str) -> SpecCommentBlocks {
         directive_comments,
         ghost_blocks,
     }
+}
+
+pub(crate) fn collect_non_ghost_spec_comments(source: &str) -> Vec<SpecComment> {
+    collect_spec_comment_blocks(source).directive_comments
 }
 
 pub fn collect_ghost_blocks(source: &str) -> Result<Vec<GhostBlock>, ParseError> {
