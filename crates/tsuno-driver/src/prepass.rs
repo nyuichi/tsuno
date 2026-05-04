@@ -658,6 +658,7 @@ fn typed_expr_contains_bind(expr: &TypedExpr) -> bool {
         }
         TypedExprKind::Field { base, .. }
         | TypedExprKind::TupleField { base, .. }
+        | TypedExprKind::VariantSelector { base, .. }
         | TypedExprKind::Unary { arg: base, .. } => typed_expr_contains_bind(base),
         TypedExprKind::Index { base, index } => {
             typed_expr_contains_bind(base) || typed_expr_contains_bind(index)
@@ -1469,6 +1470,16 @@ fn validate_enum_defs(
                     display_span: None,
                     message: format!(
                         "enum `{}` defines duplicate constructor `{}`",
+                        enum_def.name, ctor.name
+                    ),
+                });
+            }
+            if ctor.field_names.len() != ctor.fields.len() {
+                return Err(LoopPrepassError {
+                    span,
+                    display_span: None,
+                    message: format!(
+                        "enum `{}` constructor `{}` has mismatched field metadata",
                         enum_def.name, ctor.name
                     ),
                 });
@@ -2609,6 +2620,18 @@ fn infer_common_expr_types_with_expected(
         Expr::TupleField { base, .. } => Ok(Some(infer_tuple_field_expr_type(infer_expr(
             base, None, inferred,
         )?)?)),
+        Expr::VariantSelector {
+            base,
+            enum_name,
+            ctor_name,
+            type_args,
+        } => Ok(Some(infer_variant_selector_ty(
+            infer_expr(base, None, inferred)?,
+            enum_name,
+            ctor_name,
+            type_args,
+            call_ctx.enum_defs,
+        )?)),
         Expr::Index { base, index } => Ok(Some(infer_seq_index_expr_types(
             base,
             index,
@@ -3321,6 +3344,27 @@ fn typed_contract_expr_with_expected(
             )?;
             type_tuple_field_expr(base, *index)
         }
+        Expr::VariantSelector {
+            base,
+            enum_name,
+            ctor_name,
+            type_args,
+        } => {
+            let base = typed_contract_expr_with_expected(
+                base,
+                pure_fns,
+                enum_defs,
+                type_param_scope,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+                allow_bare_names,
+                None,
+            )?;
+            type_variant_selector(base, enum_name, ctor_name, type_args, enum_defs)
+        }
         Expr::Index { base, index } => type_seq_index_expr(base, index, &mut |expr, expected| {
             typed_contract_expr_with_expected(
                 expr,
@@ -3657,6 +3701,26 @@ fn typed_body_expr_with_expected(
                 None,
             )?;
             type_tuple_field_expr(base, *index)
+        }
+        Expr::VariantSelector {
+            base,
+            enum_name,
+            ctor_name,
+            type_args,
+        } => {
+            let base = typed_body_expr_with_expected(
+                expr_base(base),
+                pure_fns,
+                enum_defs,
+                type_param_scope,
+                kind,
+                spec_scope,
+                local_tys,
+                inferred,
+                allow_bare_names,
+                None,
+            )?;
+            type_variant_selector(base, enum_name, ctor_name, type_args, enum_defs)
         }
         Expr::Index { base, index } => type_seq_index_expr(base, index, &mut |expr, expected| {
             typed_body_expr_with_expected(
@@ -4000,6 +4064,140 @@ fn type_tuple_field_expr(base: TypedExpr, index: usize) -> Result<TypedExpr, Str
             index,
         },
     })
+}
+
+fn infer_variant_selector_ty(
+    base_ty: InferredExprTy,
+    enum_name: &str,
+    ctor_name: &str,
+    type_args: &[SpecTy],
+    enum_defs: &HashMap<String, EnumDef>,
+) -> Result<InferredExprTy, String> {
+    let InferredExprTy::Known(base_ty) = base_ty else {
+        return Ok(InferredExprTy::Unknown);
+    };
+    let SpecTy::Enum {
+        name: base_enum_name,
+        args,
+    } = base_ty
+    else {
+        return Err(format!(
+            "variant selector requires an enum, found `{}`",
+            display_spec_ty(&base_ty)
+        ));
+    };
+    if base_enum_name != enum_name {
+        return Err(format!(
+            "variant selector `{enum_name}::{ctor_name}` does not match enum `{base_enum_name}`"
+        ));
+    }
+    let enum_def = enum_defs
+        .get(enum_name)
+        .ok_or_else(|| format!("unknown spec enum `{enum_name}`"))?;
+    variant_selector_payload_ty(enum_def, ctor_name, type_args, &args, enum_defs)
+        .map(InferredExprTy::Known)
+}
+
+fn type_variant_selector(
+    base: TypedExpr,
+    enum_name: &str,
+    ctor_name: &str,
+    type_args: &[SpecTy],
+    enum_defs: &HashMap<String, EnumDef>,
+) -> Result<TypedExpr, String> {
+    let SpecTy::Enum {
+        name: base_enum_name,
+        args,
+    } = &base.ty
+    else {
+        return Err(format!(
+            "variant selector requires an enum, found `{}`",
+            display_spec_ty(&base.ty)
+        ));
+    };
+    if base_enum_name != enum_name {
+        return Err(format!(
+            "variant selector `{enum_name}::{ctor_name}` does not match enum `{base_enum_name}`"
+        ));
+    }
+    let enum_def = enum_defs
+        .get(enum_name)
+        .ok_or_else(|| format!("unknown spec enum `{enum_name}`"))?;
+    let (ctor_index, ty) =
+        variant_selector_payload(enum_def, ctor_name, type_args, args, enum_defs)?;
+    Ok(TypedExpr {
+        ty,
+        kind: TypedExprKind::VariantSelector {
+            base: Box::new(base),
+            enum_name: enum_name.to_owned(),
+            ctor_name: ctor_name.to_owned(),
+            ctor_index,
+        },
+    })
+}
+
+fn variant_selector_payload_ty(
+    enum_def: &EnumDef,
+    ctor_name: &str,
+    type_args: &[SpecTy],
+    inferred_args: &[SpecTy],
+    enum_defs: &HashMap<String, EnumDef>,
+) -> Result<SpecTy, String> {
+    variant_selector_payload(enum_def, ctor_name, type_args, inferred_args, enum_defs)
+        .map(|(_, ty)| ty)
+}
+
+fn variant_selector_payload(
+    enum_def: &EnumDef,
+    ctor_name: &str,
+    type_args: &[SpecTy],
+    inferred_args: &[SpecTy],
+    enum_defs: &HashMap<String, EnumDef>,
+) -> Result<(usize, SpecTy), String> {
+    let (ctor_index, ctor) = enum_def.ctor(ctor_name).ok_or_else(|| {
+        format!(
+            "enum `{}` does not define constructor `{ctor_name}`",
+            enum_def.name
+        )
+    })?;
+    let func = format!("{}::{ctor_name}", enum_def.name);
+    let mut bindings = explicit_enum_type_bindings(&func, enum_def, type_args, enum_defs)?;
+    let base_ty = SpecTy::Enum {
+        name: enum_def.name.clone(),
+        args: inferred_args.to_vec(),
+    };
+    let _ = seed_enum_type_param_bindings(enum_def, &base_ty, &mut bindings)?;
+    let fields = ctor
+        .fields
+        .iter()
+        .map(|field_ty| {
+            try_instantiate_spec_ty(field_ty, &bindings).ok_or_else(|| {
+                format!(
+                    "could not instantiate field type for constructor `{}`",
+                    ctor.name
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !ctor.field_names.is_empty() && ctor.field_names.iter().all(Option::is_some) {
+        Ok((
+            ctor_index,
+            SpecTy::Struct(StructTy {
+                name: format!("{}::{}", enum_def.name, ctor.name),
+                fields: ctor
+                    .field_names
+                    .iter()
+                    .zip(fields)
+                    .map(|(name, ty)| StructFieldTy {
+                        name: name.clone().expect("checked named variant field"),
+                        ty,
+                    })
+                    .collect(),
+            }),
+        ))
+    } else {
+        Ok((ctor_index, SpecTy::Tuple(fields)))
+    }
 }
 
 fn compute_directives<'tcx>(
@@ -6942,6 +7140,7 @@ fn typed_expr_calls_pure_fn(expr: &TypedExpr, name: &str) -> bool {
         }
         TypedExprKind::Field { base, .. }
         | TypedExprKind::TupleField { base, .. }
+        | TypedExprKind::VariantSelector { base, .. }
         | TypedExprKind::Unary { arg: base, .. } => typed_expr_calls_pure_fn(base, name),
         TypedExprKind::Index { base, index } => {
             typed_expr_calls_pure_fn(base, name) || typed_expr_calls_pure_fn(index, name)
@@ -7037,6 +7236,7 @@ fn validate_recursive_pure_expr(
         }
         TypedExprKind::Field { base, .. }
         | TypedExprKind::TupleField { base, .. }
+        | TypedExprKind::VariantSelector { base, .. }
         | TypedExprKind::Unary { arg: base, .. } => {
             validate_recursive_pure_expr(base, ctx, allowed_recursive_vars)
         }
@@ -8652,16 +8852,17 @@ fn validate_contract_expr_core(
             }
             Ok(())
         }
-        Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Deref { base } => {
-            validate_contract_expr_core(
-                base,
-                call_ctx,
-                spec_scope,
-                params,
-                allow_result,
-                allow_bare_names,
-            )
-        }
+        Expr::Field { base, .. }
+        | Expr::TupleField { base, .. }
+        | Expr::Deref { base }
+        | Expr::VariantSelector { base, .. } => validate_contract_expr_core(
+            base,
+            call_ctx,
+            spec_scope,
+            params,
+            allow_result,
+            allow_bare_names,
+        ),
         Expr::Index { base, index } => {
             validate_contract_expr_core(
                 base,
@@ -8881,9 +9082,10 @@ fn resolve_expr_env_into(
             }
             Ok(())
         }
-        Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Deref { base } => {
-            resolve_expr_env_into(base, ctx, resolved)
-        }
+        Expr::Field { base, .. }
+        | Expr::TupleField { base, .. }
+        | Expr::Deref { base }
+        | Expr::VariantSelector { base, .. } => resolve_expr_env_into(base, ctx, resolved),
         Expr::Index { base, index } => {
             resolve_expr_env_into(base, ctx, resolved)?;
             resolve_expr_env_into(index, ctx, resolved)
@@ -9444,6 +9646,7 @@ mod tests {
                     EnumCtorDef {
                         name: "Nil".to_owned(),
                         fields: vec![],
+                        field_names: vec![],
                     },
                     EnumCtorDef {
                         name: "Cons".to_owned(),
@@ -9454,6 +9657,7 @@ mod tests {
                                 args: vec![SpecTy::TypeParam("T".to_owned())],
                             },
                         ],
+                        field_names: vec![Some("head".to_owned()), Some("tail".to_owned())],
                     },
                 ],
             },
@@ -9504,6 +9708,66 @@ mod tests {
                 ..
             } if enum_name == "List" && ctor_name == "Cons"
         ));
+    }
+
+    #[test]
+    fn types_struct_variant_selector_with_inferred_type_args() {
+        let enum_defs = HashMap::from([(
+            "List".to_owned(),
+            EnumDef {
+                name: "List".to_owned(),
+                type_params: vec!["T".to_owned()],
+                ctors: vec![
+                    EnumCtorDef {
+                        name: "Nil".to_owned(),
+                        fields: vec![],
+                        field_names: vec![],
+                    },
+                    EnumCtorDef {
+                        name: "Cons".to_owned(),
+                        fields: vec![
+                            SpecTy::TypeParam("T".to_owned()),
+                            SpecTy::Enum {
+                                name: "List".to_owned(),
+                                args: vec![SpecTy::TypeParam("T".to_owned())],
+                            },
+                        ],
+                        field_names: vec![Some("head".to_owned()), Some("tail".to_owned())],
+                    },
+                ],
+            },
+        )]);
+        let params = HashMap::from([(
+            "xs".to_owned(),
+            SpecTy::Enum {
+                name: "List".to_owned(),
+                args: vec![SpecTy::I32],
+            },
+        )]);
+        let expr = Expr::Field {
+            base: Box::new(Expr::VariantSelector {
+                base: Box::new(Expr::Var("xs".to_owned())),
+                enum_name: "List".to_owned(),
+                ctor_name: "Cons".to_owned(),
+                type_args: vec![],
+            }),
+            name: "head".to_owned(),
+        };
+
+        let typed = typed_contract_expr_in_scope(
+            &expr,
+            &HashMap::new(),
+            &enum_defs,
+            &HashSet::new(),
+            &mut SpecScope::default(),
+            &params,
+            false,
+            &SpecTy::Bool,
+            &mut SpecTypeInference::default(),
+        )
+        .expect("typed selector field");
+
+        assert_eq!(typed.ty, SpecTy::I32);
     }
 
     #[test]

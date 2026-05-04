@@ -384,6 +384,38 @@ struct Mut<T> {
 }
 ```
 
+Enum variant selectors use `expr as Enum::Ctor` or
+`expr as Enum::Ctor::<T, ...>`. The selector projects the payload of the named
+variant without adding a runtime check or a tag assumption. If `expr` is not
+that variant, the selected payload is unspecified, matching SMT datatype
+selector semantics. Use `match` for ordinary safe destructuring.
+
+Tuple-like variants expose tuple fields:
+
+```rust
+enum Maybe<T> {
+    None,
+    Some(T),
+}
+
+//@ assert (Maybe::<i32>::Some({x}) as Maybe::Some::<i32>).0 == {x};
+```
+
+Struct-like variants expose their declared field names:
+
+```rust
+enum List<T> {
+    Nil,
+    Cons { head: T, tail: List<T> },
+}
+
+//@ assert (xs as List::Cons::<T>).head == h;
+```
+
+The enum name is required in selectors. `xs as Cons` is not valid. When explicit
+type arguments are omitted, they are inferred from the selected expression's
+enum type.
+
 `RustTy` is a builtin spec type used to represent Rust types as spec values.
 Each Rust type has a corresponding `RustTy` value, produced with `{type ...}`.
 For example, `{type i32}` denotes the model value for Rust `i32`, and `{type T}`

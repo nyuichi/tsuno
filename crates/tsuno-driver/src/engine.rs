@@ -5052,6 +5052,12 @@ impl<'tcx> Verifier<'tcx> {
                 let value = self.spec_expr_to_value(state, base, resolved)?;
                 self.project_field(value, &base.ty, *index, self.control_span(state.ctrl))
             }
+            TypedExprKind::VariantSelector {
+                base, ctor_index, ..
+            } => {
+                let value = self.spec_expr_to_value(state, base, resolved)?;
+                self.variant_selector_to_value(value, &base.ty, *ctor_index, &expr.ty)
+            }
             TypedExprKind::Index { base, index } => {
                 let value = self.spec_expr_to_value(state, base, resolved)?;
                 let index_value = self.spec_expr_to_value(state, index, resolved)?;
@@ -5204,6 +5210,12 @@ impl<'tcx> Verifier<'tcx> {
             TypedExprKind::TupleField { base, index } => {
                 let value = self.contract_expr_to_value(current, spec, base)?;
                 self.project_field(value, &base.ty, *index, self.report_span())
+            }
+            TypedExprKind::VariantSelector {
+                base, ctor_index, ..
+            } => {
+                let value = self.contract_expr_to_value(current, spec, base)?;
+                self.variant_selector_to_value(value, &base.ty, *ctor_index, &expr.ty)
             }
             TypedExprKind::Index { base, index } => {
                 let value = self.contract_expr_to_value(current, spec, base)?;
@@ -5461,6 +5473,14 @@ impl<'tcx> Verifier<'tcx> {
                     return Ok(None);
                 };
                 Some(self.project_field(value, &base.ty, *index, span)?)
+            }
+            TypedExprKind::VariantSelector {
+                base, ctor_index, ..
+            } => {
+                let Some(value) = self.try_eval_ground_pure_expr(base, env, span)? else {
+                    return Ok(None);
+                };
+                Some(self.variant_selector_to_value(value, &base.ty, *ctor_index, &expr.ty)?)
             }
             TypedExprKind::Index { base, index } => {
                 let Some(value) = self.try_eval_ground_pure_expr(base, env, span)? else {
@@ -6393,6 +6413,36 @@ impl<'tcx> Verifier<'tcx> {
         self.solver_result(span, self.solver.project_field(parent_ty, &value, index))
     }
 
+    fn variant_selector_to_value(
+        &self,
+        value: SymValue,
+        enum_ty: &SpecTy,
+        ctor_index: usize,
+        payload_ty: &SpecTy,
+    ) -> Result<SymValue, VerificationResult> {
+        let field_len = match payload_ty {
+            SpecTy::Tuple(items) => items.len(),
+            SpecTy::Struct(struct_ty) => struct_ty.fields.len(),
+            _ => {
+                return Err(self.unsupported_result(
+                    self.report_span(),
+                    format!("variant selector produced non-composite payload `{payload_ty:?}`"),
+                ));
+            }
+        };
+        let mut fields = Vec::with_capacity(field_len);
+        for index in 0..field_len {
+            fields.push(self.decode_composite_ctor_field(
+                enum_ty,
+                ctor_index,
+                &value,
+                index,
+                self.report_span(),
+            )?);
+        }
+        self.construct_composite(payload_ty, &fields)
+    }
+
     fn ref_deref(
         &self,
         value: &SymValue,
@@ -7313,6 +7363,7 @@ fn collect_typed_expr_pure_fn_refs(expr: &TypedExpr, out: &mut BTreeSet<String>)
         }
         TypedExprKind::Field { base, .. }
         | TypedExprKind::TupleField { base, .. }
+        | TypedExprKind::VariantSelector { base, .. }
         | TypedExprKind::Unary { arg: base, .. } => collect_typed_expr_pure_fn_refs(base, out),
         TypedExprKind::Index { base, index } => {
             collect_typed_expr_pure_fn_refs(base, out);
