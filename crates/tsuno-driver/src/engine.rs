@@ -2993,28 +2993,17 @@ impl<'tcx> Verifier<'tcx> {
                 ctor_index,
                 args,
             } => {
-                let encoding = self.composite_encoding(ty)?;
                 let mut values = Vec::with_capacity(args.len());
                 let mut conditions = Vec::with_capacity(args.len() + 1);
                 for (index, arg) in args.iter().enumerate() {
-                    let arg_value = self.decode_composite_ctor_field(
-                        &encoding,
-                        *ctor_index,
-                        actual,
-                        index,
-                        span,
-                    )?;
+                    let arg_value =
+                        self.decode_composite_ctor_field(ty, *ctor_index, actual, index, span)?;
                     conditions.push(
                         self.match_value_pattern(view, arg, &arg_value, resolution, span, env)?,
                     );
                     values.push(arg_value);
                 }
-                conditions.push(self.composite_tag_formula_for_encoding(
-                    &encoding,
-                    actual,
-                    *ctor_index,
-                    span,
-                )?);
+                conditions.push(self.composite_tag_formula(ty, actual, *ctor_index, span)?);
                 let expected = self.construct_composite_ctor(ty, *ctor_index, &values)?;
                 conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
                 Ok(bool_and(conditions))
@@ -3092,17 +3081,11 @@ impl<'tcx> Verifier<'tcx> {
                 ctor_index,
                 args,
             } => {
-                let encoding = self.composite_encoding(ty)?;
                 let mut values = Vec::with_capacity(args.len());
                 let mut conditions = Vec::with_capacity(args.len() + 1);
                 for (index, arg) in args.iter().enumerate() {
-                    let arg_value = self.decode_composite_ctor_field(
-                        &encoding,
-                        *ctor_index,
-                        actual,
-                        index,
-                        span,
-                    )?;
+                    let arg_value =
+                        self.decode_composite_ctor_field(ty, *ctor_index, actual, index, span)?;
                     conditions.push(
                         self.match_contract_value_pattern(
                             current, spec, arg, &arg_value, span, env,
@@ -3110,12 +3093,7 @@ impl<'tcx> Verifier<'tcx> {
                     );
                     values.push(arg_value);
                 }
-                conditions.push(self.composite_tag_formula_for_encoding(
-                    &encoding,
-                    actual,
-                    *ctor_index,
-                    span,
-                )?);
+                conditions.push(self.composite_tag_formula(ty, actual, *ctor_index, span)?);
                 let expected = self.construct_composite_ctor(ty, *ctor_index, &values)?;
                 conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
                 Ok(bool_and(conditions))
@@ -3834,13 +3812,12 @@ impl<'tcx> Verifier<'tcx> {
         rest: &[TypedGhostStmt],
     ) -> Result<Vec<LemmaExecState>, VerificationResult> {
         let scrutinee_value = self.contract_expr_to_value(current, &state.env, scrutinee)?;
-        let composite = self.composite_encoding(&scrutinee.ty)?;
         let mut guard_formulas = Vec::with_capacity(arms.len());
         let mut final_states = Vec::new();
         for arm in arms {
             let mut branch_state = state.clone();
-            let guard = self.composite_tag_formula_for_encoding(
-                &composite,
+            let guard = self.composite_tag_formula(
+                &scrutinee.ty,
                 &scrutinee_value,
                 arm.ctor_index,
                 self.report_span(),
@@ -3852,15 +3829,13 @@ impl<'tcx> Verifier<'tcx> {
             let mut branch_current = current.clone();
             let mut field_values = Vec::with_capacity(arm.bindings.len());
             for (field_index, binding) in arm.bindings.iter().enumerate() {
-                let field_value = self
-                    .value_encoder
-                    .project_composite_ctor_field(
-                        &composite,
-                        arm.ctor_index,
-                        &scrutinee_value,
-                        field_index,
-                    )
-                    .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+                let field_value = self.decode_composite_ctor_field(
+                    &scrutinee.ty,
+                    arm.ctor_index,
+                    &scrutinee_value,
+                    field_index,
+                    self.report_span(),
+                )?;
                 if let TypedMatchBinding::Var { name, .. } = binding {
                     branch_current.insert(name.clone(), field_value.clone());
                 }
@@ -3922,13 +3897,12 @@ impl<'tcx> Verifier<'tcx> {
         rest: &[TypedGhostStmt],
     ) -> Result<Vec<UnsafeLemmaExecState>, VerificationResult> {
         let scrutinee_value = self.contract_expr_to_value(current, &state.env, scrutinee)?;
-        let composite = self.composite_encoding(&scrutinee.ty)?;
         let mut guard_formulas = Vec::with_capacity(arms.len());
         let mut final_states = Vec::new();
         for arm in arms {
             let mut branch_state = state.clone();
-            let guard = self.composite_tag_formula_for_encoding(
-                &composite,
+            let guard = self.composite_tag_formula(
+                &scrutinee.ty,
                 &scrutinee_value,
                 arm.ctor_index,
                 self.report_span(),
@@ -3940,15 +3914,13 @@ impl<'tcx> Verifier<'tcx> {
             let mut branch_current = current.clone();
             let mut field_values = Vec::with_capacity(arm.bindings.len());
             for (field_index, binding) in arm.bindings.iter().enumerate() {
-                let field_value = self
-                    .value_encoder
-                    .project_composite_ctor_field(
-                        &composite,
-                        arm.ctor_index,
-                        &scrutinee_value,
-                        field_index,
-                    )
-                    .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+                let field_value = self.decode_composite_ctor_field(
+                    &scrutinee.ty,
+                    arm.ctor_index,
+                    &scrutinee_value,
+                    field_index,
+                    self.report_span(),
+                )?;
                 if let TypedMatchBinding::Var { name, .. } = binding {
                     branch_current.insert(name.clone(), field_value.clone());
                 }
@@ -4891,55 +4863,25 @@ impl<'tcx> Verifier<'tcx> {
                     let rhs = self.spec_expr_to_bool(state, rhs, resolved)?;
                     Ok(Bool::or(&[&lhs, &rhs]))
                 }
-                BinaryOp::Eq => {
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge => {
                     let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
                     let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
-                    self.eq_for_spec_ty(
-                        &lhs.ty,
-                        &lhs_value,
-                        &rhs_value,
-                        self.control_span(state.ctrl),
-                    )
-                }
-                BinaryOp::Ne => {
-                    let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
-                    let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
-                    Ok(self
-                        .eq_for_spec_ty(
-                            &lhs.ty,
-                            &lhs_value,
-                            &rhs_value,
+                    with_solver(|solver| {
+                        self.value_encoder
+                            .lower_binary_predicate(*op, &lhs.ty, &lhs_value, &rhs_value, solver)
+                    })
+                    .map_err(|err| self.unsupported_result(self.control_span(state.ctrl), err))?
+                    .ok_or_else(|| {
+                        self.unsupported_result(
                             self.control_span(state.ctrl),
-                        )?
-                        .not())
-                }
-                BinaryOp::Lt => {
-                    let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
-                    let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
-                    Ok(self
-                        .value_int_data(&lhs_value)
-                        .lt(self.value_int_data(&rhs_value)))
-                }
-                BinaryOp::Le => {
-                    let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
-                    let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
-                    Ok(self
-                        .value_int_data(&lhs_value)
-                        .le(self.value_int_data(&rhs_value)))
-                }
-                BinaryOp::Gt => {
-                    let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
-                    let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
-                    Ok(self
-                        .value_int_data(&lhs_value)
-                        .gt(self.value_int_data(&rhs_value)))
-                }
-                BinaryOp::Ge => {
-                    let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
-                    let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
-                    Ok(self
-                        .value_int_data(&lhs_value)
-                        .ge(self.value_int_data(&rhs_value)))
+                            "spec expression used where `bool` was required".to_owned(),
+                        )
+                    })
                 }
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
                     let value = self.spec_expr_to_value(state, expr, resolved)?;
@@ -5079,45 +5021,25 @@ impl<'tcx> Verifier<'tcx> {
                     let rhs = self.contract_expr_to_bool(current, spec, rhs)?;
                     Ok(Bool::or(&[&lhs, &rhs]))
                 }
-                BinaryOp::Eq => {
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge => {
                     let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
                     let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
-                    self.eq_for_spec_ty(&lhs.ty, &lhs_value, &rhs_value, self.report_span())
-                }
-                BinaryOp::Ne => {
-                    let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
-                    let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
-                    Ok(self
-                        .eq_for_spec_ty(&lhs.ty, &lhs_value, &rhs_value, self.report_span())?
-                        .not())
-                }
-                BinaryOp::Lt => {
-                    let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
-                    let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
-                    Ok(self
-                        .value_int_data(&lhs_value)
-                        .lt(self.value_int_data(&rhs_value)))
-                }
-                BinaryOp::Le => {
-                    let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
-                    let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
-                    Ok(self
-                        .value_int_data(&lhs_value)
-                        .le(self.value_int_data(&rhs_value)))
-                }
-                BinaryOp::Gt => {
-                    let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
-                    let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
-                    Ok(self
-                        .value_int_data(&lhs_value)
-                        .gt(self.value_int_data(&rhs_value)))
-                }
-                BinaryOp::Ge => {
-                    let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
-                    let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
-                    Ok(self
-                        .value_int_data(&lhs_value)
-                        .ge(self.value_int_data(&rhs_value)))
+                    with_solver(|solver| {
+                        self.value_encoder
+                            .lower_binary_predicate(*op, &lhs.ty, &lhs_value, &rhs_value, solver)
+                    })
+                    .map_err(|err| self.unsupported_result(self.report_span(), err))?
+                    .ok_or_else(|| {
+                        self.unsupported_result(
+                            self.report_span(),
+                            "spec expression used where `bool` was required".to_owned(),
+                        )
+                    })
                 }
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
                     let value = self.contract_expr_to_value(current, spec, expr)?;
@@ -5232,27 +5154,24 @@ impl<'tcx> Verifier<'tcx> {
         default: Option<&TypedExpr>,
     ) -> Result<SymValue, VerificationResult> {
         let scrutinee_value = self.contract_expr_to_value(current, spec, scrutinee)?;
-        let composite = self.composite_encoding(&scrutinee.ty)?;
         let mut branches = Vec::with_capacity(arms.len());
         for arm in arms {
             let mut arm_current = current.clone();
             for (field_index, binding) in arm.bindings.iter().enumerate() {
                 if let TypedMatchBinding::Var { name, .. } = binding {
-                    let field_value = self
-                        .value_encoder
-                        .project_composite_ctor_field(
-                            &composite,
-                            arm.ctor_index,
-                            &scrutinee_value,
-                            field_index,
-                        )
-                        .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+                    let field_value = self.decode_composite_ctor_field(
+                        &scrutinee.ty,
+                        arm.ctor_index,
+                        &scrutinee_value,
+                        field_index,
+                        self.report_span(),
+                    )?;
                     arm_current.insert(name.clone(), field_value);
                 }
             }
             let body = self.contract_expr_to_value(&arm_current, spec, &arm.body)?;
-            let guard = self.composite_tag_formula_for_encoding(
-                &composite,
+            let guard = self.composite_tag_formula(
+                &scrutinee.ty,
                 &scrutinee_value,
                 arm.ctor_index,
                 self.report_span(),
@@ -5414,25 +5333,25 @@ impl<'tcx> Verifier<'tcx> {
                 else {
                     return Ok(None);
                 };
-                let Some(ctor_index) =
-                    self.ground_ctor_index(&scrutinee.ty, &scrutinee_value, span)?
+                let Some(ctor_index) = with_solver(|solver| {
+                    self.value_encoder
+                        .ground_ctor_index(&scrutinee.ty, &scrutinee_value, solver)
+                })
+                .map_err(|err| self.unsupported_result(span, err))?
                 else {
                     return Ok(None);
                 };
                 if let Some(arm) = arms.iter().find(|arm| arm.ctor_index == ctor_index) {
-                    let composite = self.composite_encoding(&scrutinee.ty)?;
                     let mut arm_env = env.clone();
                     for (field_index, binding) in arm.bindings.iter().enumerate() {
                         if let TypedMatchBinding::Var { name, .. } = binding {
-                            let field_value = self
-                                .value_encoder
-                                .project_composite_ctor_field(
-                                    &composite,
-                                    ctor_index,
-                                    &scrutinee_value,
-                                    field_index,
-                                )
-                                .map_err(|err| self.unsupported_result(span, err))?;
+                            let field_value = self.decode_composite_ctor_field(
+                                &scrutinee.ty,
+                                ctor_index,
+                                &scrutinee_value,
+                                field_index,
+                                span,
+                            )?;
                             arm_env.insert(name.clone(), field_value);
                         }
                     }
@@ -5481,23 +5400,6 @@ impl<'tcx> Verifier<'tcx> {
                 Some(self.lower_binary_value(*op, &lhs.ty, &lhs_value, &rhs_value, span)?)
             }
         })
-    }
-
-    fn ground_ctor_index(
-        &self,
-        ty: &SpecTy,
-        value: &SymValue,
-        span: Span,
-    ) -> Result<Option<usize>, VerificationResult> {
-        let composite = self.composite_encoding(ty)?;
-        let decl_name = value.dynamic().decl().name();
-        for (ctor_index, ctor) in composite.constructors.iter().enumerate() {
-            if decl_name == ctor.symbol.name() {
-                return Ok(Some(ctor_index));
-            }
-        }
-        let _ = span;
-        Ok(None)
     }
 
     fn assert_constraint(
@@ -6533,8 +6435,7 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let encoding = self.composite_encoding(&SpecTy::Ref(Box::new(inner_ty.clone())))?;
-        self.decode_composite_field(&encoding, value, 0, span)
+        self.decode_composite_field(&SpecTy::Ref(Box::new(inner_ty.clone())), value, 0, span)
     }
 
     fn ref_ptr(
@@ -6543,8 +6444,7 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let encoding = self.composite_encoding(&SpecTy::Ref(Box::new(inner_ty.clone())))?;
-        self.decode_composite_field(&encoding, value, 1, span)
+        self.decode_composite_field(&SpecTy::Ref(Box::new(inner_ty.clone())), value, 1, span)
     }
 
     fn mut_cur(
@@ -6553,8 +6453,7 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let encoding = self.composite_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
-        self.decode_composite_field(&encoding, value, 0, span)
+        self.decode_composite_field(&SpecTy::Mut(Box::new(inner_ty.clone())), value, 0, span)
     }
 
     fn mut_fin(
@@ -6563,8 +6462,7 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let encoding = self.composite_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
-        self.decode_composite_field(&encoding, value, 1, span)
+        self.decode_composite_field(&SpecTy::Mut(Box::new(inner_ty.clone())), value, 1, span)
     }
 
     fn mut_ptr(
@@ -6573,18 +6471,15 @@ impl<'tcx> Verifier<'tcx> {
         inner_ty: &SpecTy,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        let encoding = self.composite_encoding(&SpecTy::Mut(Box::new(inner_ty.clone())))?;
-        self.decode_composite_field(&encoding, value, 2, span)
+        self.decode_composite_field(&SpecTy::Mut(Box::new(inner_ty.clone())), value, 2, span)
     }
 
     fn ptr_addr(&self, value: &SymValue, span: Span) -> Result<SymValue, VerificationResult> {
-        let encoding = self.composite_encoding(&ptr_spec_ty())?;
-        self.decode_composite_field(&encoding, value, 0, span)
+        self.decode_composite_field(&ptr_spec_ty(), value, 0, span)
     }
 
     fn ptr_prov(&self, value: &SymValue, span: Span) -> Result<SymValue, VerificationResult> {
-        let encoding = self.composite_encoding(&ptr_spec_ty())?;
-        self.decode_composite_field(&encoding, value, 1, span)
+        self.decode_composite_field(&ptr_spec_ty(), value, 1, span)
     }
 
     fn reference_ptr_formula(
@@ -6840,11 +6735,10 @@ impl<'tcx> Verifier<'tcx> {
             )),
             SpecTy::Seq(_) => Ok(None),
             SpecTy::Ref(inner) => {
-                let composite = self.composite_encoding(ty)?;
-                let deref = self.decode_composite_field(&composite, value, 0, span)?;
-                let ptr = self.decode_composite_field(&composite, value, 1, span)?;
+                let deref = self.decode_composite_field(ty, value, 0, span)?;
+                let ptr = self.decode_composite_field(ty, value, 1, span)?;
                 let mut formulas = vec![
-                    self.composite_tag_formula_for_encoding(&composite, value, 0, span)?,
+                    self.composite_tag_formula(ty, value, 0, span)?,
                     self.reference_ptr_formula(&ptr, span)?,
                 ];
                 if let Some(formula) = self.spec_ty_formula(inner, &deref, span)? {
@@ -6853,11 +6747,10 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(Some(bool_and(formulas)))
             }
             SpecTy::Mut(inner) => {
-                let composite = self.composite_encoding(ty)?;
-                let current = self.decode_composite_field(&composite, value, 0, span)?;
-                let ptr = self.decode_composite_field(&composite, value, 2, span)?;
+                let current = self.decode_composite_field(ty, value, 0, span)?;
+                let ptr = self.decode_composite_field(ty, value, 2, span)?;
                 let mut formulas = vec![
-                    self.composite_tag_formula_for_encoding(&composite, value, 0, span)?,
+                    self.composite_tag_formula(ty, value, 0, span)?,
                     self.reference_ptr_formula(&ptr, span)?,
                 ];
                 if let Some(formula) = self.spec_ty_formula(inner, &current, span)? {
@@ -6866,11 +6759,9 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(Some(bool_and(formulas)))
             }
             SpecTy::Tuple(items) => {
-                let composite = self.composite_encoding(ty)?;
-                let mut formulas =
-                    vec![self.composite_tag_formula_for_encoding(&composite, value, 0, span)?];
+                let mut formulas = vec![self.composite_tag_formula(ty, value, 0, span)?];
                 for (index, field_ty) in items.iter().enumerate() {
-                    let field = self.decode_composite_field(&composite, value, index, span)?;
+                    let field = self.decode_composite_field(ty, value, index, span)?;
                     if let Some(formula) = self.spec_ty_formula(field_ty, &field, span)? {
                         formulas.push(formula);
                     }
@@ -6884,11 +6775,9 @@ impl<'tcx> Verifier<'tcx> {
                 {
                     return Ok(Some(formula));
                 }
-                let mut formulas =
-                    vec![self.composite_tag_formula_for_encoding(&composite, value, 0, span)?];
+                let mut formulas = vec![self.composite_tag_formula(ty, value, 0, span)?];
                 for (index, field) in struct_ty.fields.iter().enumerate() {
-                    let field_value =
-                        self.decode_composite_field(&composite, value, index, span)?;
+                    let field_value = self.decode_composite_field(ty, value, index, span)?;
                     if let Some(formula) = self.spec_ty_formula(&field.ty, &field_value, span)? {
                         formulas.push(formula);
                     }
@@ -6907,20 +6796,16 @@ impl<'tcx> Verifier<'tcx> {
         value: &SymValue,
         span: Span,
     ) -> Result<Option<Bool>, VerificationResult> {
-        let Ok(ctor) = composite.single_constructor() else {
+        let Some(fields) = self
+            .value_encoder
+            .direct_composite_fields(composite, value)
+            .map_err(|err| self.unsupported_result(span, err))?
+        else {
             return Ok(None);
         };
-        if value.dynamic().decl().name() != ctor.symbol.name() {
-            return Ok(None);
-        }
-        let children = value.dynamic().children();
-        if children.len() != struct_ty.fields.len() {
-            return Ok(None);
-        }
         let mut formulas = Vec::new();
-        for (field, child) in struct_ty.fields.iter().zip(children) {
-            let child = SymValue::new(child);
-            if let Some(formula) = self.spec_ty_formula(&field.ty, &child, span)? {
+        for (field, field_value) in struct_ty.fields.iter().zip(fields) {
+            if let Some(formula) = self.spec_ty_formula(&field.ty, &field_value, span)? {
                 formulas.push(formula);
             }
         }
@@ -6950,20 +6835,18 @@ impl<'tcx> Verifier<'tcx> {
             | SpecTy::Usize => Ok(Bool::from_bool(true)),
             SpecTy::Seq(_) => Ok(Bool::from_bool(true)),
             SpecTy::Ref(_) => {
-                let composite = self.composite_encoding(ty)?;
-                let ptr = self.decode_composite_field(&composite, value, 1, span)?;
+                let ptr = self.decode_composite_field(ty, value, 1, span)?;
                 Ok(bool_and(vec![
-                    self.composite_tag_formula_for_encoding(&composite, value, 0, span)?,
+                    self.composite_tag_formula(ty, value, 0, span)?,
                     self.reference_ptr_formula(&ptr, span)?,
                 ]))
             }
             SpecTy::Mut(inner) => {
-                let composite = self.composite_encoding(ty)?;
-                let cur = self.decode_composite_field(&composite, value, 0, span)?;
-                let fin = self.decode_composite_field(&composite, value, 1, span)?;
-                let ptr = self.decode_composite_field(&composite, value, 2, span)?;
+                let cur = self.decode_composite_field(ty, value, 0, span)?;
+                let fin = self.decode_composite_field(ty, value, 1, span)?;
+                let ptr = self.decode_composite_field(ty, value, 2, span)?;
                 Ok(bool_and(vec![
-                    self.composite_tag_formula_for_encoding(&composite, value, 0, span)?,
+                    self.composite_tag_formula(ty, value, 0, span)?,
                     self.eq_for_spec_ty(inner, &cur, &fin, span)?,
                     self.resolve_formula_for_spec_ty(inner, &cur, span)?,
                     self.resolve_formula_for_spec_ty(inner, &fin, span)?,
@@ -6971,25 +6854,22 @@ impl<'tcx> Verifier<'tcx> {
                 ]))
             }
             SpecTy::Tuple(items) => {
-                let composite = self.composite_encoding(ty)?;
                 let mut formulas = Vec::with_capacity(items.len() + 1);
-                formulas.push(self.composite_tag_formula_for_encoding(&composite, value, 0, span)?);
+                formulas.push(self.composite_tag_formula(ty, value, 0, span)?);
                 for (index, field_ty) in items.iter().enumerate() {
-                    let field = self.decode_composite_field(&composite, value, index, span)?;
+                    let field = self.decode_composite_field(ty, value, index, span)?;
                     formulas.push(self.resolve_formula_for_spec_ty(field_ty, &field, span)?);
                 }
                 Ok(bool_and(formulas))
             }
             SpecTy::Struct(struct_ty) => {
-                let composite = self.composite_encoding(ty)?;
                 if struct_ty.name == "Ptr" {
-                    return self.composite_tag_formula_for_encoding(&composite, value, 0, span);
+                    return self.composite_tag_formula(ty, value, 0, span);
                 }
                 let mut formulas = Vec::with_capacity(struct_ty.fields.len() + 1);
-                formulas.push(self.composite_tag_formula_for_encoding(&composite, value, 0, span)?);
+                formulas.push(self.composite_tag_formula(ty, value, 0, span)?);
                 for (index, field) in struct_ty.fields.iter().enumerate() {
-                    let field_value =
-                        self.decode_composite_field(&composite, value, index, span)?;
+                    let field_value = self.decode_composite_field(ty, value, index, span)?;
                     formulas.push(self.resolve_formula_for_spec_ty(
                         &field.ty,
                         &field_value,
@@ -7010,24 +6890,15 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Bool, VerificationResult> {
         let composite = self.composite_encoding(ty)?;
-        let decl_name = value.dynamic().decl().name();
-        if let Some((ctor_index, ctor)) = composite
-            .constructors
-            .iter()
-            .enumerate()
-            .find(|(_, ctor)| decl_name == ctor.symbol.name())
+        if let Some(fields) = self
+            .value_encoder
+            .direct_composite_ctor_fields(&composite, value)
+            .map_err(|err| self.unsupported_result(span, err))?
         {
             let mut formulas =
-                vec![self.composite_tag_formula_for_encoding(&composite, value, ctor_index, span)?];
-            for (field_index, field) in ctor.fields.iter().enumerate() {
-                let field_value = self.decode_composite_ctor_field(
-                    &composite,
-                    ctor_index,
-                    value,
-                    field_index,
-                    span,
-                )?;
-                if let Some(formula) = self.spec_ty_formula(&field.ty, &field_value, span)? {
+                vec![self.composite_tag_formula(ty, value, fields.ctor_index, span)?];
+            for (field_ty, field_value) in fields.fields {
+                if let Some(formula) = self.spec_ty_formula(&field_ty, &field_value, span)? {
                     formulas.push(formula);
                 }
             }
@@ -7057,39 +6928,42 @@ impl<'tcx> Verifier<'tcx> {
 
     fn decode_composite_field(
         &self,
-        encoding: &CompositeEncoding,
+        ty: &SpecTy,
         value: &SymValue,
         index: usize,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        self.value_encoder
-            .project_composite_field(encoding, value, index)
+        with_solver(|solver| self.value_encoder.project_field(ty, value, index, solver))
             .map_err(|err| self.unsupported_result(span, err))
     }
 
     fn decode_composite_ctor_field(
         &self,
-        encoding: &CompositeEncoding,
+        ty: &SpecTy,
         ctor_index: usize,
         value: &SymValue,
         index: usize,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        self.value_encoder
-            .project_composite_ctor_field(encoding, ctor_index, value, index)
-            .map_err(|err| self.unsupported_result(span, err))
+        with_solver(|solver| {
+            self.value_encoder
+                .project_composite_ctor_field_for_ty(ty, ctor_index, value, index, solver)
+        })
+        .map_err(|err| self.unsupported_result(span, err))
     }
 
-    fn composite_tag_formula_for_encoding(
+    fn composite_tag_formula(
         &self,
-        encoding: &CompositeEncoding,
+        ty: &SpecTy,
         value: &SymValue,
         ctor_index: usize,
         span: Span,
     ) -> Result<Bool, VerificationResult> {
-        self.value_encoder
-            .tag_formula(encoding, ctor_index, value)
-            .map_err(|err| self.unsupported_result(span, err))
+        with_solver(|solver| {
+            self.value_encoder
+                .tag_formula_for_ty(ty, ctor_index, value, solver)
+        })
+        .map_err(|err| self.unsupported_result(span, err))
     }
 
     fn require_type_invariant(

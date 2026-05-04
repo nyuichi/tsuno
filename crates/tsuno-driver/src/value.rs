@@ -180,6 +180,11 @@ struct BuiltinNatDecls {
     int_to_nat: RecFuncDecl,
 }
 
+pub(crate) struct DirectCtorFields {
+    pub(crate) ctor_index: usize,
+    pub(crate) fields: Vec<(SpecTy, SymValue)>,
+}
+
 impl CompositeEncoding {
     pub(crate) fn single_constructor(&self) -> Result<&ConstructorEncoding, String> {
         match self.constructors.as_slice() {
@@ -530,7 +535,7 @@ impl ValueEncoder {
         let nat_ty = Self::nat_spec_ty();
         let composite = self.composite_encoding(&nat_ty, solver)?;
         let (zero, succ) = self.nat_ctor_indices(solver)?;
-        match Self::ground_ctor_index(&composite, value) {
+        match Self::ground_ctor_index_for_composite(&composite, value) {
             Some(index) if index == zero => Ok(Some(0)),
             Some(index) if index == succ => {
                 let tail = self.project_composite_ctor_field(&composite, succ, value, 0)?;
@@ -540,7 +545,10 @@ impl ValueEncoder {
         }
     }
 
-    fn ground_ctor_index(composite: &CompositeEncoding, value: &SymValue) -> Option<usize> {
+    fn ground_ctor_index_for_composite(
+        composite: &CompositeEncoding,
+        value: &SymValue,
+    ) -> Option<usize> {
         let decl_name = value.dynamic().decl().name();
         composite
             .constructors
@@ -869,6 +877,32 @@ impl ValueEncoder {
         })
     }
 
+    pub(crate) fn lower_binary_predicate(
+        &self,
+        op: BinaryOp,
+        lhs_ty: &SpecTy,
+        lhs: &SymValue,
+        rhs: &SymValue,
+        solver: &Solver,
+    ) -> Result<Option<Bool>, String> {
+        Ok(Some(match op {
+            BinaryOp::Eq => self.eq_for_spec_ty(lhs_ty, lhs, rhs, solver)?,
+            BinaryOp::Ne => self.eq_for_spec_ty(lhs_ty, lhs, rhs, solver)?.not(),
+            BinaryOp::Lt => self.int_term(lhs).lt(self.int_term(rhs)),
+            BinaryOp::Le => self.int_term(lhs).le(self.int_term(rhs)),
+            BinaryOp::Gt => self.int_term(lhs).gt(self.int_term(rhs)),
+            BinaryOp::Ge => self.int_term(lhs).ge(self.int_term(rhs)),
+            BinaryOp::And
+            | BinaryOp::Or
+            | BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Concat => {
+                return Ok(None);
+            }
+        }))
+    }
+
     pub(crate) fn construct_composite(
         &self,
         ty: &SpecTy,
@@ -972,6 +1006,61 @@ impl ValueEncoder {
         Ok(SymValue::new(field.inverse.apply(&[value.ast()])))
     }
 
+    pub(crate) fn project_composite_ctor_field_for_ty(
+        &self,
+        ty: &SpecTy,
+        ctor_index: usize,
+        value: &SymValue,
+        index: usize,
+        solver: &Solver,
+    ) -> Result<SymValue, String> {
+        let composite = self.composite_encoding(ty, solver)?;
+        self.project_composite_ctor_field(&composite, ctor_index, value, index)
+    }
+
+    pub(crate) fn direct_composite_fields(
+        &self,
+        composite: &CompositeEncoding,
+        value: &SymValue,
+    ) -> Result<Option<Vec<SymValue>>, String> {
+        let ctor = composite.single_constructor()?;
+        if value.dynamic().decl().name() != ctor.symbol.name() {
+            return Ok(None);
+        }
+        let children = value.dynamic().children();
+        if children.len() != ctor.fields.len() {
+            return Ok(None);
+        }
+        Ok(Some(children.into_iter().map(SymValue::new).collect()))
+    }
+
+    pub(crate) fn direct_composite_ctor_fields(
+        &self,
+        composite: &CompositeEncoding,
+        value: &SymValue,
+    ) -> Result<Option<DirectCtorFields>, String> {
+        let Some((ctor_index, ctor)) = composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| value.dynamic().decl().name() == ctor.symbol.name())
+        else {
+            return Ok(None);
+        };
+        let fields = ctor
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(field_index, field)| {
+                Ok((
+                    field.ty.clone(),
+                    self.project_composite_ctor_field(composite, ctor_index, value, field_index)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Some(DirectCtorFields { ctor_index, fields }))
+    }
+
     pub(crate) fn tag_formula(
         &self,
         composite: &CompositeEncoding,
@@ -999,6 +1088,27 @@ impl ValueEncoder {
             .as_int()
             .expect("tag result")
             .eq(&ctor.tag))
+    }
+
+    pub(crate) fn tag_formula_for_ty(
+        &self,
+        ty: &SpecTy,
+        ctor_index: usize,
+        value: &SymValue,
+        solver: &Solver,
+    ) -> Result<Bool, String> {
+        let composite = self.composite_encoding(ty, solver)?;
+        self.tag_formula(&composite, ctor_index, value)
+    }
+
+    pub(crate) fn ground_ctor_index(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+        solver: &Solver,
+    ) -> Result<Option<usize>, String> {
+        let composite = self.composite_encoding(ty, solver)?;
+        Ok(Self::ground_ctor_index_for_composite(&composite, value))
     }
 
     pub(crate) fn int_bounds(&self, ty: &SpecTy) -> Result<Option<(Int, Int)>, String> {
