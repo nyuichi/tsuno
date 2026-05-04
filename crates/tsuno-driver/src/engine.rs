@@ -789,7 +789,7 @@ impl<'tcx> Verifier<'tcx> {
                                 term.source_info.span,
                             )?,
                             &discr_value,
-                            &self.value_int(value as i64),
+                            &self.value_encoder.int_value(value as i64),
                             term.source_info.span,
                         )?,
                     };
@@ -946,7 +946,7 @@ impl<'tcx> Verifier<'tcx> {
                                 term.source_info.span,
                             )?,
                             &discr_value,
-                            &self.value_int(value as i64),
+                            &self.value_encoder.int_value(value as i64),
                             term.source_info.span,
                         )?,
                     };
@@ -4584,9 +4584,14 @@ impl<'tcx> Verifier<'tcx> {
                             "failed to evaluate boolean constant".to_owned(),
                         )
                     })?;
-                Ok(self.value_bool(value.try_to_bool().map_err(|_| {
-                    self.unsupported_result(span, "failed to evaluate boolean constant".to_owned())
-                })?))
+                Ok(self
+                    .value_encoder
+                    .bool_value(value.try_to_bool().map_err(|_| {
+                        self.unsupported_result(
+                            span,
+                            "failed to evaluate boolean constant".to_owned(),
+                        )
+                    })?))
             }
             TyKind::Int(_) | TyKind::Uint(_) => {
                 let value = constant
@@ -4906,7 +4911,7 @@ impl<'tcx> Verifier<'tcx> {
         resolved: &ResolvedExprEnv,
     ) -> Result<SymValue, VerificationResult> {
         match &expr.kind {
-            TypedExprKind::Bool(value) => Ok(self.value_bool(*value)),
+            TypedExprKind::Bool(value) => Ok(self.value_encoder.bool_value(*value)),
             TypedExprKind::Int(value) => {
                 self.value_decimal_int(&value.digits, self.control_span(state.ctrl))
             }
@@ -5064,7 +5069,7 @@ impl<'tcx> Verifier<'tcx> {
         expr: &TypedExpr,
     ) -> Result<SymValue, VerificationResult> {
         match &expr.kind {
-            TypedExprKind::Bool(value) => Ok(self.value_bool(*value)),
+            TypedExprKind::Bool(value) => Ok(self.value_encoder.bool_value(*value)),
             TypedExprKind::Int(value) => self.value_decimal_int(&value.digits, self.report_span()),
             TypedExprKind::RustType(key) => Ok(self.rust_ty_value(key)),
             TypedExprKind::SeqLit(items) => {
@@ -5269,7 +5274,7 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Option<SymValue>, VerificationResult> {
         Ok(match &expr.kind {
-            TypedExprKind::Bool(value) => Some(self.value_bool(*value)),
+            TypedExprKind::Bool(value) => Some(self.value_encoder.bool_value(*value)),
             TypedExprKind::Int(value) => Some(self.value_decimal_int(&value.digits, span)?),
             TypedExprKind::RustType(key) => Some(self.rust_ty_value(key)),
             TypedExprKind::SeqLit(items) => {
@@ -5845,18 +5850,10 @@ impl<'tcx> Verifier<'tcx> {
             .find(|unsafe_span| span_contains(*unsafe_span, span))
     }
 
-    fn value_int(&self, value: i64) -> SymValue {
-        self.value_encoder.int_value(value)
-    }
-
     fn value_decimal_int(&self, digits: &str, span: Span) -> Result<SymValue, VerificationResult> {
         self.value_encoder.decimal_int_value(digits).map_err(|_| {
             self.unsupported_result(span, format!("invalid integer literal `{digits}`"))
         })
-    }
-
-    fn value_bool(&self, value: bool) -> SymValue {
-        self.value_encoder.bool_value(value)
     }
 
     fn rust_ty_value(&self, key: &RustTyKey) -> SymValue {
@@ -5952,17 +5949,6 @@ impl<'tcx> Verifier<'tcx> {
                 .construct_composite_ctor(ty, ctor_index, fields, solver)
         })
         .map_err(|err| self.unsupported_result(self.report_span(), err))
-    }
-
-    fn construct_composite_ctor_without_axioms(
-        &self,
-        ty: &SpecTy,
-        ctor_index: usize,
-        fields: &[SymValue],
-    ) -> Result<SymValue, VerificationResult> {
-        self.value_encoder
-            .construct_composite_ctor_without_axioms(ty, ctor_index, fields)
-            .map_err(|err| self.unsupported_result(self.report_span(), err))
     }
 
     fn fresh_for_rust_ty(&self, ty: Ty<'tcx>, hint: &str) -> Result<SymValue, VerificationResult> {
@@ -6305,11 +6291,9 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn construct_option_none(&self, inner: SpecTy) -> Result<SymValue, VerificationResult> {
-        let ctor_index = self
-            .value_encoder
-            .enum_ctor_index("Option", "None")
-            .map_err(|err| self.unsupported_result(self.report_span(), err))?;
-        self.construct_composite_ctor_without_axioms(&option_spec_ty(inner), ctor_index, &[])
+        self.value_encoder
+            .construct_option_none(inner)
+            .map_err(|err| self.unsupported_result(self.report_span(), err))
     }
 
     fn construct_option_some(
@@ -6317,11 +6301,9 @@ impl<'tcx> Verifier<'tcx> {
         inner: SpecTy,
         value: SymValue,
     ) -> Result<SymValue, VerificationResult> {
-        let ctor_index = self
-            .value_encoder
-            .enum_ctor_index("Option", "Some")
-            .map_err(|err| self.unsupported_result(self.report_span(), err))?;
-        self.construct_composite_ctor_without_axioms(&option_spec_ty(inner), ctor_index, &[value])
+        self.value_encoder
+            .construct_option_some(inner, value)
+            .map_err(|err| self.unsupported_result(self.report_span(), err))
     }
 
     fn rust_ty_model_value(&self, ty: Ty<'tcx>) -> SymValue {
@@ -6704,7 +6686,7 @@ impl<'tcx> Verifier<'tcx> {
                 &self.value_int_data(value),
             )
             .unwrap_or_else(|| Bool::from_bool(true));
-        Ok(self.value_encoder.wrap_bool(&bool_not(in_range)))
+        Ok(self.value_encoder.overflow_value_for_in_range(in_range))
     }
 
     fn spec_ty_formula(
@@ -6914,14 +6896,8 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Bool, VerificationResult> {
         with_solver(|solver| {
-            let invariant = self
-                .value_encoder
-                .named_invariant(ty, solver)?
-                .ok_or_else(|| format!("missing named invariant for {ty:?}"))?;
-            Ok(invariant
-                .apply(&[value.ast()])
-                .as_bool()
-                .expect("named invariant predicate"))
+            self.value_encoder
+                .named_invariant_formula(ty, value, solver)
         })
         .map_err(|err: String| self.unsupported_result(span, err))
     }

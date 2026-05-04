@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::str::FromStr;
 
-use crate::spec::{BinaryOp, EnumDef, RustTyKey, SpecTy, StructTy, UnaryOp, ptr_spec_ty};
+use crate::spec::{
+    BinaryOp, EnumDef, RustTyKey, SpecTy, StructTy, UnaryOp, option_spec_ty, ptr_spec_ty,
+};
 use z3::ast::{self, Ast, Bool, Dynamic, Int, Seq as Z3Seq};
 use z3::{DeclKind, FuncDecl, Pattern, RecFuncDecl, Solver, Sort, Symbol};
 
@@ -338,12 +340,31 @@ impl ValueEncoder {
         Ok(composite.invariant.clone())
     }
 
+    pub(crate) fn named_invariant_formula(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+        solver: &Solver,
+    ) -> Result<Bool, String> {
+        let invariant = self
+            .named_invariant(ty, solver)?
+            .ok_or_else(|| format!("missing named invariant for {ty:?}"))?;
+        Ok(invariant
+            .apply(&[value.ast()])
+            .as_bool()
+            .expect("named invariant predicate"))
+    }
+
     pub(crate) fn wrap_bool(&self, value: &Bool) -> SymValue {
         SymValue::new(self.bool_encoding.boxed.apply(&[value]))
     }
 
     pub(crate) fn wrap_int(&self, value: &Int) -> SymValue {
         SymValue::new(self.int_encoding.boxed.apply(&[value]))
+    }
+
+    pub(crate) fn overflow_value_for_in_range(&self, in_range: Bool) -> SymValue {
+        self.wrap_bool(&in_range.not())
     }
 
     pub(crate) fn empty_seq_value(&self) -> SymValue {
@@ -960,6 +981,20 @@ impl ValueEncoder {
         }
         let args = fields.iter().map(SymValue::ast).collect::<Vec<_>>();
         Ok(SymValue::new(ctor.symbol.apply(&args)))
+    }
+
+    pub(crate) fn construct_option_none(&self, inner: SpecTy) -> Result<SymValue, String> {
+        let ctor_index = self.enum_ctor_index("Option", "None")?;
+        self.construct_composite_ctor_without_axioms(&option_spec_ty(inner), ctor_index, &[])
+    }
+
+    pub(crate) fn construct_option_some(
+        &self,
+        inner: SpecTy,
+        value: SymValue,
+    ) -> Result<SymValue, String> {
+        let ctor_index = self.enum_ctor_index("Option", "Some")?;
+        self.construct_composite_ctor_without_axioms(&option_spec_ty(inner), ctor_index, &[value])
     }
 
     pub(crate) fn project_field(
