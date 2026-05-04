@@ -767,15 +767,20 @@ impl<'tcx> Verifier<'tcx> {
                                 self.solver.bool_term(&discr_value)
                             }
                         }
-                        _ => self.eq_for_spec_ty(
-                            &self.spec_ty_for_place_ty(
-                                discr.ty(&self.body().local_decls, self.tcx),
-                                term.source_info.span,
-                            )?,
-                            &discr_value,
-                            &self.solver.int_value(value as i64),
-                            term.source_info.span,
-                        )?,
+                        _ => {
+                            let span = term.source_info.span;
+                            self.solver_result(
+                                span,
+                                self.solver.eq_for_spec_ty(
+                                    &self.spec_ty_for_place_ty(
+                                        discr.ty(&self.body().local_decls, self.tcx),
+                                        span,
+                                    )?,
+                                    &discr_value,
+                                    &self.solver.int_value(value as i64),
+                                ),
+                            )?
+                        }
                     };
                     seen_conditions.push(branch.clone());
                     if let Some(next) =
@@ -924,15 +929,20 @@ impl<'tcx> Verifier<'tcx> {
                                 self.solver.bool_term(&discr_value)
                             }
                         }
-                        _ => self.eq_for_spec_ty(
-                            &self.spec_ty_for_place_ty(
-                                discr.ty(&self.body().local_decls, self.tcx),
-                                term.source_info.span,
-                            )?,
-                            &discr_value,
-                            &self.solver.int_value(value as i64),
-                            term.source_info.span,
-                        )?,
+                        _ => {
+                            let span = term.source_info.span;
+                            self.solver_result(
+                                span,
+                                self.solver.eq_for_spec_ty(
+                                    &self.spec_ty_for_place_ty(
+                                        discr.ty(&self.body().local_decls, self.tcx),
+                                        span,
+                                    )?,
+                                    &discr_value,
+                                    &self.solver.int_value(value as i64),
+                                ),
+                            )?
+                        }
                     };
                     seen_conditions.push(branch.clone());
                     if let Some(mut next) =
@@ -1371,11 +1381,10 @@ impl<'tcx> Verifier<'tcx> {
             let merged_value =
                 self.fresh_for_rust_ty(ty, &format!("merge_{}", local.as_usize()))?;
             for (state, incoming) in states.iter().zip(incoming_values.drain(..)) {
-                let equality = self.eq_for_spec_ty(
-                    &spec_ty,
-                    &merged_value,
-                    &incoming,
+                let equality = self.solver_result(
                     self.control_span(state.ctrl),
+                    self.solver
+                        .eq_for_spec_ty(&spec_ty, &merged_value, &incoming),
                 )?;
                 self.add_path_condition(&mut merged, state.pc.clone().implies(equality));
             }
@@ -2115,7 +2124,11 @@ impl<'tcx> Verifier<'tcx> {
             }
         };
         let overflow_value = self.overflow_value_for_result(result_ty, &result_value, span)?;
-        self.checked_result_tuple_value(result_spec_ty, result_value, overflow_value, span)
+        self.solver_result(
+            span,
+            self.solver
+                .checked_result_tuple_value(result_spec_ty, result_value, overflow_value),
+        )
     }
 
     fn lower_unsafe_binary_value(
@@ -2168,8 +2181,14 @@ impl<'tcx> Verifier<'tcx> {
                 )?;
                 Ok(result.value)
             }
-            BinOp::Eq => self.lower_eq_value(&lhs_spec_ty, lhs, rhs, false, span),
-            BinOp::Ne => self.lower_eq_value(&lhs_spec_ty, lhs, rhs, true, span),
+            BinOp::Eq => self.solver_result(
+                span,
+                self.solver.lower_eq_value(&lhs_spec_ty, lhs, rhs, false),
+            ),
+            BinOp::Ne => self.solver_result(
+                span,
+                self.solver.lower_eq_value(&lhs_spec_ty, lhs, rhs, true),
+            ),
             BinOp::Lt => {
                 Ok(self
                     .solver
@@ -2457,7 +2476,11 @@ impl<'tcx> Verifier<'tcx> {
             if resource_ty != ty {
                 continue;
             }
-            let addr_matches = self.eq_for_spec_ty(&SpecTy::Usize, addr, resource_addr, span)?;
+            let addr_matches = self.solver_result(
+                span,
+                self.solver
+                    .eq_for_spec_ty(&SpecTy::Usize, addr, resource_addr),
+            )?;
             let condition = Solver::simplify_bool(&addr_matches);
             if matches!(condition.as_bool(), Some(false)) {
                 continue;
@@ -2506,7 +2529,11 @@ impl<'tcx> Verifier<'tcx> {
             if resource_ty != ty {
                 continue;
             }
-            let addr_matches = self.eq_for_spec_ty(&SpecTy::Usize, addr, resource_addr, span)?;
+            let addr_matches = self.solver_result(
+                span,
+                self.solver
+                    .eq_for_spec_ty(&SpecTy::Usize, addr, resource_addr),
+            )?;
             let condition = Solver::simplify_bool(&addr_matches);
             if matches!(condition.as_bool(), Some(false)) {
                 continue;
@@ -2738,13 +2765,22 @@ impl<'tcx> Verifier<'tcx> {
                             used,
                             condition: Solver::simplify_bool(&bool_and(vec![
                                 candidate.condition.clone(),
-                                self.eq_for_spec_ty(
-                                    &SpecTy::Usize,
-                                    &addr_value,
-                                    resource_addr,
+                                self.solver_result(
                                     span,
+                                    self.solver.eq_for_spec_ty(
+                                        &SpecTy::Usize,
+                                        &addr_value,
+                                        resource_addr,
+                                    ),
                                 )?,
-                                self.eq_for_spec_ty(&SpecTy::RustTy, &ty_value, resource_ty, span)?,
+                                self.solver_result(
+                                    span,
+                                    self.solver.eq_for_spec_ty(
+                                        &SpecTy::RustTy,
+                                        &ty_value,
+                                        resource_ty,
+                                    ),
+                                )?,
                                 value_condition,
                             ])),
                             env: next_env,
@@ -2781,7 +2817,14 @@ impl<'tcx> Verifier<'tcx> {
                             used,
                             condition: Solver::simplify_bool(&bool_and(vec![
                                 candidate.condition.clone(),
-                                self.eq_for_spec_ty(&SpecTy::Usize, &base, resource_base, span)?,
+                                self.solver_result(
+                                    span,
+                                    self.solver.eq_for_spec_ty(
+                                        &SpecTy::Usize,
+                                        &base,
+                                        resource_base,
+                                    ),
+                                )?,
                                 self.solver
                                     .int_term(&size)
                                     .eq(Int::from_u64(*resource_size)),
@@ -2851,13 +2894,22 @@ impl<'tcx> Verifier<'tcx> {
                             used,
                             condition: Solver::simplify_bool(&bool_and(vec![
                                 candidate.condition.clone(),
-                                self.eq_for_spec_ty(
-                                    &SpecTy::Usize,
-                                    &addr_value,
-                                    resource_addr,
+                                self.solver_result(
                                     span,
+                                    self.solver.eq_for_spec_ty(
+                                        &SpecTy::Usize,
+                                        &addr_value,
+                                        resource_addr,
+                                    ),
                                 )?,
-                                self.eq_for_spec_ty(&SpecTy::RustTy, &ty_value, resource_ty, span)?,
+                                self.solver_result(
+                                    span,
+                                    self.solver.eq_for_spec_ty(
+                                        &SpecTy::RustTy,
+                                        &ty_value,
+                                        resource_ty,
+                                    ),
+                                )?,
                                 value_condition,
                             ])),
                             env: next_env,
@@ -2894,7 +2946,14 @@ impl<'tcx> Verifier<'tcx> {
                             used,
                             condition: Solver::simplify_bool(&bool_and(vec![
                                 candidate.condition.clone(),
-                                self.eq_for_spec_ty(&SpecTy::Usize, &base, resource_base, span)?,
+                                self.solver_result(
+                                    span,
+                                    self.solver.eq_for_spec_ty(
+                                        &SpecTy::Usize,
+                                        &base,
+                                        resource_base,
+                                    ),
+                                )?,
                                 self.solver
                                     .int_term(&size)
                                     .eq(Int::from_u64(*resource_size)),
@@ -2940,7 +2999,7 @@ impl<'tcx> Verifier<'tcx> {
         match pattern {
             TypedValuePattern::Bind { name, ty } => {
                 if let Some(value) = env.get(name) {
-                    return self.eq_for_spec_ty(ty, value, actual, span);
+                    return self.solver_result(span, self.solver.eq_for_spec_ty(ty, value, actual));
                 }
                 env.insert(name.clone(), actual.clone());
                 Ok(Bool::from_bool(true))
@@ -2949,7 +3008,10 @@ impl<'tcx> Verifier<'tcx> {
                 let mut pattern_view = view.clone();
                 pattern_view.env.extend(env.clone());
                 let expected = self.spec_expr_to_value(&pattern_view, expr, resolution)?;
-                self.eq_for_spec_ty(&expr.ty, &expected, actual, span)
+                self.solver_result(
+                    span,
+                    self.solver.eq_for_spec_ty(&expr.ty, &expected, actual),
+                )
             }
             TypedValuePattern::SeqLit { ty, items } => {
                 let mut values = Vec::with_capacity(items.len());
@@ -2966,12 +3028,16 @@ impl<'tcx> Verifier<'tcx> {
                     )?);
                     values.push(item_value);
                 }
-                conditions.push(self.eq_for_spec_ty(
-                    ty,
-                    &self.solver.seq_literal_value(&values),
-                    actual,
-                    span,
-                )?);
+                conditions.push(
+                    self.solver_result(
+                        span,
+                        self.solver.eq_for_spec_ty(
+                            ty,
+                            &self.solver.seq_literal_value(&values),
+                            actual,
+                        ),
+                    )?,
+                );
                 Ok(bool_and(conditions))
             }
             TypedValuePattern::StructLit { ty, fields } => {
@@ -2990,7 +3056,9 @@ impl<'tcx> Verifier<'tcx> {
                     values.push(field_value);
                 }
                 let expected = self.construct_composite(ty, &values)?;
-                conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
+                conditions.push(
+                    self.solver_result(span, self.solver.eq_for_spec_ty(ty, &expected, actual))?,
+                );
                 Ok(bool_and(conditions))
             }
             TypedValuePattern::CtorCall {
@@ -3010,7 +3078,9 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 conditions.push(self.composite_tag_formula(ty, actual, *ctor_index, span)?);
                 let expected = self.construct_composite_ctor(ty, *ctor_index, &values)?;
-                conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
+                conditions.push(
+                    self.solver_result(span, self.solver.eq_for_spec_ty(ty, &expected, actual))?,
+                );
                 Ok(bool_and(conditions))
             }
         }
@@ -3028,7 +3098,7 @@ impl<'tcx> Verifier<'tcx> {
         match pattern {
             TypedValuePattern::Bind { name, ty } => {
                 if let Some(value) = env.get(name).or_else(|| spec.get(name)) {
-                    return self.eq_for_spec_ty(ty, value, actual, span);
+                    return self.solver_result(span, self.solver.eq_for_spec_ty(ty, value, actual));
                 }
                 env.insert(name.clone(), actual.clone());
                 Ok(Bool::from_bool(true))
@@ -3037,7 +3107,10 @@ impl<'tcx> Verifier<'tcx> {
                 let mut pattern_spec = spec.clone();
                 pattern_spec.extend(env.clone());
                 let expected = self.contract_expr_to_value(current, &pattern_spec, expr)?;
-                self.eq_for_spec_ty(&expr.ty, &expected, actual, span)
+                self.solver_result(
+                    span,
+                    self.solver.eq_for_spec_ty(&expr.ty, &expected, actual),
+                )
             }
             TypedValuePattern::SeqLit { ty, items } => {
                 let mut values = Vec::with_capacity(items.len());
@@ -3054,12 +3127,16 @@ impl<'tcx> Verifier<'tcx> {
                     )?);
                     values.push(item_value);
                 }
-                conditions.push(self.eq_for_spec_ty(
-                    ty,
-                    &self.solver.seq_literal_value(&values),
-                    actual,
-                    span,
-                )?);
+                conditions.push(
+                    self.solver_result(
+                        span,
+                        self.solver.eq_for_spec_ty(
+                            ty,
+                            &self.solver.seq_literal_value(&values),
+                            actual,
+                        ),
+                    )?,
+                );
                 Ok(bool_and(conditions))
             }
             TypedValuePattern::StructLit { ty, fields } => {
@@ -3078,7 +3155,9 @@ impl<'tcx> Verifier<'tcx> {
                     values.push(field_value);
                 }
                 let expected = self.construct_composite(ty, &values)?;
-                conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
+                conditions.push(
+                    self.solver_result(span, self.solver.eq_for_spec_ty(ty, &expected, actual))?,
+                );
                 Ok(bool_and(conditions))
             }
             TypedValuePattern::CtorCall {
@@ -3100,7 +3179,9 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 conditions.push(self.composite_tag_formula(ty, actual, *ctor_index, span)?);
                 let expected = self.construct_composite_ctor(ty, *ctor_index, &values)?;
-                conditions.push(self.eq_for_spec_ty(ty, &expected, actual, span)?);
+                conditions.push(
+                    self.solver_result(span, self.solver.eq_for_spec_ty(ty, &expected, actual))?,
+                );
                 Ok(bool_and(conditions))
             }
         }
@@ -3478,13 +3559,16 @@ impl<'tcx> Verifier<'tcx> {
             .map(|param| (param.name.clone(), param.ty.clone()))
             .collect::<Vec<_>>();
         let param_tys = params.iter().map(|(_, ty)| ty.clone()).collect::<Vec<_>>();
-        self.solver
-            .declare_pure_fn(&pure_fn.name, &param_tys, &pure_fn.body.ty)
-            .map_err(|err| self.unsupported_result(self.report_span(), err))?;
-        let params = self
-            .solver
-            .pure_fn_params(&pure_fn.name, &params, &mut |hint| self.fresh_name(hint))
-            .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+        self.solver_result_at_report_span(self.solver.declare_pure_fn(
+            &pure_fn.name,
+            &param_tys,
+            &pure_fn.body.ty,
+        ))?;
+        let params = self.solver_result_at_report_span(self.solver.pure_fn_params(
+            &pure_fn.name,
+            &params,
+            &mut |hint| self.fresh_name(hint),
+        ))?;
         let current = params.iter().cloned().collect::<HashMap<_, _>>();
         let vars = params
             .iter()
@@ -3492,9 +3576,7 @@ impl<'tcx> Verifier<'tcx> {
             .collect::<Vec<_>>();
         let spec = HashMap::new();
         let body = self.contract_expr_to_value(&current, &spec, &pure_fn.body)?;
-        self.solver
-            .define_pure_fn(&pure_fn.name, &vars, &body)
-            .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+        self.solver_result_at_report_span(self.solver.define_pure_fn(&pure_fn.name, &vars, &body))?;
         Ok(())
     }
 
@@ -3831,12 +3913,11 @@ impl<'tcx> Verifier<'tcx> {
             if let TypedExprKind::Var(name) = &scrutinee.kind {
                 branch_current.insert(name.clone(), ctor_value.clone());
             }
-            let branch_eq = self.eq_for_spec_ty(
+            let branch_eq = self.solver_result_at_report_span(self.solver.eq_for_spec_ty(
                 &scrutinee.ty,
                 &scrutinee_value,
                 &ctor_value,
-                self.report_span(),
-            )?;
+            ))?;
             if !self.assume_path_condition(&mut branch_state, branch_eq) {
                 continue;
             }
@@ -3916,12 +3997,11 @@ impl<'tcx> Verifier<'tcx> {
             if let TypedExprKind::Var(name) = &scrutinee.kind {
                 branch_current.insert(name.clone(), ctor_value.clone());
             }
-            let branch_eq = self.eq_for_spec_ty(
+            let branch_eq = self.solver_result_at_report_span(self.solver.eq_for_spec_ty(
                 &scrutinee.ty,
                 &scrutinee_value,
                 &ctor_value,
-                self.report_span(),
-            )?;
+            ))?;
             if !self.assume_unsafe_path_condition(&mut branch_state, branch_eq) {
                 continue;
             }
@@ -4379,8 +4459,16 @@ impl<'tcx> Verifier<'tcx> {
                 )?;
                 Ok(result.value)
             }
-            BinOp::Eq => self.lower_eq_value(&lhs_spec_ty, &lhs_value, &rhs_value, false, span),
-            BinOp::Ne => self.lower_eq_value(&lhs_spec_ty, &lhs_value, &rhs_value, true, span),
+            BinOp::Eq => self.solver_result(
+                span,
+                self.solver
+                    .lower_eq_value(&lhs_spec_ty, &lhs_value, &rhs_value, false),
+            ),
+            BinOp::Ne => self.solver_result(
+                span,
+                self.solver
+                    .lower_eq_value(&lhs_spec_ty, &lhs_value, &rhs_value, true),
+            ),
             BinOp::Lt => Ok(self.solver.lower_int_predicate_value(
                 IntValuePredicateOp::Lt,
                 &lhs_value,
@@ -4474,7 +4562,11 @@ impl<'tcx> Verifier<'tcx> {
             }
         };
         let overflow_value = self.overflow_value_for_result(result_ty, &result_value, span)?;
-        self.checked_result_tuple_value(result_spec_ty, result_value, overflow_value, span)
+        self.solver_result(
+            span,
+            self.solver
+                .checked_result_tuple_value(result_spec_ty, result_value, overflow_value),
+        )
     }
 
     fn eval_unary_op(
@@ -4971,9 +5063,10 @@ impl<'tcx> Verifier<'tcx> {
             TypedExprKind::Index { base, index } => {
                 let value = self.spec_expr_to_value(state, base, resolved)?;
                 let index_value = self.spec_expr_to_value(state, index, resolved)?;
+                let span = self.control_span(state.ctrl);
                 let index_int =
-                    self.nat_to_int_term(&index_value, self.control_span(state.ctrl))?;
-                self.seq_nth_value(&value, &index_int, self.control_span(state.ctrl))
+                    self.solver_result(span, self.solver.nat_to_int_term(&index_value))?;
+                self.solver_result(span, self.solver.seq_nth_value(&value, &index_int))
             }
             TypedExprKind::Unary { op, arg } => {
                 let value = self.spec_expr_to_value(state, arg, resolved)?;
@@ -4982,12 +5075,10 @@ impl<'tcx> Verifier<'tcx> {
             TypedExprKind::Binary { op, lhs, rhs } => {
                 let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
                 let rhs_value = self.spec_expr_to_value(state, rhs, resolved)?;
-                self.lower_binary_value(
-                    *op,
-                    &lhs.ty,
-                    &lhs_value,
-                    &rhs_value,
+                self.solver_result(
                     self.control_span(state.ctrl),
+                    self.solver
+                        .lower_binary_value(*op, &lhs.ty, &lhs_value, &rhs_value),
                 )
             }
         }
@@ -5125,8 +5216,10 @@ impl<'tcx> Verifier<'tcx> {
             TypedExprKind::Index { base, index } => {
                 let value = self.contract_expr_to_value(current, spec, base)?;
                 let index_value = self.contract_expr_to_value(current, spec, index)?;
-                let index_int = self.nat_to_int_term(&index_value, self.report_span())?;
-                self.seq_nth_value(&value, &index_int, self.report_span())
+                let span = self.report_span();
+                let index_int =
+                    self.solver_result(span, self.solver.nat_to_int_term(&index_value))?;
+                self.solver_result(span, self.solver.seq_nth_value(&value, &index_int))
             }
             TypedExprKind::Unary { op, arg } => {
                 let value = self.contract_expr_to_value(current, spec, arg)?;
@@ -5135,7 +5228,10 @@ impl<'tcx> Verifier<'tcx> {
             TypedExprKind::Binary { op, lhs, rhs } => {
                 let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
                 let rhs_value = self.contract_expr_to_value(current, spec, rhs)?;
-                self.lower_binary_value(*op, &lhs.ty, &lhs_value, &rhs_value, self.report_span())
+                self.solver_result_at_report_span(
+                    self.solver
+                        .lower_binary_value(*op, &lhs.ty, &lhs_value, &rhs_value),
+                )
             }
         }
     }
@@ -5204,9 +5300,7 @@ impl<'tcx> Verifier<'tcx> {
         if let Some(value) = self.try_eval_ground_pure_call(func, &values, span)? {
             return Ok(value);
         }
-        self.solver
-            .apply_pure_fn(func, &values)
-            .map_err(|err| self.unsupported_result(span, err))?
+        self.solver_result(span, self.solver.apply_pure_fn(func, &values))?
             .ok_or_else(|| self.unsupported_result(span, format!("unknown pure function `{func}`")))
     }
 
@@ -5240,13 +5334,18 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<Option<SymValue>, VerificationResult> {
         match (func, values) {
             ("seq_len", [value]) => {
-                let length = self.seq_len_int(value, span)?;
+                let length = self.solver_result(span, self.solver.seq_len_int(value))?;
                 if let Some(length) = Solver::simplify_int(&length).as_i64()
                     && length >= 0
                 {
-                    return Ok(Some(self.concrete_nat_value(length as u64)?));
+                    return Ok(Some(self.solver_result_at_report_span(
+                        self.solver.concrete_nat_value(length as u64),
+                    )?));
                 }
-                Ok(Some(self.int_to_nat_value(&length, span)?))
+                Ok(Some(self.solver_result(
+                    span,
+                    self.solver.int_to_nat_value(&length),
+                )?))
             }
             ("seq_len", _) => Err(self.unsupported_result(
                 span,
@@ -5311,9 +5410,7 @@ impl<'tcx> Verifier<'tcx> {
                     Some(value)
                 } else {
                     Some(
-                        self.solver
-                            .apply_pure_fn(func, &values)
-                            .map_err(|err| self.unsupported_result(span, err))?
+                        self.solver_result(span, self.solver.apply_pure_fn(func, &values))?
                             .ok_or_else(|| {
                                 self.unsupported_result(
                                     span,
@@ -5332,10 +5429,11 @@ impl<'tcx> Verifier<'tcx> {
                 else {
                     return Ok(None);
                 };
-                let Some(ctor_index) = self
-                    .solver
-                    .ground_ctor_index(&scrutinee.ty, &scrutinee_value)
-                    .map_err(|err| self.unsupported_result(span, err))?
+                let Some(ctor_index) = self.solver_result(
+                    span,
+                    self.solver
+                        .ground_ctor_index(&scrutinee.ty, &scrutinee_value),
+                )?
                 else {
                     return Ok(None);
                 };
@@ -5379,8 +5477,9 @@ impl<'tcx> Verifier<'tcx> {
                 let Some(index_value) = self.try_eval_ground_pure_expr(index, env, span)? else {
                     return Ok(None);
                 };
-                let index_int = self.nat_to_int_term(&index_value, span)?;
-                Some(self.seq_nth_value(&value, &index_int, span)?)
+                let index_int =
+                    self.solver_result(span, self.solver.nat_to_int_term(&index_value))?;
+                Some(self.solver_result(span, self.solver.seq_nth_value(&value, &index_int))?)
             }
             TypedExprKind::Unary { op, arg } => {
                 let Some(value) = self.try_eval_ground_pure_expr(arg, env, span)? else {
@@ -5395,7 +5494,13 @@ impl<'tcx> Verifier<'tcx> {
                 let Some(rhs_value) = self.try_eval_ground_pure_expr(rhs, env, span)? else {
                     return Ok(None);
                 };
-                Some(self.lower_binary_value(*op, &lhs.ty, &lhs_value, &rhs_value, span)?)
+                Some(
+                    self.solver_result(
+                        span,
+                        self.solver
+                            .lower_binary_value(*op, &lhs.ty, &lhs_value, &rhs_value),
+                    )?,
+                )
             }
         })
     }
@@ -5843,59 +5948,19 @@ impl<'tcx> Verifier<'tcx> {
         })
     }
 
-    fn seq_len_int(&self, value: &SymValue, span: Span) -> Result<Int, VerificationResult> {
-        self.solver
-            .seq_len_int(value)
-            .map_err(|err| self.unsupported_result(span, err))
+    fn solver_result<T>(
+        &self,
+        span: Span,
+        result: Result<T, String>,
+    ) -> Result<T, VerificationResult> {
+        result.map_err(|err| self.unsupported_result(span, err))
     }
 
-    fn seq_nth_value(
+    fn solver_result_at_report_span<T>(
         &self,
-        value: &SymValue,
-        index: &Int,
-        span: Span,
-    ) -> Result<SymValue, VerificationResult> {
-        self.solver
-            .seq_nth_value(value, index)
-            .map_err(|err| self.unsupported_result(span, err))
-    }
-
-    fn eq_for_spec_ty(
-        &self,
-        ty: &SpecTy,
-        lhs: &SymValue,
-        rhs: &SymValue,
-        span: Span,
-    ) -> Result<Bool, VerificationResult> {
-        self.solver
-            .eq_for_spec_ty(ty, lhs, rhs)
-            .map_err(|err| self.unsupported_result(span, err))
-    }
-
-    fn lower_eq_value(
-        &self,
-        ty: &SpecTy,
-        lhs: &SymValue,
-        rhs: &SymValue,
-        negated: bool,
-        span: Span,
-    ) -> Result<SymValue, VerificationResult> {
-        self.solver
-            .lower_eq_value(ty, lhs, rhs, negated)
-            .map_err(|err| self.unsupported_result(span, err))
-    }
-
-    fn lower_binary_value(
-        &self,
-        op: BinaryOp,
-        lhs_ty: &SpecTy,
-        lhs: &SymValue,
-        rhs: &SymValue,
-        span: Span,
-    ) -> Result<SymValue, VerificationResult> {
-        self.solver
-            .lower_binary_value(op, lhs_ty, lhs, rhs)
-            .map_err(|err| self.unsupported_result(span, err))
+        result: Result<T, String>,
+    ) -> Result<T, VerificationResult> {
+        self.solver_result(self.report_span(), result)
     }
 
     fn construct_composite(
@@ -5903,9 +5968,7 @@ impl<'tcx> Verifier<'tcx> {
         ty: &SpecTy,
         fields: &[SymValue],
     ) -> Result<SymValue, VerificationResult> {
-        self.solver
-            .construct_composite(ty, fields)
-            .map_err(|err| self.unsupported_result(self.report_span(), err))
+        self.solver_result_at_report_span(self.solver.construct_composite(ty, fields))
     }
 
     fn construct_composite_ctor(
@@ -5914,21 +5977,9 @@ impl<'tcx> Verifier<'tcx> {
         ctor_index: usize,
         fields: &[SymValue],
     ) -> Result<SymValue, VerificationResult> {
-        self.solver
-            .construct_composite_ctor(ty, ctor_index, fields)
-            .map_err(|err| self.unsupported_result(self.report_span(), err))
-    }
-
-    fn checked_result_tuple_value(
-        &self,
-        result_ty: SpecTy,
-        result_value: SymValue,
-        overflow_value: SymValue,
-        span: Span,
-    ) -> Result<SymValue, VerificationResult> {
-        self.solver
-            .checked_result_tuple_value(result_ty, result_value, overflow_value)
-            .map_err(|err| self.unsupported_result(span, err))
+        self.solver_result_at_report_span(
+            self.solver.construct_composite_ctor(ty, ctor_index, fields),
+        )
     }
 
     fn fresh_for_rust_ty(&self, ty: Ty<'tcx>, hint: &str) -> Result<SymValue, VerificationResult> {
@@ -6054,7 +6105,11 @@ impl<'tcx> Verifier<'tcx> {
         if lhs.size != rhs.size || lhs.align != rhs.align {
             return Ok(Bool::from_bool(false));
         }
-        self.eq_for_spec_ty(&SpecTy::Usize, &lhs.base_addr, &rhs.base_addr, span)
+        self.solver_result(
+            span,
+            self.solver
+                .eq_for_spec_ty(&SpecTy::Usize, &lhs.base_addr, &rhs.base_addr),
+        )
     }
 
     fn allocation_distinct_formula(
@@ -6064,7 +6119,11 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Bool, VerificationResult> {
         Ok(self
-            .eq_for_spec_ty(&SpecTy::Usize, &lhs.base_addr, &rhs.base_addr, span)?
+            .solver_result(
+                span,
+                self.solver
+                    .eq_for_spec_ty(&SpecTy::Usize, &lhs.base_addr, &rhs.base_addr),
+            )?
             .not())
     }
 
@@ -6267,9 +6326,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn construct_option_none(&self, inner: SpecTy) -> Result<SymValue, VerificationResult> {
-        self.solver
-            .construct_option_none(inner)
-            .map_err(|err| self.unsupported_result(self.report_span(), err))
+        self.solver_result_at_report_span(self.solver.construct_option_none(inner))
     }
 
     fn construct_option_some(
@@ -6277,9 +6334,7 @@ impl<'tcx> Verifier<'tcx> {
         inner: SpecTy,
         value: SymValue,
     ) -> Result<SymValue, VerificationResult> {
-        self.solver
-            .construct_option_some(inner, value)
-            .map_err(|err| self.unsupported_result(self.report_span(), err))
+        self.solver_result_at_report_span(self.solver.construct_option_some(inner, value))
     }
 
     fn rust_ty_model_value(&self, ty: Ty<'tcx>) -> SymValue {
@@ -6329,9 +6384,11 @@ impl<'tcx> Verifier<'tcx> {
             }
             _ => {}
         }
-        self.solver
-            .fresh_for_spec_ty(ty, hint, &mut |field_hint| self.fresh_name(field_hint))
-            .map_err(|err| self.unsupported_result(self.report_span(), err))
+        self.solver_result_at_report_span(self.solver.fresh_for_spec_ty(
+            ty,
+            hint,
+            &mut |field_hint| self.fresh_name(field_hint),
+        ))
     }
 
     fn project_field(
@@ -6341,9 +6398,7 @@ impl<'tcx> Verifier<'tcx> {
         index: usize,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        self.solver
-            .project_field(parent_ty, &value, index)
-            .map_err(|err| self.unsupported_result(span, err))
+        self.solver_result(span, self.solver.project_field(parent_ty, &value, index))
     }
 
     fn ref_deref(
@@ -6407,7 +6462,11 @@ impl<'tcx> Verifier<'tcx> {
         let prov = self.ptr_prov(ptr, span)?;
         let none = self.construct_option_none(provenance_spec_ty())?;
         let has_prov = self
-            .eq_for_spec_ty(&option_spec_ty(provenance_spec_ty()), &prov, &none, span)?
+            .solver_result(
+                span,
+                self.solver
+                    .eq_for_spec_ty(&option_spec_ty(provenance_spec_ty()), &prov, &none),
+            )?
             .not();
         Ok(bool_and(vec![
             self.resolve_formula_for_spec_ty(&ptr_spec_ty(), ptr, span)?,
@@ -6425,24 +6484,6 @@ impl<'tcx> Verifier<'tcx> {
         let prov = self.ptr_prov(value, span)?;
         let ty = self.rust_ty_model_value(pointee_ty);
         self.construct_ptr(addr, prov, ty)
-    }
-
-    fn nat_to_int_term(&self, value: &SymValue, span: Span) -> Result<Int, VerificationResult> {
-        self.solver
-            .nat_to_int_term(value)
-            .map_err(|err| self.unsupported_result(span, err))
-    }
-
-    fn int_to_nat_value(&self, value: &Int, span: Span) -> Result<SymValue, VerificationResult> {
-        self.solver
-            .int_to_nat_value(value)
-            .map_err(|err| self.unsupported_result(span, err))
-    }
-
-    fn concrete_nat_value(&self, n: u64) -> Result<SymValue, VerificationResult> {
-        self.solver
-            .concrete_nat_value(n)
-            .map_err(|err| self.unsupported_result(self.report_span(), err))
     }
 
     fn spec_ty_for_place_ty(&self, ty: Ty<'tcx>, span: Span) -> Result<SpecTy, VerificationResult> {
@@ -6764,7 +6805,7 @@ impl<'tcx> Verifier<'tcx> {
                 let ptr = &view.fields[2].1;
                 Ok(bool_and(vec![
                     view.tag,
-                    self.eq_for_spec_ty(inner, cur, fin, span)?,
+                    self.solver_result(span, self.solver.eq_for_spec_ty(inner, cur, fin))?,
                     self.resolve_formula_for_spec_ty(inner, cur, span)?,
                     self.resolve_formula_for_spec_ty(inner, fin, span)?,
                     self.reference_ptr_formula(ptr, span)?,
@@ -6841,9 +6882,7 @@ impl<'tcx> Verifier<'tcx> {
         index: usize,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        self.solver
-            .project_field(ty, value, index)
-            .map_err(|err| self.unsupported_result(span, err))
+        self.solver_result(span, self.solver.project_field(ty, value, index))
     }
 
     fn decode_composite_ctor_field(
@@ -6854,9 +6893,11 @@ impl<'tcx> Verifier<'tcx> {
         index: usize,
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
-        self.solver
-            .project_composite_ctor_field_for_ty(ty, ctor_index, value, index)
-            .map_err(|err| self.unsupported_result(span, err))
+        self.solver_result(
+            span,
+            self.solver
+                .project_composite_ctor_field_for_ty(ty, ctor_index, value, index),
+        )
     }
 
     fn composite_ctor_view(
@@ -6866,9 +6907,11 @@ impl<'tcx> Verifier<'tcx> {
         ctor_index: usize,
         span: Span,
     ) -> Result<CompositeCtorView, VerificationResult> {
-        self.solver
-            .composite_ctor_view_for_ty(ty, ctor_index, value)
-            .map_err(|err| self.unsupported_result(span, err))
+        self.solver_result(
+            span,
+            self.solver
+                .composite_ctor_view_for_ty(ty, ctor_index, value),
+        )
     }
 
     fn composite_tag_formula(
@@ -6878,9 +6921,7 @@ impl<'tcx> Verifier<'tcx> {
         ctor_index: usize,
         span: Span,
     ) -> Result<Bool, VerificationResult> {
-        self.solver
-            .tag_formula_for_ty(ty, ctor_index, value)
-            .map_err(|err| self.unsupported_result(span, err))
+        self.solver_result(span, self.solver.tag_formula_for_ty(ty, ctor_index, value))
     }
 
     fn require_type_invariant(
