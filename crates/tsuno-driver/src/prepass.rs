@@ -3,13 +3,15 @@ use std::ops::ControlFlow;
 
 use crate::directive::{
     CollectedFunctionDirectives, DirectiveAttach, DirectiveError, DirectiveKind, FunctionDirective,
-    ResourceAssertion, ResourcePattern, ValuePattern, collect_function_directives,
+    collect_function_directives, collect_spec_comments, is_complete_ghost_item_comment,
+    is_ghost_item_block, parse_ghost_block, spec_comment_group_text,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
-    EnumDef, Expr, GhostMatchArm, LemmaDef, MatchBinding, MatchPattern, PureFnDef, RustTyKey,
-    RustTypeExpr, SpecTy, StructDef, StructFieldTy, StructTy, TypedExpr, TypedExprKind,
-    TypedMatchArm, TypedMatchBinding, option_spec_ty, parse_ghost_block, ptr_spec_ty,
+    EnumDef, Expr, GhostMatchArm, LemmaDef, MatchBinding, MatchPattern, PureFnDef,
+    ResourceAssertion, ResourcePattern, RustTyKey, RustTypeExpr, SpecTy, StructDef, StructFieldTy,
+    StructTy, TypedExpr, TypedExprKind, TypedMatchArm, TypedMatchBinding, ValuePattern,
+    option_spec_ty, ptr_spec_ty,
 };
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{BlockCheckMode, Expr as HirExpr, ExprKind, HirId, Pat, PatKind, UnsafeSource};
@@ -8298,9 +8300,9 @@ fn collect_ghost_items_in_source(
     lemmas: &mut Vec<LemmaDef>,
 ) -> Result<(), LoopPrepassError> {
     let mut ghost_item = Vec::new();
-    for comment in crate::spec::collect_spec_comments(source) {
+    for comment in collect_spec_comments(source) {
         if ghost_item.is_empty() {
-            if !crate::spec::is_ghost_item_block(&comment.text) {
+            if !is_ghost_item_block(&comment.text) {
                 continue;
             }
             ghost_item.push(comment);
@@ -8308,8 +8310,8 @@ fn collect_ghost_items_in_source(
             ghost_item.push(comment);
         }
 
-        let block = crate::spec::spec_comment_group_text(&ghost_item);
-        if !crate::spec::is_complete_ghost_item_comment(&block) {
+        let block = spec_comment_group_text(&ghost_item);
+        if !is_complete_ghost_item_comment(&block) {
             continue;
         }
         let parsed = parse_ghost_block(&block).map_err(|err| LoopPrepassError {
