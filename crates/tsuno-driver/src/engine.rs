@@ -2985,7 +2985,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 conditions.push(self.eq_for_spec_ty(
                     ty,
-                    &self.seq_literal_value(&values),
+                    &self.value_encoder.seq_literal_value(&values),
                     actual,
                     span,
                 )?);
@@ -3073,7 +3073,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 conditions.push(self.eq_for_spec_ty(
                     ty,
-                    &self.seq_literal_value(&values),
+                    &self.value_encoder.seq_literal_value(&values),
                     actual,
                     span,
                 )?);
@@ -3284,7 +3284,7 @@ impl<'tcx> Verifier<'tcx> {
                         span,
                     )?);
                 }
-                let value = self.seq_literal_value(&values);
+                let value = self.value_encoder.seq_literal_value(&values);
                 self.assert_materialized_value_ty(expected, ty, span)?;
                 Ok(value)
             }
@@ -4942,13 +4942,15 @@ impl<'tcx> Verifier<'tcx> {
             TypedExprKind::Int(value) => {
                 self.value_decimal_int(&value.digits, self.control_span(state.ctrl))
             }
-            TypedExprKind::RustType(key) => Ok(self.rust_ty_value(key)),
+            TypedExprKind::RustType(key) => Ok(with_solver(|solver| {
+                self.value_encoder.rust_ty_value(key, solver)
+            })),
             TypedExprKind::SeqLit(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
                     values.push(self.spec_expr_to_value(state, item, resolved)?);
                 }
-                Ok(self.seq_literal_value(&values))
+                Ok(self.value_encoder.seq_literal_value(&values))
             }
             TypedExprKind::StructLit { fields } => {
                 let mut values = Vec::with_capacity(fields.len());
@@ -5014,7 +5016,7 @@ impl<'tcx> Verifier<'tcx> {
             }
             TypedExprKind::Unary { op, arg } => {
                 let value = self.spec_expr_to_value(state, arg, resolved)?;
-                Ok(self.lower_unary_value(*op, &value))
+                Ok(self.value_encoder.lower_unary_value(*op, &value))
             }
             TypedExprKind::Binary { op, lhs, rhs } => {
                 let lhs_value = self.spec_expr_to_value(state, lhs, resolved)?;
@@ -5100,13 +5102,15 @@ impl<'tcx> Verifier<'tcx> {
         match &expr.kind {
             TypedExprKind::Bool(value) => Ok(self.value_encoder.bool_value(*value)),
             TypedExprKind::Int(value) => self.value_decimal_int(&value.digits, self.report_span()),
-            TypedExprKind::RustType(key) => Ok(self.rust_ty_value(key)),
+            TypedExprKind::RustType(key) => Ok(with_solver(|solver| {
+                self.value_encoder.rust_ty_value(key, solver)
+            })),
             TypedExprKind::SeqLit(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
                     values.push(self.contract_expr_to_value(current, spec, item)?);
                 }
-                Ok(self.seq_literal_value(&values))
+                Ok(self.value_encoder.seq_literal_value(&values))
             }
             TypedExprKind::StructLit { fields } => {
                 let mut values = Vec::with_capacity(fields.len());
@@ -5169,7 +5173,7 @@ impl<'tcx> Verifier<'tcx> {
             }
             TypedExprKind::Unary { op, arg } => {
                 let value = self.contract_expr_to_value(current, spec, arg)?;
-                Ok(self.lower_unary_value(*op, &value))
+                Ok(self.value_encoder.lower_unary_value(*op, &value))
             }
             TypedExprKind::Binary { op, lhs, rhs } => {
                 let lhs_value = self.contract_expr_to_value(current, spec, lhs)?;
@@ -5305,7 +5309,9 @@ impl<'tcx> Verifier<'tcx> {
         Ok(match &expr.kind {
             TypedExprKind::Bool(value) => Some(self.value_encoder.bool_value(*value)),
             TypedExprKind::Int(value) => Some(self.value_decimal_int(&value.digits, span)?),
-            TypedExprKind::RustType(key) => Some(self.rust_ty_value(key)),
+            TypedExprKind::RustType(key) => Some(with_solver(|solver| {
+                self.value_encoder.rust_ty_value(key, solver)
+            })),
             TypedExprKind::SeqLit(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
@@ -5314,7 +5320,7 @@ impl<'tcx> Verifier<'tcx> {
                     };
                     values.push(value);
                 }
-                Some(self.seq_literal_value(&values))
+                Some(self.value_encoder.seq_literal_value(&values))
             }
             TypedExprKind::StructLit { fields } => {
                 let mut values = Vec::with_capacity(fields.len());
@@ -5422,7 +5428,7 @@ impl<'tcx> Verifier<'tcx> {
                 let Some(value) = self.try_eval_ground_pure_expr(arg, env, span)? else {
                     return Ok(None);
                 };
-                Some(self.lower_unary_value(*op, &value))
+                Some(self.value_encoder.lower_unary_value(*op, &value))
             }
             TypedExprKind::Binary { op, lhs, rhs } => {
                 let Some(lhs_value) = self.try_eval_ground_pure_expr(lhs, env, span)? else {
@@ -5885,14 +5891,6 @@ impl<'tcx> Verifier<'tcx> {
         })
     }
 
-    fn rust_ty_value(&self, key: &RustTyKey) -> SymValue {
-        with_solver(|solver| self.value_encoder.rust_ty_value(key, solver))
-    }
-
-    fn seq_literal_value(&self, items: &[SymValue]) -> SymValue {
-        self.value_encoder.seq_literal_value(items)
-    }
-
     fn seq_len_int(&self, value: &SymValue, span: Span) -> Result<Int, VerificationResult> {
         self.value_encoder
             .seq_len_int(value)
@@ -5934,10 +5932,6 @@ impl<'tcx> Verifier<'tcx> {
                 .lower_eq_value(ty, lhs, rhs, negated, solver)
         })
         .map_err(|err| self.unsupported_result(span, err))
-    }
-
-    fn lower_unary_value(&self, op: UnaryOp, value: &SymValue) -> SymValue {
-        self.value_encoder.lower_unary_value(op, value)
     }
 
     fn lower_binary_value(
@@ -6352,7 +6346,10 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn rust_ty_model_value(&self, ty: Ty<'tcx>) -> SymValue {
-        self.rust_ty_value(&self.rust_ty_key_for_rust_ty(ty))
+        with_solver(|solver| {
+            self.value_encoder
+                .rust_ty_value(&self.rust_ty_key_for_rust_ty(ty), solver)
+        })
     }
 
     fn local_rust_ty_model_value(&self, local: Local) -> SymValue {
