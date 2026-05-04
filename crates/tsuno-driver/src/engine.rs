@@ -23,7 +23,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Once;
 use std::sync::mpsc;
@@ -39,7 +38,7 @@ use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::source_map::Spanned;
 use rustc_span::{DUMMY_SP, Span};
-use z3::ast::{Ast, Bool, Dynamic, Int, Seq as Z3Seq};
+use z3::ast::{Ast, Bool, Dynamic, Int};
 use z3::{Config, Context, RecFuncDecl, SatResult, Solver, SortKind};
 
 use crate::prepass::{
@@ -55,7 +54,10 @@ use crate::spec::{
     BinaryOp, RustTyKey, SpecTy, TypedExpr, TypedExprKind, TypedMatchBinding, UnaryOp,
     option_spec_ty, provenance_spec_ty, ptr_spec_ty,
 };
-use crate::value::{CompositeEncoding, SymValue, TypeEncoding, TypeEncodingKind, ValueEncoder};
+use crate::value::{
+    CompositeCtorView, IntValueBinaryOp, IntValuePredicateOp, OptionCtorKind, SymValue,
+    ValueEncoder,
+};
 
 const SOLVER_TIMEOUT_MS: u32 = 1_000;
 const GHOST_LOAD_TIMEOUT: Duration = Duration::from_millis(1_000);
@@ -778,9 +780,9 @@ impl<'tcx> Verifier<'tcx> {
                     let branch = match discr.ty(self.body(), self.tcx).kind() {
                         TyKind::Bool => {
                             if value == 0 {
-                                self.value_is_true(&discr_value).not()
+                                self.value_encoder.bool_term(&discr_value).not()
                             } else {
-                                self.value_is_true(&discr_value)
+                                self.value_encoder.bool_term(&discr_value)
                             }
                         }
                         _ => self.eq_for_spec_ty(
@@ -821,7 +823,7 @@ impl<'tcx> Verifier<'tcx> {
                 ..
             } => {
                 let cond_value = self.eval_operand(&mut state, cond, term.source_info.span)?;
-                let mut formula = self.value_is_true(&cond_value);
+                let mut formula = self.value_encoder.bool_term(&cond_value);
                 if !*expected {
                     formula = formula.not();
                 }
@@ -896,7 +898,7 @@ impl<'tcx> Verifier<'tcx> {
             } => {
                 let cond_value =
                     self.unsafe_eval_operand(&mut state, bridge, cond, term.source_info.span)?;
-                let mut formula = self.value_is_true(&cond_value);
+                let mut formula = self.value_encoder.bool_term(&cond_value);
                 if !*expected {
                     formula = formula.not();
                 }
@@ -935,9 +937,9 @@ impl<'tcx> Verifier<'tcx> {
                     let branch = match discr.ty(self.body(), self.tcx).kind() {
                         TyKind::Bool => {
                             if value == 0 {
-                                self.value_is_true(&discr_value).not()
+                                self.value_encoder.bool_term(&discr_value).not()
                             } else {
-                                self.value_is_true(&discr_value)
+                                self.value_encoder.bool_term(&discr_value)
                             }
                         }
                         _ => self.eq_for_spec_ty(
@@ -1824,7 +1826,7 @@ impl<'tcx> Verifier<'tcx> {
             ty,
             value: Some(value.clone()),
         });
-        let addr_int = self.value_int_data(&addr);
+        let addr_int = self.value_encoder.int_term(&addr);
         self.add_unsafe_path_condition(state, addr_int.eq(Int::from_i64(0)).not());
         let ty = self.body().local_decls[local].ty;
         let (_, align) = self.layout_size_align_bytes(ty, span)?;
@@ -2073,43 +2075,52 @@ impl<'tcx> Verifier<'tcx> {
         let lhs_value = self.unsafe_eval_operand(state, bridge, lhs, span)?;
         let rhs_value = self.unsafe_eval_operand(state, bridge, rhs, span)?;
         let result_ty = lhs.ty(&self.body().local_decls, self.tcx);
-        let tuple_ty = SpecTy::Tuple(vec![
-            self.spec_ty_for_place_ty(result_ty, span)?,
-            SpecTy::Bool,
-        ]);
+        let result_spec_ty = self.spec_ty_for_place_ty(result_ty, span)?;
         let result_value = match op {
             BinOp::Add | BinOp::AddWithOverflow => {
-                let int_value = self.value_int_data(&lhs_value) + self.value_int_data(&rhs_value);
+                let result = self.value_encoder.lower_int_binary_value(
+                    IntValueBinaryOp::Add,
+                    &lhs_value,
+                    &rhs_value,
+                );
                 self.require_unsafe_int_invariant(
                     state,
                     result_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                self.value_encoder.wrap_int(&int_value)
+                result.value
             }
             BinOp::Sub | BinOp::SubWithOverflow => {
-                let int_value = self.value_int_data(&lhs_value) - self.value_int_data(&rhs_value);
+                let result = self.value_encoder.lower_int_binary_value(
+                    IntValueBinaryOp::Sub,
+                    &lhs_value,
+                    &rhs_value,
+                );
                 self.require_unsafe_int_invariant(
                     state,
                     result_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                self.value_encoder.wrap_int(&int_value)
+                result.value
             }
             BinOp::Mul | BinOp::MulWithOverflow => {
-                let int_value = self.value_int_data(&lhs_value) * self.value_int_data(&rhs_value);
+                let result = self.value_encoder.lower_int_binary_value(
+                    IntValueBinaryOp::Mul,
+                    &lhs_value,
+                    &rhs_value,
+                );
                 self.require_unsafe_int_invariant(
                     state,
                     result_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                self.value_encoder.wrap_int(&int_value)
+                result.value
             }
             other => {
                 return Err(self.unsupported_result(
@@ -2119,7 +2130,7 @@ impl<'tcx> Verifier<'tcx> {
             }
         };
         let overflow_value = self.overflow_value_for_result(result_ty, &result_value, span)?;
-        self.construct_composite(&tuple_ty, &[result_value, overflow_value])
+        self.checked_result_tuple_value(result_spec_ty, result_value, overflow_value, span)
     }
 
     fn lower_unsafe_binary_value(
@@ -2134,59 +2145,66 @@ impl<'tcx> Verifier<'tcx> {
         let lhs_spec_ty = self.spec_ty_for_place_ty(lhs_ty, span)?;
         match op {
             BinOp::Add => {
-                let value = self.value_int_data(lhs) + self.value_int_data(rhs);
+                let result =
+                    self.value_encoder
+                        .lower_int_binary_value(IntValueBinaryOp::Add, lhs, rhs);
                 self.require_unsafe_int_invariant(
                     state,
                     lhs_ty,
-                    &value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_encoder.wrap_int(&value))
+                Ok(result.value)
             }
             BinOp::Sub => {
-                let value = self.value_int_data(lhs) - self.value_int_data(rhs);
+                let result =
+                    self.value_encoder
+                        .lower_int_binary_value(IntValueBinaryOp::Sub, lhs, rhs);
                 self.require_unsafe_int_invariant(
                     state,
                     lhs_ty,
-                    &value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_encoder.wrap_int(&value))
+                Ok(result.value)
             }
             BinOp::Mul => {
-                let value = self.value_int_data(lhs) * self.value_int_data(rhs);
+                let result =
+                    self.value_encoder
+                        .lower_int_binary_value(IntValueBinaryOp::Mul, lhs, rhs);
                 self.require_unsafe_int_invariant(
                     state,
                     lhs_ty,
-                    &value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_encoder.wrap_int(&value))
+                Ok(result.value)
             }
-            BinOp::Eq => Ok(self.value_encoder.wrap_bool(&self.eq_for_spec_ty(
-                &lhs_spec_ty,
-                lhs,
-                rhs,
-                span,
-            )?)),
-            BinOp::Ne => Ok(self
-                .value_encoder
-                .wrap_bool(&self.eq_for_spec_ty(&lhs_spec_ty, lhs, rhs, span)?.not())),
-            BinOp::Lt => Ok(self
-                .value_encoder
-                .wrap_bool(&self.value_int_data(lhs).lt(self.value_int_data(rhs)))),
-            BinOp::Le => Ok(self
-                .value_encoder
-                .wrap_bool(&self.value_int_data(lhs).le(self.value_int_data(rhs)))),
-            BinOp::Gt => Ok(self
-                .value_encoder
-                .wrap_bool(&self.value_int_data(lhs).gt(self.value_int_data(rhs)))),
-            BinOp::Ge => Ok(self
-                .value_encoder
-                .wrap_bool(&self.value_int_data(lhs).ge(self.value_int_data(rhs)))),
+            BinOp::Eq => self.lower_eq_value(&lhs_spec_ty, lhs, rhs, false, span),
+            BinOp::Ne => self.lower_eq_value(&lhs_spec_ty, lhs, rhs, true, span),
+            BinOp::Lt => {
+                Ok(self
+                    .value_encoder
+                    .lower_int_predicate_value(IntValuePredicateOp::Lt, lhs, rhs))
+            }
+            BinOp::Le => {
+                Ok(self
+                    .value_encoder
+                    .lower_int_predicate_value(IntValuePredicateOp::Le, lhs, rhs))
+            }
+            BinOp::Gt => {
+                Ok(self
+                    .value_encoder
+                    .lower_int_predicate_value(IntValuePredicateOp::Gt, lhs, rhs))
+            }
+            BinOp::Ge => {
+                Ok(self
+                    .value_encoder
+                    .lower_int_predicate_value(IntValuePredicateOp::Ge, lhs, rhs))
+            }
             other => {
                 Err(self.unsupported_result(span, format!("unsupported binary operator {other:?}")))
             }
@@ -2202,19 +2220,17 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<SymValue, VerificationResult> {
         match op {
-            UnOp::Not => Ok(self
-                .value_encoder
-                .wrap_bool(&self.value_is_true(value).not())),
+            UnOp::Not => Ok(self.value_encoder.lower_bool_not_value(value)),
             UnOp::Neg => {
-                let int_value = Int::from_i64(0) - self.value_int_data(value);
+                let result = self.value_encoder.lower_int_neg_value(value);
                 self.require_unsafe_int_invariant(
                     state,
                     operand_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_encoder.wrap_int(&int_value))
+                Ok(result.value)
             }
             other => {
                 Err(self.unsupported_result(span, format!("unsupported unary operator {other:?}")))
@@ -2780,8 +2796,11 @@ impl<'tcx> Verifier<'tcx> {
                             condition: bool_and(vec![
                                 candidate.condition.clone(),
                                 self.eq_for_spec_ty(&SpecTy::Usize, &base, resource_base, span)?,
-                                self.value_int_data(&size).eq(Int::from_u64(*resource_size)),
-                                self.value_int_data(&alignment)
+                                self.value_encoder
+                                    .int_term(&size)
+                                    .eq(Int::from_u64(*resource_size)),
+                                self.value_encoder
+                                    .int_term(&alignment)
                                     .eq(Int::from_u64(*resource_alignment)),
                             ])
                             .simplify(),
@@ -2892,8 +2911,11 @@ impl<'tcx> Verifier<'tcx> {
                             condition: bool_and(vec![
                                 candidate.condition.clone(),
                                 self.eq_for_spec_ty(&SpecTy::Usize, &base, resource_base, span)?,
-                                self.value_int_data(&size).eq(Int::from_u64(*resource_size)),
-                                self.value_int_data(&alignment)
+                                self.value_encoder
+                                    .int_term(&size)
+                                    .eq(Int::from_u64(*resource_size)),
+                                self.value_encoder
+                                    .int_term(&alignment)
                                     .eq(Int::from_u64(*resource_alignment)),
                             ])
                             .simplify(),
@@ -3119,7 +3141,7 @@ impl<'tcx> Verifier<'tcx> {
                 let ty = self.contract_expr_to_value(current, spec, ty)?;
                 let value =
                     self.materialize_points_to_contract_value(current, spec, value, span)?;
-                let addr_int = self.value_int_data(&addr);
+                let addr_int = self.value_encoder.int_term(&addr);
                 self.add_unsafe_path_condition(state, addr_int.eq(Int::from_i64(0)).not());
                 state.heap.push(Resource::PointsTo { addr, ty, value });
                 Ok(())
@@ -3133,7 +3155,8 @@ impl<'tcx> Verifier<'tcx> {
                 let size = self.contract_expr_to_value(current, spec, size)?;
                 let alignment = self.contract_expr_to_value(current, spec, alignment)?;
                 let Some(size) = self
-                    .value_int_data(&size)
+                    .value_encoder
+                    .int_term(&size)
                     .as_i64()
                     .and_then(|value| u64::try_from(value).ok())
                 else {
@@ -3143,7 +3166,8 @@ impl<'tcx> Verifier<'tcx> {
                     ));
                 };
                 let Some(alignment) = self
-                    .value_int_data(&alignment)
+                    .value_encoder
+                    .int_term(&alignment)
                     .as_i64()
                     .and_then(|value| u64::try_from(value).ok())
                 else {
@@ -3181,27 +3205,24 @@ impl<'tcx> Verifier<'tcx> {
                 ctor_index,
                 args,
             } if *ty == *typed_value_pattern_ty(pattern) => {
-                let some = self
+                match self
                     .value_encoder
-                    .enum_ctor_index("Option", "Some")
-                    .map_err(|err| self.unsupported_result(span, err))?;
-                let none = self
-                    .value_encoder
-                    .enum_ctor_index("Option", "None")
-                    .map_err(|err| self.unsupported_result(span, err))?;
-                if *ctor_index == some {
-                    let Some(arg) = args.first() else {
-                        return Err(self.unsupported_result(
-                            span,
-                            "Option::Some resource value requires one argument".to_owned(),
-                        ));
-                    };
-                    return Ok(Some(self.materialize_contract_value_pattern(
-                        current, spec, arg, &inner_ty, span,
-                    )?));
-                }
-                if *ctor_index == none {
-                    return Ok(None);
+                    .option_ctor_kind(*ctor_index)
+                    .map_err(|err| self.unsupported_result(span, err))?
+                {
+                    Some(OptionCtorKind::Some) => {
+                        let Some(arg) = args.first() else {
+                            return Err(self.unsupported_result(
+                                span,
+                                "Option::Some resource value requires one argument".to_owned(),
+                            ));
+                        };
+                        return Ok(Some(self.materialize_contract_value_pattern(
+                            current, spec, arg, &inner_ty, span,
+                        )?));
+                    }
+                    Some(OptionCtorKind::None) => return Ok(None),
+                    None => {}
                 }
             }
             TypedValuePattern::Expr(expr) => {
@@ -3209,25 +3230,22 @@ impl<'tcx> Verifier<'tcx> {
                     ctor_index, args, ..
                 } = &expr.kind
                 {
-                    let some = self
+                    match self
                         .value_encoder
-                        .enum_ctor_index("Option", "Some")
-                        .map_err(|err| self.unsupported_result(span, err))?;
-                    let none = self
-                        .value_encoder
-                        .enum_ctor_index("Option", "None")
-                        .map_err(|err| self.unsupported_result(span, err))?;
-                    if *ctor_index == some {
-                        let Some(arg) = args.first() else {
-                            return Err(self.unsupported_result(
-                                span,
-                                "Option::Some resource value requires one argument".to_owned(),
-                            ));
-                        };
-                        return Ok(Some(self.contract_expr_to_value(current, spec, arg)?));
-                    }
-                    if *ctor_index == none {
-                        return Ok(None);
+                        .option_ctor_kind(*ctor_index)
+                        .map_err(|err| self.unsupported_result(span, err))?
+                    {
+                        Some(OptionCtorKind::Some) => {
+                            let Some(arg) = args.first() else {
+                                return Err(self.unsupported_result(
+                                    span,
+                                    "Option::Some resource value requires one argument".to_owned(),
+                                ));
+                            };
+                            return Ok(Some(self.contract_expr_to_value(current, spec, arg)?));
+                        }
+                        Some(OptionCtorKind::None) => return Ok(None),
+                        None => {}
                     }
                 }
             }
@@ -3474,13 +3492,10 @@ impl<'tcx> Verifier<'tcx> {
         let domain_sorts = pure_fn
             .params
             .iter()
-            .map(|param| {
-                self.type_encoding(&param.ty)
-                    .map(|encoding| encoding.sort.clone())
-            })
+            .map(|param| self.sort_for_spec_ty(&param.ty))
             .collect::<Result<Vec<_>, _>>()?;
         let domain_refs: Vec<_> = domain_sorts.iter().collect();
-        let result_sort = self.type_encoding(&pure_fn.body.ty)?.sort.clone();
+        let result_sort = self.sort_for_spec_ty(&pure_fn.body.ty)?;
         let decl = RecFuncDecl::new(
             format!("pure_fn_{}", pure_fn.name),
             &domain_refs,
@@ -3494,7 +3509,7 @@ impl<'tcx> Verifier<'tcx> {
         let mut current = HashMap::new();
         let mut vars = Vec::with_capacity(pure_fn.params.len());
         for param in &pure_fn.params {
-            let sort = self.type_encoding(&param.ty)?.sort.clone();
+            let sort = self.sort_for_spec_ty(&param.ty)?;
             let value = SymValue::new(Dynamic::new_const(
                 self.fresh_name(&format!("pure_{}_{}", pure_fn.name, param.name)),
                 &sort,
@@ -4350,68 +4365,71 @@ impl<'tcx> Verifier<'tcx> {
                 self.eval_checked_binary_op(state, op, lhs, rhs, span)
             }
             BinOp::Add => {
-                let int_value = self.value_int_data(&lhs_value) + self.value_int_data(&rhs_value);
+                let result = self.value_encoder.lower_int_binary_value(
+                    IntValueBinaryOp::Add,
+                    &lhs_value,
+                    &rhs_value,
+                );
                 self.require_int_invariant(
                     state,
                     lhs_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_encoder.wrap_int(&int_value))
+                Ok(result.value)
             }
             BinOp::Sub => {
-                let int_value = self.value_int_data(&lhs_value) - self.value_int_data(&rhs_value);
+                let result = self.value_encoder.lower_int_binary_value(
+                    IntValueBinaryOp::Sub,
+                    &lhs_value,
+                    &rhs_value,
+                );
                 self.require_int_invariant(
                     state,
                     lhs_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_encoder.wrap_int(&int_value))
+                Ok(result.value)
             }
             BinOp::Mul => {
-                let int_value = self.value_int_data(&lhs_value) * self.value_int_data(&rhs_value);
+                let result = self.value_encoder.lower_int_binary_value(
+                    IntValueBinaryOp::Mul,
+                    &lhs_value,
+                    &rhs_value,
+                );
                 self.require_int_invariant(
                     state,
                     lhs_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_encoder.wrap_int(&int_value))
+                Ok(result.value)
             }
-            BinOp::Eq => Ok(self.value_encoder.wrap_bool(&self.eq_for_spec_ty(
-                &lhs_spec_ty,
+            BinOp::Eq => self.lower_eq_value(&lhs_spec_ty, &lhs_value, &rhs_value, false, span),
+            BinOp::Ne => self.lower_eq_value(&lhs_spec_ty, &lhs_value, &rhs_value, true, span),
+            BinOp::Lt => Ok(self.value_encoder.lower_int_predicate_value(
+                IntValuePredicateOp::Lt,
                 &lhs_value,
                 &rhs_value,
-                span,
-            )?)),
-            BinOp::Ne => Ok(self.value_encoder.wrap_bool(
-                &self
-                    .eq_for_spec_ty(&lhs_spec_ty, &lhs_value, &rhs_value, span)?
-                    .not(),
             )),
-            BinOp::Lt => Ok(self.value_encoder.wrap_bool(
-                &self
-                    .value_int_data(&lhs_value)
-                    .lt(self.value_int_data(&rhs_value)),
+            BinOp::Le => Ok(self.value_encoder.lower_int_predicate_value(
+                IntValuePredicateOp::Le,
+                &lhs_value,
+                &rhs_value,
             )),
-            BinOp::Le => Ok(self.value_encoder.wrap_bool(
-                &self
-                    .value_int_data(&lhs_value)
-                    .le(self.value_int_data(&rhs_value)),
+            BinOp::Gt => Ok(self.value_encoder.lower_int_predicate_value(
+                IntValuePredicateOp::Gt,
+                &lhs_value,
+                &rhs_value,
             )),
-            BinOp::Gt => Ok(self.value_encoder.wrap_bool(
-                &self
-                    .value_int_data(&lhs_value)
-                    .gt(self.value_int_data(&rhs_value)),
-            )),
-            BinOp::Ge => Ok(self.value_encoder.wrap_bool(
-                &self
-                    .value_int_data(&lhs_value)
-                    .ge(self.value_int_data(&rhs_value)),
+            BinOp::Ge => Ok(self.value_encoder.lower_int_predicate_value(
+                IntValuePredicateOp::Ge,
+                &lhs_value,
+                &rhs_value,
             )),
             other => {
                 Err(self.unsupported_result(span, format!("unsupported binary operator {other:?}")))
@@ -4431,43 +4449,52 @@ impl<'tcx> Verifier<'tcx> {
         let lhs_value = self.eval_operand(state, lhs, span)?;
         let rhs_value = self.eval_operand(state, rhs, span)?;
         let result_ty = lhs.ty(&self.body().local_decls, self.tcx);
-        let tuple_ty = SpecTy::Tuple(vec![
-            self.spec_ty_for_place_ty(result_ty, span)?,
-            SpecTy::Bool,
-        ]);
+        let result_spec_ty = self.spec_ty_for_place_ty(result_ty, span)?;
         let result_value = match op {
             BinOp::Add | BinOp::AddWithOverflow => {
-                let int_value = self.value_int_data(&lhs_value) + self.value_int_data(&rhs_value);
+                let result = self.value_encoder.lower_int_binary_value(
+                    IntValueBinaryOp::Add,
+                    &lhs_value,
+                    &rhs_value,
+                );
                 self.require_int_invariant(
                     state,
                     result_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                self.value_encoder.wrap_int(&int_value)
+                result.value
             }
             BinOp::Sub | BinOp::SubWithOverflow => {
-                let int_value = self.value_int_data(&lhs_value) - self.value_int_data(&rhs_value);
+                let result = self.value_encoder.lower_int_binary_value(
+                    IntValueBinaryOp::Sub,
+                    &lhs_value,
+                    &rhs_value,
+                );
                 self.require_int_invariant(
                     state,
                     result_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                self.value_encoder.wrap_int(&int_value)
+                result.value
             }
             BinOp::Mul | BinOp::MulWithOverflow => {
-                let int_value = self.value_int_data(&lhs_value) * self.value_int_data(&rhs_value);
+                let result = self.value_encoder.lower_int_binary_value(
+                    IntValueBinaryOp::Mul,
+                    &lhs_value,
+                    &rhs_value,
+                );
                 self.require_int_invariant(
                     state,
                     result_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                self.value_encoder.wrap_int(&int_value)
+                result.value
             }
             other => {
                 return Err(self.unsupported_result(
@@ -4477,7 +4504,7 @@ impl<'tcx> Verifier<'tcx> {
             }
         };
         let overflow_value = self.overflow_value_for_result(result_ty, &result_value, span)?;
-        self.construct_composite(&tuple_ty, &[result_value, overflow_value])
+        self.checked_result_tuple_value(result_spec_ty, result_value, overflow_value, span)
     }
 
     fn eval_unary_op(
@@ -4490,19 +4517,17 @@ impl<'tcx> Verifier<'tcx> {
         let value = self.eval_operand(state, operand, span)?;
         let operand_ty = operand.ty(&self.body().local_decls, self.tcx);
         let result = match op {
-            UnOp::Not => Ok(self
-                .value_encoder
-                .wrap_bool(&self.value_is_true(&value).not())),
+            UnOp::Not => Ok(self.value_encoder.lower_bool_not_value(&value)),
             UnOp::Neg => {
-                let int_value = Int::from_i64(0) - self.value_int_data(&value);
+                let result = self.value_encoder.lower_int_neg_value(&value);
                 self.require_int_invariant(
                     state,
                     operand_ty,
-                    &int_value,
+                    &result.term,
                     span,
                     "type invariant does not hold".to_owned(),
                 )?;
-                Ok(self.value_encoder.wrap_int(&int_value))
+                Ok(result.value)
             }
             other => {
                 Err(self.unsupported_result(span, format!("unsupported unary operator {other:?}")))
@@ -4890,17 +4915,19 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
                     let value = self.spec_expr_to_value(state, expr, resolved)?;
-                    Ok(self.value_is_true(&value))
+                    Ok(self.value_encoder.bool_term(&value))
                 }
                 BinaryOp::Concat => Err(self.unsupported_result(
                     self.control_span(state.ctrl),
                     "sequence value used where `bool` was required".to_owned(),
                 )),
             },
-            TypedExprKind::Match { .. } => {
-                Ok(self.value_is_true(&self.spec_expr_to_value(state, expr, resolved)?))
-            }
-            _ => Ok(self.value_is_true(&self.spec_expr_to_value(state, expr, resolved)?)),
+            TypedExprKind::Match { .. } => Ok(self
+                .value_encoder
+                .bool_term(&self.spec_expr_to_value(state, expr, resolved)?)),
+            _ => Ok(self
+                .value_encoder
+                .bool_term(&self.spec_expr_to_value(state, expr, resolved)?)),
         }
     }
 
@@ -5048,17 +5075,19 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
                     let value = self.contract_expr_to_value(current, spec, expr)?;
-                    Ok(self.value_is_true(&value))
+                    Ok(self.value_encoder.bool_term(&value))
                 }
                 BinaryOp::Concat => Err(self.unsupported_result(
                     self.report_span(),
                     "sequence value used where `bool` was required".to_owned(),
                 )),
             },
-            TypedExprKind::Match { .. } => {
-                Ok(self.value_is_true(&self.contract_expr_to_value(current, spec, expr)?))
-            }
-            _ => Ok(self.value_is_true(&self.contract_expr_to_value(current, spec, expr)?)),
+            TypedExprKind::Match { .. } => Ok(self
+                .value_encoder
+                .bool_term(&self.contract_expr_to_value(current, spec, expr)?)),
+            _ => Ok(self
+                .value_encoder
+                .bool_term(&self.contract_expr_to_value(current, spec, expr)?)),
         }
     }
 
@@ -5860,14 +5889,6 @@ impl<'tcx> Verifier<'tcx> {
         with_solver(|solver| self.value_encoder.rust_ty_value(key, solver))
     }
 
-    fn value_is_true(&self, value: &SymValue) -> Bool {
-        self.value_encoder.bool_term(value)
-    }
-
-    fn value_int_data(&self, value: &SymValue) -> Int {
-        self.value_encoder.int_term(value)
-    }
-
     fn seq_literal_value(&self, items: &[SymValue]) -> SymValue {
         self.value_encoder.seq_literal_value(items)
     }
@@ -5900,6 +5921,21 @@ impl<'tcx> Verifier<'tcx> {
             .map_err(|err| self.unsupported_result(span, err))
     }
 
+    fn lower_eq_value(
+        &self,
+        ty: &SpecTy,
+        lhs: &SymValue,
+        rhs: &SymValue,
+        negated: bool,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        with_solver(|solver| {
+            self.value_encoder
+                .lower_eq_value(ty, lhs, rhs, negated, solver)
+        })
+        .map_err(|err| self.unsupported_result(span, err))
+    }
+
     fn lower_unary_value(&self, op: UnaryOp, value: &SymValue) -> SymValue {
         self.value_encoder.lower_unary_value(op, value)
     }
@@ -5919,13 +5955,8 @@ impl<'tcx> Verifier<'tcx> {
         .map_err(|err| self.unsupported_result(span, err))
     }
 
-    fn type_encoding(&self, ty: &SpecTy) -> Result<Rc<TypeEncoding>, VerificationResult> {
-        with_solver(|solver| self.value_encoder.type_encoding(ty, solver))
-            .map_err(|err| self.unsupported_result(self.report_span(), err))
-    }
-
-    fn composite_encoding(&self, ty: &SpecTy) -> Result<Rc<CompositeEncoding>, VerificationResult> {
-        with_solver(|solver| self.value_encoder.composite_encoding(ty, solver))
+    fn sort_for_spec_ty(&self, ty: &SpecTy) -> Result<z3::Sort, VerificationResult> {
+        with_solver(|solver| self.value_encoder.sort_for_ty(ty, solver))
             .map_err(|err| self.unsupported_result(self.report_span(), err))
     }
 
@@ -5949,6 +5980,24 @@ impl<'tcx> Verifier<'tcx> {
                 .construct_composite_ctor(ty, ctor_index, fields, solver)
         })
         .map_err(|err| self.unsupported_result(self.report_span(), err))
+    }
+
+    fn checked_result_tuple_value(
+        &self,
+        result_ty: SpecTy,
+        result_value: SymValue,
+        overflow_value: SymValue,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        with_solver(|solver| {
+            self.value_encoder.checked_result_tuple_value(
+                result_ty,
+                result_value,
+                overflow_value,
+                solver,
+            )
+        })
+        .map_err(|err| self.unsupported_result(span, err))
     }
 
     fn fresh_for_rust_ty(&self, ty: Ty<'tcx>, hint: &str) -> Result<SymValue, VerificationResult> {
@@ -6098,19 +6147,19 @@ impl<'tcx> Verifier<'tcx> {
             formulas.push(base_in_range);
         }
         let (_, usize_max) = self.pointer_sized_int_bounds(false)?;
-        let end = self.value_int_data(&alloc.base_addr) + Int::from_u64(alloc.size);
+        let end = self.value_encoder.int_term(&alloc.base_addr) + Int::from_u64(alloc.size);
         formulas.push(end.le(usize_max));
         if alloc.align > 1 {
-            let base = self.value_int_data(&alloc.base_addr);
+            let base = self.value_encoder.int_term(&alloc.base_addr);
             formulas.push(base.modulo(Int::from_u64(alloc.align)).eq(0));
         }
         Ok(bool_and(formulas))
     }
 
     fn allocation_non_overlapping_formula(&self, alloc: &Allocation, other: &Allocation) -> Bool {
-        let alloc_base = self.value_int_data(&alloc.base_addr);
+        let alloc_base = self.value_encoder.int_term(&alloc.base_addr);
         let alloc_end = alloc_base.clone() + Int::from_u64(alloc.size);
-        let other_base = self.value_int_data(&other.base_addr);
+        let other_base = self.value_encoder.int_term(&other.base_addr);
         let other_end = other_base.clone() + Int::from_u64(other.size);
         Bool::or(&[&alloc_end.le(&other_base), &other_end.le(alloc_base)])
     }
@@ -6227,11 +6276,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn add_addr_offset(&self, base: SymValue, offset: u64) -> SymValue {
-        if offset == 0 {
-            return base;
-        }
-        self.value_encoder
-            .wrap_int(&(self.value_int_data(&base) + Int::from_u64(offset)))
+        self.value_encoder.offset_int_value(&base, offset)
     }
 
     fn layout_for_ty(
@@ -6353,48 +6398,13 @@ impl<'tcx> Verifier<'tcx> {
             }
             _ => {}
         }
-        if matches!(ty, SpecTy::Enum { .. }) {
-            return Ok(SymValue::new(Dynamic::new_const(
-                self.fresh_name(hint),
-                self.value_encoder.value_sort(),
-            )));
-        }
-        let encoding = self.type_encoding(ty)?;
-        self.fresh_for_encoding(&encoding, hint)
-    }
-
-    fn fresh_for_encoding(
-        &self,
-        encoding: &TypeEncoding,
-        hint: &str,
-    ) -> Result<SymValue, VerificationResult> {
-        match &encoding.kind {
-            TypeEncodingKind::Bool => Ok(self
-                .value_encoder
-                .wrap_bool(&Bool::new_const(self.fresh_name(hint)))),
-            TypeEncodingKind::Int => Ok(self
-                .value_encoder
-                .wrap_int(&Int::new_const(self.fresh_name(hint)))),
-            TypeEncodingKind::Opaque => Ok(SymValue::new(Dynamic::new_const(
-                self.fresh_name(hint),
-                self.value_encoder.value_sort(),
-            ))),
-            TypeEncodingKind::Seq => Ok(SymValue::new(Dynamic::from(Z3Seq::new_const(
-                self.fresh_name(hint),
-                self.value_encoder.value_sort(),
-            )))),
-            TypeEncodingKind::Composite(composite) => {
-                let ctor = composite
-                    .single_constructor()
-                    .map_err(|err| self.unsupported_result(self.report_span(), err))?;
-                let mut fields = Vec::with_capacity(ctor.fields.len());
-                for (index, field) in ctor.fields.iter().enumerate() {
-                    fields.push(self.fresh_for_spec_ty(&field.ty, &format!("{hint}_{index}"))?);
-                }
-                let args = fields.iter().map(SymValue::ast).collect::<Vec<_>>();
-                Ok(SymValue::new(ctor.symbol.apply(&args)))
-            }
-        }
+        with_solver(|solver| {
+            self.value_encoder
+                .fresh_for_spec_ty(ty, hint, solver, &mut |field_hint| {
+                    self.fresh_name(field_hint)
+                })
+        })
+        .map_err(|err| self.unsupported_result(self.report_span(), err))
     }
 
     fn project_field(
@@ -6671,7 +6681,7 @@ impl<'tcx> Verifier<'tcx> {
                 );
             }
         };
-        Ok(self.value_encoder.wrap_int(&int))
+        Ok(self.value_encoder.scalar_int_value(&int))
     }
 
     fn overflow_value_for_result(
@@ -6683,7 +6693,7 @@ impl<'tcx> Verifier<'tcx> {
         let in_range = self
             .int_range_formula_for_int(
                 self.int_bounds_for_rust_ty(ty, span)?,
-                &self.value_int_data(value),
+                &self.value_encoder.int_term(value),
             )
             .unwrap_or_else(|| Bool::from_bool(true));
         Ok(self.value_encoder.overflow_value_for_in_range(in_range))
@@ -6713,37 +6723,33 @@ impl<'tcx> Verifier<'tcx> {
                 self.value_encoder
                     .int_bounds(ty)
                     .map_err(|err| self.unsupported_result(span, err))?,
-                &self.value_int_data(value),
+                &self.value_encoder.int_term(value),
             )),
             SpecTy::Seq(_) => Ok(None),
             SpecTy::Ref(inner) => {
-                let deref = self.decode_composite_field(ty, value, 0, span)?;
-                let ptr = self.decode_composite_field(ty, value, 1, span)?;
-                let mut formulas = vec![
-                    self.composite_tag_formula(ty, value, 0, span)?,
-                    self.reference_ptr_formula(&ptr, span)?,
-                ];
-                if let Some(formula) = self.spec_ty_formula(inner, &deref, span)? {
+                let view = self.composite_ctor_view(ty, value, 0, span)?;
+                let deref = &view.fields[0].1;
+                let ptr = &view.fields[1].1;
+                let mut formulas = vec![view.tag, self.reference_ptr_formula(ptr, span)?];
+                if let Some(formula) = self.spec_ty_formula(inner, deref, span)? {
                     formulas.push(formula);
                 }
                 Ok(Some(bool_and(formulas)))
             }
             SpecTy::Mut(inner) => {
-                let current = self.decode_composite_field(ty, value, 0, span)?;
-                let ptr = self.decode_composite_field(ty, value, 2, span)?;
-                let mut formulas = vec![
-                    self.composite_tag_formula(ty, value, 0, span)?,
-                    self.reference_ptr_formula(&ptr, span)?,
-                ];
-                if let Some(formula) = self.spec_ty_formula(inner, &current, span)? {
+                let view = self.composite_ctor_view(ty, value, 0, span)?;
+                let cur = &view.fields[0].1;
+                let ptr = &view.fields[2].1;
+                let mut formulas = vec![view.tag, self.reference_ptr_formula(ptr, span)?];
+                if let Some(formula) = self.spec_ty_formula(inner, cur, span)? {
                     formulas.push(formula);
                 }
                 Ok(Some(bool_and(formulas)))
             }
             SpecTy::Tuple(items) => {
-                let mut formulas = vec![self.composite_tag_formula(ty, value, 0, span)?];
-                for (index, field_ty) in items.iter().enumerate() {
-                    let field = self.decode_composite_field(ty, value, index, span)?;
+                let view = self.composite_ctor_view(ty, value, 0, span)?;
+                let mut formulas = vec![view.tag];
+                for (field_ty, (_, field)) in items.iter().zip(view.fields) {
                     if let Some(formula) = self.spec_ty_formula(field_ty, &field, span)? {
                         formulas.push(formula);
                     }
@@ -6751,15 +6757,14 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(Some(bool_and(formulas)))
             }
             SpecTy::Struct(struct_ty) => {
-                let composite = self.composite_encoding(ty)?;
                 if let Some(formula) =
-                    self.direct_struct_invariant_formula(&composite, struct_ty, value, span)?
+                    self.direct_struct_invariant_formula(ty, struct_ty, value, span)?
                 {
                     return Ok(Some(formula));
                 }
-                let mut formulas = vec![self.composite_tag_formula(ty, value, 0, span)?];
-                for (index, field) in struct_ty.fields.iter().enumerate() {
-                    let field_value = self.decode_composite_field(ty, value, index, span)?;
+                let view = self.composite_ctor_view(ty, value, 0, span)?;
+                let mut formulas = vec![view.tag];
+                for (field, (_, field_value)) in struct_ty.fields.iter().zip(view.fields) {
                     if let Some(formula) = self.spec_ty_formula(&field.ty, &field_value, span)? {
                         formulas.push(formula);
                     }
@@ -6773,15 +6778,16 @@ impl<'tcx> Verifier<'tcx> {
 
     fn direct_struct_invariant_formula(
         &self,
-        composite: &CompositeEncoding,
+        ty: &SpecTy,
         struct_ty: &crate::spec::StructTy,
         value: &SymValue,
         span: Span,
     ) -> Result<Option<Bool>, VerificationResult> {
-        let Some(fields) = self
-            .value_encoder
-            .direct_composite_fields(composite, value)
-            .map_err(|err| self.unsupported_result(span, err))?
+        let Some(fields) = with_solver(|solver| {
+            self.value_encoder
+                .direct_composite_fields_for_ty(ty, value, solver)
+        })
+        .map_err(|err| self.unsupported_result(span, err))?
         else {
             return Ok(None);
         };
@@ -6817,29 +6823,31 @@ impl<'tcx> Verifier<'tcx> {
             | SpecTy::Usize => Ok(Bool::from_bool(true)),
             SpecTy::Seq(_) => Ok(Bool::from_bool(true)),
             SpecTy::Ref(_) => {
-                let ptr = self.decode_composite_field(ty, value, 1, span)?;
+                let view = self.composite_ctor_view(ty, value, 0, span)?;
+                let ptr = &view.fields[1].1;
                 Ok(bool_and(vec![
-                    self.composite_tag_formula(ty, value, 0, span)?,
-                    self.reference_ptr_formula(&ptr, span)?,
+                    view.tag,
+                    self.reference_ptr_formula(ptr, span)?,
                 ]))
             }
             SpecTy::Mut(inner) => {
-                let cur = self.decode_composite_field(ty, value, 0, span)?;
-                let fin = self.decode_composite_field(ty, value, 1, span)?;
-                let ptr = self.decode_composite_field(ty, value, 2, span)?;
+                let view = self.composite_ctor_view(ty, value, 0, span)?;
+                let cur = &view.fields[0].1;
+                let fin = &view.fields[1].1;
+                let ptr = &view.fields[2].1;
                 Ok(bool_and(vec![
-                    self.composite_tag_formula(ty, value, 0, span)?,
-                    self.eq_for_spec_ty(inner, &cur, &fin, span)?,
-                    self.resolve_formula_for_spec_ty(inner, &cur, span)?,
-                    self.resolve_formula_for_spec_ty(inner, &fin, span)?,
-                    self.reference_ptr_formula(&ptr, span)?,
+                    view.tag,
+                    self.eq_for_spec_ty(inner, cur, fin, span)?,
+                    self.resolve_formula_for_spec_ty(inner, cur, span)?,
+                    self.resolve_formula_for_spec_ty(inner, fin, span)?,
+                    self.reference_ptr_formula(ptr, span)?,
                 ]))
             }
             SpecTy::Tuple(items) => {
+                let view = self.composite_ctor_view(ty, value, 0, span)?;
                 let mut formulas = Vec::with_capacity(items.len() + 1);
-                formulas.push(self.composite_tag_formula(ty, value, 0, span)?);
-                for (index, field_ty) in items.iter().enumerate() {
-                    let field = self.decode_composite_field(ty, value, index, span)?;
+                formulas.push(view.tag);
+                for (field_ty, (_, field)) in items.iter().zip(view.fields) {
                     formulas.push(self.resolve_formula_for_spec_ty(field_ty, &field, span)?);
                 }
                 Ok(bool_and(formulas))
@@ -6848,10 +6856,10 @@ impl<'tcx> Verifier<'tcx> {
                 if struct_ty.name == "Ptr" {
                     return self.composite_tag_formula(ty, value, 0, span);
                 }
+                let view = self.composite_ctor_view(ty, value, 0, span)?;
                 let mut formulas = Vec::with_capacity(struct_ty.fields.len() + 1);
-                formulas.push(self.composite_tag_formula(ty, value, 0, span)?);
-                for (index, field) in struct_ty.fields.iter().enumerate() {
-                    let field_value = self.decode_composite_field(ty, value, index, span)?;
+                formulas.push(view.tag);
+                for (field, (_, field_value)) in struct_ty.fields.iter().zip(view.fields) {
                     formulas.push(self.resolve_formula_for_spec_ty(
                         &field.ty,
                         &field_value,
@@ -6871,11 +6879,11 @@ impl<'tcx> Verifier<'tcx> {
         value: &SymValue,
         span: Span,
     ) -> Result<Bool, VerificationResult> {
-        let composite = self.composite_encoding(ty)?;
-        if let Some(fields) = self
-            .value_encoder
-            .direct_composite_ctor_fields(&composite, value)
-            .map_err(|err| self.unsupported_result(span, err))?
+        if let Some(fields) = with_solver(|solver| {
+            self.value_encoder
+                .direct_composite_ctor_fields_for_ty(ty, value, solver)
+        })
+        .map_err(|err| self.unsupported_result(span, err))?
         {
             let mut formulas =
                 vec![self.composite_tag_formula(ty, value, fields.ctor_index, span)?];
@@ -6924,6 +6932,20 @@ impl<'tcx> Verifier<'tcx> {
         with_solver(|solver| {
             self.value_encoder
                 .project_composite_ctor_field_for_ty(ty, ctor_index, value, index, solver)
+        })
+        .map_err(|err| self.unsupported_result(span, err))
+    }
+
+    fn composite_ctor_view(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+        ctor_index: usize,
+        span: Span,
+    ) -> Result<CompositeCtorView, VerificationResult> {
+        with_solver(|solver| {
+            self.value_encoder
+                .composite_ctor_view_for_ty(ty, ctor_index, value, solver)
         })
         .map_err(|err| self.unsupported_result(span, err))
     }

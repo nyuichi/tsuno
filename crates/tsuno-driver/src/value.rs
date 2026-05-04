@@ -137,13 +137,13 @@ impl SymValue {
 }
 
 #[derive(Debug)]
-pub(crate) struct TypeEncoding {
-    pub(crate) kind: TypeEncodingKind,
-    pub(crate) sort: Sort,
+struct TypeEncoding {
+    kind: TypeEncodingKind,
+    sort: Sort,
 }
 
 #[derive(Debug)]
-pub(crate) enum TypeEncodingKind {
+enum TypeEncodingKind {
     Bool,
     Int,
     Opaque,
@@ -152,16 +152,16 @@ pub(crate) enum TypeEncodingKind {
 }
 
 #[derive(Debug)]
-pub(crate) struct PrimitiveEncoding {
-    pub(crate) boxed: FuncDecl,
-    pub(crate) unboxed: FuncDecl,
+struct PrimitiveEncoding {
+    boxed: FuncDecl,
+    unboxed: FuncDecl,
 }
 
 #[derive(Debug)]
-pub(crate) struct CompositeEncoding {
-    pub(crate) tag_function: FuncDecl,
-    pub(crate) constructors: Vec<Rc<ConstructorEncoding>>,
-    pub(crate) invariant: Option<Rc<FuncDecl>>,
+struct CompositeEncoding {
+    tag_function: FuncDecl,
+    constructors: Vec<Rc<ConstructorEncoding>>,
+    invariant: Option<Rc<FuncDecl>>,
 }
 
 #[derive(Debug)]
@@ -187,8 +187,39 @@ pub(crate) struct DirectCtorFields {
     pub(crate) fields: Vec<(SpecTy, SymValue)>,
 }
 
+pub(crate) struct CompositeCtorView {
+    pub(crate) tag: Bool,
+    pub(crate) fields: Vec<(SpecTy, SymValue)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OptionCtorKind {
+    None,
+    Some,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntValueBinaryOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntValuePredicateOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+pub(crate) struct IntValueResult {
+    pub(crate) term: Int,
+    pub(crate) value: SymValue,
+}
+
 impl CompositeEncoding {
-    pub(crate) fn single_constructor(&self) -> Result<&ConstructorEncoding, String> {
+    fn single_constructor(&self) -> Result<&ConstructorEncoding, String> {
         match self.constructors.as_slice() {
             [ctor] => Ok(ctor.as_ref()),
             ctors => Err(format!(
@@ -200,17 +231,17 @@ impl CompositeEncoding {
 }
 
 #[derive(Debug)]
-pub(crate) struct ConstructorEncoding {
-    pub(crate) name: String,
-    pub(crate) symbol: FuncDecl,
-    pub(crate) fields: Vec<FieldEncoding>,
-    pub(crate) tag: Int,
+struct ConstructorEncoding {
+    name: String,
+    symbol: FuncDecl,
+    fields: Vec<FieldEncoding>,
+    tag: Int,
 }
 
 #[derive(Debug)]
-pub(crate) struct FieldEncoding {
-    pub(crate) inverse: FuncDecl,
-    pub(crate) ty: SpecTy,
+struct FieldEncoding {
+    inverse: FuncDecl,
+    ty: SpecTy,
 }
 
 type CtorFields = Vec<(String, SpecTy)>;
@@ -292,15 +323,25 @@ impl ValueEncoder {
             .ok_or_else(|| format!("unknown constructor `{enum_name}::{ctor_name}`"))
     }
 
+    pub(crate) fn option_ctor_kind(
+        &self,
+        ctor_index: usize,
+    ) -> Result<Option<OptionCtorKind>, String> {
+        if ctor_index == self.enum_ctor_index("Option", "None")? {
+            return Ok(Some(OptionCtorKind::None));
+        }
+        if ctor_index == self.enum_ctor_index("Option", "Some")? {
+            return Ok(Some(OptionCtorKind::Some));
+        }
+        Ok(None)
+    }
+
+    #[cfg(test)]
     pub(crate) fn value_sort(&self) -> &Sort {
         &self.value_sort
     }
 
-    pub(crate) fn type_encoding(
-        &self,
-        ty: &SpecTy,
-        solver: &Solver,
-    ) -> Result<Rc<TypeEncoding>, String> {
+    fn type_encoding(&self, ty: &SpecTy, solver: &Solver) -> Result<Rc<TypeEncoding>, String> {
         self.ensure_primitive_axioms(solver);
         let cached = { self.type_encodings.borrow().get(ty).cloned() };
         if let Some(encoding) = cached {
@@ -319,7 +360,11 @@ impl ValueEncoder {
         Ok(encoding)
     }
 
-    pub(crate) fn composite_encoding(
+    pub(crate) fn sort_for_ty(&self, ty: &SpecTy, solver: &Solver) -> Result<Sort, String> {
+        Ok(self.type_encoding(ty, solver)?.sort.clone())
+    }
+
+    fn composite_encoding(
         &self,
         ty: &SpecTy,
         solver: &Solver,
@@ -331,7 +376,7 @@ impl ValueEncoder {
         }
     }
 
-    pub(crate) fn named_invariant(
+    fn named_invariant(
         &self,
         ty: &SpecTy,
         solver: &Solver,
@@ -365,6 +410,17 @@ impl ValueEncoder {
 
     pub(crate) fn overflow_value_for_in_range(&self, in_range: Bool) -> SymValue {
         self.wrap_bool(&in_range.not())
+    }
+
+    pub(crate) fn scalar_int_value(&self, value: &Int) -> SymValue {
+        self.wrap_int(value)
+    }
+
+    pub(crate) fn offset_int_value(&self, base: &SymValue, offset: u64) -> SymValue {
+        if offset == 0 {
+            return base.clone();
+        }
+        self.wrap_int(&(self.int_term(base) + Int::from_u64(offset)))
     }
 
     pub(crate) fn empty_seq_value(&self) -> SymValue {
@@ -866,6 +922,61 @@ impl ValueEncoder {
         }
     }
 
+    pub(crate) fn lower_bool_not_value(&self, value: &SymValue) -> SymValue {
+        self.wrap_bool(&self.bool_term(value).not())
+    }
+
+    pub(crate) fn lower_int_neg_value(&self, value: &SymValue) -> IntValueResult {
+        let term = Int::from_i64(0) - self.int_term(value);
+        let value = self.wrap_int(&term);
+        IntValueResult { term, value }
+    }
+
+    pub(crate) fn lower_int_binary_value(
+        &self,
+        op: IntValueBinaryOp,
+        lhs: &SymValue,
+        rhs: &SymValue,
+    ) -> IntValueResult {
+        let term = match op {
+            IntValueBinaryOp::Add => self.int_term(lhs) + self.int_term(rhs),
+            IntValueBinaryOp::Sub => self.int_term(lhs) - self.int_term(rhs),
+            IntValueBinaryOp::Mul => self.int_term(lhs) * self.int_term(rhs),
+        };
+        let value = self.wrap_int(&term);
+        IntValueResult { term, value }
+    }
+
+    pub(crate) fn lower_eq_value(
+        &self,
+        ty: &SpecTy,
+        lhs: &SymValue,
+        rhs: &SymValue,
+        negated: bool,
+        solver: &Solver,
+    ) -> Result<SymValue, String> {
+        let eq = self.eq_for_spec_ty(ty, lhs, rhs, solver)?;
+        let formula = if negated { eq.not() } else { eq };
+        Ok(self.wrap_bool(&formula))
+    }
+
+    pub(crate) fn lower_int_predicate_value(
+        &self,
+        op: IntValuePredicateOp,
+        lhs: &SymValue,
+        rhs: &SymValue,
+    ) -> SymValue {
+        let lhs = self.int_term(lhs);
+        let rhs = self.int_term(rhs);
+        let formula = match op {
+            IntValuePredicateOp::Lt => lhs.lt(rhs),
+            IntValuePredicateOp::Le => lhs.le(rhs),
+            IntValuePredicateOp::Gt => lhs.gt(rhs),
+            IntValuePredicateOp::Ge => lhs.ge(rhs),
+        };
+        self.wrap_bool(&formula)
+    }
+
     pub(crate) fn lower_binary_value(
         &self,
         op: BinaryOp,
@@ -957,7 +1068,7 @@ impl ValueEncoder {
         Ok(SymValue::new(ctor.symbol.apply(&args)))
     }
 
-    pub(crate) fn construct_composite_ctor_without_axioms(
+    fn construct_composite_ctor_without_axioms(
         &self,
         ty: &SpecTy,
         ctor_index: usize,
@@ -997,6 +1108,37 @@ impl ValueEncoder {
         self.construct_composite_ctor_without_axioms(&option_spec_ty(inner), ctor_index, &[value])
     }
 
+    pub(crate) fn checked_result_tuple_value(
+        &self,
+        result_ty: SpecTy,
+        result_value: SymValue,
+        overflow_value: SymValue,
+        solver: &Solver,
+    ) -> Result<SymValue, String> {
+        self.construct_composite(
+            &SpecTy::Tuple(vec![result_ty, SpecTy::Bool]),
+            &[result_value, overflow_value],
+            solver,
+        )
+    }
+
+    pub(crate) fn fresh_for_spec_ty(
+        &self,
+        ty: &SpecTy,
+        hint: &str,
+        solver: &Solver,
+        fresh_name: &mut impl FnMut(&str) -> String,
+    ) -> Result<SymValue, String> {
+        if matches!(ty, SpecTy::Enum { .. }) {
+            return Ok(SymValue::new(Dynamic::new_const(
+                fresh_name(hint),
+                &self.value_sort,
+            )));
+        }
+        let encoding = self.type_encoding(ty, solver)?;
+        self.fresh_for_encoding(&encoding, hint, solver, fresh_name)
+    }
+
     pub(crate) fn project_field(
         &self,
         ty: &SpecTy,
@@ -1008,7 +1150,7 @@ impl ValueEncoder {
         self.project_composite_field(&composite, value, index)
     }
 
-    pub(crate) fn project_composite_field(
+    fn project_composite_field(
         &self,
         composite: &CompositeEncoding,
         value: &SymValue,
@@ -1017,7 +1159,7 @@ impl ValueEncoder {
         self.project_composite_ctor_field(composite, 0, value, index)
     }
 
-    pub(crate) fn project_composite_ctor_field(
+    fn project_composite_ctor_field(
         &self,
         composite: &CompositeEncoding,
         ctor_index: usize,
@@ -1053,7 +1195,34 @@ impl ValueEncoder {
         self.project_composite_ctor_field(&composite, ctor_index, value, index)
     }
 
-    pub(crate) fn direct_composite_fields(
+    pub(crate) fn composite_ctor_view_for_ty(
+        &self,
+        ty: &SpecTy,
+        ctor_index: usize,
+        value: &SymValue,
+        solver: &Solver,
+    ) -> Result<CompositeCtorView, String> {
+        let composite = self.composite_encoding(ty, solver)?;
+        let ctor = composite
+            .constructors
+            .get(ctor_index)
+            .ok_or_else(|| format!("constructor index {ctor_index} out of range"))?;
+        let tag = self.tag_formula(&composite, ctor_index, value)?;
+        let fields = ctor
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(field_index, field)| {
+                Ok((
+                    field.ty.clone(),
+                    self.project_composite_ctor_field(&composite, ctor_index, value, field_index)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(CompositeCtorView { tag, fields })
+    }
+
+    fn direct_composite_fields(
         &self,
         composite: &CompositeEncoding,
         value: &SymValue,
@@ -1069,7 +1238,17 @@ impl ValueEncoder {
         Ok(Some(children.into_iter().map(SymValue::new).collect()))
     }
 
-    pub(crate) fn direct_composite_ctor_fields(
+    pub(crate) fn direct_composite_fields_for_ty(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+        solver: &Solver,
+    ) -> Result<Option<Vec<SymValue>>, String> {
+        let composite = self.composite_encoding(ty, solver)?;
+        self.direct_composite_fields(&composite, value)
+    }
+
+    fn direct_composite_ctor_fields(
         &self,
         composite: &CompositeEncoding,
         value: &SymValue,
@@ -1096,7 +1275,17 @@ impl ValueEncoder {
         Ok(Some(DirectCtorFields { ctor_index, fields }))
     }
 
-    pub(crate) fn tag_formula(
+    pub(crate) fn direct_composite_ctor_fields_for_ty(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+        solver: &Solver,
+    ) -> Result<Option<DirectCtorFields>, String> {
+        let composite = self.composite_encoding(ty, solver)?;
+        self.direct_composite_ctor_fields(&composite, value)
+    }
+
+    fn tag_formula(
         &self,
         composite: &CompositeEncoding,
         ctor_index: usize,
@@ -1144,6 +1333,41 @@ impl ValueEncoder {
     ) -> Result<Option<usize>, String> {
         let composite = self.composite_encoding(ty, solver)?;
         Ok(Self::ground_ctor_index_for_composite(&composite, value))
+    }
+
+    fn fresh_for_encoding(
+        &self,
+        encoding: &TypeEncoding,
+        hint: &str,
+        solver: &Solver,
+        fresh_name: &mut impl FnMut(&str) -> String,
+    ) -> Result<SymValue, String> {
+        match &encoding.kind {
+            TypeEncodingKind::Bool => Ok(self.wrap_bool(&Bool::new_const(fresh_name(hint)))),
+            TypeEncodingKind::Int => Ok(self.wrap_int(&Int::new_const(fresh_name(hint)))),
+            TypeEncodingKind::Opaque => Ok(SymValue::new(Dynamic::new_const(
+                fresh_name(hint),
+                &self.value_sort,
+            ))),
+            TypeEncodingKind::Seq => Ok(SymValue::new(Dynamic::from(Z3Seq::new_const(
+                fresh_name(hint),
+                &self.value_sort,
+            )))),
+            TypeEncodingKind::Composite(composite) => {
+                let ctor = composite.single_constructor()?;
+                let mut fields = Vec::with_capacity(ctor.fields.len());
+                for (index, field) in ctor.fields.iter().enumerate() {
+                    fields.push(self.fresh_for_spec_ty(
+                        &field.ty,
+                        &format!("{hint}_{index}"),
+                        solver,
+                        fresh_name,
+                    )?);
+                }
+                let args = fields.iter().map(SymValue::ast).collect::<Vec<_>>();
+                Ok(SymValue::new(ctor.symbol.apply(&args)))
+            }
+        }
     }
 
     pub(crate) fn int_bounds(&self, ty: &SpecTy) -> Result<Option<(Int, Int)>, String> {
