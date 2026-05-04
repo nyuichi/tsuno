@@ -5,12 +5,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Once;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use crate::spec::{
     BinaryOp, EnumDef, RustTyKey, SpecTy, StructTy, UnaryOp, option_spec_ty, ptr_spec_ty,
 };
 use z3::ast::{self, Ast, Bool, Dynamic, Int, Seq as Z3Seq};
-use z3::{DeclKind, FuncDecl, Pattern, RecFuncDecl, SatResult, Solver as Z3Solver, Sort, Symbol};
+use z3::{
+    Config, Context, DeclKind, FuncDecl, Pattern, RecFuncDecl, SatResult, Solver as Z3Solver, Sort,
+    SortKind, Symbol,
+};
 
 const SOLVER_TIMEOUT_MS: u32 = 1_000;
 
@@ -272,6 +278,7 @@ pub(crate) struct Solver {
     rust_ty_values: RefCell<BTreeMap<RustTyKey, SymValue>>,
     asserted_rust_ty_distinct: RefCell<BTreeSet<(RustTyKey, RustTyKey)>>,
     builtin_nat_decls: RefCell<Option<Rc<BuiltinNatDecls>>>,
+    pure_fn_decls: RefCell<BTreeMap<String, RecFuncDecl>>,
 }
 
 impl Solver {
@@ -304,6 +311,7 @@ impl Solver {
             rust_ty_values: RefCell::new(BTreeMap::new()),
             asserted_rust_ty_distinct: RefCell::new(BTreeSet::new()),
             builtin_nat_decls: RefCell::new(None),
+            pure_fn_decls: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -345,10 +353,6 @@ impl Solver {
             return Ok(Some(OptionCtorKind::Some));
         }
         Ok(None)
-    }
-
-    pub(crate) fn sort_for_ty(&self, ty: &SpecTy) -> Result<Sort, String> {
-        with_z3_solver(|solver| self.sort_for_ty_with_z3(ty, solver))
     }
 
     pub(crate) fn named_invariant_formula(
@@ -520,6 +524,103 @@ impl Solver {
 
     pub(crate) fn check_assumptions(&self, assumptions: &[Bool]) -> SatResult {
         with_z3_solver(|solver| solver.check_assumptions(assumptions))
+    }
+
+    pub(crate) fn bool_marker(&self, name: impl Into<Symbol>) -> Bool {
+        Bool::new_const(name)
+    }
+
+    pub(crate) fn simplify_bool(value: &Bool) -> Bool {
+        value.simplify()
+    }
+
+    pub(crate) fn simplify_int(value: &Int) -> Int {
+        value.simplify()
+    }
+
+    pub(crate) fn bool_contains_marker(expr: &Bool, marker: &str) -> bool {
+        if expr.is_const() {
+            return expr.decl().name() == marker;
+        }
+        expr.children().into_iter().any(|child| {
+            child
+                .as_bool()
+                .filter(|_| child.sort_kind() == SortKind::Bool)
+                .map(|child| Self::bool_contains_marker(&child, marker))
+                .unwrap_or(false)
+        })
+    }
+
+    pub(crate) fn declare_pure_fn(
+        &self,
+        name: &str,
+        param_tys: &[SpecTy],
+        result_ty: &SpecTy,
+    ) -> Result<(), String> {
+        with_z3_solver(|solver| {
+            let domain_sorts = param_tys
+                .iter()
+                .map(|ty| self.sort_for_ty_with_z3(ty, solver))
+                .collect::<Result<Vec<_>, _>>()?;
+            let domain_refs = domain_sorts.iter().collect::<Vec<_>>();
+            let result_sort = self.sort_for_ty_with_z3(result_ty, solver)?;
+            let decl = RecFuncDecl::new(format!("pure_fn_{name}"), &domain_refs, &result_sort);
+            let inserted = self
+                .pure_fn_decls
+                .borrow_mut()
+                .insert(name.to_owned(), decl)
+                .is_none();
+            assert!(inserted, "duplicate pure function decl `{name}`");
+            Ok(())
+        })
+    }
+
+    pub(crate) fn pure_fn_params(
+        &self,
+        func: &str,
+        params: &[(String, SpecTy)],
+        fresh_name: &mut impl FnMut(&str) -> String,
+    ) -> Result<Vec<(String, SymValue)>, String> {
+        with_z3_solver(|solver| {
+            let mut values = Vec::with_capacity(params.len());
+            for (name, ty) in params {
+                let sort = self.sort_for_ty_with_z3(ty, solver)?;
+                let value = SymValue::new(Dynamic::new_const(
+                    fresh_name(&format!("pure_{func}_{name}")),
+                    &sort,
+                ));
+                values.push((name.clone(), value));
+            }
+            Ok(values)
+        })
+    }
+
+    pub(crate) fn define_pure_fn(
+        &self,
+        name: &str,
+        args: &[SymValue],
+        body: &SymValue,
+    ) -> Result<(), String> {
+        let decls = self.pure_fn_decls.borrow();
+        let decl = decls
+            .get(name)
+            .ok_or_else(|| format!("unknown pure function `{name}`"))?;
+        let args = args.iter().map(SymValue::ast).collect::<Vec<_>>();
+        decl.add_def(&args, body.dynamic());
+        Ok(())
+    }
+
+    pub(crate) fn apply_pure_fn(
+        &self,
+        name: &str,
+        args: &[SymValue],
+    ) -> Result<Option<SymValue>, String> {
+        let decls = self.pure_fn_decls.borrow();
+        let Some(decl) = decls.get(name) else {
+            return Ok(None);
+        };
+        let args = args.iter().map(SymValue::ast).collect::<Vec<_>>();
+        Ok(Some(SymValue::new(decl.apply(&args))))
     }
 
     #[cfg(test)]
@@ -2361,6 +2462,33 @@ pub(crate) fn with_z3_solver<T>(f: impl FnOnce(&Z3Solver) -> T) -> T {
     Z3_SOLVER.with(|solver| f(&solver.borrow()))
 }
 
+pub(crate) fn with_z3_context<T>(f: impl FnOnce() -> T + Send + Sync) -> T
+where
+    T: Send + Sync,
+{
+    z3::with_z3_config(&Config::new(), f)
+}
+
+pub(crate) fn with_z3_deadline<T>(budget: Duration, f: impl FnOnce() -> T) -> (T, bool) {
+    let ctx = Context::thread_local();
+    let handle = ctx.handle();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    thread::scope(|scope| {
+        let watchdog = scope.spawn(move || {
+            if done_rx.recv_timeout(budget).is_err() {
+                handle.interrupt();
+                true
+            } else {
+                false
+            }
+        });
+        let result = f();
+        let _ = done_tx.send(());
+        let timed_out = watchdog.join().expect("watchdog thread");
+        (result, timed_out)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2370,6 +2498,56 @@ mod tests {
     fn with_test_solver<T>(f: impl FnOnce(&Solver, &Z3Solver) -> T) -> T {
         let solver = Solver::new(64);
         with_z3_solver(|z3_solver| f(&solver, z3_solver))
+    }
+
+    #[test]
+    fn thread_local_solver_distinguishes_sat_from_unsat() {
+        rebuild_z3_solver();
+        let x = Int::new_const("x");
+        let sat = with_z3_solver(|solver| {
+            solver.push();
+            solver.assert(x.eq(1));
+            let result = solver.check();
+            solver.pop(1);
+            result
+        });
+        assert_eq!(sat, SatResult::Sat);
+
+        let unsat = with_z3_solver(|solver| {
+            solver.push();
+            solver.assert(x.eq(1));
+            solver.assert(x.eq(2));
+            let result = solver.check();
+            solver.pop(1);
+            result
+        });
+        assert_eq!(unsat, SatResult::Unsat);
+    }
+
+    #[test]
+    fn z3_context_solver_distinguishes_sat_from_unsat() {
+        let result = with_z3_context(|| {
+            rebuild_z3_solver();
+            let x = Int::new_const("x");
+            let sat = with_z3_solver(|solver| {
+                solver.push();
+                solver.assert(x.eq(1));
+                let result = solver.check();
+                solver.pop(1);
+                result
+            });
+            let unsat = with_z3_solver(|solver| {
+                solver.push();
+                solver.assert(x.eq(1));
+                solver.assert(x.eq(2));
+                let result = solver.check();
+                solver.pop(1);
+                result
+            });
+            (sat, unsat)
+        });
+        assert_eq!(result.0, SatResult::Sat);
+        assert_eq!(result.1, SatResult::Unsat);
     }
 
     #[test]
@@ -2476,6 +2654,38 @@ mod tests {
 
             assert_eq!(z3_solver.check(), SatResult::Sat);
         });
+    }
+
+    #[test]
+    fn pure_function_declarations_are_owned_by_solver() {
+        let solver = Solver::new(64);
+        solver
+            .declare_pure_fn("id", &[SpecTy::I32], &SpecTy::I32)
+            .expect("declare pure function");
+        let mut next = 0;
+        let params = solver
+            .pure_fn_params("id", &[("x".to_owned(), SpecTy::I32)], &mut |hint| {
+                next += 1;
+                format!("{hint}_{next}")
+            })
+            .expect("pure function params");
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].0, "x");
+        solver
+            .define_pure_fn("id", &[params[0].1.clone()], &params[0].1)
+            .expect("define pure function");
+
+        let value = solver
+            .apply_pure_fn("id", &[solver.int_value(5)])
+            .expect("apply pure function")
+            .expect("known pure function");
+        assert_eq!(value.dynamic().decl().name().to_string(), "pure_fn_id");
+        assert!(
+            solver
+                .apply_pure_fn("unknown", &[])
+                .expect("unknown pure function")
+                .is_none()
+        );
     }
 
     #[test]

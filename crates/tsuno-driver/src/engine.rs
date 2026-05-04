@@ -24,8 +24,6 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::str::FromStr;
-use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
 
 use rustc_hir::def_id::{DefId, LocalDefId};
@@ -37,8 +35,8 @@ use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::source_map::Spanned;
 use rustc_span::{DUMMY_SP, Span};
-use z3::ast::{Ast, Bool, Dynamic, Int};
-use z3::{Config, Context, RecFuncDecl, SatResult, SortKind};
+use z3::SatResult;
+use z3::ast::{Bool, Int};
 
 use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
@@ -51,6 +49,7 @@ use crate::prepass::{
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::solver::{
     CompositeCtorView, IntValueBinaryOp, IntValuePredicateOp, OptionCtorKind, Solver, SymValue,
+    with_z3_context, with_z3_deadline,
 };
 use crate::spec::{
     BinaryOp, RustTyKey, SpecTy, TypedExpr, TypedExprKind, TypedMatchBinding, UnaryOp,
@@ -118,7 +117,6 @@ pub struct Verifier<'tcx> {
     context: VerifierContext<'tcx>,
     contracts: HashMap<LocalDefId, FunctionContract>,
     pure_fns: HashMap<String, TypedPureFnDef>,
-    pure_fn_decls: HashMap<String, RecFuncDecl>,
     lemmas: HashMap<String, TypedLemmaDef>,
     next_sym: Cell<usize>,
     solver: Solver,
@@ -198,7 +196,7 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
     } = program;
     let tcx_capture = UnsafeCallbackArg(tcx);
     let ghosts_capture = UnsafeCallbackArg(&ghosts);
-    let prepass_error = z3::with_z3_config(&Config::new(), move || {
+    let prepass_error = with_z3_context(move || {
         let tcx = tcx_capture.get();
         let ghosts = ghosts_capture.get();
         let mut verifier = Verifier::new(tcx, HashMap::new());
@@ -240,7 +238,7 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
         );
         let def_id = function.def_id;
         let prepass = function.prepass;
-        let result = z3::with_z3_config(&Config::new(), move || {
+        let result = with_z3_context(move || {
             let tcx = tcx_capture.get();
             let ghosts = ghosts_capture.get();
             let contracts = contracts_capture.get().clone();
@@ -273,7 +271,6 @@ impl<'tcx> Verifier<'tcx> {
             context: VerifierContext::Ghost,
             contracts,
             pure_fns: HashMap::new(),
-            pure_fn_decls: HashMap::new(),
             lemmas: HashMap::new(),
             next_sym: Cell::new(0),
             solver: Solver::new(tcx.data_layout.pointer_size().bits()),
@@ -1280,7 +1277,10 @@ impl<'tcx> Verifier<'tcx> {
                 if !self.assume_path_condition(&mut abstract_state, invariant) {
                     return Ok(None);
                 }
-                abstract_state.pc = bool_and(vec![abstract_state.pc, self.loop_marker(target)]);
+                abstract_state.pc = Solver::simplify_bool(&bool_and(vec![
+                    abstract_state.pc,
+                    self.loop_marker(target),
+                ]));
                 abstract_state.ctrl = ControlPoint {
                     basic_block: target,
                     statement_index: 0,
@@ -1451,7 +1451,7 @@ impl<'tcx> Verifier<'tcx> {
             }
         }
 
-        merged.pc = merged.pc.simplify();
+        merged.pc = Solver::simplify_bool(&merged.pc);
         Ok(Some(merged))
     }
 
@@ -2458,7 +2458,7 @@ impl<'tcx> Verifier<'tcx> {
                 continue;
             }
             let addr_matches = self.eq_for_spec_ty(&SpecTy::Usize, addr, resource_addr, span)?;
-            let condition = addr_matches.simplify();
+            let condition = Solver::simplify_bool(&addr_matches);
             if matches!(condition.as_bool(), Some(false)) {
                 continue;
             }
@@ -2507,7 +2507,7 @@ impl<'tcx> Verifier<'tcx> {
                 continue;
             }
             let addr_matches = self.eq_for_spec_ty(&SpecTy::Usize, addr, resource_addr, span)?;
-            let condition = addr_matches.simplify();
+            let condition = Solver::simplify_bool(&addr_matches);
             if matches!(condition.as_bool(), Some(false)) {
                 continue;
             }
@@ -2572,7 +2572,8 @@ impl<'tcx> Verifier<'tcx> {
             let mut candidate_view = view.clone();
             candidate_view.env.extend(candidate.env.clone());
             let where_condition = self.spec_expr_to_bool(&candidate_view, condition, resolution)?;
-            candidate.condition = bool_and(vec![candidate.condition, where_condition]).simplify();
+            candidate.condition =
+                Solver::simplify_bool(&bool_and(vec![candidate.condition, where_condition]));
             if matches!(candidate.condition.as_bool(), Some(false)) {
                 continue;
             }
@@ -2630,7 +2631,8 @@ impl<'tcx> Verifier<'tcx> {
             candidate_spec.extend(candidate.env.clone());
             let where_condition =
                 self.contract_expr_to_bool(current, &candidate_spec, &assertion.condition)?;
-            candidate.condition = bool_and(vec![candidate.condition, where_condition]).simplify();
+            candidate.condition =
+                Solver::simplify_bool(&bool_and(vec![candidate.condition, where_condition]));
             if matches!(candidate.condition.as_bool(), Some(false)) {
                 continue;
             }
@@ -2734,7 +2736,7 @@ impl<'tcx> Verifier<'tcx> {
                         used.insert(index);
                         out.push(ResourcePatternMatch {
                             used,
-                            condition: bool_and(vec![
+                            condition: Solver::simplify_bool(&bool_and(vec![
                                 candidate.condition.clone(),
                                 self.eq_for_spec_ty(
                                     &SpecTy::Usize,
@@ -2744,8 +2746,7 @@ impl<'tcx> Verifier<'tcx> {
                                 )?,
                                 self.eq_for_spec_ty(&SpecTy::RustTy, &ty_value, resource_ty, span)?,
                                 value_condition,
-                            ])
-                            .simplify(),
+                            ])),
                             env: next_env,
                         });
                     }
@@ -2778,7 +2779,7 @@ impl<'tcx> Verifier<'tcx> {
                         used.insert(index);
                         out.push(ResourcePatternMatch {
                             used,
-                            condition: bool_and(vec![
+                            condition: Solver::simplify_bool(&bool_and(vec![
                                 candidate.condition.clone(),
                                 self.eq_for_spec_ty(&SpecTy::Usize, &base, resource_base, span)?,
                                 self.solver
@@ -2787,8 +2788,7 @@ impl<'tcx> Verifier<'tcx> {
                                 self.solver
                                     .int_term(&alignment)
                                     .eq(Int::from_u64(*resource_alignment)),
-                            ])
-                            .simplify(),
+                            ])),
                             env: candidate.env.clone(),
                         });
                     }
@@ -2849,7 +2849,7 @@ impl<'tcx> Verifier<'tcx> {
                         used.insert(index);
                         out.push(ResourcePatternMatch {
                             used,
-                            condition: bool_and(vec![
+                            condition: Solver::simplify_bool(&bool_and(vec![
                                 candidate.condition.clone(),
                                 self.eq_for_spec_ty(
                                     &SpecTy::Usize,
@@ -2859,8 +2859,7 @@ impl<'tcx> Verifier<'tcx> {
                                 )?,
                                 self.eq_for_spec_ty(&SpecTy::RustTy, &ty_value, resource_ty, span)?,
                                 value_condition,
-                            ])
-                            .simplify(),
+                            ])),
                             env: next_env,
                         });
                     }
@@ -2893,7 +2892,7 @@ impl<'tcx> Verifier<'tcx> {
                         used.insert(index);
                         out.push(ResourcePatternMatch {
                             used,
-                            condition: bool_and(vec![
+                            condition: Solver::simplify_bool(&bool_and(vec![
                                 candidate.condition.clone(),
                                 self.eq_for_spec_ty(&SpecTy::Usize, &base, resource_base, span)?,
                                 self.solver
@@ -2902,8 +2901,7 @@ impl<'tcx> Verifier<'tcx> {
                                 self.solver
                                     .int_term(&alignment)
                                     .eq(Int::from_u64(*resource_alignment)),
-                            ])
-                            .simplify(),
+                            ])),
                             env: candidate.env.clone(),
                         });
                     }
@@ -3401,7 +3399,7 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
         message: String,
     ) -> Result<(), VerificationResult> {
-        let constraint = constraint.simplify();
+        let constraint = Solver::simplify_bool(&constraint);
         if let Some(value) = constraint.as_bool() {
             return match value {
                 true => {
@@ -3422,7 +3420,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn add_unsafe_path_condition(&self, state: &mut UnsafeState, constraint: Bool) {
-        state.pc = bool_and(vec![state.pc.clone(), constraint]).simplify();
+        state.pc = Solver::simplify_bool(&bool_and(vec![state.pc.clone(), constraint]));
     }
 
     fn require_unsafe_type_invariant(
@@ -3474,42 +3472,29 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn register_pure_fn(&mut self, pure_fn: &TypedPureFnDef) -> Result<(), VerificationResult> {
-        let domain_sorts = pure_fn
+        let params = pure_fn
             .params
             .iter()
-            .map(|param| self.sort_for_spec_ty(&param.ty))
-            .collect::<Result<Vec<_>, _>>()?;
-        let domain_refs: Vec<_> = domain_sorts.iter().collect();
-        let result_sort = self.sort_for_spec_ty(&pure_fn.body.ty)?;
-        let decl = RecFuncDecl::new(
-            format!("pure_fn_{}", pure_fn.name),
-            &domain_refs,
-            &result_sort,
-        );
-        let inserted = self
-            .pure_fn_decls
-            .insert(pure_fn.name.clone(), decl)
-            .is_none();
-        assert!(inserted, "duplicate pure function decl `{}`", pure_fn.name);
-        let mut current = HashMap::new();
-        let mut vars = Vec::with_capacity(pure_fn.params.len());
-        for param in &pure_fn.params {
-            let sort = self.sort_for_spec_ty(&param.ty)?;
-            let value = SymValue::new(Dynamic::new_const(
-                self.fresh_name(&format!("pure_{}_{}", pure_fn.name, param.name)),
-                &sort,
-            ));
-            current.insert(param.name.clone(), value.clone());
-            vars.push(value);
-        }
+            .map(|param| (param.name.clone(), param.ty.clone()))
+            .collect::<Vec<_>>();
+        let param_tys = params.iter().map(|(_, ty)| ty.clone()).collect::<Vec<_>>();
+        self.solver
+            .declare_pure_fn(&pure_fn.name, &param_tys, &pure_fn.body.ty)
+            .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+        let params = self
+            .solver
+            .pure_fn_params(&pure_fn.name, &params, &mut |hint| self.fresh_name(hint))
+            .map_err(|err| self.unsupported_result(self.report_span(), err))?;
+        let current = params.iter().cloned().collect::<HashMap<_, _>>();
+        let vars = params
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
         let spec = HashMap::new();
         let body = self.contract_expr_to_value(&current, &spec, &pure_fn.body)?;
-        let args: Vec<&dyn Ast> = vars.iter().map(SymValue::ast).collect();
-        let decl = self
-            .pure_fn_decls
-            .get(&pure_fn.name)
-            .expect("pure function decl must be inserted before lowering the body");
-        decl.add_def(&args, body.dynamic());
+        self.solver
+            .define_pure_fn(&pure_fn.name, &vars, &body)
+            .map_err(|err| self.unsupported_result(self.report_span(), err))?;
         Ok(())
     }
 
@@ -5219,11 +5204,10 @@ impl<'tcx> Verifier<'tcx> {
         if let Some(value) = self.try_eval_ground_pure_call(func, &values, span)? {
             return Ok(value);
         }
-        let Some(decl) = self.pure_fn_decls.get(func) else {
-            return Err(self.unsupported_result(span, format!("unknown pure function `{func}`")));
-        };
-        let args: Vec<&dyn Ast> = values.iter().map(SymValue::ast).collect();
-        Ok(SymValue::new(decl.apply(&args)))
+        self.solver
+            .apply_pure_fn(func, &values)
+            .map_err(|err| self.unsupported_result(span, err))?
+            .ok_or_else(|| self.unsupported_result(span, format!("unknown pure function `{func}`")))
     }
 
     fn try_eval_ground_pure_call(
@@ -5257,7 +5241,7 @@ impl<'tcx> Verifier<'tcx> {
         match (func, values) {
             ("seq_len", [value]) => {
                 let length = self.seq_len_int(value, span)?;
-                if let Some(length) = length.simplify().as_i64()
+                if let Some(length) = Solver::simplify_int(&length).as_i64()
                     && length >= 0
                 {
                     return Ok(Some(self.concrete_nat_value(length as u64)?));
@@ -5326,12 +5310,17 @@ impl<'tcx> Verifier<'tcx> {
                 if let Some(value) = self.try_eval_ground_pure_call(func, &values, span)? {
                     Some(value)
                 } else {
-                    let Some(decl) = self.pure_fn_decls.get(func) else {
-                        return Err(self
-                            .unsupported_result(span, format!("unknown pure function `{func}`")));
-                    };
-                    let args: Vec<&dyn Ast> = values.iter().map(SymValue::ast).collect();
-                    Some(SymValue::new(decl.apply(&args)))
+                    Some(
+                        self.solver
+                            .apply_pure_fn(func, &values)
+                            .map_err(|err| self.unsupported_result(span, err))?
+                            .ok_or_else(|| {
+                                self.unsupported_result(
+                                    span,
+                                    format!("unknown pure function `{func}`"),
+                                )
+                            })?,
+                    )
                 }
             }
             TypedExprKind::Match {
@@ -5417,7 +5406,7 @@ impl<'tcx> Verifier<'tcx> {
         constraint: Bool,
         failure: AssertionFailure,
     ) -> Result<(), VerificationResult> {
-        let constraint = constraint.simplify();
+        let constraint = Solver::simplify_bool(&constraint);
         if let Some(value) = constraint.as_bool() {
             return match value {
                 true => {
@@ -5553,7 +5542,7 @@ impl<'tcx> Verifier<'tcx> {
     // are satisfiable is optional and was the main source of spurious `unknown`s
     // once recursive prelude definitions were loaded.
     fn assume_path_condition(&self, state: &mut State, constraint: Bool) -> bool {
-        let constraint = constraint.simplify();
+        let constraint = Solver::simplify_bool(&constraint);
         match constraint.as_bool() {
             Some(true) => {
                 self.add_path_condition(state, constraint);
@@ -5568,7 +5557,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn assume_unsafe_path_condition(&self, state: &mut UnsafeState, constraint: Bool) -> bool {
-        let constraint = constraint.simplify();
+        let constraint = Solver::simplify_bool(&constraint);
         match constraint.as_bool() {
             Some(true) => {
                 self.add_unsafe_path_condition(state, constraint);
@@ -5583,7 +5572,7 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn assume_checked_path_condition(&self, state: &mut State, constraint: Bool) -> bool {
-        let constraint = constraint.simplify();
+        let constraint = Solver::simplify_bool(&constraint);
         if let Some(value) = constraint.as_bool() {
             if value {
                 self.add_path_condition(state, constraint);
@@ -5636,7 +5625,7 @@ impl<'tcx> Verifier<'tcx> {
         constraint: Bool,
         _span: Span,
     ) -> Result<Option<State>, VerificationResult> {
-        let constraint = constraint.simplify();
+        let constraint = Solver::simplify_bool(&constraint);
         if let Some(value) = constraint.as_bool() {
             if value {
                 self.add_path_condition(&mut state, constraint);
@@ -5663,7 +5652,7 @@ impl<'tcx> Verifier<'tcx> {
         constraint: Bool,
         _span: Span,
     ) -> Result<Option<UnsafeState>, VerificationResult> {
-        let constraint = constraint.simplify();
+        let constraint = Solver::simplify_bool(&constraint);
         if let Some(value) = constraint.as_bool() {
             if value {
                 self.add_unsafe_path_condition(&mut state, constraint);
@@ -5685,11 +5674,14 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn add_path_condition(&self, state: &mut State, constraint: Bool) {
-        state.pc = bool_and(vec![state.pc.clone(), constraint]).simplify();
+        state.pc = Solver::simplify_bool(&bool_and(vec![state.pc.clone(), constraint]));
     }
 
     fn check_sat(&self, assumptions: &[Bool]) -> SatResult {
-        let assumptions = assumptions.iter().map(Bool::simplify).collect::<Vec<_>>();
+        let assumptions = assumptions
+            .iter()
+            .map(Solver::simplify_bool)
+            .collect::<Vec<_>>();
         self.solver.check_assumptions(&assumptions)
     }
 
@@ -5777,21 +5769,12 @@ impl<'tcx> Verifier<'tcx> {
     }
 
     fn loop_marker(&self, header: BasicBlock) -> Bool {
-        Bool::new_const(format!("loop_{}", header.index()))
+        self.solver.bool_marker(format!("loop_{}", header.index()))
     }
 
     fn has_loop_marker(&self, expr: &Bool, header: BasicBlock) -> bool {
         let marker = format!("loop_{}", header.index());
-        if expr.is_const() {
-            return expr.decl().name() == marker;
-        }
-        expr.children().into_iter().any(|child| {
-            child
-                .as_bool()
-                .filter(|_| child.sort_kind() == SortKind::Bool)
-                .map(|child| self.has_loop_marker(&child, header))
-                .unwrap_or(false)
-        })
+        Solver::bool_contains_marker(expr, &marker)
     }
 
     fn called_local_def_id(&self, func: &Operand<'tcx>) -> Option<LocalDefId> {
@@ -5913,12 +5896,6 @@ impl<'tcx> Verifier<'tcx> {
         self.solver
             .lower_binary_value(op, lhs_ty, lhs, rhs)
             .map_err(|err| self.unsupported_result(span, err))
-    }
-
-    fn sort_for_spec_ty(&self, ty: &SpecTy) -> Result<z3::Sort, VerificationResult> {
-        self.solver
-            .sort_for_ty(ty)
-            .map_err(|err| self.unsupported_result(self.report_span(), err))
     }
 
     fn construct_composite(
@@ -7318,26 +7295,6 @@ fn collect_typed_expr_pure_fn_refs(expr: &TypedExpr, out: &mut BTreeSet<String>)
     }
 }
 
-fn with_z3_deadline<T>(budget: Duration, f: impl FnOnce() -> T) -> (T, bool) {
-    let ctx = Context::thread_local();
-    let handle = ctx.handle();
-    let (done_tx, done_rx) = mpsc::channel::<()>();
-    thread::scope(|scope| {
-        let watchdog = scope.spawn(move || {
-            if done_rx.recv_timeout(budget).is_err() {
-                handle.interrupt();
-                true
-            } else {
-                false
-            }
-        });
-        let result = f();
-        let _ = done_tx.send(());
-        let timed_out = watchdog.join().expect("watchdog thread");
-        (result, timed_out)
-    })
-}
-
 fn bool_and(exprs: Vec<Bool>) -> Bool {
     match exprs.len() {
         0 => Bool::from_bool(true),
@@ -7404,60 +7361,7 @@ mod tests {
         AssertionContract, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
         FunctionContract, LoopContracts, NormalizedPredicate, ResolvedExprEnv, TypedPureFnDef,
     };
-    use crate::solver::{rebuild_z3_solver, with_z3_solver};
     use crate::spec::{SpecTy, TypedExpr, TypedExprKind};
-    use z3::ast::Int;
-    use z3::{Config, SatResult};
-
-    #[test]
-    fn thread_local_solver_distinguishes_sat_from_unsat() {
-        rebuild_z3_solver();
-        let x = Int::new_const("x");
-        let sat = with_z3_solver(|solver| {
-            solver.push();
-            solver.assert(x.eq(1));
-            let result = solver.check();
-            solver.pop(1);
-            result
-        });
-        assert_eq!(sat, SatResult::Sat);
-
-        let unsat = with_z3_solver(|solver| {
-            solver.push();
-            solver.assert(x.eq(1));
-            solver.assert(x.eq(2));
-            let result = solver.check();
-            solver.pop(1);
-            result
-        });
-        assert_eq!(unsat, SatResult::Unsat);
-    }
-
-    #[test]
-    fn with_z3_config_solver_distinguishes_sat_from_unsat() {
-        let result = z3::with_z3_config(&Config::new(), || {
-            rebuild_z3_solver();
-            let x = Int::new_const("x");
-            let sat = with_z3_solver(|solver| {
-                solver.push();
-                solver.assert(x.eq(1));
-                let result = solver.check();
-                solver.pop(1);
-                result
-            });
-            let unsat = with_z3_solver(|solver| {
-                solver.push();
-                solver.assert(x.eq(1));
-                solver.assert(x.eq(2));
-                let result = solver.check();
-                solver.pop(1);
-                result
-            });
-            (sat, unsat)
-        });
-        assert_eq!(result.0, SatResult::Sat);
-        assert_eq!(result.1, SatResult::Unsat);
-    }
 
     #[test]
     fn collect_needed_pure_fns_depends_only_on_live_prepass_output() {
