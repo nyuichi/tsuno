@@ -1,3 +1,5 @@
+//! HIR/MIR prepass that resolves directives into typed verification input.
+
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::ControlFlow;
 

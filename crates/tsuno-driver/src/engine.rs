@@ -1,5 +1,7 @@
 #![allow(clippy::result_large_err)]
 
+//! Verification engine for MIR execution, contracts, resources, and solver checks.
+
 // Supported Rust types are reflected into the spec language and encoded in Z3 as follows:
 //
 // | Rust type                          | spec type           | Z3 representation           | invariant |
@@ -38,7 +40,7 @@ use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use rustc_span::source_map::Spanned;
 use rustc_span::{DUMMY_SP, Span};
 use z3::ast::{Ast, Bool, Dynamic, Int, Seq as Z3Seq};
-use z3::{Config, Context, RecFuncDecl, SatResult, Solver, Sort, SortKind};
+use z3::{Config, Context, RecFuncDecl, SatResult, Solver, SortKind};
 
 use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
@@ -98,11 +100,6 @@ struct Allocation {
     align: u64,
 }
 
-struct BuiltinNatDecls {
-    nat_to_int: RecFuncDecl,
-    int_to_nat: RecFuncDecl,
-}
-
 struct AssertionFailure {
     span: Span,
     diagnostic_span: String,
@@ -130,7 +127,6 @@ pub struct Verifier<'tcx> {
     pure_fns: HashMap<String, TypedPureFnDef>,
     pure_fn_decls: HashMap<String, RecFuncDecl>,
     lemmas: HashMap<String, TypedLemmaDef>,
-    builtin_nat_decls: RefCell<Option<Rc<BuiltinNatDecls>>>,
     next_sym: Cell<usize>,
     value_encoder: ValueEncoder,
 }
@@ -287,7 +283,6 @@ impl<'tcx> Verifier<'tcx> {
             pure_fns: HashMap::new(),
             pure_fn_decls: HashMap::new(),
             lemmas: HashMap::new(),
-            builtin_nat_decls: RefCell::new(None),
             next_sym: Cell::new(0),
             value_encoder: ValueEncoder::new(tcx.data_layout.pointer_size().bits()),
         }
@@ -6620,157 +6615,19 @@ impl<'tcx> Verifier<'tcx> {
         self.construct_ptr(addr, prov, ty)
     }
 
-    fn builtin_nat_decls(&self, span: Span) -> Result<Rc<BuiltinNatDecls>, VerificationResult> {
-        if let Some(decls) = self.builtin_nat_decls.borrow().as_ref().cloned() {
-            return Ok(decls);
-        }
-        let decls = with_solver(|solver| {
-            let nat_ty = SpecTy::Enum {
-                name: "Nat".to_owned(),
-                args: vec![],
-            };
-            let nat_composite = self.value_encoder.composite_encoding(&nat_ty, solver)?;
-            let (zero_index, zero_ctor) = nat_composite
-                .constructors
-                .iter()
-                .enumerate()
-                .find(|(_, ctor)| ctor.fields.is_empty())
-                .ok_or_else(|| "Nat is missing `Zero`".to_owned())?;
-            let (succ_index, succ_ctor) = nat_composite
-                .constructors
-                .iter()
-                .enumerate()
-                .find(|(_, ctor)| ctor.fields.len() == 1)
-                .ok_or_else(|| "Nat is missing `Succ`".to_owned())?;
-
-            let nat_to_int = RecFuncDecl::new(
-                "builtin_nat_to_int",
-                &[self.value_encoder.value_sort()],
-                &Sort::int(),
-            );
-            let int_to_nat = RecFuncDecl::new(
-                "builtin_int_to_nat",
-                &[&Sort::int()],
-                self.value_encoder.value_sort(),
-            );
-
-            let int_arg = Int::new_const(self.fresh_name("builtin_int_to_nat_arg"));
-            let zero_value = zero_ctor.symbol.apply(&[]);
-            let int_minus_one = int_arg.clone() - Int::from_i64(1);
-            let succ_tail = int_to_nat.apply(&[&int_minus_one]);
-            let succ_value = succ_ctor.symbol.apply(&[&succ_tail]);
-            let int_to_nat_body = int_arg.le(0).ite(&zero_value, &succ_value);
-            int_to_nat.add_def(&[&int_arg], &int_to_nat_body);
-
-            let nat_arg = Dynamic::new_const(
-                self.fresh_name("builtin_nat_to_int_arg"),
-                self.value_encoder.value_sort(),
-            );
-            let nat_value = SymValue::new(nat_arg.clone());
-            let zero_case =
-                self.value_encoder
-                    .tag_formula(&nat_composite, zero_index, &nat_value)?;
-            let succ_field = self.value_encoder.project_composite_ctor_field(
-                &nat_composite,
-                succ_index,
-                &nat_value,
-                0,
-            )?;
-            let succ_int = nat_to_int
-                .apply(&[succ_field.ast()])
-                .as_int()
-                .ok_or_else(|| "builtin_nat_to_int must return Int".to_owned())?;
-            let nat_to_int_body = zero_case.ite(&Int::from_i64(0), &(Int::from_i64(1) + succ_int));
-            nat_to_int.add_def(&[&nat_arg], &nat_to_int_body);
-
-            Ok(Rc::new(BuiltinNatDecls {
-                nat_to_int,
-                int_to_nat,
-            }))
-        })
-        .map_err(|err: String| self.unsupported_result(span, err))?;
-        self.builtin_nat_decls.replace(Some(decls.clone()));
-        Ok(decls)
-    }
-
     fn nat_to_int_term(&self, value: &SymValue, span: Span) -> Result<Int, VerificationResult> {
-        if let Some(n) = self.try_concrete_nat_usize(value, span)? {
-            return Ok(Int::from_u64(n));
-        }
-        let decls = self.builtin_nat_decls(span)?;
-        decls
-            .nat_to_int
-            .apply(&[value.ast()])
-            .as_int()
-            .ok_or_else(|| {
-                self.unsupported_result(span, "builtin_nat_to_int must return Int".to_owned())
-            })
+        with_solver(|solver| self.value_encoder.nat_to_int_term(value, solver))
+            .map_err(|err| self.unsupported_result(span, err))
     }
 
     fn int_to_nat_value(&self, value: &Int, span: Span) -> Result<SymValue, VerificationResult> {
-        let decls = self.builtin_nat_decls(span)?;
-        Ok(SymValue::new(decls.int_to_nat.apply(&[value])))
-    }
-
-    fn nat_spec_ty() -> SpecTy {
-        SpecTy::Enum {
-            name: "Nat".to_owned(),
-            args: vec![],
-        }
-    }
-
-    fn nat_ctor_indices(&self) -> Result<(usize, usize), VerificationResult> {
-        let composite = self.composite_encoding(&Self::nat_spec_ty())?;
-        let zero = composite
-            .constructors
-            .iter()
-            .enumerate()
-            .find(|(_, ctor)| ctor.fields.is_empty())
-            .map(|(index, _)| index)
-            .ok_or_else(|| {
-                self.unsupported_result(self.report_span(), "Nat is missing `Zero`".to_owned())
-            })?;
-        let succ = composite
-            .constructors
-            .iter()
-            .enumerate()
-            .find(|(_, ctor)| ctor.fields.len() == 1)
-            .map(|(index, _)| index)
-            .ok_or_else(|| {
-                self.unsupported_result(self.report_span(), "Nat is missing `Succ`".to_owned())
-            })?;
-        Ok((zero, succ))
-    }
-
-    fn try_concrete_nat_usize(
-        &self,
-        value: &SymValue,
-        span: Span,
-    ) -> Result<Option<u64>, VerificationResult> {
-        let nat_ty = Self::nat_spec_ty();
-        let (zero, succ) = self.nat_ctor_indices()?;
-        match self.ground_ctor_index(&nat_ty, value, span)? {
-            Some(index) if index == zero => Ok(Some(0)),
-            Some(index) if index == succ => {
-                let composite = self.composite_encoding(&nat_ty)?;
-                let tail = self
-                    .value_encoder
-                    .project_composite_ctor_field(&composite, succ, value, 0)
-                    .map_err(|err| self.unsupported_result(span, err))?;
-                Ok(self.try_concrete_nat_usize(&tail, span)?.map(|n| n + 1))
-            }
-            _ => Ok(None),
-        }
+        with_solver(|solver| self.value_encoder.int_to_nat_value(value, solver))
+            .map_err(|err| self.unsupported_result(span, err))
     }
 
     fn concrete_nat_value(&self, n: u64) -> Result<SymValue, VerificationResult> {
-        let nat_ty = Self::nat_spec_ty();
-        let (zero, succ) = self.nat_ctor_indices()?;
-        let mut value = self.construct_composite_ctor(&nat_ty, zero, &[])?;
-        for _ in 0..n {
-            value = self.construct_composite_ctor(&nat_ty, succ, &[value])?;
-        }
-        Ok(value)
+        with_solver(|solver| self.value_encoder.concrete_nat_value(n, solver))
+            .map_err(|err| self.unsupported_result(self.report_span(), err))
     }
 
     fn spec_ty_for_place_ty(&self, ty: Ty<'tcx>, span: Span) -> Result<SpecTy, VerificationResult> {

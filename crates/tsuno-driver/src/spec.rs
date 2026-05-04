@@ -1,3 +1,5 @@
+//! Abstract syntax and typed data structures for the spec language.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expr {
     Bool(bool),

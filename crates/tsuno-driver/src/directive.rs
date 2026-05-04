@@ -1,3 +1,5 @@
+//! Concrete spec directive collection and parsing from Rust source comments.
+
 use std::ops::ControlFlow;
 
 use rustc_hir::intravisit::{self, Visitor};

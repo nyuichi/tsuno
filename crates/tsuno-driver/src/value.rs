@@ -1,3 +1,5 @@
+//! Z3 value-level encoding for spec types, values, constructors, and invariants.
+
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
@@ -5,7 +7,7 @@ use std::str::FromStr;
 
 use crate::spec::{BinaryOp, EnumDef, RustTyKey, SpecTy, StructTy, UnaryOp, ptr_spec_ty};
 use z3::ast::{self, Ast, Bool, Dynamic, Int, Seq as Z3Seq};
-use z3::{DeclKind, FuncDecl, Pattern, Solver, Sort, Symbol};
+use z3::{DeclKind, FuncDecl, Pattern, RecFuncDecl, Solver, Sort, Symbol};
 
 /*
 Value encoding overview
@@ -108,8 +110,9 @@ or tag terms; there is no global eta/extensionality axiom for tuples, refs, or
 plain structs.
 
 Pure functions are encoded in `engine.rs` on top of these symbols using
-`RecFuncDecl`. This file only defines the value-level constructor/tag/invariant
-encoding that those recursive definitions refer to.
+`RecFuncDecl`. This file owns the value-level constructor/tag/invariant
+encoding and built-in value conversions that those recursive definitions refer
+to.
 */
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +175,11 @@ struct EnumFamilyCtorEncoding {
     tag_value: u32,
 }
 
+struct BuiltinNatDecls {
+    nat_to_int: RecFuncDecl,
+    int_to_nat: RecFuncDecl,
+}
+
 impl CompositeEncoding {
     pub(crate) fn single_constructor(&self) -> Result<&ConstructorEncoding, String> {
         match self.constructors.as_slice() {
@@ -216,6 +224,7 @@ pub(crate) struct ValueEncoder {
     asserted_type_axioms: RefCell<BTreeSet<SpecTy>>,
     rust_ty_values: RefCell<BTreeMap<RustTyKey, SymValue>>,
     asserted_rust_ty_distinct: RefCell<BTreeSet<(RustTyKey, RustTyKey)>>,
+    builtin_nat_decls: RefCell<Option<Rc<BuiltinNatDecls>>>,
 }
 
 impl ValueEncoder {
@@ -246,6 +255,7 @@ impl ValueEncoder {
             asserted_type_axioms: RefCell::new(BTreeSet::new()),
             rust_ty_values: RefCell::new(BTreeMap::new()),
             asserted_rust_ty_distinct: RefCell::new(BTreeSet::new()),
+            builtin_nat_decls: RefCell::new(None),
         }
     }
 
@@ -253,6 +263,7 @@ impl ValueEncoder {
         self.primitive_axioms_asserted.set(false);
         self.asserted_type_axioms.borrow_mut().clear();
         self.asserted_rust_ty_distinct.borrow_mut().clear();
+        self.builtin_nat_decls.replace(None);
     }
 
     pub(crate) fn register_enum_def(&self, def: EnumDef) {
@@ -371,6 +382,37 @@ impl ValueEncoder {
         ))
     }
 
+    pub(crate) fn nat_to_int_term(&self, value: &SymValue, solver: &Solver) -> Result<Int, String> {
+        if let Some(n) = self.try_concrete_nat_usize(value, solver)? {
+            return Ok(Int::from_u64(n));
+        }
+        let decls = self.builtin_nat_decls(solver)?;
+        decls
+            .nat_to_int
+            .apply(&[value.ast()])
+            .as_int()
+            .ok_or_else(|| "builtin_nat_to_int must return Int".to_owned())
+    }
+
+    pub(crate) fn int_to_nat_value(
+        &self,
+        value: &Int,
+        solver: &Solver,
+    ) -> Result<SymValue, String> {
+        let decls = self.builtin_nat_decls(solver)?;
+        Ok(SymValue::new(decls.int_to_nat.apply(&[value])))
+    }
+
+    pub(crate) fn concrete_nat_value(&self, n: u64, solver: &Solver) -> Result<SymValue, String> {
+        let nat_ty = Self::nat_spec_ty();
+        let (zero, succ) = self.nat_ctor_indices(solver)?;
+        let mut value = self.construct_composite_ctor(&nat_ty, zero, &[], solver)?;
+        for _ in 0..n {
+            value = self.construct_composite_ctor(&nat_ty, succ, &[value], solver)?;
+        }
+        Ok(value)
+    }
+
     fn ground_seq_nth(ast: &Dynamic, index: usize) -> Option<Dynamic> {
         match ast.decl().kind() {
             DeclKind::SEQ_UNIT => ast.children().first().cloned().filter(|_| index == 0),
@@ -401,6 +443,111 @@ impl ValueEncoder {
                 .sum(),
             _ => None,
         }
+    }
+
+    fn builtin_nat_decls(&self, solver: &Solver) -> Result<Rc<BuiltinNatDecls>, String> {
+        if let Some(decls) = self.builtin_nat_decls.borrow().as_ref().cloned() {
+            return Ok(decls);
+        }
+
+        let nat_ty = Self::nat_spec_ty();
+        let nat_composite = self.composite_encoding(&nat_ty, solver)?;
+        let (zero_index, zero_ctor) = nat_composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| ctor.fields.is_empty())
+            .ok_or_else(|| "Nat is missing `Zero`".to_owned())?;
+        let (succ_index, succ_ctor) = nat_composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| ctor.fields.len() == 1)
+            .ok_or_else(|| "Nat is missing `Succ`".to_owned())?;
+
+        let nat_to_int = RecFuncDecl::new("builtin_nat_to_int", &[&self.value_sort], &Sort::int());
+        let int_to_nat = RecFuncDecl::new("builtin_int_to_nat", &[&Sort::int()], &self.value_sort);
+
+        let int_arg = Int::new_const("builtin_int_to_nat_arg");
+        let zero_value = zero_ctor.symbol.apply(&[]);
+        let int_minus_one = int_arg.clone() - Int::from_i64(1);
+        let succ_tail = int_to_nat.apply(&[&int_minus_one]);
+        let succ_value = succ_ctor.symbol.apply(&[&succ_tail]);
+        let int_to_nat_body = int_arg.le(0).ite(&zero_value, &succ_value);
+        int_to_nat.add_def(&[&int_arg], &int_to_nat_body);
+
+        let nat_arg = Dynamic::new_const("builtin_nat_to_int_arg", &self.value_sort);
+        let nat_value = SymValue::new(nat_arg.clone());
+        let zero_case = self.tag_formula(&nat_composite, zero_index, &nat_value)?;
+        let succ_field =
+            self.project_composite_ctor_field(&nat_composite, succ_index, &nat_value, 0)?;
+        let succ_int = nat_to_int
+            .apply(&[succ_field.ast()])
+            .as_int()
+            .ok_or_else(|| "builtin_nat_to_int must return Int".to_owned())?;
+        let nat_to_int_body = zero_case.ite(&Int::from_i64(0), &(Int::from_i64(1) + succ_int));
+        nat_to_int.add_def(&[&nat_arg], &nat_to_int_body);
+
+        let decls = Rc::new(BuiltinNatDecls {
+            nat_to_int,
+            int_to_nat,
+        });
+        self.builtin_nat_decls.replace(Some(decls.clone()));
+        Ok(decls)
+    }
+
+    fn nat_spec_ty() -> SpecTy {
+        SpecTy::Enum {
+            name: "Nat".to_owned(),
+            args: vec![],
+        }
+    }
+
+    fn nat_ctor_indices(&self, solver: &Solver) -> Result<(usize, usize), String> {
+        let composite = self.composite_encoding(&Self::nat_spec_ty(), solver)?;
+        let zero = composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| ctor.fields.is_empty())
+            .map(|(index, _)| index)
+            .ok_or_else(|| "Nat is missing `Zero`".to_owned())?;
+        let succ = composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| ctor.fields.len() == 1)
+            .map(|(index, _)| index)
+            .ok_or_else(|| "Nat is missing `Succ`".to_owned())?;
+        Ok((zero, succ))
+    }
+
+    fn try_concrete_nat_usize(
+        &self,
+        value: &SymValue,
+        solver: &Solver,
+    ) -> Result<Option<u64>, String> {
+        let nat_ty = Self::nat_spec_ty();
+        let composite = self.composite_encoding(&nat_ty, solver)?;
+        let (zero, succ) = self.nat_ctor_indices(solver)?;
+        match Self::ground_ctor_index(&composite, value) {
+            Some(index) if index == zero => Ok(Some(0)),
+            Some(index) if index == succ => {
+                let tail = self.project_composite_ctor_field(&composite, succ, value, 0)?;
+                Ok(self.try_concrete_nat_usize(&tail, solver)?.map(|n| n + 1))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn ground_ctor_index(composite: &CompositeEncoding, value: &SymValue) -> Option<usize> {
+        let decl_name = value.dynamic().decl().name();
+        composite
+            .constructors
+            .iter()
+            .enumerate()
+            .find(|(_, ctor)| decl_name == ctor.symbol.name())
+            .map(|(index, _)| index)
     }
 
     pub(crate) fn bool_value(&self, value: bool) -> SymValue {
