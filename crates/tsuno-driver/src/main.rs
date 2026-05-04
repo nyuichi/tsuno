@@ -13,6 +13,7 @@ mod directive;
 mod engine;
 mod prepass;
 mod report;
+mod solver;
 mod spec;
 mod value;
 
