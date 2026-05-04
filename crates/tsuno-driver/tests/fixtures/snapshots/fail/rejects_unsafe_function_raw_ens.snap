@@ -4,9 +4,11 @@ expression: result
 ---
 status: Some(1)
 stdout:
-FAIL rejects_stack_dealloc_token_reify
-  raw assertion failed
-  src/main.rs:7:13: 7:18
+FAIL leaves_value_unchanged
+  raw postcondition failed
+  src/main.rs:5:2: 5:2
+PASS rejects_unsafe_function_raw_ens
+  all assertions discharged
 PASS main
   all assertions discharged
 

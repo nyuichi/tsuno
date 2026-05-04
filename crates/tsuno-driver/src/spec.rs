@@ -294,21 +294,21 @@ pub struct LemmaDef {
     pub type_params: Vec<String>,
     pub params: Vec<PureFnParam>,
     pub req: Expr,
-    pub resource_reqs: Vec<ResourceAssertion>,
+    pub raw_reqs: Vec<RawAssertion>,
     pub ens: Expr,
-    pub resource_ens: Vec<ResourceAssertion>,
+    pub raw_ens: Vec<RawAssertion>,
     pub body: Vec<GhostStmt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResourceAssertion {
-    pub pattern: ResourcePattern,
+pub struct RawAssertion {
+    pub pattern: RawPattern,
     pub condition: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResourcePattern {
-    Star(Box<ResourcePattern>, Box<ResourcePattern>),
+pub enum RawPattern {
+    Star(Box<RawPattern>, Box<RawPattern>),
     PointsTo {
         addr: Expr,
         ty: Expr,

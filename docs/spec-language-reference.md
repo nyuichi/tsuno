@@ -503,15 +503,15 @@ The `PointsTo(..., Option::None)` precondition says that the typed cell is live
 and uninitialized as `T`; the `DeallocToken` precondition says that the caller
 owns the right to deallocate that allocation with the matching layout. Both
 resources are consumed. `emp` is used here as the usual separation-logic empty
-heap notation; in the current resource contract syntax this is represented by
-omitting a `resource ens` clause.
+heap notation; in the current raw contract syntax this is represented by
+omitting a `raw ens` clause.
 
 The safe-to-unsafe bridge is explicit. `enter_unsafe` converts each live safe
 local that currently has a safe model value to
 `PointsTo(base, {type local_ty}, Some(value))`. If the local has been moved out
 or otherwise has no safe model value, it creates no initialized typed cell for
 that local. Stack and local allocations do not produce `DeallocToken` resources;
-such tokens come from resource contracts, unsafe API specifications, or future
+such tokens come from raw contracts, unsafe API specifications, or future
 bridge rules for ownership-bearing heap values. `exit_unsafe` converts bridged
 local resources back to the safe state:
 `PointsTo(base, {type local_ty}, Some(value))` becomes the local's safe model
@@ -536,86 +536,86 @@ control returns to safe code.
 Currently supported unsafe code is single-threaded Rust for raw pointer reads
 and writes, ordinary branches, ordinary reference construction, checked integer
 arithmetic, and calls to ordinary safe Rust functions. An `unsafe fn` body is
-verified by the unsafe engine even when it has no `resource req` or
-`resource ens` clauses. A safe function call from unsafe code uses the same
+verified by the unsafe engine even when it has no `raw req` or
+`raw ens` clauses. A safe function call from unsafe code uses the same
 contract behavior as safe code: the callee precondition is asserted, the callee
 postcondition is assumed, and opaque calls produce a fresh result satisfying the
 result type invariant. Unsafe function calls from unsafe code are supported when
 the unsafe callee has a local function contract. Ordinary `req` and `ens`
 clauses keep their path-condition meaning, and unsafe heap requirements are
-written with `resource req` and `resource ens`.
+written with `raw req` and `raw ens`.
 
 ```rust
 unsafe fn write_i32(p: *mut i32)
-//@ resource req *p |-> Option::Some(?old)
-//@ resource ens *p |-> Option::Some(42i32) where old >= 0i32
+//@ raw req *p |-> Option::Some(?old)
+//@ raw ens *p |-> Option::Some(42i32) where old >= 0i32
 {
     // ...
 }
 ```
 
-`resource req` and `resource ens` use the same resource-pattern syntax as
-`resource assert`. They may be omitted independently. `//@ let` directives may
-appear before `resource req`, as with ordinary function contracts. Resource
-function contracts are supported only on `unsafe fn`.
+`raw req` and `raw ens` use the same raw-pattern syntax as
+`raw assert`. They may be omitted independently. `//@ let` directives may
+appear before `raw req`, as with ordinary function contracts. Raw function
+contracts are supported only on `unsafe fn`.
 
-When an unsafe function body is verified, each `resource req` materializes the
+When an unsafe function body is verified, each `raw req` materializes the
 specified resources into the function's initial unsafe heap and assumes its
 `where` condition. At each return, ordinary `ens` clauses are asserted, then each
-`resource ens` is checked against the function's final unsafe heap. Resource
-postcondition matching is exact: each resource pattern must match exactly one
+`raw ens` is checked against the function's final unsafe heap. Raw
+postcondition matching is exact: each raw pattern must match exactly one
 set of heap resources after its `where` condition is applied. The matched
 resources are consumed at return because no unsafe heap is reflected to a caller
 during callee-body verification. After those postcondition resources and the
 callee's own bridged local resources have been consumed, the final unsafe heap
 must be empty.
 
-At an unsafe call site, each `resource req` is checked against the caller's
-unsafe heap and consumes exactly the matched resources. Each `resource ens`
+At an unsafe call site, each `raw req` is checked against the caller's
+unsafe heap and consumes exactly the matched resources. Each `raw ens`
 materializes resources back into the caller heap after the call. If a
-`resource ens` has a `where` clause, that boolean condition is also added to the
+`raw ens` has a `where` clause, that boolean condition is also added to the
 caller path condition after the call. The `result` variable is available in both
-the resource pattern and the `where` clause of `resource ens`.
+the raw pattern and the `where` clause of `raw ens`.
 
-Unsafe lemmas use the same resource contract model as unsafe functions. They are
+Unsafe lemmas use the same raw contract model as unsafe functions. They are
 declared as ghost items with `unsafe fn`, spec parameters, optional ordinary
-`req` and `ens` clauses, and optional `resource req` and `resource ens` clauses:
+`req` and `ens` clauses, and optional `raw req` and `raw ens` clauses:
 
 ```rust
 /*@
 unsafe fn keep_i32_cell(p: Ptr)
-  resource req PointsTo(p.addr, {type i32}, Option::Some(?old))
-  resource ens PointsTo(p.addr, {type i32}, Option::Some(?v)) where v == old
+  raw req PointsTo(p.addr, {type i32}, Option::Some(?old))
+  raw ens PointsTo(p.addr, {type i32}, Option::Some(?v)) where v == old
 {
 }
 */
 ```
 
-An unsafe lemma body is verified. Its `resource req` clauses materialize the
-initial unsafe heap, and its `resource ens` clauses are checked against the final
-unsafe heap. After the lemma's `resource ens` clauses are consumed, its final
+An unsafe lemma body is verified. Its `raw req` clauses materialize the
+initial unsafe heap, and its `raw ens` clauses are checked against the final
+unsafe heap. After the lemma's `raw ens` clauses are consumed, its final
 unsafe heap must be empty. Calling an unsafe lemma from unsafe code applies the
-same resource contract behavior as an unsafe function call: resource
-preconditions are consumed from the caller heap and resource postconditions are
+same raw contract behavior as an unsafe function call: raw preconditions are
+consumed from the caller heap and raw postconditions are
 materialized back into it. Unsafe lemma calls are supported inside both unsafe
 blocks and unsafe function bodies.
 
 Inside unsafe blocks and unsafe function bodies, ordinary `//@ let`,
 `//@ assert`, `//@ assume`, and lemma-call directives are supported when they
 only affect the symbolic path condition or the directive environment, as they do
-in safe code. Unsafe code also supports resource assertions:
+in safe code. Unsafe code also supports raw assertions:
 
 ```rust
-//@ resource assert PointsTo({p}.addr, {type i32}, Option::Some(42i32));
-//@ resource assert PointsTo({p}.addr, {type i32}, Option::Some(?v)) where v > 0i32;
-//@ resource assert *p |-> Option::Some(?v) where v > 0i32;
+//@ raw assert PointsTo({p}.addr, {type i32}, Option::Some(42i32));
+//@ raw assert PointsTo({p}.addr, {type i32}, Option::Some(?v)) where v > 0i32;
+//@ raw assert *p |-> Option::Some(?v) where v > 0i32;
 ```
 
-A resource assertion checks a `ResourcePattern`. The initial resource patterns
+A raw assertion checks a `RawPattern`. The initial raw patterns
 are `PointsTo(addr_expr, rust_ty_expr, option_value_expr)`,
 the shorthand `*ptr |-> option_value_pattern`,
 `DeallocToken(base_expr, size_expr, alignment_expr)`, and separating
-conjunction `left * right`; parentheses may be used freely to group resource
+conjunction `left * right`; parentheses may be used freely to group raw
 patterns.
 `*ptr |-> value` is accepted only when `ptr` is a Rust local, function
 parameter, or allowed `result` binding whose type is a raw pointer `*const T` or
@@ -635,15 +635,15 @@ may themselves contain pattern variables. Pattern variables are bound from left
 to right, are visible in the optional `where` condition, and remain available to
 later directives in the same directive environment.
 
-`resource assert R where P` first enumerates matches of `R` against the current
+`raw assert R where P` first enumerates matches of `R` against the current
 unsafe heap, using `*` to require distinct matched atomic resources. It then
 filters those matches by the boolean spec expression `P`; if the `where` clause
 is omitted, `P` is `true`. The directive succeeds only when exactly one match
 remains under the current path condition. If no matching resource remains,
 verification fails; if multiple matches remain or a match is only
 path-conditionally possible, the assertion is currently reported as unsupported.
-Resource assertions do not consume resources, and no backtracking crosses a
-directive boundary. Resource assertions are only supported inside unsafe blocks.
+Raw assertions do not consume resources, and no backtracking crosses a
+directive boundary. Raw assertions are only supported inside unsafe blocks.
 
 Loop invariants inside unsafe blocks are not supported. Loop contracts inside
 unsafe code are not supported yet; existing loop prepass restrictions still
@@ -742,7 +742,7 @@ Supported items:
 - pure functions: `fn name<T>(args...) -> Ty { expr }`
 - lemmas: `fn name<T>(args...) req <expr> ens <expr> { stmts }`
 - unsafe lemmas:
-  `unsafe fn name<T>(args...) req <expr> resource req <pattern> ens <expr> resource ens <pattern> { stmts }`
+  `unsafe fn name<T>(args...) req <expr> raw req <pattern> ens <expr> raw ens <pattern> { stmts }`
 
 Pure function bodies are expression bodies. Lemma bodies are statement bodies.
 

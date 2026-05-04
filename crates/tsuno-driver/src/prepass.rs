@@ -9,10 +9,9 @@ use crate::directive::{
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
-    EnumDef, Expr, GhostMatchArm, LemmaDef, MatchBinding, MatchPattern, PureFnDef,
-    ResourceAssertion, ResourcePattern, RustTyKey, RustTypeExpr, SpecTy, StructDef, StructFieldTy,
-    StructTy, TypedExpr, TypedExprKind, TypedMatchArm, TypedMatchBinding, ValuePattern,
-    option_spec_ty, ptr_spec_ty,
+    EnumDef, Expr, GhostMatchArm, LemmaDef, MatchBinding, MatchPattern, PureFnDef, RawAssertion,
+    RawPattern, RustTyKey, RustTypeExpr, SpecTy, StructDef, StructFieldTy, StructTy, TypedExpr,
+    TypedExprKind, TypedMatchArm, TypedMatchBinding, ValuePattern, option_spec_ty, ptr_spec_ty,
 };
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{BlockCheckMode, Expr as HirExpr, ExprKind, HirId, Pat, PatKind, UnsafeSource};
@@ -93,16 +92,16 @@ pub struct LemmaCallContract {
 }
 
 #[derive(Debug, Clone)]
-pub struct ResourceAssertionContract {
-    pub pattern: TypedResourcePattern,
+pub struct RawAssertionContract {
+    pub pattern: TypedRawPattern,
     pub condition: TypedExpr,
     pub resolution: ResolvedExprEnv,
     pub assertion_span: String,
 }
 
 #[derive(Debug, Clone)]
-pub enum TypedResourcePattern {
-    Star(Box<TypedResourcePattern>, Box<TypedResourcePattern>),
+pub enum TypedRawPattern {
+    Star(Box<TypedRawPattern>, Box<TypedRawPattern>),
     PointsTo {
         addr: TypedExpr,
         ty: TypedExpr,
@@ -137,7 +136,7 @@ pub enum TypedValuePattern {
     },
 }
 
-struct ResourceTypingCtx<'a, 'tcx> {
+struct RawTypingCtx<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     body: &'a Body<'tcx>,
     resolution: &'a ResolvedExprEnv,
@@ -151,7 +150,7 @@ pub enum ControlPointDirective {
     Let(LetBindingContract),
     Assert(AssertionContract),
     Assume(AssumptionContract),
-    ResourceAssert(Box<ResourceAssertionContract>),
+    RawAssert(Box<RawAssertionContract>),
     LemmaCall(LemmaCallContract),
 }
 
@@ -195,9 +194,9 @@ pub struct TypedLemmaDef {
     pub is_unsafe: bool,
     pub params: Vec<ContractParam>,
     pub req: NormalizedPredicate,
-    pub resource_reqs: Vec<ResourceAssertionContract>,
+    pub raw_reqs: Vec<RawAssertionContract>,
     pub ens: TypedExpr,
-    pub resource_ens: Vec<ResourceAssertionContract>,
+    pub raw_ens: Vec<RawAssertionContract>,
     pub body: Vec<TypedGhostStmt>,
 }
 
@@ -219,10 +218,10 @@ pub struct FunctionContract {
     pub req: NormalizedPredicate,
     #[allow(dead_code)]
     pub req_span: String,
-    pub resource_reqs: Vec<ResourceAssertionContract>,
+    pub raw_reqs: Vec<RawAssertionContract>,
     pub ens: TypedExpr,
     pub ens_span: String,
-    pub resource_ens: Vec<ResourceAssertionContract>,
+    pub raw_ens: Vec<RawAssertionContract>,
     pub result: SpecTy,
 }
 
@@ -3981,8 +3980,8 @@ fn compute_directives<'tcx>(
     let mut contract_scope = SpecScope::default();
     let mut req_directive = None;
     let mut ens_directive = None;
-    let mut resource_req_directives = Vec::new();
-    let mut resource_ens_directives = Vec::new();
+    let mut raw_req_directives = Vec::new();
+    let mut raw_ens_directives = Vec::new();
     let mut contract_lets = Vec::new();
     for directive in &directives.directives {
         match directive.kind {
@@ -4007,11 +4006,11 @@ fn compute_directives<'tcx>(
                     });
                 }
             }
-            DirectiveKind::ResourceReq if matches!(directive.attach, DirectiveAttach::Function) => {
-                resource_req_directives.push(directive);
+            DirectiveKind::RawReq if matches!(directive.attach, DirectiveAttach::Function) => {
+                raw_req_directives.push(directive);
             }
-            DirectiveKind::ResourceEns if matches!(directive.attach, DirectiveAttach::Function) => {
-                resource_ens_directives.push(directive);
+            DirectiveKind::RawEns if matches!(directive.attach, DirectiveAttach::Function) => {
+                raw_ens_directives.push(directive);
             }
             _ => {}
         }
@@ -4019,11 +4018,7 @@ fn compute_directives<'tcx>(
     let first_req_line = req_directive
         .map(|directive| directive.line_no)
         .into_iter()
-        .chain(
-            resource_req_directives
-                .iter()
-                .map(|directive| directive.line_no),
-        )
+        .chain(raw_req_directives.iter().map(|directive| directive.line_no))
         .min();
     if let Some(req_line) = first_req_line {
         for directive in &contract_lets {
@@ -4032,25 +4027,23 @@ fn compute_directives<'tcx>(
                     span: directive.span,
                     display_span: Some(directive.span_text.clone()),
                     message:
-                        "//@ let directives in function contracts must be placed before //@ req or //@ resource req"
+                        "//@ let directives in function contracts must be placed before //@ req or //@ raw req"
                             .to_owned(),
                 });
             }
         }
     }
-    let has_resource_contract =
-        !resource_req_directives.is_empty() || !resource_ens_directives.is_empty();
-    if has_resource_contract && !tcx.fn_sig(def_id).skip_binder().safety().is_unsafe() {
+    let has_raw_contract = !raw_req_directives.is_empty() || !raw_ens_directives.is_empty();
+    if has_raw_contract && !tcx.fn_sig(def_id).skip_binder().safety().is_unsafe() {
         return Err(LoopPrepassError {
             span: tcx.def_span(def_id.to_def_id()),
             display_span: None,
-            message: "resource function contracts are only supported on unsafe functions"
-                .to_owned(),
+            message: "raw function contracts are only supported on unsafe functions".to_owned(),
         });
     }
     let param_names = if req_directive.is_some()
         || ens_directive.is_some()
-        || has_resource_contract
+        || has_raw_contract
         || !contract_lets.is_empty()
     {
         function_param_names(tcx, def_id).map_err(|err| LoopPrepassError {
@@ -4112,8 +4105,8 @@ fn compute_directives<'tcx>(
             &mut contract_scope,
         )?
     }
-    for directive in &resource_req_directives {
-        validate_function_contract_resource_prepass(
+    for directive in &raw_req_directives {
+        validate_function_contract_raw_prepass(
             directive,
             pure_fns,
             enum_defs,
@@ -4131,7 +4124,7 @@ fn compute_directives<'tcx>(
             DirectiveKind::Let
                 | DirectiveKind::Assert
                 | DirectiveKind::Assume
-                | DirectiveKind::ResourceAssert
+                | DirectiveKind::RawAssert
                 | DirectiveKind::Inv
                 | DirectiveKind::LemmaCall
         )
@@ -4176,10 +4169,8 @@ fn compute_directives<'tcx>(
                 )?;
                 resolution
             }
-            DirectiveKind::ResourceAssert => resolve_resource_pattern_env(
-                directive
-                    .resource_assertion()
-                    .expect("resource assertion payload"),
+            DirectiveKind::RawAssert => resolve_raw_pattern_env(
+                directive.raw_assertion().expect("raw assertion payload"),
                 pure_fns,
                 enum_defs,
                 &binding_info,
@@ -4215,8 +4206,8 @@ fn compute_directives<'tcx>(
             &mut contract_scope,
         )?
     }
-    for directive in &resource_ens_directives {
-        validate_function_contract_resource_prepass(
+    for directive in &raw_ens_directives {
+        validate_function_contract_raw_prepass(
             directive,
             pure_fns,
             enum_defs,
@@ -4276,11 +4267,9 @@ fn compute_directives<'tcx>(
             message,
         })?;
     }
-    for directive in &resource_req_directives {
-        infer_contract_resource_assertion(
-            directive
-                .resource_assertion()
-                .expect("resource req payload"),
+    for directive in &raw_req_directives {
+        infer_contract_raw_assertion(
+            directive.raw_assertion().expect("raw req payload"),
             pure_fns,
             enum_defs,
             &mut contract_infer_scope,
@@ -4303,7 +4292,7 @@ fn compute_directives<'tcx>(
             DirectiveKind::Let
                 | DirectiveKind::Assert
                 | DirectiveKind::Assume
-                | DirectiveKind::ResourceAssert
+                | DirectiveKind::RawAssert
                 | DirectiveKind::Inv
                 | DirectiveKind::LemmaCall
         )
@@ -4373,11 +4362,9 @@ fn compute_directives<'tcx>(
                     }
                 })?;
             }
-            DirectiveKind::ResourceAssert => {
-                infer_resource_pattern_types(
-                    directive
-                        .resource_assertion()
-                        .expect("resource assertion payload"),
+            DirectiveKind::RawAssert => {
+                infer_raw_pattern_types(
+                    directive.raw_assertion().expect("raw assertion payload"),
                     pure_fns,
                     enum_defs,
                     &mut body_infer_scope,
@@ -4425,11 +4412,9 @@ fn compute_directives<'tcx>(
             message,
         })?;
     }
-    for directive in &resource_ens_directives {
-        infer_contract_resource_assertion(
-            directive
-                .resource_assertion()
-                .expect("resource ens payload"),
+    for directive in &raw_ens_directives {
+        infer_contract_raw_assertion(
+            directive.raw_assertion().expect("raw ens payload"),
             pure_fns,
             enum_defs,
             &mut contract_infer_scope,
@@ -4507,9 +4492,9 @@ fn compute_directives<'tcx>(
         }
         None => None,
     };
-    let typed_resource_reqs = typed_contract_resource_assertions(
+    let typed_raw_reqs = typed_contract_raw_assertions(
         tcx,
-        &resource_req_directives,
+        &raw_req_directives,
         pure_fns,
         enum_defs,
         &mut contract_type_scope,
@@ -4523,7 +4508,7 @@ fn compute_directives<'tcx>(
     let mut typed_body_assertions = HashMap::new();
     let mut typed_body_exprs = HashMap::new();
     let mut typed_body_lets = HashMap::new();
-    let mut typed_body_resource_assertions = HashMap::new();
+    let mut typed_body_raw_assertions = HashMap::new();
     let mut body_type_scope = if req_directive.is_some() || !contract_lets.is_empty() {
         let mut scope = contract_type_scope.clone();
         if let Some(directive) = req_directive {
@@ -4553,7 +4538,7 @@ fn compute_directives<'tcx>(
             DirectiveKind::Let
                 | DirectiveKind::Assert
                 | DirectiveKind::Assume
-                | DirectiveKind::ResourceAssert
+                | DirectiveKind::RawAssert
                 | DirectiveKind::Inv
                 | DirectiveKind::LemmaCall
         )
@@ -4625,14 +4610,12 @@ fn compute_directives<'tcx>(
                     },
                 );
             }
-            DirectiveKind::ResourceAssert => {
+            DirectiveKind::RawAssert => {
                 let resolution = resolved_exprs
                     .get(&directive.span_text)
-                    .expect("resolved resource assertion expression");
-                let assertion = directive
-                    .resource_assertion()
-                    .expect("resource assertion payload");
-                let resource_ctx = ResourceTypingCtx {
+                    .expect("resolved raw assertion expression");
+                let assertion = directive.raw_assertion().expect("raw assertion payload");
+                let raw_ctx = RawTypingCtx {
                     tcx,
                     body,
                     resolution,
@@ -4640,18 +4623,14 @@ fn compute_directives<'tcx>(
                     enum_defs,
                     local_tys: &local_tys,
                 };
-                let typed = typed_resource_pattern(
-                    assertion,
-                    &resource_ctx,
-                    &mut body_type_scope,
-                    &mut inferred,
-                )
-                .map_err(|message| LoopPrepassError {
-                    span: directive.span,
-                    display_span: Some(directive.span_text.clone()),
-                    message,
-                })?;
-                typed_body_resource_assertions.insert(directive.span_text.clone(), typed);
+                let typed =
+                    typed_raw_pattern(assertion, &raw_ctx, &mut body_type_scope, &mut inferred)
+                        .map_err(|message| LoopPrepassError {
+                            span: directive.span,
+                            display_span: Some(directive.span_text.clone()),
+                            message,
+                        })?;
+                typed_body_raw_assertions.insert(directive.span_text.clone(), typed);
                 let condition = typed_body_expr_with_expected(
                     &assertion.condition,
                     pure_fns,
@@ -4713,9 +4692,9 @@ fn compute_directives<'tcx>(
                         DirectiveKind::Req
                         | DirectiveKind::Ens
                         | DirectiveKind::Let
-                        | DirectiveKind::ResourceAssert
-                        | DirectiveKind::ResourceReq
-                        | DirectiveKind::ResourceEns
+                        | DirectiveKind::RawAssert
+                        | DirectiveKind::RawReq
+                        | DirectiveKind::RawEns
                         | DirectiveKind::LemmaCall => {
                             unreachable!("filtered above")
                         }
@@ -4771,9 +4750,9 @@ fn compute_directives<'tcx>(
         }
         None => None,
     };
-    let typed_resource_ens = typed_contract_resource_assertions(
+    let typed_raw_ens = typed_contract_raw_assertions(
         tcx,
-        &resource_ens_directives,
+        &raw_ens_directives,
         pure_fns,
         enum_defs,
         &mut contract_type_scope,
@@ -4787,15 +4766,15 @@ fn compute_directives<'tcx>(
     let function_contract = match (
         req_directive,
         ens_directive,
-        typed_resource_reqs.is_empty(),
-        typed_resource_ens.is_empty(),
+        typed_raw_reqs.is_empty(),
+        typed_raw_ens.is_empty(),
     ) {
         (None, None, true, true) if !contract_lets.is_empty() => {
             return Err(LoopPrepassError {
                 span: tcx.def_span(def_id.to_def_id()),
                 display_span: None,
                 message:
-                    "function contract requires a //@ req, //@ ens, //@ resource req, or //@ resource ens predicate"
+                    "function contract requires a //@ req, //@ ens, //@ raw req, or //@ raw ens predicate"
                         .to_owned(),
             });
         }
@@ -4808,12 +4787,12 @@ fn compute_directives<'tcx>(
             req_span: req
                 .map(|directive| directive.span_text.clone())
                 .unwrap_or_else(|| def_span.clone()),
-            resource_reqs: typed_resource_reqs,
+            raw_reqs: typed_raw_reqs,
             ens: typed_ens.unwrap_or_else(|| typed_bool_expr(true)),
             ens_span: ens
                 .map(|directive| directive.span_text.clone())
                 .unwrap_or(def_span),
-            resource_ens: typed_resource_ens,
+            raw_ens: typed_raw_ens,
             result,
         }),
     };
@@ -4825,8 +4804,8 @@ fn compute_directives<'tcx>(
         match directive.kind {
             DirectiveKind::Req
             | DirectiveKind::Ens
-            | DirectiveKind::ResourceReq
-            | DirectiveKind::ResourceEns => {}
+            | DirectiveKind::RawReq
+            | DirectiveKind::RawEns => {}
             DirectiveKind::Let if matches!(directive.attach, DirectiveAttach::Function) => {}
             DirectiveKind::Let => {
                 let control = control_point_after(body, directive_anchor_span(&directive.attach))
@@ -4913,13 +4892,13 @@ fn compute_directives<'tcx>(
                         resolution,
                     }));
             }
-            DirectiveKind::ResourceAssert => {
+            DirectiveKind::RawAssert => {
                 let control = control_point_after(body, directive_anchor_span(&directive.attach))
                     .ok_or_else(|| LoopPrepassError {
                     span: directive.span,
                     display_span: Some(directive.span_text.clone()),
                     message: format!(
-                        "unable to map //@ resource assert at {} to MIR",
+                        "unable to map //@ raw assert at {} to MIR",
                         tcx.sess
                             .source_map()
                             .span_to_diagnostic_string(directive.span)
@@ -4928,21 +4907,21 @@ fn compute_directives<'tcx>(
                 let resolution = resolved_exprs
                     .get(&directive.span_text)
                     .cloned()
-                    .expect("resolved resource assertion expression");
+                    .expect("resolved raw assertion expression");
                 control_point_directives
                     .by_control_point
                     .entry(control)
                     .or_default()
-                    .push(ControlPointDirective::ResourceAssert(Box::new(
-                        ResourceAssertionContract {
-                            pattern: typed_body_resource_assertions
+                    .push(ControlPointDirective::RawAssert(Box::new(
+                        RawAssertionContract {
+                            pattern: typed_body_raw_assertions
                                 .get(&directive.span_text)
                                 .cloned()
-                                .expect("typed resource assertion expression"),
+                                .expect("typed raw assertion expression"),
                             condition: typed_body_exprs
                                 .get(&directive.span_text)
                                 .cloned()
-                                .expect("typed resource assertion condition"),
+                                .expect("typed raw assertion condition"),
                             resolution,
                             assertion_span: directive.span_text.clone(),
                         },
@@ -4995,8 +4974,8 @@ fn collect_unsafe_block_spans<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Ve
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_resource_pattern_env(
-    assertion: &ResourceAssertion,
+fn resolve_raw_pattern_env(
+    assertion: &RawAssertion,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
     binding_info: &HirBindingInfo,
@@ -5006,7 +4985,7 @@ fn resolve_resource_pattern_env(
     spec_scope: &mut SpecScope,
 ) -> Result<ResolvedExprEnv, LoopPrepassError> {
     let mut resolved = ResolvedExprEnv::default();
-    resolve_resource_pattern_env_into(
+    resolve_raw_pattern_env_into(
         &assertion.pattern,
         pure_fns,
         enum_defs,
@@ -5025,7 +5004,7 @@ fn resolve_resource_pattern_env(
         hir_locals,
         span,
         anchor_span,
-        DirectiveKind::ResourceAssert,
+        DirectiveKind::RawAssert,
         spec_scope,
     )?;
     resolved.locals.extend(condition_resolved.locals);
@@ -5033,8 +5012,8 @@ fn resolve_resource_pattern_env(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_resource_pattern_env_into(
-    pattern: &ResourcePattern,
+fn resolve_raw_pattern_env_into(
+    pattern: &RawPattern,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
     binding_info: &HirBindingInfo,
@@ -5045,8 +5024,8 @@ fn resolve_resource_pattern_env_into(
     resolved: &mut ResolvedExprEnv,
 ) -> Result<(), LoopPrepassError> {
     match pattern {
-        ResourcePattern::Star(lhs, rhs) => {
-            resolve_resource_pattern_env_into(
+        RawPattern::Star(lhs, rhs) => {
+            resolve_raw_pattern_env_into(
                 lhs,
                 pure_fns,
                 enum_defs,
@@ -5057,7 +5036,7 @@ fn resolve_resource_pattern_env_into(
                 spec_scope,
                 resolved,
             )?;
-            resolve_resource_pattern_env_into(
+            resolve_raw_pattern_env_into(
                 rhs,
                 pure_fns,
                 enum_defs,
@@ -5069,7 +5048,7 @@ fn resolve_resource_pattern_env_into(
                 resolved,
             )
         }
-        ResourcePattern::PointsTo { addr, ty, value } => {
+        RawPattern::PointsTo { addr, ty, value } => {
             for expr in [addr, ty] {
                 let expr_resolved = resolve_expr_env(
                     expr,
@@ -5079,7 +5058,7 @@ fn resolve_resource_pattern_env_into(
                     hir_locals,
                     span,
                     anchor_span,
-                    DirectiveKind::ResourceAssert,
+                    DirectiveKind::RawAssert,
                     spec_scope,
                 )?;
                 resolved.locals.extend(expr_resolved.locals);
@@ -5097,13 +5076,13 @@ fn resolve_resource_pattern_env_into(
             )?;
             Ok(())
         }
-        ResourcePattern::PointsToSugar { pointer, value } => {
+        RawPattern::PointsToSugar { pointer, value } => {
             let symbol = Symbol::intern(pointer);
             let Some(hir_id) = resolve_binding_hir_id(binding_info, symbol, anchor_span) else {
                 return Err(LoopPrepassError {
                     span,
                     display_span: None,
-                    message: format!("unresolved pointer `{pointer}` in //@ resource assert"),
+                    message: format!("unresolved pointer `{pointer}` in //@ raw assert"),
                 });
             };
             let Some(local) = hir_locals.get(&hir_id).copied() else {
@@ -5127,7 +5106,7 @@ fn resolve_resource_pattern_env_into(
             )?;
             Ok(())
         }
-        ResourcePattern::DeallocToken {
+        RawPattern::DeallocToken {
             base,
             size,
             alignment,
@@ -5141,7 +5120,7 @@ fn resolve_resource_pattern_env_into(
                     hir_locals,
                     span,
                     anchor_span,
-                    DirectiveKind::ResourceAssert,
+                    DirectiveKind::RawAssert,
                     spec_scope,
                 )?;
                 resolved.locals.extend(expr_resolved.locals);
@@ -5177,7 +5156,7 @@ fn resolve_value_pattern_env(
                 hir_locals,
                 span,
                 anchor_span,
-                DirectiveKind::ResourceAssert,
+                DirectiveKind::RawAssert,
                 spec_scope,
             )?;
             resolved.locals.extend(expr_resolved.locals);
@@ -5234,15 +5213,15 @@ fn resolve_value_pattern_env(
     }
 }
 
-fn infer_resource_pattern_types(
-    assertion: &ResourceAssertion,
+fn infer_raw_pattern_types(
+    assertion: &RawAssertion,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
 ) -> Result<(), String> {
-    infer_resource_pattern_types_into(
+    infer_raw_pattern_types_into(
         &assertion.pattern,
         pure_fns,
         enum_defs,
@@ -5254,7 +5233,7 @@ fn infer_resource_pattern_types(
         &assertion.condition,
         pure_fns,
         enum_defs,
-        DirectiveKind::ResourceAssert,
+        DirectiveKind::RawAssert,
         spec_scope,
         local_tys,
         inferred,
@@ -5265,8 +5244,8 @@ fn infer_resource_pattern_types(
     Ok(())
 }
 
-fn infer_resource_pattern_types_into(
-    pattern: &ResourcePattern,
+fn infer_raw_pattern_types_into(
+    pattern: &RawPattern,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
     spec_scope: &mut SpecScope,
@@ -5274,21 +5253,19 @@ fn infer_resource_pattern_types_into(
     inferred: &mut SpecTypeInference,
 ) -> Result<(), String> {
     match pattern {
-        ResourcePattern::Star(lhs, rhs) => {
-            infer_resource_pattern_types_into(
+        RawPattern::Star(lhs, rhs) => {
+            infer_raw_pattern_types_into(
                 lhs, pure_fns, enum_defs, spec_scope, local_tys, inferred,
             )?;
-            infer_resource_pattern_types_into(
-                rhs, pure_fns, enum_defs, spec_scope, local_tys, inferred,
-            )
+            infer_raw_pattern_types_into(rhs, pure_fns, enum_defs, spec_scope, local_tys, inferred)
         }
-        ResourcePattern::PointsTo { addr, ty, value } => {
+        RawPattern::PointsTo { addr, ty, value } => {
             for expr in [addr, ty] {
                 infer_body_expr_types(
                     expr,
                     pure_fns,
                     enum_defs,
-                    DirectiveKind::ResourceAssert,
+                    DirectiveKind::RawAssert,
                     spec_scope,
                     local_tys,
                     inferred,
@@ -5296,7 +5273,7 @@ fn infer_resource_pattern_types_into(
             }
             if value_pattern_contains_bind(value) {
                 let ty_ty =
-                    typed_resource_expr(ty, pure_fns, enum_defs, spec_scope, local_tys, inferred)?;
+                    typed_raw_expr(ty, pure_fns, enum_defs, spec_scope, local_tys, inferred)?;
                 let expected = option_spec_ty_for_rust_ty_expr(&ty_ty)?;
                 infer_value_pattern_types(
                     value, &expected, pure_fns, enum_defs, spec_scope, local_tys, inferred,
@@ -5306,7 +5283,7 @@ fn infer_resource_pattern_types_into(
                     expr,
                     pure_fns,
                     enum_defs,
-                    DirectiveKind::ResourceAssert,
+                    DirectiveKind::RawAssert,
                     spec_scope,
                     local_tys,
                     inferred,
@@ -5314,7 +5291,7 @@ fn infer_resource_pattern_types_into(
             }
             Ok(())
         }
-        ResourcePattern::PointsToSugar { value, .. } => {
+        RawPattern::PointsToSugar { value, .. } => {
             if value_pattern_contains_bind(value) {
                 bind_value_pattern_vars(value, spec_scope, inferred)?;
                 return Ok(());
@@ -5324,7 +5301,7 @@ fn infer_resource_pattern_types_into(
                     expr,
                     pure_fns,
                     enum_defs,
-                    DirectiveKind::ResourceAssert,
+                    DirectiveKind::RawAssert,
                     spec_scope,
                     local_tys,
                     inferred,
@@ -5332,7 +5309,7 @@ fn infer_resource_pattern_types_into(
             }
             Ok(())
         }
-        ResourcePattern::DeallocToken {
+        RawPattern::DeallocToken {
             base,
             size,
             alignment,
@@ -5342,7 +5319,7 @@ fn infer_resource_pattern_types_into(
                     expr,
                     pure_fns,
                     enum_defs,
-                    DirectiveKind::ResourceAssert,
+                    DirectiveKind::RawAssert,
                     spec_scope,
                     local_tys,
                     inferred,
@@ -5353,17 +5330,17 @@ fn infer_resource_pattern_types_into(
     }
 }
 
-fn typed_resource_pattern(
-    assertion: &ResourceAssertion,
-    ctx: &ResourceTypingCtx<'_, '_>,
+fn typed_raw_pattern(
+    assertion: &RawAssertion,
+    ctx: &RawTypingCtx<'_, '_>,
     spec_scope: &mut SpecScope,
     inferred: &mut SpecTypeInference,
-) -> Result<TypedResourcePattern, String> {
-    typed_resource_pattern_into(&assertion.pattern, ctx, spec_scope, inferred)
+) -> Result<TypedRawPattern, String> {
+    typed_raw_pattern_into(&assertion.pattern, ctx, spec_scope, inferred)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn typed_contract_resource_assertions<'tcx>(
+fn typed_contract_raw_assertions<'tcx>(
     tcx: TyCtxt<'tcx>,
     directives: &[&FunctionDirective],
     pure_fns: &HashMap<String, PureFnDef>,
@@ -5375,13 +5352,11 @@ fn typed_contract_resource_assertions<'tcx>(
     result_ty: &SpecTy,
     result_rust_ty: Ty<'tcx>,
     inferred: &mut SpecTypeInference,
-) -> Result<Vec<ResourceAssertionContract>, LoopPrepassError> {
+) -> Result<Vec<RawAssertionContract>, LoopPrepassError> {
     let mut out = Vec::with_capacity(directives.len());
     for directive in directives {
-        let assertion = directive
-            .resource_assertion()
-            .expect("resource contract payload");
-        let pattern = typed_contract_resource_pattern(
+        let assertion = directive.raw_assertion().expect("raw contract payload");
+        let pattern = typed_contract_raw_pattern(
             tcx,
             &assertion.pattern,
             pure_fns,
@@ -5417,7 +5392,7 @@ fn typed_contract_resource_assertions<'tcx>(
             display_span: Some(directive.span_text.clone()),
             message,
         })?;
-        out.push(ResourceAssertionContract {
+        out.push(RawAssertionContract {
             pattern,
             condition,
             resolution: ResolvedExprEnv::default(),
@@ -5428,8 +5403,8 @@ fn typed_contract_resource_assertions<'tcx>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn typed_lemma_resource_assertions(
-    assertions: &[ResourceAssertion],
+fn typed_lemma_raw_assertions(
+    assertions: &[RawAssertion],
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
     spec_scope: &mut SpecScope,
@@ -5437,10 +5412,10 @@ fn typed_lemma_resource_assertions(
     allow_result: bool,
     result_ty: &SpecTy,
     inferred: &mut SpecTypeInference,
-) -> Result<Vec<ResourceAssertionContract>, String> {
+) -> Result<Vec<RawAssertionContract>, String> {
     let mut out = Vec::with_capacity(assertions.len());
     for assertion in assertions {
-        let pattern = typed_lemma_resource_pattern(
+        let pattern = typed_lemma_raw_pattern(
             &assertion.pattern,
             pure_fns,
             enum_defs,
@@ -5463,19 +5438,19 @@ fn typed_lemma_resource_assertions(
             true,
             Some(&SpecTy::Bool),
         )?;
-        out.push(ResourceAssertionContract {
+        out.push(RawAssertionContract {
             pattern,
             condition,
             resolution: ResolvedExprEnv::default(),
-            assertion_span: "lemma resource contract".to_owned(),
+            assertion_span: "lemma raw contract".to_owned(),
         });
     }
     Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn typed_lemma_resource_pattern(
-    pattern: &ResourcePattern,
+fn typed_lemma_raw_pattern(
+    pattern: &RawPattern,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
     spec_scope: &mut SpecScope,
@@ -5483,10 +5458,10 @@ fn typed_lemma_resource_pattern(
     allow_result: bool,
     result_ty: &SpecTy,
     inferred: &mut SpecTypeInference,
-) -> Result<TypedResourcePattern, String> {
+) -> Result<TypedRawPattern, String> {
     match pattern {
-        ResourcePattern::Star(lhs, rhs) => Ok(TypedResourcePattern::Star(
-            Box::new(typed_lemma_resource_pattern(
+        RawPattern::Star(lhs, rhs) => Ok(TypedRawPattern::Star(
+            Box::new(typed_lemma_raw_pattern(
                 lhs,
                 pure_fns,
                 enum_defs,
@@ -5496,7 +5471,7 @@ fn typed_lemma_resource_pattern(
                 result_ty,
                 inferred,
             )?),
-            Box::new(typed_lemma_resource_pattern(
+            Box::new(typed_lemma_raw_pattern(
                 rhs,
                 pure_fns,
                 enum_defs,
@@ -5507,8 +5482,8 @@ fn typed_lemma_resource_pattern(
                 inferred,
             )?),
         )),
-        ResourcePattern::PointsTo { addr, ty, value } => {
-            let addr = typed_contract_resource_expr(
+        RawPattern::PointsTo { addr, ty, value } => {
+            let addr = typed_contract_raw_expr(
                 addr,
                 pure_fns,
                 enum_defs,
@@ -5519,7 +5494,7 @@ fn typed_lemma_resource_pattern(
                 inferred,
                 Some(&SpecTy::Usize),
             )?;
-            let ty = typed_contract_resource_expr(
+            let ty = typed_contract_raw_expr(
                 ty,
                 pure_fns,
                 enum_defs,
@@ -5542,17 +5517,17 @@ fn typed_lemma_resource_pattern(
                 result_ty,
                 inferred,
             )?;
-            Ok(TypedResourcePattern::PointsTo { addr, ty, value })
+            Ok(TypedRawPattern::PointsTo { addr, ty, value })
         }
-        ResourcePattern::PointsToSugar { .. } => Err(
-            "`|->` resource sugar in unsafe lemmas is unsupported; use `PointsTo(...)`".to_owned(),
-        ),
-        ResourcePattern::DeallocToken {
+        RawPattern::PointsToSugar { .. } => {
+            Err("`|->` raw sugar in unsafe lemmas is unsupported; use `PointsTo(...)`".to_owned())
+        }
+        RawPattern::DeallocToken {
             base,
             size,
             alignment,
-        } => Ok(TypedResourcePattern::DeallocToken {
-            base: typed_contract_resource_expr(
+        } => Ok(TypedRawPattern::DeallocToken {
+            base: typed_contract_raw_expr(
                 base,
                 pure_fns,
                 enum_defs,
@@ -5563,7 +5538,7 @@ fn typed_lemma_resource_pattern(
                 inferred,
                 Some(&SpecTy::Usize),
             )?,
-            size: typed_contract_resource_expr(
+            size: typed_contract_raw_expr(
                 size,
                 pure_fns,
                 enum_defs,
@@ -5574,7 +5549,7 @@ fn typed_lemma_resource_pattern(
                 inferred,
                 Some(&SpecTy::Usize),
             )?,
-            alignment: typed_contract_resource_expr(
+            alignment: typed_contract_raw_expr(
                 alignment,
                 pure_fns,
                 enum_defs,
@@ -5590,9 +5565,9 @@ fn typed_lemma_resource_pattern(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn typed_contract_resource_pattern<'tcx>(
+fn typed_contract_raw_pattern<'tcx>(
     tcx: TyCtxt<'tcx>,
-    pattern: &ResourcePattern,
+    pattern: &RawPattern,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
     spec_scope: &mut SpecScope,
@@ -5602,10 +5577,10 @@ fn typed_contract_resource_pattern<'tcx>(
     result_ty: &SpecTy,
     result_rust_ty: Ty<'tcx>,
     inferred: &mut SpecTypeInference,
-) -> Result<TypedResourcePattern, String> {
+) -> Result<TypedRawPattern, String> {
     match pattern {
-        ResourcePattern::Star(lhs, rhs) => Ok(TypedResourcePattern::Star(
-            Box::new(typed_contract_resource_pattern(
+        RawPattern::Star(lhs, rhs) => Ok(TypedRawPattern::Star(
+            Box::new(typed_contract_raw_pattern(
                 tcx,
                 lhs,
                 pure_fns,
@@ -5618,7 +5593,7 @@ fn typed_contract_resource_pattern<'tcx>(
                 result_rust_ty,
                 inferred,
             )?),
-            Box::new(typed_contract_resource_pattern(
+            Box::new(typed_contract_raw_pattern(
                 tcx,
                 rhs,
                 pure_fns,
@@ -5632,8 +5607,8 @@ fn typed_contract_resource_pattern<'tcx>(
                 inferred,
             )?),
         )),
-        ResourcePattern::PointsTo { addr, ty, value } => {
-            let addr = typed_contract_resource_expr(
+        RawPattern::PointsTo { addr, ty, value } => {
+            let addr = typed_contract_raw_expr(
                 addr,
                 pure_fns,
                 enum_defs,
@@ -5644,7 +5619,7 @@ fn typed_contract_resource_pattern<'tcx>(
                 inferred,
                 Some(&SpecTy::Usize),
             )?;
-            let ty = typed_contract_resource_expr(
+            let ty = typed_contract_raw_expr(
                 ty,
                 pure_fns,
                 enum_defs,
@@ -5667,21 +5642,21 @@ fn typed_contract_resource_pattern<'tcx>(
                 result_ty,
                 inferred,
             )?;
-            Ok(TypedResourcePattern::PointsTo { addr, ty, value })
+            Ok(TypedRawPattern::PointsTo { addr, ty, value })
         }
-        ResourcePattern::PointsToSugar { pointer, value } => {
+        RawPattern::PointsToSugar { pointer, value } => {
             let pointer_ty = if allow_result && pointer == "result" {
                 result_rust_ty
             } else {
                 *rust_params
                     .get(pointer)
-                    .ok_or_else(|| format!("unresolved pointer `{pointer}` in resource contract"))?
+                    .ok_or_else(|| format!("unresolved pointer `{pointer}` in raw contract"))?
             };
             let pointee_rust_ty = match pointer_ty.kind() {
                 TyKind::RawPtr(pointee, _) => *pointee,
                 _ => {
                     return Err(format!(
-                        "`|->` resource pattern requires a raw pointer, found `{}`",
+                        "`|->` raw pattern requires a raw pointer, found `{}`",
                         display_spec_ty(&spec_ty_for_rust_ty(tcx, pointer_ty)?)
                     ));
                 }
@@ -5721,14 +5696,14 @@ fn typed_contract_resource_pattern<'tcx>(
                 result_ty,
                 inferred,
             )?;
-            Ok(TypedResourcePattern::PointsTo { addr, ty, value })
+            Ok(TypedRawPattern::PointsTo { addr, ty, value })
         }
-        ResourcePattern::DeallocToken {
+        RawPattern::DeallocToken {
             base,
             size,
             alignment,
-        } => Ok(TypedResourcePattern::DeallocToken {
-            base: typed_contract_resource_expr(
+        } => Ok(TypedRawPattern::DeallocToken {
+            base: typed_contract_raw_expr(
                 base,
                 pure_fns,
                 enum_defs,
@@ -5739,7 +5714,7 @@ fn typed_contract_resource_pattern<'tcx>(
                 inferred,
                 Some(&SpecTy::Usize),
             )?,
-            size: typed_contract_resource_expr(
+            size: typed_contract_raw_expr(
                 size,
                 pure_fns,
                 enum_defs,
@@ -5750,7 +5725,7 @@ fn typed_contract_resource_pattern<'tcx>(
                 inferred,
                 Some(&SpecTy::Usize),
             )?,
-            alignment: typed_contract_resource_expr(
+            alignment: typed_contract_raw_expr(
                 alignment,
                 pure_fns,
                 enum_defs,
@@ -5766,7 +5741,7 @@ fn typed_contract_resource_pattern<'tcx>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn typed_contract_resource_expr(
+fn typed_contract_raw_expr(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
@@ -5815,7 +5790,7 @@ fn typed_contract_value_pattern(
                 ty: expected.clone(),
             })
         }
-        ValuePattern::Expr(expr) => Ok(TypedValuePattern::Expr(typed_contract_resource_expr(
+        ValuePattern::Expr(expr) => Ok(TypedValuePattern::Expr(typed_contract_raw_expr(
             expr,
             pure_fns,
             enum_defs,
@@ -5829,7 +5804,7 @@ fn typed_contract_value_pattern(
         ValuePattern::SeqLit(items) => {
             let SpecTy::Seq(inner) = expected else {
                 return Err(format!(
-                    "sequence resource pattern requires `Seq<T>`, got {}",
+                    "sequence raw pattern requires `Seq<T>`, got {}",
                     display_spec_ty(expected)
                 ));
             };
@@ -5855,13 +5830,13 @@ fn typed_contract_value_pattern(
         ValuePattern::StructLit { name, fields } => {
             let SpecTy::Struct(struct_ty) = expected else {
                 return Err(format!(
-                    "struct resource pattern `{name}` requires a struct type, got {}",
+                    "struct raw pattern `{name}` requires a struct type, got {}",
                     display_spec_ty(expected)
                 ));
             };
             if &struct_ty.name != name {
                 return Err(format!(
-                    "struct resource pattern `{name}` does not match `{}`",
+                    "struct raw pattern `{name}` does not match `{}`",
                     struct_ty.name
                 ));
             }
@@ -5934,8 +5909,8 @@ fn typed_contract_value_pattern(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn infer_contract_resource_assertion(
-    assertion: &ResourceAssertion,
+fn infer_contract_raw_assertion(
+    assertion: &RawAssertion,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
     spec_scope: &mut SpecScope,
@@ -5944,7 +5919,7 @@ fn infer_contract_resource_assertion(
     result_ty: &SpecTy,
     inferred: &mut SpecTypeInference,
 ) -> Result<(), String> {
-    infer_contract_resource_pattern_types(
+    infer_contract_raw_pattern_types(
         &assertion.pattern,
         pure_fns,
         enum_defs,
@@ -5971,8 +5946,8 @@ fn infer_contract_resource_assertion(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn infer_contract_resource_pattern_types(
-    pattern: &ResourcePattern,
+fn infer_contract_raw_pattern_types(
+    pattern: &RawPattern,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
     spec_scope: &mut SpecScope,
@@ -5982,8 +5957,8 @@ fn infer_contract_resource_pattern_types(
     inferred: &mut SpecTypeInference,
 ) -> Result<(), String> {
     match pattern {
-        ResourcePattern::Star(lhs, rhs) => {
-            infer_contract_resource_pattern_types(
+        RawPattern::Star(lhs, rhs) => {
+            infer_contract_raw_pattern_types(
                 lhs,
                 pure_fns,
                 enum_defs,
@@ -5993,7 +5968,7 @@ fn infer_contract_resource_pattern_types(
                 result_ty,
                 inferred,
             )?;
-            infer_contract_resource_pattern_types(
+            infer_contract_raw_pattern_types(
                 rhs,
                 pure_fns,
                 enum_defs,
@@ -6004,7 +5979,7 @@ fn infer_contract_resource_pattern_types(
                 inferred,
             )
         }
-        ResourcePattern::PointsTo { addr, ty, value } => {
+        RawPattern::PointsTo { addr, ty, value } => {
             for (expr, expected) in [(addr, &SpecTy::Usize), (ty, &SpecTy::RustTy)] {
                 infer_contract_expr_types_with_expected(
                     expr,
@@ -6031,7 +6006,7 @@ fn infer_contract_resource_pattern_types(
                 inferred,
             )
         }
-        ResourcePattern::PointsToSugar { value, .. } => infer_contract_value_pattern(
+        RawPattern::PointsToSugar { value, .. } => infer_contract_value_pattern(
             value,
             pure_fns,
             enum_defs,
@@ -6041,7 +6016,7 @@ fn infer_contract_resource_pattern_types(
             result_ty,
             inferred,
         ),
-        ResourcePattern::DeallocToken {
+        RawPattern::DeallocToken {
             base,
             size,
             alignment,
@@ -6099,19 +6074,19 @@ fn infer_contract_value_pattern(
     }
 }
 
-fn typed_resource_pattern_into(
-    pattern: &ResourcePattern,
-    ctx: &ResourceTypingCtx<'_, '_>,
+fn typed_raw_pattern_into(
+    pattern: &RawPattern,
+    ctx: &RawTypingCtx<'_, '_>,
     spec_scope: &mut SpecScope,
     inferred: &mut SpecTypeInference,
-) -> Result<TypedResourcePattern, String> {
+) -> Result<TypedRawPattern, String> {
     match pattern {
-        ResourcePattern::Star(lhs, rhs) => Ok(TypedResourcePattern::Star(
-            Box::new(typed_resource_pattern_into(lhs, ctx, spec_scope, inferred)?),
-            Box::new(typed_resource_pattern_into(rhs, ctx, spec_scope, inferred)?),
+        RawPattern::Star(lhs, rhs) => Ok(TypedRawPattern::Star(
+            Box::new(typed_raw_pattern_into(lhs, ctx, spec_scope, inferred)?),
+            Box::new(typed_raw_pattern_into(rhs, ctx, spec_scope, inferred)?),
         )),
-        ResourcePattern::PointsTo { addr, ty, value } => {
-            let addr = typed_resource_expr(
+        RawPattern::PointsTo { addr, ty, value } => {
+            let addr = typed_raw_expr(
                 addr,
                 ctx.pure_fns,
                 ctx.enum_defs,
@@ -6119,8 +6094,8 @@ fn typed_resource_pattern_into(
                 ctx.local_tys,
                 inferred,
             )?;
-            ensure_resource_expr_ty(&addr, &SpecTy::Usize, "PointsTo address")?;
-            let ty = typed_resource_expr(
+            ensure_raw_expr_ty(&addr, &SpecTy::Usize, "PointsTo address")?;
+            let ty = typed_raw_expr(
                 ty,
                 ctx.pure_fns,
                 ctx.enum_defs,
@@ -6128,7 +6103,7 @@ fn typed_resource_pattern_into(
                 ctx.local_tys,
                 inferred,
             )?;
-            ensure_resource_expr_ty(&ty, &SpecTy::RustTy, "PointsTo type")?;
+            ensure_raw_expr_ty(&ty, &SpecTy::RustTy, "PointsTo type")?;
             let value = if value_pattern_contains_bind(value) {
                 let expected = option_spec_ty_for_rust_ty_expr(&ty)?;
                 typed_value_pattern(
@@ -6141,7 +6116,7 @@ fn typed_resource_pattern_into(
                     inferred,
                 )?
             } else if let ValuePattern::Expr(expr) = value {
-                let typed = typed_resource_expr(
+                let typed = typed_raw_expr(
                     expr,
                     ctx.pure_fns,
                     ctx.enum_defs,
@@ -6149,24 +6124,25 @@ fn typed_resource_pattern_into(
                     ctx.local_tys,
                     inferred,
                 )?;
-                ensure_option_resource_value(&typed)?;
+                ensure_option_raw_value(&typed)?;
                 TypedValuePattern::Expr(typed)
             } else {
                 unreachable!("pattern without binders must be an expression")
             };
-            Ok(TypedResourcePattern::PointsTo { addr, ty, value })
+            Ok(TypedRawPattern::PointsTo { addr, ty, value })
         }
-        ResourcePattern::PointsToSugar { pointer, value } => {
-            let local =
-                *ctx.resolution.locals.get(pointer).ok_or_else(|| {
-                    format!("unresolved pointer `{pointer}` in //@ resource assert")
-                })?;
+        RawPattern::PointsToSugar { pointer, value } => {
+            let local = *ctx
+                .resolution
+                .locals
+                .get(pointer)
+                .ok_or_else(|| format!("unresolved pointer `{pointer}` in //@ raw assert"))?;
             let pointer_ty = ctx.body.local_decls[local].ty;
             let pointee_ty = match pointer_ty.kind() {
                 TyKind::RawPtr(pointee, _) => *pointee,
                 _ => {
                     return Err(format!(
-                        "`|->` resource pattern requires a raw pointer, found `{}`",
+                        "`|->` raw pattern requires a raw pointer, found `{}`",
                         display_spec_ty(&spec_ty_for_rust_ty(ctx.tcx, pointer_ty)?)
                     ));
                 }
@@ -6206,26 +6182,26 @@ fn typed_resource_pattern_into(
                     ctx.pure_fns,
                     ctx.enum_defs,
                     &HashSet::new(),
-                    DirectiveKind::ResourceAssert,
+                    DirectiveKind::RawAssert,
                     spec_scope,
                     ctx.local_tys,
                     inferred,
                     false,
                     Some(&expected),
                 )?;
-                ensure_option_resource_value(&typed)?;
+                ensure_option_raw_value(&typed)?;
                 TypedValuePattern::Expr(typed)
             } else {
                 unreachable!("pattern without binders must be an expression")
             };
-            Ok(TypedResourcePattern::PointsTo { addr, ty, value })
+            Ok(TypedRawPattern::PointsTo { addr, ty, value })
         }
-        ResourcePattern::DeallocToken {
+        RawPattern::DeallocToken {
             base,
             size,
             alignment,
         } => {
-            let base = typed_resource_expr(
+            let base = typed_raw_expr(
                 base,
                 ctx.pure_fns,
                 ctx.enum_defs,
@@ -6233,8 +6209,8 @@ fn typed_resource_pattern_into(
                 ctx.local_tys,
                 inferred,
             )?;
-            ensure_resource_expr_ty(&base, &SpecTy::Usize, "DeallocToken base")?;
-            let size = typed_resource_expr(
+            ensure_raw_expr_ty(&base, &SpecTy::Usize, "DeallocToken base")?;
+            let size = typed_raw_expr(
                 size,
                 ctx.pure_fns,
                 ctx.enum_defs,
@@ -6242,8 +6218,8 @@ fn typed_resource_pattern_into(
                 ctx.local_tys,
                 inferred,
             )?;
-            ensure_resource_expr_ty(&size, &SpecTy::Usize, "DeallocToken size")?;
-            let alignment = typed_resource_expr(
+            ensure_raw_expr_ty(&size, &SpecTy::Usize, "DeallocToken size")?;
+            let alignment = typed_raw_expr(
                 alignment,
                 ctx.pure_fns,
                 ctx.enum_defs,
@@ -6251,8 +6227,8 @@ fn typed_resource_pattern_into(
                 ctx.local_tys,
                 inferred,
             )?;
-            ensure_resource_expr_ty(&alignment, &SpecTy::Usize, "DeallocToken alignment")?;
-            Ok(TypedResourcePattern::DeallocToken {
+            ensure_raw_expr_ty(&alignment, &SpecTy::Usize, "DeallocToken alignment")?;
+            Ok(TypedRawPattern::DeallocToken {
                 base,
                 size,
                 alignment,
@@ -6261,7 +6237,7 @@ fn typed_resource_pattern_into(
     }
 }
 
-fn typed_resource_expr(
+fn typed_raw_expr(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
@@ -6273,7 +6249,7 @@ fn typed_resource_expr(
         expr,
         pure_fns,
         enum_defs,
-        DirectiveKind::ResourceAssert,
+        DirectiveKind::RawAssert,
         spec_scope,
         local_tys,
         inferred,
@@ -6302,7 +6278,7 @@ fn infer_value_pattern_types(
                 pure_fns,
                 enum_defs,
                 &HashSet::new(),
-                DirectiveKind::ResourceAssert,
+                DirectiveKind::RawAssert,
                 spec_scope,
                 local_tys,
                 inferred,
@@ -6314,7 +6290,7 @@ fn infer_value_pattern_types(
         ValuePattern::SeqLit(items) => {
             let SpecTy::Seq(inner) = expected else {
                 return Err(format!(
-                    "sequence resource pattern requires `Seq<T>`, got {}",
+                    "sequence raw pattern requires `Seq<T>`, got {}",
                     display_spec_ty(expected)
                 ));
             };
@@ -6328,13 +6304,13 @@ fn infer_value_pattern_types(
         ValuePattern::StructLit { name, fields } => {
             let SpecTy::Struct(struct_ty) = expected else {
                 return Err(format!(
-                    "struct resource pattern `{name}` requires a struct type, got {}",
+                    "struct raw pattern `{name}` requires a struct type, got {}",
                     display_spec_ty(expected)
                 ));
             };
             if &struct_ty.name != name {
                 return Err(format!(
-                    "struct resource pattern `{name}` does not match `{}`",
+                    "struct raw pattern `{name}` does not match `{}`",
                     struct_ty.name
                 ));
             }
@@ -6443,7 +6419,7 @@ fn typed_value_pattern(
             pure_fns,
             enum_defs,
             &HashSet::new(),
-            DirectiveKind::ResourceAssert,
+            DirectiveKind::RawAssert,
             spec_scope,
             local_tys,
             inferred,
@@ -6453,7 +6429,7 @@ fn typed_value_pattern(
         ValuePattern::SeqLit(items) => {
             let SpecTy::Seq(inner) = expected else {
                 return Err(format!(
-                    "sequence resource pattern requires `Seq<T>`, got {}",
+                    "sequence raw pattern requires `Seq<T>`, got {}",
                     display_spec_ty(expected)
                 ));
             };
@@ -6471,13 +6447,13 @@ fn typed_value_pattern(
         ValuePattern::StructLit { name, fields } => {
             let SpecTy::Struct(struct_ty) = expected else {
                 return Err(format!(
-                    "struct resource pattern `{name}` requires a struct type, got {}",
+                    "struct raw pattern `{name}` requires a struct type, got {}",
                     display_spec_ty(expected)
                 ));
             };
             if &struct_ty.name != name {
                 return Err(format!(
-                    "struct resource pattern `{name}` does not match `{}`",
+                    "struct raw pattern `{name}` does not match `{}`",
                     struct_ty.name
                 ));
             }
@@ -6545,7 +6521,7 @@ fn typed_value_pattern(
     }
 }
 
-fn ensure_resource_expr_ty(expr: &TypedExpr, expected: &SpecTy, label: &str) -> Result<(), String> {
+fn ensure_raw_expr_ty(expr: &TypedExpr, expected: &SpecTy, label: &str) -> Result<(), String> {
     if &expr.ty == expected {
         Ok(())
     } else {
@@ -6557,7 +6533,7 @@ fn ensure_resource_expr_ty(expr: &TypedExpr, expected: &SpecTy, label: &str) -> 
     }
 }
 
-fn ensure_option_resource_value(expr: &TypedExpr) -> Result<(), String> {
+fn ensure_option_raw_value(expr: &TypedExpr) -> Result<(), String> {
     match &expr.ty {
         SpecTy::Enum { name, args } if name == "Option" && args.len() == 1 => Ok(()),
         ty => Err(format!(
@@ -6608,7 +6584,7 @@ fn rust_ty_key_to_spec_ty(key: &str) -> Result<SpecTy, String> {
             raw.trim_start_matches('&').trim(),
         )?))),
         other => Err(format!(
-            "unsupported PointsTo Rust type expression `{other}` in resource pattern"
+            "unsupported PointsTo Rust type expression `{other}` in raw pattern"
         )),
     }
 }
@@ -6670,9 +6646,7 @@ pub fn rust_ty_key_text_for_rust_ty(tcx: TyCtxt<'_>, ty: Ty<'_>) -> Result<Strin
         }
         TyKind::Param(param) => param.name.to_string(),
         other => {
-            return Err(format!(
-                "unsupported Rust type in resource pattern `{other:?}`"
-            ));
+            return Err(format!("unsupported Rust type in raw pattern `{other:?}`"));
         }
     })
 }
@@ -6707,9 +6681,9 @@ fn reject_directives_inside_unsafe_blocks(
                 | DirectiveKind::Let
                 | DirectiveKind::Assert
                 | DirectiveKind::Assume
-                | DirectiveKind::ResourceAssert
-                | DirectiveKind::ResourceReq
-                | DirectiveKind::ResourceEns
+                | DirectiveKind::RawAssert
+                | DirectiveKind::RawReq
+                | DirectiveKind::RawEns
                 | DirectiveKind::LemmaCall
         ) {
             continue;
@@ -7831,12 +7805,12 @@ fn type_lemmas(
             .collect::<Vec<_>>();
         let mut visible_lemmas = available_lemmas.clone();
         visible_lemmas.insert(lemma.name.clone(), lemma.clone());
-        if !lemma.is_unsafe && (!lemma.resource_reqs.is_empty() || !lemma.resource_ens.is_empty()) {
+        if !lemma.is_unsafe && (!lemma.raw_reqs.is_empty() || !lemma.raw_ens.is_empty()) {
             return Err(LoopPrepassError {
                 span,
                 display_span: None,
                 message: format!(
-                    "lemma `{}` resource contracts are only supported on unsafe lemmas",
+                    "lemma `{}` raw contracts are only supported on unsafe lemmas",
                     lemma.name
                 ),
             });
@@ -7861,8 +7835,8 @@ fn type_lemmas(
             message: format!("lemma `{}` req: {message}", lemma.name),
         })?;
         let mut body_infer_scope = infer_scope.clone();
-        for resource_req in &lemma.resource_reqs {
-            infer_contract_resource_assertion(
+        for resource_req in &lemma.raw_reqs {
+            infer_contract_raw_assertion(
                 resource_req,
                 pure_fns,
                 enum_defs,
@@ -7875,7 +7849,7 @@ fn type_lemmas(
             .map_err(|message| LoopPrepassError {
                 span,
                 display_span: None,
-                message: format!("lemma `{}` resource req: {message}", lemma.name),
+                message: format!("lemma `{}` raw req: {message}", lemma.name),
             })?;
         }
         infer_lemma_stmts(
@@ -7936,8 +7910,8 @@ fn type_lemmas(
                 message: format!("lemma `{}` req: {message}", lemma.name),
             })
         })?;
-        let resource_reqs = typed_lemma_resource_assertions(
-            &lemma.resource_reqs,
+        let raw_reqs = typed_lemma_raw_assertions(
+            &lemma.raw_reqs,
             pure_fns,
             enum_defs,
             &mut type_scope,
@@ -7949,7 +7923,7 @@ fn type_lemmas(
         .map_err(|message| LoopPrepassError {
             span,
             display_span: None,
-            message: format!("lemma `{}` resource req: {message}", lemma.name),
+            message: format!("lemma `{}` raw req: {message}", lemma.name),
         })?;
         let body = typed_lemma_stmts(
             &lemma.body,
@@ -7991,9 +7965,9 @@ fn type_lemmas(
                 message: format!("lemma `{}` ens: {message}", lemma.name),
             })
         })?;
-        for resource_ens in &lemma.resource_ens {
-            infer_contract_resource_assertion(
-                resource_ens,
+        for raw_ens in &lemma.raw_ens {
+            infer_contract_raw_assertion(
+                raw_ens,
                 pure_fns,
                 enum_defs,
                 &mut body_infer_scope,
@@ -8005,11 +7979,11 @@ fn type_lemmas(
             .map_err(|message| LoopPrepassError {
                 span,
                 display_span: None,
-                message: format!("lemma `{}` resource ens: {message}", lemma.name),
+                message: format!("lemma `{}` raw ens: {message}", lemma.name),
             })?;
         }
-        let resource_ens = typed_lemma_resource_assertions(
-            &lemma.resource_ens,
+        let raw_ens = typed_lemma_raw_assertions(
+            &lemma.raw_ens,
             pure_fns,
             enum_defs,
             &mut type_scope,
@@ -8021,16 +7995,16 @@ fn type_lemmas(
         .map_err(|message| LoopPrepassError {
             span,
             display_span: None,
-            message: format!("lemma `{}` resource ens: {message}", lemma.name),
+            message: format!("lemma `{}` raw ens: {message}", lemma.name),
         })?;
         let typed_def = TypedLemmaDef {
             name: lemma.name.clone(),
             is_unsafe: lemma.is_unsafe,
             params,
             req,
-            resource_reqs,
+            raw_reqs,
             ens,
-            resource_ens,
+            raw_ens,
             body,
         };
         validate_recursive_lemma(&typed_def).map_err(|message| LoopPrepassError {
@@ -8344,7 +8318,7 @@ fn validate_function_contract_expr_prepass(
     })
 }
 
-fn validate_function_contract_resource_prepass(
+fn validate_function_contract_raw_prepass(
     directive: &FunctionDirective,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
@@ -8353,10 +8327,8 @@ fn validate_function_contract_resource_prepass(
     allow_result: bool,
     spec_scope: &mut SpecScope,
 ) -> Result<(), LoopPrepassError> {
-    let assertion = directive
-        .resource_assertion()
-        .expect("resource contract payload");
-    validate_function_contract_resource_pattern_prepass(
+    let assertion = directive.raw_assertion().expect("raw contract payload");
+    validate_function_contract_raw_pattern_prepass(
         &assertion.pattern,
         directive,
         pure_fns,
@@ -8380,8 +8352,8 @@ fn validate_function_contract_resource_prepass(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_function_contract_resource_pattern_prepass(
-    pattern: &ResourcePattern,
+fn validate_function_contract_raw_pattern_prepass(
+    pattern: &RawPattern,
     directive: &FunctionDirective,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
@@ -8391,8 +8363,8 @@ fn validate_function_contract_resource_pattern_prepass(
     spec_scope: &mut SpecScope,
 ) -> Result<(), LoopPrepassError> {
     match pattern {
-        ResourcePattern::Star(lhs, rhs) => {
-            validate_function_contract_resource_pattern_prepass(
+        RawPattern::Star(lhs, rhs) => {
+            validate_function_contract_raw_pattern_prepass(
                 lhs,
                 directive,
                 pure_fns,
@@ -8402,7 +8374,7 @@ fn validate_function_contract_resource_pattern_prepass(
                 allow_result,
                 spec_scope,
             )?;
-            validate_function_contract_resource_pattern_prepass(
+            validate_function_contract_raw_pattern_prepass(
                 rhs,
                 directive,
                 pure_fns,
@@ -8413,7 +8385,7 @@ fn validate_function_contract_resource_pattern_prepass(
                 spec_scope,
             )
         }
-        ResourcePattern::PointsTo { addr, ty, value } => {
+        RawPattern::PointsTo { addr, ty, value } => {
             for expr in [addr, ty] {
                 validate_function_contract_expr_prepass(
                     directive.span,
@@ -8438,14 +8410,14 @@ fn validate_function_contract_resource_pattern_prepass(
                 spec_scope,
             )
         }
-        ResourcePattern::PointsToSugar { pointer, value } => {
+        RawPattern::PointsToSugar { pointer, value } => {
             if !(params.iter().any(|param| param == pointer)
                 || (allow_result && pointer == "result"))
             {
                 return Err(LoopPrepassError {
                     span: directive.span,
                     display_span: Some(directive.span_text.clone()),
-                    message: format!("unresolved pointer `{pointer}` in resource contract"),
+                    message: format!("unresolved pointer `{pointer}` in raw contract"),
                 });
             }
             validate_function_contract_value_pattern_prepass(
@@ -8459,7 +8431,7 @@ fn validate_function_contract_resource_pattern_prepass(
                 spec_scope,
             )
         }
-        ResourcePattern::DeallocToken {
+        RawPattern::DeallocToken {
             base,
             size,
             alignment,
@@ -9505,9 +9477,9 @@ mod tests {
                     ty: SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned()))),
                 }],
                 req: true_expr(),
-                resource_reqs: vec![],
+                raw_reqs: vec![],
                 ens: true_expr(),
-                resource_ens: vec![],
+                raw_ens: vec![],
                 body: vec![],
             },
         )]);

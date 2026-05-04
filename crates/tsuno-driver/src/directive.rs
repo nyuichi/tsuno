@@ -11,9 +11,8 @@ use rustc_span::def_id::LocalDefId;
 use crate::spec::{
     self, BinaryOp, EnumCtorDef, EnumDef, Expr, GhostBlock, GhostMatchArm, GhostStmt, IntLiteral,
     IntSuffix, LemmaDef, MatchArm, MatchBinding, MatchPattern, PureFnDef, PureFnParam,
-    ResourceAssertion, ResourcePattern, RustTypeExpr, SpecTy, StructDef, StructFieldTy,
-    StructLitField, UnaryOp, ValuePattern, ValuePatternStructField, provenance_spec_ty,
-    ptr_spec_ty,
+    RawAssertion, RawPattern, RustTypeExpr, SpecTy, StructDef, StructFieldTy, StructLitField,
+    UnaryOp, ValuePattern, ValuePatternStructField, provenance_spec_ty, ptr_spec_ty,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,9 +23,9 @@ pub enum DirectiveKind {
     Inv,
     Assert,
     Assume,
-    ResourceAssert,
-    ResourceReq,
-    ResourceEns,
+    RawAssert,
+    RawReq,
+    RawEns,
     LemmaCall,
 }
 
@@ -39,9 +38,9 @@ impl DirectiveKind {
             Self::Inv => "inv",
             Self::Assert => "assert",
             Self::Assume => "assume",
-            Self::ResourceAssert => "resource assert",
-            Self::ResourceReq => "resource req",
-            Self::ResourceEns => "resource ens",
+            Self::RawAssert => "raw assert",
+            Self::RawReq => "raw req",
+            Self::RawEns => "raw ens",
             Self::LemmaCall => "lemma_call",
         }
     }
@@ -76,7 +75,7 @@ pub struct FunctionDirective {
 pub enum DirectivePayload {
     Predicate(spec::Expr),
     Let { name: String, value: spec::Expr },
-    ResourceAssert(ResourceAssertion),
+    RawAssert(RawAssertion),
     LemmaCall(spec::Expr),
 }
 
@@ -85,15 +84,15 @@ impl FunctionDirective {
         match &self.payload {
             DirectivePayload::Predicate(expr) | DirectivePayload::LemmaCall(expr) => expr,
             DirectivePayload::Let { value, .. } => value,
-            DirectivePayload::ResourceAssert(_) => {
-                panic!("resource assertion directive has no single expression")
+            DirectivePayload::RawAssert(_) => {
+                panic!("raw assertion directive has no single expression")
             }
         }
     }
 
-    pub fn resource_assertion(&self) -> Option<&ResourceAssertion> {
+    pub fn raw_assertion(&self) -> Option<&RawAssertion> {
         match &self.payload {
-            DirectivePayload::ResourceAssert(assertion) => Some(assertion),
+            DirectivePayload::RawAssert(assertion) => Some(assertion),
             _ => None,
         }
     }
@@ -201,9 +200,9 @@ fn parse_directive_payload(
     }
     if matches!(
         kind,
-        DirectiveKind::ResourceAssert | DirectiveKind::ResourceReq | DirectiveKind::ResourceEns
+        DirectiveKind::RawAssert | DirectiveKind::RawReq | DirectiveKind::RawEns
     ) {
-        return parse_resource_assert_directive(text, span);
+        return parse_raw_assert_directive(text, span);
     }
     let parsed = match kind {
         DirectiveKind::Assert | DirectiveKind::Assume => parse_statement_expr(kind.keyword(), text),
@@ -217,35 +216,32 @@ fn parse_directive_payload(
         .map(DirectivePayload::Predicate)
 }
 
-fn parse_resource_assert_directive(
-    text: &str,
-    span: Span,
-) -> Result<DirectivePayload, DirectiveError> {
-    parse_resource_assertion(text)
-        .map(DirectivePayload::ResourceAssert)
+fn parse_raw_assert_directive(text: &str, span: Span) -> Result<DirectivePayload, DirectiveError> {
+    parse_raw_assertion(text)
+        .map(DirectivePayload::RawAssert)
         .map_err(|err| DirectiveError {
             span,
             message: err.to_string(),
         })
 }
 
-fn parse_resource_assertion(text: &str) -> Result<ResourceAssertion, ParseError> {
+fn parse_raw_assertion(text: &str) -> Result<RawAssertion, ParseError> {
     let text = text.trim().strip_suffix(';').unwrap_or(text.trim()).trim();
-    let (pattern, condition) = split_resource_assert_where(text);
-    let pattern = parse_resource_pattern(pattern)?;
+    let (pattern, condition) = split_raw_assert_where(text);
+    let pattern = parse_raw_pattern(pattern)?;
     let condition = match condition {
-        Some(condition) => parse_resource_expr(condition)?,
+        Some(condition) => parse_raw_assert_expr(condition)?,
         None => spec::Expr::Bool(true),
     };
-    Ok(ResourceAssertion { pattern, condition })
+    Ok(RawAssertion { pattern, condition })
 }
 
-fn parse_resource_pattern(text: &str) -> Result<ResourcePattern, ParseError> {
+fn parse_raw_pattern(text: &str) -> Result<RawPattern, ParseError> {
     let text = strip_enclosing_parens(text.trim());
     if let Some(index) = top_level_star(text) {
-        let lhs = parse_resource_pattern(&text[..index])?;
-        let rhs = parse_resource_pattern(&text[index + 1..])?;
-        return Ok(ResourcePattern::Star(Box::new(lhs), Box::new(rhs)));
+        let lhs = parse_raw_pattern(&text[..index])?;
+        let rhs = parse_raw_pattern(&text[index + 1..])?;
+        return Ok(RawPattern::Star(Box::new(lhs), Box::new(rhs)));
     }
     if let Some(index) = top_level_points_to_arrow(text) {
         return parse_points_to_sugar(&text[..index], &text[index + "|->".len()..]);
@@ -254,12 +250,12 @@ fn parse_resource_pattern(text: &str) -> Result<ResourcePattern, ParseError> {
         let args = split_top_level_args(args)?;
         if args.len() != 3 {
             return Err(ParseError::new(
-                "`PointsTo` resource pattern expects three arguments",
+                "`PointsTo` raw pattern expects three arguments",
             ));
         }
-        return Ok(ResourcePattern::PointsTo {
-            addr: parse_resource_expr(args[0])?,
-            ty: parse_resource_expr(args[1])?,
+        return Ok(RawPattern::PointsTo {
+            addr: parse_raw_assert_expr(args[0])?,
+            ty: parse_raw_assert_expr(args[1])?,
             value: parse_value_pattern(args[2])?,
         });
     }
@@ -267,39 +263,39 @@ fn parse_resource_pattern(text: &str) -> Result<ResourcePattern, ParseError> {
         let args = split_top_level_args(args)?;
         if args.len() != 3 {
             return Err(ParseError::new(
-                "`DeallocToken` resource pattern expects three arguments",
+                "`DeallocToken` raw pattern expects three arguments",
             ));
         }
-        return Ok(ResourcePattern::DeallocToken {
-            base: parse_resource_expr(args[0])?,
-            size: parse_resource_expr(args[1])?,
-            alignment: parse_resource_expr(args[2])?,
+        return Ok(RawPattern::DeallocToken {
+            base: parse_raw_assert_expr(args[0])?,
+            size: parse_raw_assert_expr(args[1])?,
+            alignment: parse_raw_assert_expr(args[2])?,
         });
     }
     Err(ParseError::new(
-        "resource assertion must be a `PointsTo`, `DeallocToken`, or `*` pattern",
+        "raw assertion must be a `PointsTo`, `DeallocToken`, or `*` pattern",
     ))
 }
 
-fn parse_points_to_sugar(lhs: &str, rhs: &str) -> Result<ResourcePattern, ParseError> {
+fn parse_points_to_sugar(lhs: &str, rhs: &str) -> Result<RawPattern, ParseError> {
     let lhs = strip_enclosing_parens(lhs.trim());
     let Some(pointer) = lhs.strip_prefix('*').map(str::trim) else {
         return Err(ParseError::new(
-            "`|->` resource pattern must have the form `*ptr |-> value`",
+            "`|->` raw pattern must have the form `*ptr |-> value`",
         ));
     };
     if !is_ident(pointer) {
         return Err(ParseError::new(
-            "`|->` resource pattern pointer must be a Rust local name",
+            "`|->` raw pattern pointer must be a Rust local name",
         ));
     }
-    Ok(ResourcePattern::PointsToSugar {
+    Ok(RawPattern::PointsToSugar {
         pointer: pointer.to_owned(),
         value: parse_value_pattern(rhs)?,
     })
 }
 
-fn split_resource_assert_where(text: &str) -> (&str, Option<&str>) {
+fn split_raw_assert_where(text: &str) -> (&str, Option<&str>) {
     let mut depth = 0usize;
     for (index, _) in text.match_indices("where") {
         for ch in text[..index].chars() {
@@ -328,7 +324,7 @@ fn split_resource_assert_where(text: &str) -> (&str, Option<&str>) {
 
 fn parse_value_pattern(text: &str) -> Result<ValuePattern, ParseError> {
     let (rewritten, binders) = rewrite_pattern_binders(text)?;
-    let expr = parse_resource_expr(&rewritten)?;
+    let expr = parse_raw_assert_expr(&rewritten)?;
     Ok(expr_to_value_pattern(expr, &binders).0)
 }
 
@@ -342,10 +338,10 @@ fn rewrite_pattern_binders(text: &str) -> Result<(String, Vec<(String, String)>)
             continue;
         }
         let Some((_, first)) = chars.peek().copied() else {
-            return Err(ParseError::new("resource pattern binder must be `?ident`"));
+            return Err(ParseError::new("raw pattern binder must be `?ident`"));
         };
         if !(first == '_' || first.is_ascii_alphabetic()) {
-            return Err(ParseError::new("resource pattern binder must be `?ident`"));
+            return Err(ParseError::new("raw pattern binder must be `?ident`"));
         }
         let mut name = String::new();
         while let Some((_, ch)) = chars.peek().copied() {
@@ -356,7 +352,7 @@ fn rewrite_pattern_binders(text: &str) -> Result<(String, Vec<(String, String)>)
                 break;
             }
         }
-        let placeholder = format!("__tsuno_resource_binder_{}", binders.len());
+        let placeholder = format!("__tsuno_raw_binder_{}", binders.len());
         rewritten.push_str(&placeholder);
         binders.push((placeholder, name));
     }
@@ -478,9 +474,9 @@ fn value_pattern_to_expr(pattern: ValuePattern) -> Option<spec::Expr> {
     }
 }
 
-fn parse_resource_expr(text: &str) -> Result<spec::Expr, ParseError> {
-    parse_source_expr("resource assert", text.trim())
-        .map_err(|err| ParseError::new(render_parse_error(DirectiveKind::ResourceAssert, err)))
+fn parse_raw_assert_expr(text: &str) -> Result<spec::Expr, ParseError> {
+    parse_source_expr("raw assert", text.trim())
+        .map_err(|err| ParseError::new(render_parse_error(DirectiveKind::RawAssert, err)))
 }
 
 fn strip_enclosing_parens(mut text: &str) -> &str {
@@ -566,9 +562,7 @@ fn split_top_level_args(text: &str) -> Result<Vec<&str>, ParseError> {
     }
     args.push(text[start..].trim());
     if args.iter().any(|arg| arg.is_empty()) {
-        return Err(ParseError::new(
-            "resource pattern arguments must not be empty",
-        ));
+        return Err(ParseError::new("raw pattern arguments must not be empty"));
     }
     Ok(args)
 }
@@ -760,7 +754,7 @@ fn statement_directive_entries(
                 Some(
                     DirectiveKind::Assert
                         | DirectiveKind::Assume
-                        | DirectiveKind::ResourceAssert
+                        | DirectiveKind::RawAssert
                         | DirectiveKind::Let
                 )
             )
@@ -907,8 +901,8 @@ fn contract_comment_kind(text: &str) -> Option<DirectiveKind> {
     directive_kind_prefix(
         text,
         &[
-            DirectiveKind::ResourceReq,
-            DirectiveKind::ResourceEns,
+            DirectiveKind::RawReq,
+            DirectiveKind::RawEns,
             DirectiveKind::Req,
             DirectiveKind::Ens,
             DirectiveKind::Let,
@@ -1372,7 +1366,7 @@ fn classify_statement_directive(text: &str) -> Option<DirectiveKind> {
         &[
             DirectiveKind::Assert,
             DirectiveKind::Assume,
-            DirectiveKind::ResourceAssert,
+            DirectiveKind::RawAssert,
             DirectiveKind::Let,
         ],
     )
@@ -1384,7 +1378,7 @@ fn matches_reserved_statement_directive(text: &str) -> bool {
         &[
             DirectiveKind::Assert,
             DirectiveKind::Assume,
-            DirectiveKind::ResourceAssert,
+            DirectiveKind::RawAssert,
             DirectiveKind::Inv,
             DirectiveKind::Req,
             DirectiveKind::Ens,
@@ -2707,24 +2701,24 @@ impl<'a> GhostBlockParser<'a> {
         params: Vec<PureFnParam>,
     ) -> Result<LemmaDef, ParseError> {
         let mut req = None;
-        let mut resource_reqs = Vec::new();
+        let mut raw_reqs = Vec::new();
         let mut ens = None;
-        let mut resource_ens = Vec::new();
+        let mut raw_ens = Vec::new();
         loop {
             self.skip_ws();
             if self.peek_char() == Some('{') {
                 break;
             }
-            if self.starts_with_keyword("resource") {
-                self.expect_keyword("resource")?;
+            if self.starts_with_keyword("raw") {
+                self.expect_keyword("raw")?;
                 self.skip_ws();
                 if self.starts_with_keyword("req") {
                     self.expect_keyword("req")?;
-                    resource_reqs.push(self.parse_line_resource_assertion("lemma resource req")?);
+                    raw_reqs.push(self.parse_line_raw_assertion("lemma raw req")?);
                     continue;
                 }
                 self.expect_keyword("ens")?;
-                resource_ens.push(self.parse_line_resource_assertion("lemma resource ens")?);
+                raw_ens.push(self.parse_line_raw_assertion("lemma raw ens")?);
                 continue;
             }
             if self.starts_with_keyword("req") {
@@ -2754,9 +2748,9 @@ impl<'a> GhostBlockParser<'a> {
             type_params,
             params,
             req: req.unwrap_or(Expr::Bool(true)),
-            resource_reqs,
+            raw_reqs,
             ens: ens.unwrap_or(Expr::Bool(true)),
-            resource_ens,
+            raw_ens,
             body,
         })
     }
@@ -2920,14 +2914,11 @@ impl<'a> GhostBlockParser<'a> {
         parse_source_expr_with_type_params(kind, text, type_params)
     }
 
-    fn parse_line_resource_assertion(
-        &mut self,
-        kind: &str,
-    ) -> Result<ResourceAssertion, ParseError> {
+    fn parse_line_raw_assertion(&mut self, kind: &str) -> Result<RawAssertion, ParseError> {
         let (text, next) = self.parse_line_expr_text(self.text, self.cursor)?;
         self.cursor = next;
-        parse_resource_assertion(text)
-            .map_err(|err| ParseError::new(err.to_string().replace("//@ resource assert", kind)))
+        parse_raw_assertion(text)
+            .map_err(|err| ParseError::new(err.to_string().replace("//@ raw assert", kind)))
     }
 
     fn parse_spec_ty_annotation(
@@ -3680,7 +3671,7 @@ fn add1_done(x: i32)
                         ty: SpecTy::I32,
                     }],
                     req: true_expr(),
-                    resource_reqs: vec![],
+                    raw_reqs: vec![],
                     ens: Expr::Binary {
                         op: BinaryOp::Eq,
                         lhs: Box::new(Expr::Call {
@@ -3697,7 +3688,7 @@ fn add1_done(x: i32)
                             })),
                         }),
                     },
-                    resource_ens: vec![],
+                    raw_ens: vec![],
                     body: vec![GhostStmt::Assert(Expr::Binary {
                         op: BinaryOp::Eq,
                         lhs: Box::new(Expr::Call {
@@ -3770,9 +3761,9 @@ fn refl<T>(xs: Seq<T>)
                     ty: SpecTy::Seq(Box::new(SpecTy::TypeParam("T".to_owned()))),
                 }],
                 req: true_expr(),
-                resource_reqs: vec![],
+                raw_reqs: vec![],
                 ens: true_expr(),
-                resource_ens: vec![],
+                raw_ens: vec![],
                 body: vec![GhostStmt::Call {
                     name: "refl".to_owned(),
                     type_args: vec![SpecTy::TypeParam("T".to_owned())],
@@ -3783,12 +3774,12 @@ fn refl<T>(xs: Seq<T>)
     }
 
     #[test]
-    fn parses_unsafe_lemma_resource_contracts() {
+    fn parses_unsafe_lemma_raw_contracts() {
         let block = parse_ghost_block(
             r#"
 unsafe fn preserves_cell(p: Ptr)
-  resource req PointsTo(p.addr, {type i32}, Option::Some(?old)) where old == 0i32
-  resource ens PointsTo(p.addr, {type i32}, Option::Some(?new)) where new == old
+  raw req PointsTo(p.addr, {type i32}, Option::Some(?old)) where old == 0i32
+  raw ens PointsTo(p.addr, {type i32}, Option::Some(?new)) where new == old
   req true
   ens true
 {
@@ -3796,11 +3787,11 @@ unsafe fn preserves_cell(p: Ptr)
 }
 "#,
         )
-        .expect("unsafe lemma resource contract should parse");
+        .expect("unsafe lemma raw contract should parse");
 
         assert_eq!(block.lemmas.len(), 1);
-        assert_eq!(block.lemmas[0].resource_reqs.len(), 1);
-        assert_eq!(block.lemmas[0].resource_ens.len(), 1);
+        assert_eq!(block.lemmas[0].raw_reqs.len(), 1);
+        assert_eq!(block.lemmas[0].raw_ens.len(), 1);
     }
 
     #[test]

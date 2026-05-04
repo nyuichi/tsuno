@@ -1,5 +1,5 @@
 unsafe fn produce_dealloc_token(p: *mut i32)
-//@ resource ens DeallocToken({p}.addr, 4usize, 4usize);
+//@ raw ens DeallocToken({p}.addr, 4usize, 4usize);
 {
     //@ assume false;
 }

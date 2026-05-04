@@ -1,7 +1,7 @@
 unsafe fn swap_i32(p: *mut i32, q: *mut i32)
 //@ req {p}.addr != {q}.addr
-//@ resource req *p |-> Option::Some(?old_p) * *q |-> Option::Some(?old_q);
-//@ resource ens *p |-> Option::Some(?new_p) * *q |-> Option::Some(?new_q) where new_p == old_q && new_q == old_p;
+//@ raw req *p |-> Option::Some(?old_p) * *q |-> Option::Some(?old_q);
+//@ raw ens *p |-> Option::Some(?new_p) * *q |-> Option::Some(?new_q) where new_p == old_q && new_q == old_p;
 {
     let tmp = *p;
     *p = *q;
