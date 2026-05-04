@@ -659,6 +659,11 @@ struct DirectiveText {
     start_offset: usize,
 }
 
+struct SpecCommentBlocks {
+    directive_comments: Vec<SpecComment>,
+    ghost_blocks: Vec<String>,
+}
+
 fn function_contract_comment_lines_before_item(
     source: &str,
     item_line: usize,
@@ -722,26 +727,7 @@ fn physical_lines_between_are_blank(source: &str, start_line: usize, end_line: u
 }
 
 fn collect_line_spec_comments(source: &str) -> Vec<SpecCommentLine> {
-    let mut comments = Vec::new();
-    let mut ghost_item = Vec::new();
-    for comment in collect_spec_comments(source) {
-        if ghost_item.is_empty() && is_ghost_item_block(&comment.text) {
-            ghost_item.push(comment);
-            if is_complete_ghost_item_comment(&spec_comment_group_text(&ghost_item)) {
-                ghost_item.clear();
-            }
-            continue;
-        }
-        if !ghost_item.is_empty() {
-            ghost_item.push(comment);
-            if is_complete_ghost_item_comment(&spec_comment_group_text(&ghost_item)) {
-                ghost_item.clear();
-            }
-            continue;
-        }
-        comments.push(comment);
-    }
-    comments
+    collect_spec_comment_blocks(source).directive_comments
 }
 
 fn contract_directive_entries(
@@ -1542,15 +1528,18 @@ fn spec_comment_group_text(group: &[SpecComment]) -> String {
         .join("\n")
 }
 
-pub fn collect_ghost_blocks(source: &str) -> Result<Vec<GhostBlock>, ParseError> {
-    let mut blocks = Vec::new();
+fn collect_spec_comment_blocks(source: &str) -> SpecCommentBlocks {
+    let mut directive_comments = Vec::new();
+    let mut ghost_blocks = Vec::new();
     let mut ghost_item = Vec::new();
     for comment in collect_spec_comments(source) {
         if ghost_item.is_empty() {
-            if !is_ghost_item_block(&comment.text) {
+            if is_ghost_item_block(&comment.text) {
+                ghost_item.push(comment);
+            } else {
+                directive_comments.push(comment);
                 continue;
             }
-            ghost_item.push(comment);
         } else {
             ghost_item.push(comment);
         }
@@ -1559,10 +1548,21 @@ pub fn collect_ghost_blocks(source: &str) -> Result<Vec<GhostBlock>, ParseError>
         if !is_complete_ghost_item_comment(&block) {
             continue;
         }
-        blocks.push(parse_ghost_block(&block)?);
+        ghost_blocks.push(block);
         ghost_item.clear();
     }
-    Ok(blocks)
+    SpecCommentBlocks {
+        directive_comments,
+        ghost_blocks,
+    }
+}
+
+pub fn collect_ghost_blocks(source: &str) -> Result<Vec<GhostBlock>, ParseError> {
+    collect_spec_comment_blocks(source)
+        .ghost_blocks
+        .into_iter()
+        .map(|block| parse_ghost_block(&block))
+        .collect()
 }
 
 #[cfg(test)]
@@ -3928,6 +3928,12 @@ fn len(xs: List<i32>) -> i32 {
 //@   ens true
 //@ {}
 
+//@ req true
+//@ ens result == 0i32
+fn f() -> i32 {
+    0
+}
+
 /*@ fn mixed_comment_lemma(n: Nat) */
 //@   req true
 /*@   ens true */
@@ -3937,6 +3943,11 @@ fn len(xs: List<i32>) -> i32 {
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].lemmas[0].name, "line_comment_lemma");
         assert_eq!(blocks[1].lemmas[0].name, "mixed_comment_lemma");
+
+        let lines = super::function_contract_comment_lines_before_item(source, 9).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "req true");
+        assert_eq!(lines[1].text, "ens result == 0i32");
     }
 }
 
