@@ -30,6 +30,12 @@ pub enum Expr {
         base: Box<Expr>,
         index: usize,
     },
+    VariantSelector {
+        base: Box<Expr>,
+        enum_name: String,
+        ctor_name: String,
+        type_args: Vec<SpecTy>,
+    },
     Index {
         base: Box<Expr>,
         index: Box<Expr>,
@@ -115,6 +121,12 @@ pub enum TypedExprKind {
     TupleField {
         base: Box<TypedExpr>,
         index: usize,
+    },
+    VariantSelector {
+        base: Box<TypedExpr>,
+        enum_name: String,
+        ctor_name: String,
+        ctor_index: usize,
     },
     Index {
         base: Box<TypedExpr>,
@@ -375,6 +387,7 @@ impl EnumDef {
 pub struct EnumCtorDef {
     pub name: String,
     pub fields: Vec<SpecTy>,
+    pub field_names: Vec<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

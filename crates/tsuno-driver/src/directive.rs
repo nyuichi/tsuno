@@ -75,7 +75,7 @@ pub struct FunctionDirective {
 pub enum DirectivePayload {
     Predicate(spec::Expr),
     Let { name: String, value: spec::Expr },
-    RawAssert(RawAssertion),
+    RawAssert(Box<RawAssertion>),
     LemmaCall(spec::Expr),
 }
 
@@ -92,7 +92,7 @@ impl FunctionDirective {
 
     pub fn raw_assertion(&self) -> Option<&RawAssertion> {
         match &self.payload {
-            DirectivePayload::RawAssert(assertion) => Some(assertion),
+            DirectivePayload::RawAssert(assertion) => Some(assertion.as_ref()),
             _ => None,
         }
     }
@@ -218,6 +218,7 @@ fn parse_directive_payload(
 
 fn parse_raw_assert_directive(text: &str, span: Span) -> Result<DirectivePayload, DirectiveError> {
     parse_raw_assertion(text)
+        .map(Box::new)
         .map(DirectivePayload::RawAssert)
         .map_err(|err| DirectiveError {
             span,
@@ -2105,9 +2106,49 @@ impl Parser {
                 };
                 continue;
             }
+            if self.next_is_ident("as") {
+                self.cursor += 1;
+                let (enum_name, ctor_name, type_args) = self.parse_variant_selector_path()?;
+                expr = Expr::VariantSelector {
+                    base: Box::new(expr),
+                    enum_name,
+                    ctor_name,
+                    type_args,
+                };
+                continue;
+            }
             break;
         }
         Ok(expr)
+    }
+
+    fn parse_variant_selector_path(&mut self) -> Result<(String, String, Vec<SpecTy>), ParseError> {
+        let Some(Token::Ident(enum_name)) = self.next().cloned() else {
+            return Err(ParseError::new(
+                "expected enum-qualified constructor after `as`",
+            ));
+        };
+        self.expect(&Token::ColonColon)?;
+        let Some(Token::Ident(ctor_name)) = self.next().cloned() else {
+            return Err(ParseError::new("expected constructor name after `::`"));
+        };
+        let type_args = if self.eat(&Token::ColonColon) {
+            self.expect(&Token::Lt)?;
+            let mut args = Vec::new();
+            if !self.eat(&Token::Gt) {
+                loop {
+                    args.push(self.parse_spec_ty()?);
+                    if self.eat(&Token::Gt) {
+                        break;
+                    }
+                    self.expect(&Token::Comma)?;
+                }
+            }
+            args
+        } else {
+            Vec::new()
+        };
+        Ok((enum_name, ctor_name, type_args))
     }
 
     fn parse_call_args(&mut self) -> Result<Vec<Expr>, ParseError> {
@@ -2518,6 +2559,10 @@ impl Parser {
         }
     }
 
+    fn next_is_ident(&self, ident: &str) -> bool {
+        matches!(self.tokens.get(self.cursor), Some(Token::Ident(name)) if name == ident)
+    }
+
     fn expect(&mut self, token: &Token) -> Result<(), ParseError> {
         if self.eat(token) {
             Ok(())
@@ -2661,9 +2706,29 @@ impl<'a> GhostBlockParser<'a> {
                     }
                 }
             }
+            let mut field_names = vec![None; fields.len()];
+            if self.eat_char('{') {
+                fields.clear();
+                field_names.clear();
+                self.skip_ws();
+                if !self.eat_char('}') {
+                    loop {
+                        let field_name = self.parse_ident()?;
+                        self.expect_char(':')?;
+                        fields.push(self.parse_spec_ty_annotation(&type_params, &[',', '}'])?);
+                        field_names.push(Some(field_name));
+                        self.skip_ws();
+                        if self.eat_char('}') {
+                            break;
+                        }
+                        self.expect_char(',')?;
+                    }
+                }
+            }
             ctors.push(EnumCtorDef {
                 name: ctor_name,
                 fields,
+                field_names,
             });
             self.skip_ws();
             if self.eat_char(',') {
@@ -3302,6 +3367,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_enum_variant_selector() {
+        let expr = parse_expr("assert", r#"({xs} as List::Cons::<i32>).head"#).expect("expr");
+        assert_eq!(
+            expr,
+            Expr::Field {
+                base: Box::new(Expr::VariantSelector {
+                    base: Box::new(Expr::Interpolated("xs".to_owned())),
+                    enum_name: "List".to_owned(),
+                    ctor_name: "Cons".to_owned(),
+                    type_args: vec![SpecTy::I32],
+                }),
+                name: "head".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unqualified_enum_variant_selector() {
+        let expr = parse_expr("assert", r#"{xs} as Cons"#);
+        assert!(expr.is_err(), "{expr:?}");
+    }
+
+    #[test]
     fn parses_large_integer_suffixes() {
         let expr = parse_expr("assert", r#"18446744073709551615u64 == 0usize"#).expect("expr");
         assert_eq!(
@@ -3869,6 +3957,7 @@ fn singleton(x: i32) -> IntList {
                         EnumCtorDef {
                             name: "Nil".to_owned(),
                             fields: vec![],
+                            field_names: vec![],
                         },
                         EnumCtorDef {
                             name: "Cons".to_owned(),
@@ -3879,6 +3968,7 @@ fn singleton(x: i32) -> IntList {
                                     args: vec![],
                                 },
                             ],
+                            field_names: vec![None, None],
                         },
                     ],
                 }],
