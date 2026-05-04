@@ -103,6 +103,12 @@ struct BuiltinNatDecls {
     int_to_nat: RecFuncDecl,
 }
 
+struct AssertionFailure {
+    span: Span,
+    diagnostic_span: String,
+    message: String,
+}
+
 struct FunctionContext<'tcx> {
     def_id: LocalDefId,
     body: Body<'tcx>,
@@ -114,7 +120,7 @@ struct FunctionContext<'tcx> {
 
 enum VerifierContext<'tcx> {
     Ghost,
-    Function(FunctionContext<'tcx>),
+    Function(Box<FunctionContext<'tcx>>),
 }
 
 pub struct Verifier<'tcx> {
@@ -376,14 +382,14 @@ impl<'tcx> Verifier<'tcx> {
         } = prepass;
         let contract = function_contract.expect("successful function prepass must yield contract");
         self.contracts.insert(def_id, contract.clone());
-        self.context = VerifierContext::Function(FunctionContext {
+        self.context = VerifierContext::Function(Box::new(FunctionContext {
             def_id,
             body,
             contract,
             loop_contracts,
             control_point_directives,
             unsafe_blocks,
-        });
+        }));
 
         let initial_state = match self.initial_state() {
             Ok(Some(state)) => state,
@@ -586,9 +592,11 @@ impl<'tcx> Verifier<'tcx> {
                         state,
                         &assertion.assertion,
                         &assertion.resolution,
-                        self.control_span(ctrl),
-                        assertion.assertion_span.clone(),
-                        "assertion failed".to_owned(),
+                        AssertionFailure {
+                            span: self.control_span(ctrl),
+                            diagnostic_span: assertion.assertion_span.clone(),
+                            message: "assertion failed".to_owned(),
+                        },
                     )?;
                 }
                 ControlPointDirective::Assume(assumption) => {
@@ -749,12 +757,14 @@ impl<'tcx> Verifier<'tcx> {
                     let contract = self.current_contract();
                     let env = CallEnv::for_function(self, &state, contract)?;
                     let ens = self.contract_ens_formula(contract, &env, term.source_info.span)?;
-                    self.assert_predicate_constraint(
+                    self.assert_constraint(
                         &mut state,
                         ens,
-                        term.source_info.span,
-                        contract.ens_span.clone(),
-                        "postcondition failed".to_owned(),
+                        AssertionFailure {
+                            span: term.source_info.span,
+                            diagnostic_span: contract.ens_span.clone(),
+                            message: "postcondition failed".to_owned(),
+                        },
                     )?;
                 }
                 let live_locals: Vec<_> = state.store.keys().copied().collect();
@@ -823,9 +833,11 @@ impl<'tcx> Verifier<'tcx> {
                 self.assert_constraint(
                     &mut state,
                     formula,
-                    term.source_info.span,
-                    span_text(self.tcx, term.source_info.span),
-                    format!("assertion failed: {msg:?}"),
+                    AssertionFailure {
+                        span: term.source_info.span,
+                        diagnostic_span: span_text(self.tcx, term.source_info.span),
+                        message: format!("assertion failed: {msg:?}"),
+                    },
                 )?;
                 self.goto_target(state, *target, term.source_info.span)
             }
@@ -1006,12 +1018,14 @@ impl<'tcx> Verifier<'tcx> {
                 spec: spec.clone(),
             };
             let req = self.contract_req_formula(contract, &req_env, span)?;
-            self.assert_predicate_constraint(
+            self.assert_constraint(
                 &mut state,
                 req,
-                span,
-                contract.req_span.clone(),
-                "precondition failed".to_owned(),
+                AssertionFailure {
+                    span,
+                    diagnostic_span: contract.req_span.clone(),
+                    message: "precondition failed".to_owned(),
+                },
             )?;
             let result_ty = self.place_ty(destination);
             let result_value = self.fresh_for_rust_ty(result_ty, "call_result")?;
@@ -1261,12 +1275,14 @@ impl<'tcx> Verifier<'tcx> {
                 &loop_contract.invariant,
                 &loop_contract.resolution,
             )?;
-            self.assert_predicate_constraint(
+            self.assert_constraint(
                 &mut state,
                 invariant.clone(),
-                span,
-                loop_contract.invariant_span.clone(),
-                "loop invariant does not hold".to_owned(),
+                AssertionFailure {
+                    span,
+                    diagnostic_span: loop_contract.invariant_span.clone(),
+                    message: "loop invariant does not hold".to_owned(),
+                },
             )?;
             let invariant = self.spec_expr_to_bool(
                 &state,
@@ -1579,9 +1595,11 @@ impl<'tcx> Verifier<'tcx> {
                         &mut view,
                         &assertion.assertion,
                         &assertion.resolution,
-                        self.control_span(ctrl),
-                        assertion.assertion_span.clone(),
-                        "assertion failed".to_owned(),
+                        AssertionFailure {
+                            span: self.control_span(ctrl),
+                            diagnostic_span: assertion.assertion_span.clone(),
+                            message: "assertion failed".to_owned(),
+                        },
                     )?;
                     true
                 }
@@ -3562,12 +3580,14 @@ impl<'tcx> Verifier<'tcx> {
             let mut final_state = final_exec.state;
             let ens =
                 self.contract_expr_to_bool(&final_exec.current, &final_state.env, &lemma.ens)?;
-            self.assert_predicate_constraint(
+            self.assert_constraint(
                 &mut final_state,
                 ens,
-                self.report_span(),
-                format!("lemma `{}`", lemma.name),
-                format!("lemma `{}` postcondition failed", lemma.name),
+                AssertionFailure {
+                    span: self.report_span(),
+                    diagnostic_span: format!("lemma `{}`", lemma.name),
+                    message: format!("lemma `{}` postcondition failed", lemma.name),
+                },
             )?;
         }
         Ok(())
@@ -3674,9 +3694,11 @@ impl<'tcx> Verifier<'tcx> {
                     expr,
                     current,
                     &state_spec,
-                    self.report_span(),
-                    format!("lemma `{}`", lemma.name),
-                    format!("lemma `{}` assertion failed", lemma.name),
+                    AssertionFailure {
+                        span: self.report_span(),
+                        diagnostic_span: format!("lemma `{}`", lemma.name),
+                        message: format!("lemma `{}` assertion failed", lemma.name),
+                    },
                 )?;
                 state.env = spec;
                 self.execute_lemma_stmts(lemma, current, state, rest)
@@ -3701,9 +3723,11 @@ impl<'tcx> Verifier<'tcx> {
                     &callee.req,
                     &env.current,
                     &env.spec,
-                    self.report_span(),
-                    format!("lemma `{}`", lemma.name),
-                    format!("lemma `{}` precondition failed", callee.name),
+                    AssertionFailure {
+                        span: self.report_span(),
+                        diagnostic_span: format!("lemma `{}`", lemma.name),
+                        message: format!("lemma `{}` precondition failed", callee.name),
+                    },
                 )?;
                 let ens = self.contract_expr_to_bool(&env.current, &spec, &callee.ens)?;
                 if !self.assume_path_condition(&mut state, ens) {
@@ -4000,9 +4024,11 @@ impl<'tcx> Verifier<'tcx> {
             &lemma.req,
             &env.current,
             &env.spec,
-            span,
-            call.span_text.clone(),
-            format!("lemma `{}` precondition failed", lemma.name),
+            AssertionFailure {
+                span,
+                diagnostic_span: call.span_text.clone(),
+                message: format!("lemma `{}` precondition failed", lemma.name),
+            },
         )?;
         let ens = self.contract_expr_to_bool(&env.current, &spec, &lemma.ens)?;
         Ok(self.assume_path_condition(state, ens))
@@ -4029,9 +4055,11 @@ impl<'tcx> Verifier<'tcx> {
                 &lemma.req,
                 &env.current,
                 &env.spec,
-                span,
-                call.span_text.clone(),
-                format!("lemma `{}` precondition failed", lemma.name),
+                AssertionFailure {
+                    span,
+                    diagnostic_span: call.span_text.clone(),
+                    message: format!("lemma `{}` precondition failed", lemma.name),
+                },
             )?;
             let ens = self.contract_expr_to_bool(&env.current, &spec, &lemma.ens)?;
             if !self.assume_path_condition(&mut view, ens) {
@@ -4184,9 +4212,11 @@ impl<'tcx> Verifier<'tcx> {
         self.assert_constraint(
             state,
             formula,
-            span,
-            span_text(self.tcx, span),
-            "mutable reference close failed".to_owned(),
+            AssertionFailure {
+                span,
+                diagnostic_span: span_text(self.tcx, span),
+                message: "mutable reference close failed".to_owned(),
+            },
         )?;
         Ok(())
     }
@@ -5479,9 +5509,7 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         state: &mut State,
         constraint: Bool,
-        span: Span,
-        diagnostic_span: String,
-        message: String,
+        failure: AssertionFailure,
     ) -> Result<(), VerificationResult> {
         let constraint = constraint.simplify();
         if let Some(value) = constraint.as_bool() {
@@ -5493,8 +5521,8 @@ impl<'tcx> Verifier<'tcx> {
                 false => Err(VerificationResult {
                     function: self.report_function(),
                     status: VerificationStatus::Fail,
-                    span: diagnostic_span,
-                    message,
+                    span: failure.diagnostic_span,
+                    message: failure.message,
                 }),
             };
         }
@@ -5502,14 +5530,16 @@ impl<'tcx> Verifier<'tcx> {
             SatResult::Sat => Err(VerificationResult {
                 function: self.report_function(),
                 status: VerificationStatus::Fail,
-                span: diagnostic_span,
-                message,
+                span: failure.diagnostic_span,
+                message: failure.message,
             }),
             SatResult::Unsat => {
                 self.add_path_condition(state, constraint);
                 Ok(())
             }
-            SatResult::Unknown => Err(self.unknown_solver_result(span, "checking an assertion")),
+            SatResult::Unknown => {
+                Err(self.unknown_solver_result(failure.span, "checking an assertion"))
+            }
         }
     }
 
@@ -5540,29 +5570,16 @@ impl<'tcx> Verifier<'tcx> {
         Ok(bound)
     }
 
-    fn assert_predicate_constraint(
-        &self,
-        state: &mut State,
-        constraint: Bool,
-        span: Span,
-        diagnostic_span: String,
-        message: String,
-    ) -> Result<(), VerificationResult> {
-        self.assert_constraint(state, constraint, span, diagnostic_span, message)
-    }
-
     fn assert_spec_predicate_constraint(
         &self,
         state: &mut State,
         predicate: &NormalizedPredicate,
         resolved: &ResolvedExprEnv,
-        span: Span,
-        diagnostic_span: String,
-        message: String,
+        failure: AssertionFailure,
     ) -> Result<(), VerificationResult> {
         self.bind_state_spec_values(state, &predicate.bindings, resolved)?;
         let constraint = self.spec_expr_to_bool(state, &predicate.condition, resolved)?;
-        self.assert_predicate_constraint(state, constraint, span, diagnostic_span, message)
+        self.assert_constraint(state, constraint, failure)
     }
 
     fn assert_contract_predicate_constraint(
@@ -5571,13 +5588,11 @@ impl<'tcx> Verifier<'tcx> {
         predicate: &NormalizedPredicate,
         current: &HashMap<String, SymValue>,
         spec: &HashMap<String, SymValue>,
-        span: Span,
-        diagnostic_span: String,
-        message: String,
+        failure: AssertionFailure,
     ) -> Result<HashMap<String, SymValue>, VerificationResult> {
         let spec = self.bind_contract_spec_values(current, spec, &predicate.bindings)?;
         let constraint = self.contract_expr_to_bool(current, &spec, &predicate.condition)?;
-        self.assert_predicate_constraint(state, constraint, span, diagnostic_span, message)?;
+        self.assert_constraint(state, constraint, failure)?;
         Ok(spec)
     }
 
@@ -7233,7 +7248,15 @@ impl<'tcx> Verifier<'tcx> {
         let Some(formula) = self.spec_ty_formula(&spec_ty, value, span)? else {
             return Ok(());
         };
-        self.assert_constraint(state, formula, span, span_text(self.tcx, span), message)
+        self.assert_constraint(
+            state,
+            formula,
+            AssertionFailure {
+                span,
+                diagnostic_span: span_text(self.tcx, span),
+                message,
+            },
+        )
     }
 
     fn require_int_invariant(
@@ -7250,9 +7273,11 @@ impl<'tcx> Verifier<'tcx> {
         self.assert_constraint(
             state,
             bool_and(vec![value.ge(lower), value.le(upper)]),
-            span,
-            span_text(self.tcx, span),
-            message,
+            AssertionFailure {
+                span,
+                diagnostic_span: span_text(self.tcx, span),
+                message,
+            },
         )
     }
 
