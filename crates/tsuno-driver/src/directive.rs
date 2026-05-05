@@ -239,6 +239,9 @@ fn parse_raw_assertion(text: &str) -> Result<RawAssertion, ParseError> {
 
 fn parse_raw_pattern(text: &str) -> Result<RawPattern, ParseError> {
     let text = strip_enclosing_parens(text.trim());
+    if text == "emp" {
+        return Ok(RawPattern::Emp);
+    }
     if let Some(index) = top_level_star(text) {
         let lhs = parse_raw_pattern(&text[..index])?;
         let rhs = parse_raw_pattern(&text[index + 1..])?;
@@ -274,7 +277,7 @@ fn parse_raw_pattern(text: &str) -> Result<RawPattern, ParseError> {
         });
     }
     Err(ParseError::new(
-        "raw assertion must be a `PointsTo`, `DeallocToken`, or `*` pattern",
+        "raw assertion must be an `emp`, `PointsTo`, `DeallocToken`, or `*` pattern",
     ))
 }
 

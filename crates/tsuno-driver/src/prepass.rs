@@ -103,6 +103,7 @@ pub struct RawAssertionContract {
 
 #[derive(Debug, Clone)]
 pub enum TypedRawPattern {
+    Emp,
     Star(Box<TypedRawPattern>, Box<TypedRawPattern>),
     PointsTo {
         addr: TypedExpr,
@@ -5264,6 +5265,7 @@ fn resolve_raw_pattern_env_into(
     resolved: &mut ResolvedExprEnv,
 ) -> Result<(), LoopPrepassError> {
     match pattern {
+        RawPattern::Emp => Ok(()),
         RawPattern::Star(lhs, rhs) => {
             resolve_raw_pattern_env_into(
                 lhs,
@@ -5493,6 +5495,7 @@ fn infer_raw_pattern_types_into(
     inferred: &mut SpecTypeInference,
 ) -> Result<(), String> {
     match pattern {
+        RawPattern::Emp => Ok(()),
         RawPattern::Star(lhs, rhs) => {
             infer_raw_pattern_types_into(
                 lhs, pure_fns, enum_defs, spec_scope, local_tys, inferred,
@@ -5700,6 +5703,7 @@ fn typed_lemma_raw_pattern(
     inferred: &mut SpecTypeInference,
 ) -> Result<TypedRawPattern, String> {
     match pattern {
+        RawPattern::Emp => Ok(TypedRawPattern::Emp),
         RawPattern::Star(lhs, rhs) => Ok(TypedRawPattern::Star(
             Box::new(typed_lemma_raw_pattern(
                 lhs,
@@ -5819,6 +5823,7 @@ fn typed_contract_raw_pattern<'tcx>(
     inferred: &mut SpecTypeInference,
 ) -> Result<TypedRawPattern, String> {
     match pattern {
+        RawPattern::Emp => Ok(TypedRawPattern::Emp),
         RawPattern::Star(lhs, rhs) => Ok(TypedRawPattern::Star(
             Box::new(typed_contract_raw_pattern(
                 tcx,
@@ -6197,6 +6202,7 @@ fn infer_contract_raw_pattern_types(
     inferred: &mut SpecTypeInference,
 ) -> Result<(), String> {
     match pattern {
+        RawPattern::Emp => Ok(()),
         RawPattern::Star(lhs, rhs) => {
             infer_contract_raw_pattern_types(
                 lhs,
@@ -6321,6 +6327,7 @@ fn typed_raw_pattern_into(
     inferred: &mut SpecTypeInference,
 ) -> Result<TypedRawPattern, String> {
     match pattern {
+        RawPattern::Emp => Ok(TypedRawPattern::Emp),
         RawPattern::Star(lhs, rhs) => Ok(TypedRawPattern::Star(
             Box::new(typed_raw_pattern_into(lhs, ctx, spec_scope, inferred)?),
             Box::new(typed_raw_pattern_into(rhs, ctx, spec_scope, inferred)?),
@@ -8605,6 +8612,7 @@ fn validate_function_contract_raw_pattern_prepass(
     spec_scope: &mut SpecScope,
 ) -> Result<(), LoopPrepassError> {
     match pattern {
+        RawPattern::Emp => Ok(()),
         RawPattern::Star(lhs, rhs) => {
             validate_function_contract_raw_pattern_prepass(
                 lhs,
