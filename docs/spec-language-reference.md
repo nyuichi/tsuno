@@ -644,11 +644,15 @@ in safe code. Unsafe code also supports raw assertions:
 ```
 
 A raw assertion checks a `RawPattern`. The initial raw patterns
-are `PointsTo(addr_expr, rust_ty_expr, option_value_expr)`,
+are `emp`,
+`PointsTo(addr_expr, rust_ty_expr, option_value_expr)`,
 the shorthand `*ptr |-> option_value_pattern`,
 `DeallocToken(base_expr, size_expr, alignment_expr)`, and separating
 conjunction `left * right`; parentheses may be used freely to group raw
 patterns.
+`emp` is the empty raw pattern: it matches without requiring any heap resource,
+consumes no resource in `raw req` or `raw ens`, and materializes no resource.
+It may be combined with other raw patterns as in `emp * R` or `R * emp`.
 `*ptr |-> value` is accepted only when `ptr` is a Rust local, function
 parameter, or allowed `result` binding whose type is a raw pointer `*const T` or
 `*mut T`; it is desugared before unsafe execution to

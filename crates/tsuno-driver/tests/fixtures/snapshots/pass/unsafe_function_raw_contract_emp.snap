@@ -1,0 +1,17 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+assertion_line: 85
+expression: snapshot_output(output)
+---
+status: Some(0)
+stdout:
+PASS empty_raw_contract
+  all assertions discharged
+PASS preserves_i32_with_emp
+  all assertions discharged
+PASS unsafe_function_raw_contract_emp
+  all assertions discharged
+PASS main
+  all assertions discharged
+
+stderr:

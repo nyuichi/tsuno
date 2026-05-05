@@ -320,6 +320,7 @@ pub struct RawAssertion {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RawPattern {
+    Emp,
     Star(Box<RawPattern>, Box<RawPattern>),
     PointsTo {
         addr: Expr,

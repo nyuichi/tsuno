@@ -2721,6 +2721,7 @@ impl<'tcx> Verifier<'tcx> {
         candidates: Vec<RawPatternMatch>,
     ) -> Result<Vec<RawPatternMatch>, VerificationResult> {
         match pattern {
+            TypedRawPattern::Emp => Ok(candidates),
             TypedRawPattern::Star(lhs, rhs) => {
                 let lhs_matches =
                     self.match_contract_raw_pattern(state, current, spec, lhs, span, candidates)?;
@@ -2850,6 +2851,7 @@ impl<'tcx> Verifier<'tcx> {
         candidates: Vec<RawPatternMatch>,
     ) -> Result<Vec<RawPatternMatch>, VerificationResult> {
         match pattern {
+            TypedRawPattern::Emp => Ok(candidates),
             TypedRawPattern::Star(lhs, rhs) => {
                 let lhs_matches =
                     self.match_raw_pattern(state, view, lhs, resolution, span, candidates)?;
@@ -3195,6 +3197,7 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<(), VerificationResult> {
         match pattern {
+            TypedRawPattern::Emp => Ok(()),
             TypedRawPattern::Star(lhs, rhs) => {
                 self.materialize_contract_raw_pattern(state, current, spec, lhs, span)?;
                 self.materialize_contract_raw_pattern(state, current, spec, rhs, span)
@@ -7277,6 +7280,7 @@ fn collect_directive_prepass_pure_fn_refs(
 
 fn collect_typed_raw_pattern_pure_fn_refs(pattern: &TypedRawPattern, out: &mut BTreeSet<String>) {
     match pattern {
+        TypedRawPattern::Emp => {}
         TypedRawPattern::Star(lhs, rhs) => {
             collect_typed_raw_pattern_pure_fn_refs(lhs, out);
             collect_typed_raw_pattern_pure_fn_refs(rhs, out);
