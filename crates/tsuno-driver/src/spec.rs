@@ -368,11 +368,12 @@ pub struct GhostBlock {
     pub lemmas: Vec<LemmaDef>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumDef {
     pub name: String,
     pub type_params: Vec<String>,
     pub ctors: Vec<EnumCtorDef>,
+    pub invariant: Option<Expr>,
 }
 
 impl EnumDef {
@@ -391,11 +392,12 @@ pub struct EnumCtorDef {
     pub field_names: Vec<Option<String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructDef {
     pub name: String,
     pub type_params: Vec<String>,
     pub fields: Vec<StructFieldTy>,
+    pub invariant: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -471,6 +473,7 @@ pub enum BinaryOp {
     Add,
     Sub,
     Mul,
+    Rem,
     Concat,
     Eq,
     Ne,

@@ -41,8 +41,9 @@ use z3::ast::{Bool, Int};
 use crate::prepass::{
     ContractParam, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
     FunctionContract, LemmaCallContract, LoopContract, LoopContracts, NormalizedBinding,
-    NormalizedPredicate, ProgramPrepass, RawAssertionContract, ResolvedExprEnv, TypedGhostMatchArm,
-    TypedGhostStmt, TypedLemmaDef, TypedPureFnDef, TypedRawPattern, TypedValuePattern,
+    NormalizedPredicate, ProgramPrepass, RawAssertionContract, ResolvedExprEnv, TypedEnumInvariant,
+    TypedGhostMatchArm, TypedGhostStmt, TypedLemmaDef, TypedPureFnDef, TypedRawPattern,
+    TypedStructInvariant, TypedValuePattern,
     rust_ty_key_text_for_rust_ty as checked_rust_ty_key_text_for_rust_ty, spec_ty_for_rust_ty,
 };
 use crate::report::{VerificationResult, VerificationStatus};
@@ -117,6 +118,8 @@ pub struct Verifier<'tcx> {
     contracts: HashMap<LocalDefId, FunctionContract>,
     pure_fns: HashMap<String, TypedPureFnDef>,
     lemmas: HashMap<String, TypedLemmaDef>,
+    struct_invariants: HashMap<String, TypedStructInvariant>,
+    enum_invariants: HashMap<String, TypedEnumInvariant>,
     next_sym: Cell<usize>,
     solver: Solver,
 }
@@ -199,6 +202,8 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
         let tcx = tcx_capture.get();
         let ghosts = ghosts_capture.get();
         let mut verifier = Verifier::new(tcx, HashMap::new());
+        verifier.struct_invariants = ghosts.struct_invariants.clone();
+        verifier.enum_invariants = ghosts.enum_invariants.clone();
         for enum_def in ghosts.enums.values() {
             verifier.solver.register_enum_def(enum_def.clone());
         }
@@ -234,6 +239,8 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
             &function.prepass,
             &ghosts.typed_lemmas,
             &ghosts.typed_pure_fns,
+            &ghosts.struct_invariants,
+            &ghosts.enum_invariants,
         );
         let def_id = function.def_id;
         let prepass = function.prepass;
@@ -242,6 +249,8 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
             let ghosts = ghosts_capture.get();
             let contracts = contracts_capture.get().clone();
             let mut verifier = Verifier::new(tcx, contracts);
+            verifier.struct_invariants = ghosts.struct_invariants.clone();
+            verifier.enum_invariants = ghosts.enum_invariants.clone();
             for enum_def in ghosts.enums.values() {
                 verifier.solver.register_enum_def(enum_def.clone());
             }
@@ -271,6 +280,8 @@ impl<'tcx> Verifier<'tcx> {
             contracts,
             pure_fns: HashMap::new(),
             lemmas: HashMap::new(),
+            struct_invariants: HashMap::new(),
+            enum_invariants: HashMap::new(),
             next_sym: Cell::new(0),
             solver: Solver::new(tcx.data_layout.pointer_size().bits()),
         }
@@ -4963,7 +4974,7 @@ impl<'tcx> Verifier<'tcx> {
                             )
                         })
                 }
-                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Rem => {
                     let value = self.spec_expr_to_value(state, expr, resolved)?;
                     Ok(self.solver.bool_term(&value))
                 }
@@ -5126,7 +5137,7 @@ impl<'tcx> Verifier<'tcx> {
                             )
                         })
                 }
-                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Rem => {
                     let value = self.contract_expr_to_value(current, spec, expr)?;
                     Ok(self.solver.bool_term(&value))
                 }
@@ -5566,6 +5577,13 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<(), VerificationResult> {
         for binding in bindings {
             let value = self.spec_expr_to_value(state, &binding.value, resolved)?;
+            self.require_spec_type_invariant(
+                state,
+                &binding.value.ty,
+                &value,
+                self.control_span(state.ctrl),
+                "type invariant does not hold".to_owned(),
+            )?;
             state.env.insert(binding.name.clone(), value);
         }
         Ok(())
@@ -6774,7 +6792,13 @@ impl<'tcx> Verifier<'tcx> {
                 if let Some(formula) =
                     self.direct_struct_invariant_formula(ty, struct_ty, value, span)?
                 {
-                    return Ok(Some(formula));
+                    let mut formulas = vec![formula];
+                    if let Some(user_formula) =
+                        self.user_struct_invariant_formula(ty, struct_ty, value, span)?
+                    {
+                        formulas.push(user_formula);
+                    }
+                    return Ok(Some(bool_and(formulas)));
                 }
                 let view = self.composite_ctor_view(ty, value, 0, span)?;
                 let mut formulas = vec![view.tag];
@@ -6782,6 +6806,11 @@ impl<'tcx> Verifier<'tcx> {
                     if let Some(formula) = self.spec_ty_formula(&field.ty, &field_value, span)? {
                         formulas.push(formula);
                     }
+                }
+                if let Some(user_formula) =
+                    self.user_struct_invariant_formula(ty, struct_ty, value, span)?
+                {
+                    formulas.push(user_formula);
                 }
                 Ok(Some(bool_and(formulas)))
             }
@@ -6811,6 +6840,34 @@ impl<'tcx> Verifier<'tcx> {
             }
         }
         Ok(Some(bool_and(formulas)))
+    }
+
+    fn user_struct_invariant_formula(
+        &self,
+        ty: &SpecTy,
+        struct_ty: &crate::spec::StructTy,
+        value: &SymValue,
+        span: Span,
+    ) -> Result<Option<Bool>, VerificationResult> {
+        let Some(invariant) = self.struct_invariants.get(&struct_ty.name) else {
+            return Ok(None);
+        };
+        let mut env = HashMap::new();
+        for field in &invariant.fields {
+            let Some((index, _)) = struct_ty.field(&field.name) else {
+                return Err(self.unsupported_result(
+                    span,
+                    format!(
+                        "struct `{}` invariant field `{}` is missing",
+                        struct_ty.name, field.name
+                    ),
+                ));
+            };
+            let field_value = self.project_field(value.clone(), ty, index, span)?;
+            env.insert(field.name.clone(), field_value);
+        }
+        self.contract_expr_to_bool(&env, &HashMap::new(), &invariant.condition)
+            .map(Some)
     }
 
     fn resolve_formula_for_spec_ty(
@@ -6904,9 +6961,33 @@ impl<'tcx> Verifier<'tcx> {
                     formulas.push(formula);
                 }
             }
+            if let Some(user_formula) = self.user_enum_invariant_formula(ty, value, span)? {
+                formulas.push(user_formula);
+            }
             return Ok(bool_and(formulas));
         }
-        self.named_invariant_formula(ty, value, span)
+        let mut formulas = vec![self.named_invariant_formula(ty, value, span)?];
+        if let Some(user_formula) = self.user_enum_invariant_formula(ty, value, span)? {
+            formulas.push(user_formula);
+        }
+        Ok(bool_and(formulas))
+    }
+
+    fn user_enum_invariant_formula(
+        &self,
+        ty: &SpecTy,
+        value: &SymValue,
+        _span: Span,
+    ) -> Result<Option<Bool>, VerificationResult> {
+        let SpecTy::Enum { name, .. } = ty else {
+            return Ok(None);
+        };
+        let Some(invariant) = self.enum_invariants.get(name) else {
+            return Ok(None);
+        };
+        let env = HashMap::from([("self".to_owned(), value.clone())]);
+        self.contract_expr_to_bool(&env, &HashMap::new(), &invariant.condition)
+            .map(Some)
     }
 
     fn named_invariant_formula(
@@ -6980,6 +7061,28 @@ impl<'tcx> Verifier<'tcx> {
         let spec_ty =
             spec_ty_for_rust_ty(self.tcx, ty).map_err(|err| self.unsupported_result(span, err))?;
         let Some(formula) = self.spec_ty_formula(&spec_ty, value, span)? else {
+            return Ok(());
+        };
+        self.assert_constraint(
+            state,
+            formula,
+            AssertionFailure {
+                span,
+                diagnostic_span: span_text(self.tcx, span),
+                message,
+            },
+        )
+    }
+
+    fn require_spec_type_invariant(
+        &self,
+        state: &mut State,
+        ty: &SpecTy,
+        value: &SymValue,
+        span: Span,
+        message: String,
+    ) -> Result<(), VerificationResult> {
+        let Some(formula) = self.spec_ty_formula(ty, value, span)? else {
             return Ok(());
         };
         self.assert_constraint(
@@ -7178,6 +7281,8 @@ fn collect_needed_pure_fns(
     prepass: &DirectivePrepass,
     lemmas: &[TypedLemmaDef],
     pure_fns: &[TypedPureFnDef],
+    struct_invariants: &HashMap<String, TypedStructInvariant>,
+    enum_invariants: &HashMap<String, TypedEnumInvariant>,
 ) -> Vec<TypedPureFnDef> {
     let pure_fn_defs = pure_fns
         .iter()
@@ -7191,6 +7296,12 @@ fn collect_needed_pure_fns(
         .collect::<HashMap<_, _>>();
     let mut needed = BTreeSet::new();
     collect_directive_prepass_pure_fn_refs(prepass, &lemma_map, &mut needed);
+    for invariant in struct_invariants.values() {
+        collect_typed_expr_pure_fn_refs(&invariant.condition, &mut needed);
+    }
+    for invariant in enum_invariants.values() {
+        collect_typed_expr_pure_fn_refs(&invariant.condition, &mut needed);
+    }
     let mut agenda = needed.iter().cloned().collect::<VecDeque<_>>();
     while let Some(name) = agenda.pop_front() {
         let Some(pure_fn) = pure_fn_defs.get(&name) else {
@@ -7441,6 +7552,8 @@ fn span_text(tcx: TyCtxt<'_>, span: Span) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::collect_needed_pure_fns;
     use crate::prepass::{
         AssertionContract, ControlPointDirective, ControlPointDirectives, DirectivePrepass,
@@ -7521,7 +7634,8 @@ mod tests {
                 },
             },
         ];
-        let needed = collect_needed_pure_fns(&prepass, &[], &pure_fns);
+        let needed =
+            collect_needed_pure_fns(&prepass, &[], &pure_fns, &HashMap::new(), &HashMap::new());
         assert_eq!(needed.len(), 1);
         assert_eq!(needed[0].name, "id");
     }

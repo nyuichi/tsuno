@@ -1,0 +1,14 @@
+---
+source: crates/tsuno-driver/tests/snapshot_tests.rs
+assertion_line: 85
+expression: snapshot_output(output)
+---
+status: Some(1)
+stdout:
+FAIL rejects_spec_enum_invariant
+  type invariant does not hold
+  src/main.rs:10:2: 10:2
+PASS main
+  all assertions discharged
+
+stderr:

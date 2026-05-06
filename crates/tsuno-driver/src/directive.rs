@@ -1686,6 +1686,7 @@ enum Token {
     Plus,
     Minus,
     Star,
+    Percent,
     Bang,
     Amp,
     EqEq,
@@ -1815,6 +1816,10 @@ fn lex_expr(text: &str) -> Result<Vec<Token>, ParseError> {
             '*' => {
                 chars.next();
                 tokens.push(Token::Star);
+            }
+            '%' => {
+                chars.next();
+                tokens.push(Token::Percent);
             }
             '!' => {
                 chars.next();
@@ -2043,10 +2048,20 @@ impl Parser {
 
     fn parse_mul(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_unary()?;
-        while self.eat(&Token::Star) {
+        loop {
+            let op = if self.eat(&Token::Star) {
+                Some(BinaryOp::Mul)
+            } else if self.eat(&Token::Percent) {
+                Some(BinaryOp::Rem)
+            } else {
+                None
+            };
+            let Some(op) = op else {
+                break;
+            };
             let rhs = self.parse_unary()?;
             expr = Expr::Binary {
-                op: BinaryOp::Mul,
+                op,
                 lhs: Box::new(expr),
                 rhs: Box::new(rhs),
             };
@@ -2740,10 +2755,12 @@ impl<'a> GhostBlockParser<'a> {
             self.expect_char('}')?;
             break;
         }
+        let invariant = self.parse_type_invariant(&type_params)?;
         Ok(EnumDef {
             name,
             type_params,
             ctors,
+            invariant,
         })
     }
 
@@ -2771,11 +2788,28 @@ impl<'a> GhostBlockParser<'a> {
             self.expect_char('}')?;
             break;
         }
+        let invariant = self.parse_type_invariant(&type_params)?;
         Ok(StructDef {
             name,
             type_params,
             fields,
+            invariant,
         })
+    }
+
+    fn parse_type_invariant(&mut self, type_params: &[String]) -> Result<Option<Expr>, ParseError> {
+        self.skip_ws();
+        if !self.starts_with_keyword("where") {
+            return Ok(None);
+        }
+        self.expect_keyword("where")?;
+        let (text, next) = self.parse_stmt_expr_text(self.text, self.cursor)?;
+        self.cursor = next;
+        Ok(Some(parse_source_expr_with_type_params(
+            "type invariant",
+            text,
+            type_params,
+        )?))
     }
 
     fn parse_pure_fn_def(
@@ -3074,13 +3108,19 @@ impl<'a> GhostBlockParser<'a> {
             }
         }
         let start = cursor;
+        let mut depth = 0usize;
         while let Some(ch) = text[cursor..].chars().next() {
-            if ch == ';' {
+            if ch == ';' && depth == 0 {
                 let expr = text[start..cursor].trim_end();
                 if expr.is_empty() {
                     return Err(ParseError::new("expected spec expression"));
                 }
                 return Ok((expr, cursor + 1));
+            }
+            match ch {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                _ => {}
             }
             cursor += ch.len_utf8();
         }
@@ -3719,12 +3759,31 @@ struct Foo {
                         ty: SpecTy::Bool,
                     },
                 ],
+                invariant: None,
             }]
         );
 
         let expr = parse_expr("assert", "Foo { bar: 42isize, baz: true }.bar")
             .expect("struct literal field");
         assert!(matches!(expr, Expr::Field { .. }));
+    }
+
+    #[test]
+    fn parses_struct_and_enum_type_invariants() {
+        let block = parse_ghost_block(
+            r#"
+struct Odd {
+    n: Nat,
+} where n % 2 == 1;
+
+enum Small {
+    One(Int),
+} where (self as Small::One).0 < 10;
+"#,
+        )
+        .expect("invariant block");
+        assert!(block.structs[0].invariant.is_some());
+        assert!(block.enums[0].invariant.is_some());
     }
 
     #[test]
@@ -3974,6 +4033,7 @@ fn singleton(x: i32) -> IntList {
                             field_names: vec![None, None],
                         },
                     ],
+                    invariant: None,
                 }],
                 structs: vec![],
                 pure_fns: vec![PureFnDef {
