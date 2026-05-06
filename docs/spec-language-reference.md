@@ -181,6 +181,7 @@ expr.0
 lhs + rhs
 lhs - rhs
 lhs * rhs
+lhs % rhs
 lhs ++ rhs
 lhs == rhs
 lhs != rhs
@@ -199,7 +200,7 @@ The operator precedence, from tightest to loosest, is:
 ```text
 1. postfix        .field   .0   [i]
 2. unary          !   -   *
-3. multiplicative *
+3. multiplicative *   %
 4. additive       +   -
 5. sequence concat ++
 6. comparison     <   <=   >   >=
@@ -722,6 +723,29 @@ struct Foo {
 
 //@ assert (Foo { bar: 42isize, baz: true }).bar == 42isize;
 ```
+
+Struct and enum declarations may end with a type invariant written as
+`where <bool expr>;`. A struct invariant may refer to its fields by bare field
+name. An enum invariant may refer to the constructed value as `self`.
+
+```rust
+/*@
+struct Odd {
+    n: Nat,
+} where n % 2 == 1;
+
+enum Small {
+    One(Int),
+} where (self as Small::One).0 < 10;
+*/
+
+//@ let odd = Odd { n: 3Nat };
+//@ let small = Small::One(9);
+```
+
+When a spec value is introduced with `let`, the corresponding type invariant is
+asserted. Where a value's spec type is used as an invariant, the user-written
+type invariant is conjoined with the existing field and constructor invariant.
 
 Numeric projection works on tuples.
 

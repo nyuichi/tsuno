@@ -1286,6 +1286,10 @@ impl Solver {
             BinaryOp::Add => self.wrap_int(&(self.int_term(lhs) + self.int_term(rhs))),
             BinaryOp::Sub => self.wrap_int(&(self.int_term(lhs) - self.int_term(rhs))),
             BinaryOp::Mul => self.wrap_int(&(self.int_term(lhs) * self.int_term(rhs))),
+            BinaryOp::Rem if matches!(lhs_ty, SpecTy::Enum { name, args } if name == "Nat" && args.is_empty()) => {
+                self.wrap_int(&(self.nat_to_int_term_with_z3(lhs, solver)? % self.int_term(rhs)))
+            }
+            BinaryOp::Rem => self.wrap_int(&(self.int_term(lhs) % self.int_term(rhs))),
             BinaryOp::Concat => {
                 let lhs = self.seq_term(lhs)?;
                 let rhs = self.seq_term(rhs)?;
@@ -1314,6 +1318,7 @@ impl Solver {
             | BinaryOp::Add
             | BinaryOp::Sub
             | BinaryOp::Mul
+            | BinaryOp::Rem
             | BinaryOp::Concat => {
                 return Ok(None);
             }

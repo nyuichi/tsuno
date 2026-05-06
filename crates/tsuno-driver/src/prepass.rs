@@ -239,6 +239,7 @@ pub struct DirectivePrepass {
 #[derive(Debug, Clone)]
 struct RawGlobalGhostPrepass {
     pub enums: HashMap<String, EnumDef>,
+    pub structs: HashMap<String, StructDef>,
     pub pure_fns: HashMap<String, PureFnDef>,
     pub lemmas: HashMap<String, LemmaDef>,
     pure_fn_order: Vec<String>,
@@ -248,8 +249,21 @@ struct RawGlobalGhostPrepass {
 #[derive(Debug, Clone)]
 pub struct GlobalGhostPrepass {
     pub enums: HashMap<String, EnumDef>,
+    pub struct_invariants: HashMap<String, TypedStructInvariant>,
+    pub enum_invariants: HashMap<String, TypedEnumInvariant>,
     pub typed_pure_fns: Vec<TypedPureFnDef>,
     pub typed_lemmas: Vec<TypedLemmaDef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypedStructInvariant {
+    pub fields: Vec<StructFieldTy>,
+    pub condition: TypedExpr,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypedEnumInvariant {
+    pub condition: TypedExpr,
 }
 
 #[derive(Debug, Clone)]
@@ -457,6 +471,7 @@ fn compute_raw_global_ghost_prepass<'tcx>(
 
     Ok(RawGlobalGhostPrepass {
         enums,
+        structs,
         pure_fns,
         lemmas,
         pure_fn_order,
@@ -508,6 +523,8 @@ fn type_global_ghost_prepass(
     anchor_span: Span,
 ) -> Result<GlobalGhostPrepass, LoopPrepassError> {
     let typed_pure_fns = type_pure_fns(&raw.pure_fns, &raw.pure_fn_order, &raw.enums, anchor_span)?;
+    let (struct_invariants, enum_invariants) =
+        type_type_invariants(&raw.structs, &raw.enums, &raw.pure_fns, anchor_span)?;
     let typed_lemmas = type_lemmas(
         &raw.lemmas,
         &raw.lemma_order,
@@ -517,9 +534,112 @@ fn type_global_ghost_prepass(
     )?;
     Ok(GlobalGhostPrepass {
         enums: raw.enums.clone(),
+        struct_invariants,
+        enum_invariants,
         typed_pure_fns,
         typed_lemmas,
     })
+}
+
+fn type_type_invariants(
+    structs: &HashMap<String, StructDef>,
+    enums: &HashMap<String, EnumDef>,
+    pure_fns: &HashMap<String, PureFnDef>,
+    anchor_span: Span,
+) -> Result<
+    (
+        HashMap<String, TypedStructInvariant>,
+        HashMap<String, TypedEnumInvariant>,
+    ),
+    LoopPrepassError,
+> {
+    let mut struct_invariants = HashMap::new();
+    for def in structs.values() {
+        let Some(invariant) = &def.invariant else {
+            continue;
+        };
+        let params = def
+            .fields
+            .iter()
+            .map(|field| (field.name.clone(), field.ty.clone()))
+            .collect::<HashMap<_, _>>();
+        let type_params = def.type_params.iter().cloned().collect::<HashSet<_>>();
+        let condition = typed_contract_expr_with_expected(
+            invariant,
+            pure_fns,
+            enums,
+            &type_params,
+            &mut SpecScope::default(),
+            &params,
+            false,
+            &SpecTy::Bool,
+            &mut SpecTypeInference::default(),
+            true,
+            Some(&SpecTy::Bool),
+        )
+        .map_err(|message| LoopPrepassError {
+            span: anchor_span,
+            display_span: None,
+            message: format!("struct `{}` invariant: {message}", def.name),
+        })?;
+        if condition.ty != SpecTy::Bool {
+            return Err(LoopPrepassError {
+                span: anchor_span,
+                display_span: None,
+                message: format!("struct `{}` invariant must have type `bool`", def.name),
+            });
+        }
+        struct_invariants.insert(
+            def.name.clone(),
+            TypedStructInvariant {
+                fields: def.fields.clone(),
+                condition,
+            },
+        );
+    }
+
+    let mut enum_invariants = HashMap::new();
+    for def in enums.values() {
+        let Some(invariant) = &def.invariant else {
+            continue;
+        };
+        let type_params = def.type_params.iter().cloned().collect::<HashSet<_>>();
+        let self_ty = enum_result_ty(
+            def,
+            def.type_params
+                .iter()
+                .map(|param| SpecTy::TypeParam(param.clone()))
+                .collect(),
+        );
+        let params = HashMap::from([("self".to_owned(), self_ty.clone())]);
+        let condition = typed_contract_expr_with_expected(
+            invariant,
+            pure_fns,
+            enums,
+            &type_params,
+            &mut SpecScope::default(),
+            &params,
+            false,
+            &SpecTy::Bool,
+            &mut SpecTypeInference::default(),
+            true,
+            Some(&SpecTy::Bool),
+        )
+        .map_err(|message| LoopPrepassError {
+            span: anchor_span,
+            display_span: None,
+            message: format!("enum `{}` invariant: {message}", def.name),
+        })?;
+        if condition.ty != SpecTy::Bool {
+            return Err(LoopPrepassError {
+                span: anchor_span,
+                display_span: None,
+                message: format!("enum `{}` invariant must have type `bool`", def.name),
+            });
+        }
+        enum_invariants.insert(def.name.clone(), TypedEnumInvariant { condition });
+    }
+    Ok((struct_invariants, enum_invariants))
 }
 
 fn collect_global_ghost_sources<'tcx>(tcx: TyCtxt<'tcx>, anchor_span: Span) -> Vec<(Span, String)> {
@@ -1037,6 +1157,10 @@ fn is_integer_spec_ty(ty: &SpecTy) -> bool {
             | SpecTy::U64
             | SpecTy::Usize
     )
+}
+
+fn is_numeric_spec_ty(ty: &SpecTy) -> bool {
+    is_integer_spec_ty(ty) || is_nat_spec_ty(ty)
 }
 
 fn is_concrete_integer_spec_ty(ty: &SpecTy) -> bool {
@@ -2703,6 +2827,19 @@ fn infer_common_expr_types_with_expected(
                     constrain_expr_ty(inferred, &rhs_ty, &SpecTy::IntLiteral)?;
                     numeric_expr_result_ty(inferred, &lhs_ty, &rhs_ty)?
                 }
+                crate::spec::BinaryOp::Rem => {
+                    let lhs = known_spec_ty(&lhs_ty);
+                    let rhs = known_spec_ty(&rhs_ty);
+                    if lhs.as_ref().is_some_and(is_nat_spec_ty)
+                        || rhs.as_ref().is_some_and(is_nat_spec_ty)
+                    {
+                        InferredExprTy::Known(SpecTy::Int)
+                    } else {
+                        constrain_expr_ty(inferred, &lhs_ty, &SpecTy::IntLiteral)?;
+                        constrain_expr_ty(inferred, &rhs_ty, &SpecTy::IntLiteral)?;
+                        numeric_expr_result_ty(inferred, &lhs_ty, &rhs_ty)?
+                    }
+                }
                 crate::spec::BinaryOp::Concat => {
                     let Some(lhs_ty) = known_spec_ty(&lhs_ty) else {
                         return Ok(Some(InferredExprTy::Unknown));
@@ -3910,6 +4047,33 @@ fn type_binary_expr(
             }
             Ok(TypedExpr {
                 ty: unified,
+                kind: TypedExprKind::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+            })
+        }
+        crate::spec::BinaryOp::Rem => {
+            if !is_numeric_spec_ty(&lhs.ty) && lhs.ty != SpecTy::IntLiteral {
+                return Err(format!(
+                    "remainder requires numbers, found `{}`",
+                    display_spec_ty(&lhs.ty)
+                ));
+            }
+            if !is_numeric_spec_ty(&rhs.ty) && rhs.ty != SpecTy::IntLiteral {
+                return Err(format!(
+                    "remainder requires numbers, found `{}`",
+                    display_spec_ty(&rhs.ty)
+                ));
+            }
+            let ty = if is_nat_spec_ty(&lhs.ty) || is_nat_spec_ty(&rhs.ty) {
+                SpecTy::Int
+            } else {
+                unify_spec_tys(&lhs.ty, &rhs.ty)?
+            };
+            Ok(TypedExpr {
+                ty,
                 kind: TypedExprKind::Binary {
                     op,
                     lhs: Box::new(lhs),
@@ -9668,6 +9832,7 @@ mod tests {
                         field_names: vec![Some("head".to_owned()), Some("tail".to_owned())],
                     },
                 ],
+                invariant: None,
             },
         )]);
 
@@ -9743,6 +9908,7 @@ mod tests {
                         field_names: vec![Some("head".to_owned()), Some("tail".to_owned())],
                     },
                 ],
+                invariant: None,
             },
         )]);
         let params = HashMap::from([(
@@ -9871,6 +10037,8 @@ mod tests {
     fn global_ghost_prepass_exposes_only_typed_output() {
         let ghosts = GlobalGhostPrepass {
             enums: HashMap::new(),
+            struct_invariants: HashMap::new(),
+            enum_invariants: HashMap::new(),
             typed_pure_fns: vec![TypedPureFnDef {
                 name: "id".to_owned(),
                 params: Vec::new(),
