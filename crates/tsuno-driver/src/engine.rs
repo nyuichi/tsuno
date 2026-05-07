@@ -52,8 +52,8 @@ use crate::solver::{
     with_z3_context, with_z3_deadline,
 };
 use crate::spec::{
-    BinaryOp, RustTyKey, SpecTy, TypedExpr, TypedExprKind, TypedMatchBinding, UnaryOp,
-    option_spec_ty, provenance_spec_ty, ptr_spec_ty,
+    BinaryOp, RustTyKey, SpecTy, StructFieldTy, TypedExpr, TypedExprKind, TypedMatchBinding,
+    UnaryOp, option_spec_ty, provenance_spec_ty, ptr_spec_ty,
 };
 
 const GHOST_LOAD_TIMEOUT: Duration = Duration::from_millis(1_000);
@@ -118,6 +118,7 @@ pub struct Verifier<'tcx> {
     contracts: HashMap<LocalDefId, FunctionContract>,
     pure_fns: HashMap<String, TypedPureFnDef>,
     lemmas: HashMap<String, TypedLemmaDef>,
+    structs: HashMap<String, crate::spec::StructDef>,
     struct_invariants: HashMap<String, TypedStructInvariant>,
     enum_invariants: HashMap<String, TypedEnumInvariant>,
     next_sym: Cell<usize>,
@@ -202,8 +203,12 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
         let tcx = tcx_capture.get();
         let ghosts = ghosts_capture.get();
         let mut verifier = Verifier::new(tcx, HashMap::new());
+        verifier.structs = ghosts.structs.clone();
         verifier.struct_invariants = ghosts.struct_invariants.clone();
         verifier.enum_invariants = ghosts.enum_invariants.clone();
+        for struct_def in ghosts.structs.values() {
+            verifier.solver.register_struct_def(struct_def.clone());
+        }
         for enum_def in ghosts.enums.values() {
             verifier.solver.register_enum_def(enum_def.clone());
         }
@@ -249,8 +254,12 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
             let ghosts = ghosts_capture.get();
             let contracts = contracts_capture.get().clone();
             let mut verifier = Verifier::new(tcx, contracts);
+            verifier.structs = ghosts.structs.clone();
             verifier.struct_invariants = ghosts.struct_invariants.clone();
             verifier.enum_invariants = ghosts.enum_invariants.clone();
+            for struct_def in ghosts.structs.values() {
+                verifier.solver.register_struct_def(struct_def.clone());
+            }
             for enum_def in ghosts.enums.values() {
                 verifier.solver.register_enum_def(enum_def.clone());
             }
@@ -280,6 +289,7 @@ impl<'tcx> Verifier<'tcx> {
             contracts,
             pure_fns: HashMap::new(),
             lemmas: HashMap::new(),
+            structs: HashMap::new(),
             struct_invariants: HashMap::new(),
             enum_invariants: HashMap::new(),
             next_sym: Cell::new(0),
@@ -4901,9 +4911,18 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 self.construct_composite(spec_ty, &updated)
             }
-            SpecTy::Struct(struct_ty) => {
+            SpecTy::Record(struct_ty) => {
                 let mut updated = Vec::with_capacity(struct_ty.fields.len());
                 for (index, field_ty) in struct_ty.fields.iter().enumerate() {
+                    let field_value = self.project_field(value.clone(), spec_ty, index, span)?;
+                    updated.push(self.dangle_value(&field_ty.ty, &field_value, span)?);
+                }
+                self.construct_composite(spec_ty, &updated)
+            }
+            SpecTy::Struct { .. } => {
+                let fields = self.struct_fields_for_ty(spec_ty, span)?;
+                let mut updated = Vec::with_capacity(fields.len());
+                for (index, field_ty) in fields.iter().enumerate() {
                     let field_value = self.project_field(value.clone(), spec_ty, index, span)?;
                     updated.push(self.dangle_value(&field_ty.ty, &field_value, span)?);
                 }
@@ -6304,7 +6323,7 @@ impl<'tcx> Verifier<'tcx> {
         match spec_ty {
             SpecTy::Ref(inner) => self.ref_ptr(value, inner, span),
             SpecTy::Mut(inner) => self.mut_ptr(value, inner, span),
-            SpecTy::Struct(struct_ty) if struct_ty.name == "Ptr" => Ok(value.clone()),
+            SpecTy::Record(struct_ty) if struct_ty.name == "Ptr" => Ok(value.clone()),
             _ => Err(self.unsupported_result(
                 span,
                 format!("raw pointer requested through non-pointer place `{spec_ty:?}`"),
@@ -6508,7 +6527,7 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<SymValue, VerificationResult> {
         let field_len = match payload_ty {
             SpecTy::Tuple(items) => items.len(),
-            SpecTy::Struct(struct_ty) => struct_ty.fields.len(),
+            SpecTy::Record(struct_ty) => struct_ty.fields.len(),
             _ => {
                 return Err(self.unsupported_result(
                     self.report_span(),
@@ -6628,7 +6647,7 @@ impl<'tcx> Verifier<'tcx> {
     fn composite_spec_field_count(&self, ty: &SpecTy) -> Option<usize> {
         match ty {
             SpecTy::Tuple(items) => Some(items.len()),
-            SpecTy::Struct(struct_ty) => Some(struct_ty.fields.len()),
+            SpecTy::Record(struct_ty) => Some(struct_ty.fields.len()),
             _ => None,
         }
     }
@@ -6636,7 +6655,7 @@ impl<'tcx> Verifier<'tcx> {
     fn composite_spec_field_ty<'a>(&self, ty: &'a SpecTy, index: usize) -> Option<&'a SpecTy> {
         match ty {
             SpecTy::Tuple(items) => items.get(index),
-            SpecTy::Struct(struct_ty) => struct_ty.fields.get(index).map(|field| &field.ty),
+            SpecTy::Record(struct_ty) => struct_ty.fields.get(index).map(|field| &field.ty),
             _ => None,
         }
     }
@@ -6853,7 +6872,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(Some(bool_and(formulas)))
             }
-            SpecTy::Struct(struct_ty) => {
+            SpecTy::Record(struct_ty) => {
                 if let Some(formula) =
                     self.direct_struct_invariant_formula(ty, struct_ty, value, span)?
                 {
@@ -6879,8 +6898,155 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(Some(bool_and(formulas)))
             }
+            SpecTy::Struct { name, .. } => {
+                let fields = self.struct_fields_for_ty(ty, span)?;
+                let view = self.composite_ctor_view(ty, value, 0, span)?;
+                let mut formulas = vec![view.tag];
+                for (field, (_, field_value)) in fields.iter().zip(view.fields) {
+                    if let Some(formula) = self.spec_ty_formula(&field.ty, &field_value, span)? {
+                        formulas.push(formula);
+                    }
+                }
+                if let Some(invariant) = self.struct_invariants.get(name) {
+                    let mut env = HashMap::new();
+                    for field in &invariant.fields {
+                        let Some((index, _)) = fields
+                            .iter()
+                            .enumerate()
+                            .find(|(_, item)| item.name == field.name)
+                        else {
+                            return Err(self.unsupported_result(
+                                span,
+                                format!(
+                                    "struct `{name}` invariant field `{}` is missing",
+                                    field.name
+                                ),
+                            ));
+                        };
+                        let field_value = self.project_field(value.clone(), ty, index, span)?;
+                        env.insert(field.name.clone(), field_value);
+                    }
+                    formulas.push(self.contract_expr_to_bool(
+                        &env,
+                        &HashMap::new(),
+                        &invariant.condition,
+                    )?);
+                }
+                Ok(Some(bool_and(formulas)))
+            }
             SpecTy::Enum { .. } => self.enum_invariant_formula(ty, value, span).map(Some),
             SpecTy::TypeParam(_) => Ok(None),
+        }
+    }
+
+    fn struct_fields_for_ty(
+        &self,
+        ty: &SpecTy,
+        span: Span,
+    ) -> Result<Vec<StructFieldTy>, VerificationResult> {
+        let SpecTy::Struct { name, args } = ty else {
+            return Err(self.unsupported_result(span, "expected spec struct type".to_owned()));
+        };
+        let Some(def) = self.structs.get(name) else {
+            return Err(self.unsupported_result(span, format!("unknown spec struct `{name}`")));
+        };
+        if def.type_params.len() != args.len() {
+            return Err(self.unsupported_result(
+                span,
+                format!(
+                    "spec struct `{name}` expects {} type arguments, found {}",
+                    def.type_params.len(),
+                    args.len()
+                ),
+            ));
+        }
+        let bindings = def
+            .type_params
+            .iter()
+            .cloned()
+            .zip(args.iter().cloned())
+            .collect::<HashMap<_, _>>();
+        def.fields
+            .iter()
+            .map(|field| {
+                Ok(StructFieldTy {
+                    name: field.name.clone(),
+                    ty: self.instantiate_spec_ty(&field.ty, &bindings, span)?,
+                })
+            })
+            .collect()
+    }
+
+    fn instantiate_spec_ty(
+        &self,
+        ty: &SpecTy,
+        bindings: &HashMap<String, SpecTy>,
+        span: Span,
+    ) -> Result<SpecTy, VerificationResult> {
+        match ty {
+            SpecTy::Bool
+            | SpecTy::Int
+            | SpecTy::I8
+            | SpecTy::I16
+            | SpecTy::I32
+            | SpecTy::I64
+            | SpecTy::Isize
+            | SpecTy::U8
+            | SpecTy::U16
+            | SpecTy::U32
+            | SpecTy::U64
+            | SpecTy::Usize
+            | SpecTy::IntLiteral
+            | SpecTy::RustTy => Ok(ty.clone()),
+            SpecTy::Seq(inner) => Ok(SpecTy::Seq(Box::new(
+                self.instantiate_spec_ty(inner, bindings, span)?,
+            ))),
+            SpecTy::Tuple(items) => items
+                .iter()
+                .map(|item| self.instantiate_spec_ty(item, bindings, span))
+                .collect::<Result<Vec<_>, _>>()
+                .map(SpecTy::Tuple),
+            SpecTy::Record(struct_ty) => struct_ty
+                .fields
+                .iter()
+                .map(|field| {
+                    Ok(StructFieldTy {
+                        name: field.name.clone(),
+                        ty: self.instantiate_spec_ty(&field.ty, bindings, span)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(|fields| {
+                    SpecTy::Record(crate::spec::StructTy {
+                        name: struct_ty.name.clone(),
+                        fields,
+                    })
+                }),
+            SpecTy::Struct { name, args } => args
+                .iter()
+                .map(|arg| self.instantiate_spec_ty(arg, bindings, span))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|args| SpecTy::Struct {
+                    name: name.clone(),
+                    args,
+                }),
+            SpecTy::Enum { name, args } => args
+                .iter()
+                .map(|arg| self.instantiate_spec_ty(arg, bindings, span))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|args| SpecTy::Enum {
+                    name: name.clone(),
+                    args,
+                }),
+            SpecTy::TypeParam(name) => bindings.get(name).cloned().ok_or_else(|| {
+                self.unsupported_result(span, format!("unbound spec type parameter `{name}`"))
+            }),
+            SpecTy::Ref(inner) => Ok(SpecTy::Ref(Box::new(
+                self.instantiate_spec_ty(inner, bindings, span)?,
+            ))),
+            SpecTy::Mut(inner) => Ok(SpecTy::Mut(Box::new(
+                self.instantiate_spec_ty(inner, bindings, span)?,
+            ))),
         }
     }
 
@@ -6987,7 +7153,7 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(bool_and(formulas))
             }
-            SpecTy::Struct(struct_ty) => {
+            SpecTy::Record(struct_ty) => {
                 if struct_ty.name == "Ptr" {
                     return self.composite_tag_formula(ty, value, 0, span);
                 }
@@ -6995,6 +7161,20 @@ impl<'tcx> Verifier<'tcx> {
                 let mut formulas = Vec::with_capacity(struct_ty.fields.len() + 1);
                 formulas.push(view.tag);
                 for (field, (_, field_value)) in struct_ty.fields.iter().zip(view.fields) {
+                    formulas.push(self.resolve_formula_for_spec_ty(
+                        &field.ty,
+                        &field_value,
+                        span,
+                    )?);
+                }
+                Ok(bool_and(formulas))
+            }
+            SpecTy::Struct { .. } => {
+                let fields = self.struct_fields_for_ty(ty, span)?;
+                let view = self.composite_ctor_view(ty, value, 0, span)?;
+                let mut formulas = Vec::with_capacity(fields.len() + 1);
+                formulas.push(view.tag);
+                for (field, (_, field_value)) in fields.iter().zip(view.fields) {
                     formulas.push(self.resolve_formula_for_spec_ty(
                         &field.ty,
                         &field_value,
@@ -7589,7 +7769,7 @@ fn spec_ty_contains_mut_ref(ty: &SpecTy) -> bool {
         SpecTy::Ref(inner) => spec_ty_contains_mut_ref(inner),
         SpecTy::Seq(inner) => spec_ty_contains_mut_ref(inner),
         SpecTy::Tuple(items) => items.iter().any(spec_ty_contains_mut_ref),
-        SpecTy::Struct(struct_ty) => struct_ty
+        SpecTy::Record(struct_ty) => struct_ty
             .fields
             .iter()
             .any(|field| spec_ty_contains_mut_ref(&field.ty)),

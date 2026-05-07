@@ -262,7 +262,8 @@ pub enum SpecTy {
     Usize,
     Seq(Box<SpecTy>),
     Tuple(Vec<SpecTy>),
-    Struct(StructTy),
+    Struct { name: String, args: Vec<SpecTy> },
+    Record(StructTy),
     Enum { name: String, args: Vec<SpecTy> },
     TypeParam(String),
     Ref(Box<SpecTy>),
@@ -428,10 +429,6 @@ pub struct StructFieldTy {
     pub ty: SpecTy,
 }
 
-pub fn rust_ty_spec_ty() -> SpecTy {
-    SpecTy::RustTy
-}
-
 pub fn option_spec_ty(inner: SpecTy) -> SpecTy {
     SpecTy::Enum {
         name: "Option".to_owned(),
@@ -440,7 +437,7 @@ pub fn option_spec_ty(inner: SpecTy) -> SpecTy {
 }
 
 pub fn provenance_spec_ty() -> SpecTy {
-    SpecTy::Struct(StructTy {
+    SpecTy::Record(StructTy {
         name: "Provenance".to_owned(),
         fields: vec![StructFieldTy {
             name: "base".to_owned(),
@@ -450,7 +447,7 @@ pub fn provenance_spec_ty() -> SpecTy {
 }
 
 pub fn ptr_spec_ty() -> SpecTy {
-    SpecTy::Struct(StructTy {
+    SpecTy::Record(StructTy {
         name: "Ptr".to_owned(),
         fields: vec![
             StructFieldTy {
@@ -463,7 +460,7 @@ pub fn ptr_spec_ty() -> SpecTy {
             },
             StructFieldTy {
                 name: "ty".to_owned(),
-                ty: rust_ty_spec_ty(),
+                ty: SpecTy::RustTy,
             },
         ],
     })

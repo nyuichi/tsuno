@@ -251,6 +251,7 @@ struct RawGlobalGhostPrepass {
 #[derive(Debug, Clone)]
 pub struct GlobalGhostPrepass {
     pub enums: HashMap<String, EnumDef>,
+    pub structs: HashMap<String, StructDef>,
     pub struct_invariants: HashMap<String, TypedStructInvariant>,
     pub enum_invariants: HashMap<String, TypedEnumInvariant>,
     pub typed_pure_fns: Vec<TypedPureFnDef>,
@@ -549,6 +550,7 @@ fn type_global_ghost_prepass(
     )?;
     Ok(GlobalGhostPrepass {
         enums: raw.enums.clone(),
+        structs: raw.structs.clone(),
         struct_invariants,
         enum_invariants,
         typed_pure_fns,
@@ -1033,27 +1035,33 @@ fn unify_spec_tys(lhs: &SpecTy, rhs: &SpecTy) -> Result<SpecTy, String> {
             }
             Ok(SpecTy::Tuple(items))
         }
-        (SpecTy::Struct(lhs), SpecTy::Struct(rhs))
-            if lhs.name == rhs.name && lhs.fields.len() == rhs.fields.len() =>
-        {
-            let mut fields = Vec::with_capacity(lhs.fields.len());
-            for (lhs, rhs) in lhs.fields.iter().zip(rhs.fields.iter()) {
-                if lhs.name != rhs.name {
-                    return Err(format!(
-                        "type mismatch between `{}` and `{}`",
-                        display_spec_field_ty(lhs),
-                        display_spec_field_ty(rhs)
-                    ));
-                }
-                fields.push(StructFieldTy {
-                    name: lhs.name.clone(),
-                    ty: unify_spec_tys(&lhs.ty, &rhs.ty)?,
-                });
+        (
+            SpecTy::Struct {
+                name: lhs_name,
+                args: lhs_args,
+            },
+            SpecTy::Struct {
+                name: rhs_name,
+                args: rhs_args,
+            },
+        ) if lhs_name == rhs_name && lhs_args.len() == rhs_args.len() => {
+            let mut args = Vec::with_capacity(lhs_args.len());
+            for (lhs_arg, rhs_arg) in lhs_args.iter().zip(rhs_args) {
+                args.push(unify_spec_tys(lhs_arg, rhs_arg)?);
             }
-            Ok(SpecTy::Struct(StructTy {
-                name: lhs.name.clone(),
-                fields,
-            }))
+            Ok(SpecTy::Struct {
+                name: lhs_name.clone(),
+                args,
+            })
+        }
+        (SpecTy::Struct { name, .. }, SpecTy::Record(record))
+        | (SpecTy::Record(record), SpecTy::Struct { name, .. })
+            if name == &record.name =>
+        {
+            Ok(SpecTy::Struct {
+                name: name.clone(),
+                args: vec![],
+            })
         }
         (
             SpecTy::Enum {
@@ -1112,7 +1120,21 @@ fn display_spec_ty(ty: &SpecTy) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        SpecTy::Struct(struct_ty) => struct_ty.name.clone(),
+        SpecTy::Struct { name, args } => {
+            if args.is_empty() {
+                name.clone()
+            } else {
+                format!(
+                    "{}<{}>",
+                    name,
+                    args.iter()
+                        .map(display_spec_ty)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        }
+        SpecTy::Record(struct_ty) => struct_ty.name.clone(),
         SpecTy::Enum { name, args } => {
             if args.is_empty() {
                 name.clone()
@@ -1240,7 +1262,8 @@ fn is_fully_inferred_spec_ty(ty: &SpecTy) -> bool {
     match ty {
         SpecTy::IntLiteral => false,
         SpecTy::Tuple(items) => items.iter().all(is_fully_inferred_spec_ty),
-        SpecTy::Struct(struct_ty) => struct_ty
+        SpecTy::Struct { args, .. } => args.iter().all(is_fully_inferred_spec_ty),
+        SpecTy::Record(struct_ty) => struct_ty
             .fields
             .iter()
             .all(|field| is_fully_inferred_spec_ty(&field.ty)),
@@ -1390,7 +1413,7 @@ pub fn spec_ty_for_rust_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<Spec
                     ty: spec_ty_for_rust_ty(tcx, field.ty(tcx, args))?,
                 });
             }
-            Ok(SpecTy::Struct(StructTy { name, fields }))
+            Ok(SpecTy::Record(StructTy { name, fields }))
         }
         other => Err(format!("unsupported type {other:?}")),
     }
@@ -1438,7 +1461,15 @@ fn resolve_named_struct_spec_ty(
             .map(|item| resolve_named_struct_spec_ty(item, enum_defs, struct_defs, type_params))
             .collect::<Result<Vec<_>, _>>()
             .map(SpecTy::Tuple),
-        SpecTy::Struct(struct_ty) => struct_ty
+        SpecTy::Struct { name, args } => args
+            .iter()
+            .map(|arg| resolve_named_struct_spec_ty(arg, enum_defs, struct_defs, type_params))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|args| SpecTy::Struct {
+                name: name.clone(),
+                args,
+            }),
+        SpecTy::Record(struct_ty) => struct_ty
             .fields
             .iter()
             .map(|field| {
@@ -1454,7 +1485,7 @@ fn resolve_named_struct_spec_ty(
             })
             .collect::<Result<Vec<_>, String>>()
             .map(|fields| {
-                SpecTy::Struct(StructTy {
+                SpecTy::Record(StructTy {
                     name: struct_ty.name.clone(),
                     fields,
                 })
@@ -1493,41 +1524,10 @@ fn resolve_named_struct_spec_ty(
                 .iter()
                 .map(|arg| resolve_named_struct_spec_ty(arg, enum_defs, struct_defs, type_params))
                 .collect::<Result<Vec<_>, _>>()?;
-            let bindings = struct_def
-                .type_params
-                .iter()
-                .cloned()
-                .zip(args)
-                .collect::<HashMap<_, _>>();
-            let def_type_params = struct_def
-                .type_params
-                .iter()
-                .cloned()
-                .collect::<HashSet<_>>();
-            struct_def
-                .fields
-                .iter()
-                .map(|field| {
-                    let field_ty = resolve_named_struct_spec_ty(
-                        &field.ty,
-                        enum_defs,
-                        struct_defs,
-                        &def_type_params,
-                    )?;
-                    let ty = try_instantiate_spec_ty(&field_ty, &bindings)
-                        .ok_or_else(|| format!("unbound spec type parameter in `{name}`"))?;
-                    Ok(StructFieldTy {
-                        name: field.name.clone(),
-                        ty,
-                    })
-                })
-                .collect::<Result<Vec<_>, String>>()
-                .map(|fields| {
-                    SpecTy::Struct(StructTy {
-                        name: name.clone(),
-                        fields,
-                    })
-                })
+            Ok(SpecTy::Struct {
+                name: name.clone(),
+                args,
+            })
         }
         SpecTy::TypeParam(name) => type_params
             .contains(name)
@@ -1658,7 +1658,13 @@ fn validate_named_spec_ty(
             }
             Ok(())
         }
-        SpecTy::Struct(struct_ty) => {
+        SpecTy::Struct { args, .. } => {
+            for arg in args {
+                validate_named_spec_ty(arg, enum_defs, type_params)?;
+            }
+            Ok(())
+        }
+        SpecTy::Record(struct_ty) => {
             for field in &struct_ty.fields {
                 validate_named_spec_ty(&field.ty, enum_defs, type_params)?;
             }
@@ -1721,7 +1727,15 @@ fn try_instantiate_spec_ty(ty: &SpecTy, bindings: &HashMap<String, SpecTy>) -> O
             .map(|item| try_instantiate_spec_ty(item, bindings))
             .collect::<Option<Vec<_>>>()
             .map(SpecTy::Tuple),
-        SpecTy::Struct(struct_ty) => struct_ty
+        SpecTy::Struct { name, args } => args
+            .iter()
+            .map(|arg| try_instantiate_spec_ty(arg, bindings))
+            .collect::<Option<Vec<_>>>()
+            .map(|args| SpecTy::Struct {
+                name: name.clone(),
+                args,
+            }),
+        SpecTy::Record(struct_ty) => struct_ty
             .fields
             .iter()
             .map(|field| {
@@ -1732,7 +1746,7 @@ fn try_instantiate_spec_ty(ty: &SpecTy, bindings: &HashMap<String, SpecTy>) -> O
             })
             .collect::<Option<Vec<_>>>()
             .map(|fields| {
-                SpecTy::Struct(StructTy {
+                SpecTy::Record(StructTy {
                     name: struct_ty.name.clone(),
                     fields,
                 })
@@ -1803,8 +1817,23 @@ fn infer_type_param_bindings(
                 Ok(())
             }
         },
-        SpecTy::Struct(struct_ty) => match actual {
-            SpecTy::Struct(actual_struct)
+        SpecTy::Struct { name, args } => match actual {
+            SpecTy::Struct {
+                name: actual_name,
+                args: actual_args,
+            } if name == actual_name && args.len() == actual_args.len() => {
+                for (arg, actual_arg) in args.iter().zip(actual_args) {
+                    infer_type_param_bindings(arg, actual_arg, bindings)?;
+                }
+                Ok(())
+            }
+            _ => {
+                let _ = unify_spec_tys(pattern, actual)?;
+                Ok(())
+            }
+        },
+        SpecTy::Record(struct_ty) => match actual {
+            SpecTy::Record(actual_struct)
                 if struct_ty.name == actual_struct.name
                     && struct_ty.fields.len() == actual_struct.fields.len() =>
             {
@@ -2010,15 +2039,23 @@ fn type_struct_lit_expr(
     expected: Option<&SpecTy>,
     type_value: &mut impl FnMut(&Expr, Option<&SpecTy>) -> Result<TypedExpr, String>,
 ) -> Result<TypedExpr, String> {
-    let expected_struct = match expected {
-        Some(SpecTy::Struct(struct_ty)) if struct_ty.name == name => Some(struct_ty),
+    let expected_record = match expected {
+        Some(SpecTy::Record(struct_ty)) if struct_ty.name == name => Some(struct_ty),
         Some(other) => {
-            return Err(format!(
-                "struct literal `{name}` requires `{name}`, found `{}`",
-                display_spec_ty(other)
-            ));
+            if !matches!(other, SpecTy::Struct { name: expected_name, .. } if expected_name == name)
+            {
+                return Err(format!(
+                    "struct literal `{name}` requires `{name}`, found `{}`",
+                    display_spec_ty(other)
+                ));
+            }
+            None
         }
         None => None,
+    };
+    let expected_struct_fields = match expected {
+        Some(SpecTy::Struct { .. }) => None,
+        _ => expected_record.map(|struct_ty| struct_ty.fields.clone()),
     };
     let mut seen = HashSet::new();
     let mut struct_fields = Vec::with_capacity(fields.len());
@@ -2030,8 +2067,10 @@ fn type_struct_lit_expr(
                 field.name
             ));
         }
-        let expected_field = expected_struct
-            .and_then(|struct_ty| struct_ty.field(&field.name).map(|(_, field)| &field.ty));
+        let expected_field = expected_struct_fields
+            .as_ref()
+            .and_then(|fields| fields.iter().find(|item| item.name == field.name))
+            .map(|field| &field.ty);
         let typed = type_value(&field.value, expected_field)?;
         struct_fields.push(StructFieldTy {
             name: field.name.clone(),
@@ -2039,8 +2078,8 @@ fn type_struct_lit_expr(
         });
         typed_fields.push(typed);
     }
-    if let Some(expected_struct) = expected_struct {
-        for expected_field in &expected_struct.fields {
+    if let Some(expected_fields) = &expected_struct_fields {
+        for expected_field in expected_fields {
             if !seen.contains(&expected_field.name) {
                 return Err(format!(
                     "struct literal `{name}` is missing field `{}`",
@@ -2048,23 +2087,33 @@ fn type_struct_lit_expr(
                 ));
             }
         }
-        struct_fields = expected_struct.fields.clone();
+        struct_fields = expected_fields.clone();
         let mut by_name = fields
             .iter()
             .zip(typed_fields)
             .map(|(field, typed)| (field.name.clone(), typed))
             .collect::<HashMap<_, _>>();
-        typed_fields = expected_struct
-            .fields
+        typed_fields = expected_fields
             .iter()
             .map(|field| by_name.remove(&field.name).expect("checked field exists"))
             .collect();
     }
-    Ok(TypedExpr {
-        ty: SpecTy::Struct(StructTy {
+    let ty = match expected {
+        Some(SpecTy::Struct { name, args }) => SpecTy::Struct {
+            name: name.clone(),
+            args: args.clone(),
+        },
+        Some(SpecTy::Record(_)) => SpecTy::Record(StructTy {
             name: name.to_owned(),
             fields: struct_fields,
         }),
+        _ => SpecTy::Record(StructTy {
+            name: name.to_owned(),
+            fields: struct_fields,
+        }),
+    };
+    Ok(TypedExpr {
+        ty,
         kind: TypedExprKind::StructLit {
             fields: typed_fields,
         },
@@ -3033,24 +3082,34 @@ fn infer_common_expr_types_with_expected(
             &mut |item, expected| infer_expr(item, expected, inferred),
         )?)),
         Expr::StructLit { name, fields } => {
-            let expected_struct = match expected {
-                Some(SpecTy::Struct(struct_ty)) if struct_ty.name == *name => Some(struct_ty),
+            let expected_record = match expected {
+                Some(SpecTy::Record(struct_ty)) if struct_ty.name == *name => Some(struct_ty),
                 _ => None,
             };
+            let expected_fields = expected_record.map(|struct_ty| struct_ty.fields.clone());
             let mut typed_fields = Vec::with_capacity(fields.len());
             for field in fields {
-                let field_expected = expected_struct
-                    .and_then(|struct_ty| struct_ty.field(&field.name).map(|(_, field)| &field.ty));
+                let field_expected = expected_fields
+                    .as_ref()
+                    .and_then(|fields| fields.iter().find(|item| item.name == field.name))
+                    .map(|field| &field.ty);
                 let field_ty = infer_expr(&field.value, field_expected, inferred)?;
                 typed_fields.push(StructFieldTy {
                     name: field.name.clone(),
                     ty: known_spec_ty(&field_ty).unwrap_or(SpecTy::IntLiteral),
                 });
             }
-            Ok(Some(InferredExprTy::Known(SpecTy::Struct(StructTy {
-                name: name.clone(),
-                fields: typed_fields,
-            }))))
+            let ty = match expected {
+                Some(SpecTy::Struct { name, args }) => SpecTy::Struct {
+                    name: name.clone(),
+                    args: args.clone(),
+                },
+                _ => SpecTy::Record(StructTy {
+                    name: name.clone(),
+                    fields: typed_fields,
+                }),
+            };
+            Ok(Some(InferredExprTy::Known(ty)))
         }
         Expr::Call {
             func,
@@ -3498,10 +3557,11 @@ fn infer_named_field_expr_type(
     name: &str,
 ) -> Result<InferredExprTy, String> {
     match base_ty {
-        InferredExprTy::Known(SpecTy::Struct(struct_ty)) => Ok(struct_ty
+        InferredExprTy::Known(SpecTy::Record(struct_ty)) => Ok(struct_ty
             .field(name)
             .map(|(_, field)| InferredExprTy::Known(field.ty.clone()))
             .unwrap_or(InferredExprTy::Unknown)),
+        InferredExprTy::Known(SpecTy::Struct { .. }) => Ok(InferredExprTy::Unknown),
         InferredExprTy::Known(SpecTy::Ref(inner)) if name == "deref" => {
             Ok(InferredExprTy::Known(*inner))
         }
@@ -3526,7 +3586,7 @@ fn infer_tuple_field_expr_type(base_ty: InferredExprTy) -> Result<InferredExprTy
     match base_ty {
         InferredExprTy::Known(SpecTy::Tuple(_)) => Ok(InferredExprTy::Unknown),
         InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
-        InferredExprTy::Known(SpecTy::Struct(_)) => {
+        InferredExprTy::Known(SpecTy::Record(_)) => {
             Err("tuple field access is not supported on struct types".to_owned())
         }
         InferredExprTy::Known(other) => Err(format!(
@@ -4547,7 +4607,7 @@ fn type_named_field_expr(base: TypedExpr, name: &str) -> Result<TypedExpr, Strin
         }
         _ => {}
     }
-    let SpecTy::Struct(struct_ty) = &base.ty else {
+    let SpecTy::Record(struct_ty) = &base.ty else {
         return Err(format!(
             "field access requires a struct, found `{}`",
             display_spec_ty(&base.ty)
@@ -4610,7 +4670,7 @@ fn type_cast_expr(arg: TypedExpr, ty: &SpecTy) -> Result<TypedExpr, String> {
 
 fn type_tuple_field_expr(base: TypedExpr, index: usize) -> Result<TypedExpr, String> {
     let SpecTy::Tuple(items) = &base.ty else {
-        if matches!(base.ty, SpecTy::Struct(_)) {
+        if matches!(base.ty, SpecTy::Record(_)) {
             return Err("tuple field access is not supported on struct types".to_owned());
         }
         return Err(format!(
@@ -4746,7 +4806,7 @@ fn variant_selector_payload(
     if !ctor.field_names.is_empty() && ctor.field_names.iter().all(Option::is_some) {
         Ok((
             ctor_index,
-            SpecTy::Struct(StructTy {
+            SpecTy::Record(StructTy {
                 name: format!("{}::{}", enum_def.name, ctor.name),
                 fields: ctor
                     .field_names
@@ -6636,7 +6696,7 @@ fn typed_contract_value_pattern(
             })
         }
         ValuePattern::StructLit { name, fields } => {
-            let SpecTy::Struct(struct_ty) = expected else {
+            let SpecTy::Record(struct_ty) = expected else {
                 return Err(format!(
                     "struct raw pattern `{name}` requires a struct type, got {}",
                     display_spec_ty(expected)
@@ -7112,7 +7172,7 @@ fn infer_value_pattern_types(
             Ok(())
         }
         ValuePattern::StructLit { name, fields } => {
-            let SpecTy::Struct(struct_ty) = expected else {
+            let SpecTy::Record(struct_ty) = expected else {
                 return Err(format!(
                     "struct raw pattern `{name}` requires a struct type, got {}",
                     display_spec_ty(expected)
@@ -7255,7 +7315,7 @@ fn typed_value_pattern(
             })
         }
         ValuePattern::StructLit { name, fields } => {
-            let SpecTy::Struct(struct_ty) = expected else {
+            let SpecTy::Record(struct_ty) = expected else {
                 return Err(format!(
                     "struct raw pattern `{name}` requires a struct type, got {}",
                     display_spec_ty(expected)
@@ -10453,6 +10513,7 @@ mod tests {
     fn global_ghost_prepass_exposes_only_typed_output() {
         let ghosts = GlobalGhostPrepass {
             enums: HashMap::new(),
+            structs: HashMap::new(),
             struct_invariants: HashMap::new(),
             enum_invariants: HashMap::new(),
             typed_pure_fns: vec![TypedPureFnDef {
