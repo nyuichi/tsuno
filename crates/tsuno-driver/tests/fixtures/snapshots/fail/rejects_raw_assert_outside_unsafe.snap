@@ -5,7 +5,7 @@ expression: result
 status: Some(1)
 stdout:
 UNSUPPORTED rejects_raw_assert_outside_unsafe
-  raw assertions outside unsafe blocks are unsupported: src/main.rs:2:1: 2:53
+  raw assertions outside unsafe blocks are unsupported: src/main.rs:2:1: 2:77
   src/main.rs:3:9: 3:11
 PASS main
   all assertions discharged

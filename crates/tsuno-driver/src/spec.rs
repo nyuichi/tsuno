@@ -36,6 +36,10 @@ pub enum Expr {
         ctor_name: String,
         type_args: Vec<SpecTy>,
     },
+    Cast {
+        arg: Box<Expr>,
+        ty: SpecTy,
+    },
     Index {
         base: Box<Expr>,
         index: Box<Expr>,
@@ -127,6 +131,9 @@ pub enum TypedExprKind {
         enum_name: String,
         ctor_name: String,
         ctor_index: usize,
+    },
+    Cast {
+        arg: Box<TypedExpr>,
     },
     Index {
         base: Box<TypedExpr>,
@@ -255,7 +262,8 @@ pub enum SpecTy {
     Usize,
     Seq(Box<SpecTy>),
     Tuple(Vec<SpecTy>),
-    Struct(StructTy),
+    Struct { name: String, args: Vec<SpecTy> },
+    Record(StructTy),
     Enum { name: String, args: Vec<SpecTy> },
     TypeParam(String),
     Ref(Box<SpecTy>),
@@ -274,7 +282,7 @@ pub struct PureFnDef {
     pub type_params: Vec<String>,
     pub params: Vec<PureFnParam>,
     pub result_ty: SpecTy,
-    pub body: Expr,
+    pub body: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,8 +341,7 @@ pub enum RawPattern {
     },
     DeallocToken {
         base: Expr,
-        size: Expr,
-        alignment: Expr,
+        layout: Expr,
     },
 }
 
@@ -421,10 +428,6 @@ pub struct StructFieldTy {
     pub ty: SpecTy,
 }
 
-pub fn rust_ty_spec_ty() -> SpecTy {
-    SpecTy::RustTy
-}
-
 pub fn option_spec_ty(inner: SpecTy) -> SpecTy {
     SpecTy::Enum {
         name: "Option".to_owned(),
@@ -433,33 +436,24 @@ pub fn option_spec_ty(inner: SpecTy) -> SpecTy {
 }
 
 pub fn provenance_spec_ty() -> SpecTy {
-    SpecTy::Struct(StructTy {
+    SpecTy::Struct {
         name: "Provenance".to_owned(),
-        fields: vec![StructFieldTy {
-            name: "base".to_owned(),
-            ty: SpecTy::Usize,
-        }],
-    })
+        args: Vec::new(),
+    }
 }
 
 pub fn ptr_spec_ty() -> SpecTy {
-    SpecTy::Struct(StructTy {
+    SpecTy::Struct {
         name: "Ptr".to_owned(),
-        fields: vec![
-            StructFieldTy {
-                name: "addr".to_owned(),
-                ty: SpecTy::Usize,
-            },
-            StructFieldTy {
-                name: "prov".to_owned(),
-                ty: option_spec_ty(provenance_spec_ty()),
-            },
-            StructFieldTy {
-                name: "ty".to_owned(),
-                ty: rust_ty_spec_ty(),
-            },
-        ],
-    })
+        args: Vec::new(),
+    }
+}
+
+pub fn layout_spec_ty() -> SpecTy {
+    SpecTy::Struct {
+        name: "Layout".to_owned(),
+        args: Vec::new(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -474,6 +468,7 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Rem,
+    BitAnd,
     Concat,
     Eq,
     Ne,

@@ -25,6 +25,22 @@ struct Mut<T> {
     ptr: Ptr,
 }
 
+struct Layout {
+    size: usize,
+    align: usize,
+} where align != 0usize &&
+    (align & (align - 1usize)) == 0usize &&
+    size + align - 1usize <= (isize::MAX as usize);
+
+fn layout_of(ty: RustTy) -> Layout;
+
+fn layout_of_i32()
+  req true
+  ens layout_of({type i32}) == Layout { size: 4usize, align: 4usize }
+{
+    assume false;
+}
+
 enum Nat {
     Zero,
     Succ(Nat),

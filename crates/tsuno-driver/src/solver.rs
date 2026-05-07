@@ -10,9 +10,9 @@ use std::thread;
 use std::time::Duration;
 
 use crate::spec::{
-    BinaryOp, EnumDef, RustTyKey, SpecTy, StructTy, UnaryOp, option_spec_ty, ptr_spec_ty,
+    BinaryOp, EnumDef, RustTyKey, SpecTy, StructDef, StructTy, UnaryOp, option_spec_ty, ptr_spec_ty,
 };
-use z3::ast::{self, Ast, Bool, Dynamic, Int, Seq as Z3Seq};
+use z3::ast::{self, Ast, BV, Bool, Dynamic, Int, Seq as Z3Seq};
 use z3::{
     Config, Context, DeclKind, FuncDecl, Pattern, RecFuncDecl, SatResult, Solver as Z3Solver, Sort,
     SortKind, Symbol,
@@ -272,6 +272,7 @@ pub(crate) struct Solver {
     next_subtype_id: Cell<u32>,
     next_ctor_tag: Cell<u32>,
     enum_defs: RefCell<BTreeMap<String, EnumDef>>,
+    struct_defs: RefCell<BTreeMap<String, StructDef>>,
     enum_family_encodings: RefCell<BTreeMap<String, Rc<EnumFamilyEncoding>>>,
     type_encodings: RefCell<BTreeMap<SpecTy, Rc<TypeEncoding>>>,
     asserted_type_axioms: RefCell<BTreeSet<SpecTy>>,
@@ -305,6 +306,7 @@ impl Solver {
             next_subtype_id: Cell::new(0),
             next_ctor_tag: Cell::new(0),
             enum_defs: RefCell::new(BTreeMap::new()),
+            struct_defs: RefCell::new(BTreeMap::new()),
             enum_family_encodings: RefCell::new(BTreeMap::new()),
             type_encodings: RefCell::new(BTreeMap::new()),
             asserted_type_axioms: RefCell::new(BTreeSet::new()),
@@ -325,6 +327,10 @@ impl Solver {
 
     pub(crate) fn register_enum_def(&self, def: EnumDef) {
         self.enum_defs.borrow_mut().insert(def.name.clone(), def);
+    }
+
+    pub(crate) fn register_struct_def(&self, def: StructDef) {
+        self.struct_defs.borrow_mut().insert(def.name.clone(), def);
     }
 
     pub(crate) fn enum_ctor_index(
@@ -1081,7 +1087,8 @@ impl Solver {
                 .zip(self.int_term(rhs).as_i64())
                 .map(|(lhs, rhs)| lhs == rhs)),
             SpecTy::Tuple(_)
-            | SpecTy::Struct(_)
+            | SpecTy::Struct { .. }
+            | SpecTy::Record(_)
             | SpecTy::Enum { .. }
             | SpecTy::Ref(_)
             | SpecTy::Mut(_) => self.try_ground_composite_eq_for_spec_ty(ty, lhs, rhs),
@@ -1286,6 +1293,11 @@ impl Solver {
             BinaryOp::Add => self.wrap_int(&(self.int_term(lhs) + self.int_term(rhs))),
             BinaryOp::Sub => self.wrap_int(&(self.int_term(lhs) - self.int_term(rhs))),
             BinaryOp::Mul => self.wrap_int(&(self.int_term(lhs) * self.int_term(rhs))),
+            BinaryOp::BitAnd => {
+                let lhs = BV::from_int(&self.int_term(lhs), self.pointer_width_bits as u32);
+                let rhs = BV::from_int(&self.int_term(rhs), self.pointer_width_bits as u32);
+                self.wrap_int(&(lhs & rhs).to_int(false))
+            }
             BinaryOp::Rem if matches!(lhs_ty, SpecTy::Enum { name, args } if name == "Nat" && args.is_empty()) => {
                 self.wrap_int(&(self.nat_to_int_term_with_z3(lhs, solver)? % self.int_term(rhs)))
             }
@@ -1318,6 +1330,7 @@ impl Solver {
             | BinaryOp::Add
             | BinaryOp::Sub
             | BinaryOp::Mul
+            | BinaryOp::BitAnd
             | BinaryOp::Rem
             | BinaryOp::Concat => {
                 return Ok(None);
@@ -1706,7 +1719,8 @@ impl Solver {
             | SpecTy::Usize => (TypeEncodingKind::Int, self.value_sort.clone()),
             SpecTy::Seq(_) => (TypeEncodingKind::Seq, self.seq_value_sort.clone()),
             SpecTy::Tuple(_)
-            | SpecTy::Struct(_)
+            | SpecTy::Struct { .. }
+            | SpecTy::Record(_)
             | SpecTy::Enum { .. }
             | SpecTy::Ref(_)
             | SpecTy::Mut(_) => (
@@ -2145,7 +2159,7 @@ impl Solver {
                 }
                 Ok(Some(bool_conjoin(forms)))
             }
-            SpecTy::Struct(struct_ty) => {
+            SpecTy::Record(struct_ty) => {
                 let composite = self.composite_encoding(ty, solver)?;
                 if struct_ty.name == "Ptr" {
                     return Ok(Some(self.tag_formula(&composite, 0, value)?));
@@ -2155,6 +2169,35 @@ impl Solver {
                     let field = self.project_composite_field(&composite, value, index)?;
                     if let Some(formula) =
                         self.field_invariant_formula(&field_ty.ty, &field, solver)?
+                    {
+                        forms.push(formula);
+                    }
+                }
+                Ok(Some(bool_conjoin(forms)))
+            }
+            SpecTy::Struct { name, args } => {
+                let composite = self.composite_encoding(ty, solver)?;
+                if name == "Ptr" {
+                    return Ok(Some(self.tag_formula(&composite, 0, value)?));
+                }
+                let struct_def = self
+                    .struct_defs
+                    .borrow()
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown spec struct `{name}`"))?;
+                let bindings = struct_def
+                    .type_params
+                    .iter()
+                    .cloned()
+                    .zip(args.iter().cloned())
+                    .collect::<BTreeMap<_, _>>();
+                let mut forms = vec![self.tag_formula(&composite, 0, value)?];
+                for (index, field_ty) in struct_def.fields.iter().enumerate() {
+                    let field = self.project_composite_field(&composite, value, index)?;
+                    let field_ty = self.instantiate_named_field_ty(&field_ty.ty, &bindings)?;
+                    if let Some(formula) =
+                        self.field_invariant_formula(&field_ty, &field, solver)?
                     {
                         forms.push(formula);
                     }
@@ -2206,7 +2249,41 @@ impl Solver {
                     .map(|(index, item)| (format!("_{index}"), item.clone()))
                     .collect(),
             )]),
-            SpecTy::Struct(StructTy { fields, .. }) => Ok(vec![(
+            SpecTy::Struct { name, args } => {
+                let struct_def = self
+                    .struct_defs
+                    .borrow()
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown spec struct `{name}`"))?;
+                if struct_def.type_params.len() != args.len() {
+                    return Err(format!(
+                        "spec struct `{name}` expects {} type arguments, found {}",
+                        struct_def.type_params.len(),
+                        args.len()
+                    ));
+                }
+                let bindings = struct_def
+                    .type_params
+                    .iter()
+                    .cloned()
+                    .zip(args.iter().cloned())
+                    .collect::<BTreeMap<_, _>>();
+                Ok(vec![(
+                    String::new(),
+                    struct_def
+                        .fields
+                        .iter()
+                        .map(|field| {
+                            Ok((
+                                field.name.clone(),
+                                self.instantiate_named_field_ty(&field.ty, &bindings)?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, String>>()?,
+                )])
+            }
+            SpecTy::Record(StructTy { fields, .. }) => Ok(vec![(
                 String::new(),
                 fields
                     .iter()
@@ -2290,7 +2367,7 @@ impl Solver {
                     .map(|item| self.instantiate_named_field_ty(item, bindings))
                     .collect::<Result<Vec<_>, _>>()?,
             )),
-            SpecTy::Struct(struct_ty) => Ok(SpecTy::Struct(StructTy {
+            SpecTy::Record(struct_ty) => Ok(SpecTy::Record(StructTy {
                 name: struct_ty.name.clone(),
                 fields: struct_ty
                     .fields
@@ -2303,6 +2380,13 @@ impl Solver {
                     })
                     .collect::<Result<Vec<_>, String>>()?,
             })),
+            SpecTy::Struct { name, args } => Ok(SpecTy::Struct {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|arg| self.instantiate_named_field_ty(arg, bindings))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
             SpecTy::Enum { name, args } => Ok(SpecTy::Enum {
                 name: name.clone(),
                 args: args
@@ -2361,7 +2445,8 @@ impl Solver {
                     .collect::<Vec<_>>()
                     .join("_")
             ),
-            SpecTy::Struct(struct_ty) => format!("struct_{}", sanitize(&struct_ty.name)),
+            SpecTy::Record(struct_ty) => format!("struct_{}", sanitize(&struct_ty.name)),
+            SpecTy::Struct { name, args } => self.instantiated_named_type_name(name, args),
             SpecTy::Enum { name, args } => self.instantiated_named_type_name(name, args),
             SpecTy::Seq(inner) => format!("seq_{}", self.type_name(inner)),
             SpecTy::Ref(inner) => format!("ref_{}", self.type_name(inner)),
@@ -2569,7 +2654,7 @@ mod tests {
                 .expect("tuple encoding");
             let struct_encoding = solver
                 .type_encoding(
-                    &SpecTy::Struct(StructTy {
+                    &SpecTy::Record(StructTy {
                         name: "Pair".to_owned(),
                         fields: vec![
                             StructFieldTy {
