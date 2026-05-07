@@ -11,8 +11,8 @@ use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
     EnumDef, Expr, GhostMatchArm, LemmaDef, MatchBinding, MatchPattern, PureFnDef, PureFnParam,
     RawAssertion, RawPattern, RustTyKey, RustTypeExpr, SpecTy, StructDef, StructFieldTy, StructTy,
-    TypedExpr, TypedExprKind, TypedMatchArm, TypedMatchBinding, ValuePattern, option_spec_ty,
-    ptr_spec_ty,
+    TypedExpr, TypedExprKind, TypedMatchArm, TypedMatchBinding, ValuePattern, layout_spec_ty,
+    option_spec_ty, ptr_spec_ty,
 };
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{
@@ -113,8 +113,7 @@ pub enum TypedRawPattern {
     },
     DeallocToken {
         base: TypedExpr,
-        size: TypedExpr,
-        alignment: TypedExpr,
+        layout: TypedExpr,
     },
 }
 
@@ -5971,12 +5970,8 @@ fn resolve_raw_pattern_env_into(
             )?;
             Ok(())
         }
-        RawPattern::DeallocToken {
-            base,
-            size,
-            alignment,
-        } => {
-            for expr in [base, size, alignment] {
+        RawPattern::DeallocToken { base, layout } => {
+            for expr in [base, layout] {
                 let expr_resolved = resolve_expr_env(
                     expr,
                     pure_fns,
@@ -6175,12 +6170,8 @@ fn infer_raw_pattern_types_into(
             }
             Ok(())
         }
-        RawPattern::DeallocToken {
-            base,
-            size,
-            alignment,
-        } => {
-            for expr in [base, size, alignment] {
+        RawPattern::DeallocToken { base, layout } => {
+            for expr in [base, layout] {
                 infer_body_expr_types(
                     expr,
                     pure_fns,
@@ -6389,11 +6380,7 @@ fn typed_lemma_raw_pattern(
         RawPattern::PointsToSugar { .. } => {
             Err("`|->` raw sugar in unsafe lemmas is unsupported; use `PointsTo(...)`".to_owned())
         }
-        RawPattern::DeallocToken {
-            base,
-            size,
-            alignment,
-        } => Ok(TypedRawPattern::DeallocToken {
+        RawPattern::DeallocToken { base, layout } => Ok(TypedRawPattern::DeallocToken {
             base: typed_contract_raw_expr(
                 base,
                 pure_fns,
@@ -6405,8 +6392,8 @@ fn typed_lemma_raw_pattern(
                 inferred,
                 Some(&SpecTy::Usize),
             )?,
-            size: typed_contract_raw_expr(
-                size,
+            layout: typed_contract_raw_expr(
+                layout,
                 pure_fns,
                 enum_defs,
                 spec_scope,
@@ -6414,18 +6401,7 @@ fn typed_lemma_raw_pattern(
                 allow_result,
                 result_ty,
                 inferred,
-                Some(&SpecTy::Usize),
-            )?,
-            alignment: typed_contract_raw_expr(
-                alignment,
-                pure_fns,
-                enum_defs,
-                spec_scope,
-                params,
-                allow_result,
-                result_ty,
-                inferred,
-                Some(&SpecTy::Usize),
+                Some(&layout_spec_ty()),
             )?,
         }),
     }
@@ -6566,11 +6542,7 @@ fn typed_contract_raw_pattern<'tcx>(
             )?;
             Ok(TypedRawPattern::PointsTo { addr, ty, value })
         }
-        RawPattern::DeallocToken {
-            base,
-            size,
-            alignment,
-        } => Ok(TypedRawPattern::DeallocToken {
+        RawPattern::DeallocToken { base, layout } => Ok(TypedRawPattern::DeallocToken {
             base: typed_contract_raw_expr(
                 base,
                 pure_fns,
@@ -6582,8 +6554,8 @@ fn typed_contract_raw_pattern<'tcx>(
                 inferred,
                 Some(&SpecTy::Usize),
             )?,
-            size: typed_contract_raw_expr(
-                size,
+            layout: typed_contract_raw_expr(
+                layout,
                 pure_fns,
                 enum_defs,
                 spec_scope,
@@ -6591,18 +6563,7 @@ fn typed_contract_raw_pattern<'tcx>(
                 allow_result,
                 result_ty,
                 inferred,
-                Some(&SpecTy::Usize),
-            )?,
-            alignment: typed_contract_raw_expr(
-                alignment,
-                pure_fns,
-                enum_defs,
-                spec_scope,
-                params,
-                allow_result,
-                result_ty,
-                inferred,
-                Some(&SpecTy::Usize),
+                Some(&layout_spec_ty()),
             )?,
         }),
     }
@@ -6885,26 +6846,33 @@ fn infer_contract_raw_pattern_types(
             result_ty,
             inferred,
         ),
-        RawPattern::DeallocToken {
-            base,
-            size,
-            alignment,
-        } => {
-            for expr in [base, size, alignment] {
-                infer_contract_expr_types_with_expected(
-                    expr,
-                    pure_fns,
-                    enum_defs,
-                    &HashSet::new(),
-                    spec_scope,
-                    params,
-                    allow_result,
-                    result_ty,
-                    inferred,
-                    true,
-                    Some(&SpecTy::Usize),
-                )?;
-            }
+        RawPattern::DeallocToken { base, layout } => {
+            infer_contract_expr_types_with_expected(
+                base,
+                pure_fns,
+                enum_defs,
+                &HashSet::new(),
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+                true,
+                Some(&SpecTy::Usize),
+            )?;
+            infer_contract_expr_types_with_expected(
+                layout,
+                pure_fns,
+                enum_defs,
+                &HashSet::new(),
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+                true,
+                Some(&layout_spec_ty()),
+            )?;
             Ok(())
         }
     }
@@ -7066,11 +7034,7 @@ fn typed_raw_pattern_into(
             };
             Ok(TypedRawPattern::PointsTo { addr, ty, value })
         }
-        RawPattern::DeallocToken {
-            base,
-            size,
-            alignment,
-        } => {
+        RawPattern::DeallocToken { base, layout } => {
             let base = typed_raw_expr(
                 base,
                 ctx.pure_fns,
@@ -7080,29 +7044,17 @@ fn typed_raw_pattern_into(
                 inferred,
             )?;
             ensure_raw_expr_ty(&base, &SpecTy::Usize, "DeallocToken base")?;
-            let size = typed_raw_expr(
-                size,
+            let layout = typed_raw_expr_with_expected(
+                layout,
                 ctx.pure_fns,
                 ctx.enum_defs,
                 spec_scope,
                 ctx.local_tys,
                 inferred,
+                Some(&layout_spec_ty()),
             )?;
-            ensure_raw_expr_ty(&size, &SpecTy::Usize, "DeallocToken size")?;
-            let alignment = typed_raw_expr(
-                alignment,
-                ctx.pure_fns,
-                ctx.enum_defs,
-                spec_scope,
-                ctx.local_tys,
-                inferred,
-            )?;
-            ensure_raw_expr_ty(&alignment, &SpecTy::Usize, "DeallocToken alignment")?;
-            Ok(TypedRawPattern::DeallocToken {
-                base,
-                size,
-                alignment,
-            })
+            ensure_raw_expr_ty(&layout, &layout_spec_ty(), "DeallocToken layout")?;
+            Ok(TypedRawPattern::DeallocToken { base, layout })
         }
     }
 }
@@ -7123,6 +7075,29 @@ fn typed_raw_expr(
         spec_scope,
         local_tys,
         inferred,
+    )
+}
+
+fn typed_raw_expr_with_expected(
+    expr: &Expr,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    local_tys: &HashMap<String, SpecTy>,
+    inferred: &mut SpecTypeInference,
+    expected: Option<&SpecTy>,
+) -> Result<TypedExpr, String> {
+    typed_body_expr_with_expected(
+        expr,
+        pure_fns,
+        enum_defs,
+        &HashSet::new(),
+        DirectiveKind::RawAssert,
+        spec_scope,
+        local_tys,
+        inferred,
+        false,
+        expected,
     )
 }
 
@@ -9319,12 +9294,8 @@ fn validate_function_contract_raw_pattern_prepass(
                 spec_scope,
             )
         }
-        RawPattern::DeallocToken {
-            base,
-            size,
-            alignment,
-        } => {
-            for expr in [base, size, alignment] {
+        RawPattern::DeallocToken { base, layout } => {
+            for expr in [base, layout] {
                 validate_function_contract_expr_prepass(
                     directive.span,
                     &directive.span_text,

@@ -53,7 +53,7 @@ use crate::solver::{
 };
 use crate::spec::{
     BinaryOp, RustTyKey, SpecTy, StructFieldTy, TypedExpr, TypedExprKind, TypedMatchBinding,
-    UnaryOp, option_spec_ty, provenance_spec_ty, ptr_spec_ty,
+    UnaryOp, layout_spec_ty, option_spec_ty, provenance_spec_ty, ptr_spec_ty,
 };
 
 const GHOST_LOAD_TIMEOUT: Duration = Duration::from_millis(1_000);
@@ -144,8 +144,7 @@ enum Resource {
     },
     DeallocToken {
         base: SymValue,
-        size: u64,
-        alignment: u64,
+        layout: SymValue,
     },
 }
 
@@ -2810,14 +2809,9 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(out)
             }
-            TypedRawPattern::DeallocToken {
-                base,
-                size,
-                alignment,
-            } => {
+            TypedRawPattern::DeallocToken { base, layout } => {
                 let base = self.contract_expr_to_value(current, spec, base)?;
-                let size = self.contract_expr_to_value(current, spec, size)?;
-                let alignment = self.contract_expr_to_value(current, spec, alignment)?;
+                let layout = self.contract_expr_to_value(current, spec, layout)?;
                 let mut out = Vec::new();
                 for candidate in candidates {
                     for (index, resource) in state.heap.iter().enumerate() {
@@ -2826,8 +2820,7 @@ impl<'tcx> Verifier<'tcx> {
                         }
                         let Resource::DeallocToken {
                             base: resource_base,
-                            size: resource_size,
-                            alignment: resource_alignment,
+                            layout: resource_layout,
                         } = resource
                         else {
                             continue;
@@ -2846,12 +2839,14 @@ impl<'tcx> Verifier<'tcx> {
                                         resource_base,
                                     ),
                                 )?,
-                                self.solver
-                                    .int_term(&size)
-                                    .eq(Int::from_u64(*resource_size)),
-                                self.solver
-                                    .int_term(&alignment)
-                                    .eq(Int::from_u64(*resource_alignment)),
+                                self.solver_result(
+                                    span,
+                                    self.solver.eq_for_spec_ty(
+                                        &layout_spec_ty(),
+                                        &layout,
+                                        resource_layout,
+                                    ),
+                                )?,
                             ])),
                             env: candidate.env.clone(),
                         });
@@ -2940,14 +2935,9 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(out)
             }
-            TypedRawPattern::DeallocToken {
-                base,
-                size,
-                alignment,
-            } => {
+            TypedRawPattern::DeallocToken { base, layout } => {
                 let base = self.spec_expr_to_value(view, base, resolution)?;
-                let size = self.spec_expr_to_value(view, size, resolution)?;
-                let alignment = self.spec_expr_to_value(view, alignment, resolution)?;
+                let layout = self.spec_expr_to_value(view, layout, resolution)?;
                 let mut out = Vec::new();
                 for candidate in candidates {
                     for (index, resource) in state.heap.iter().enumerate() {
@@ -2956,8 +2946,7 @@ impl<'tcx> Verifier<'tcx> {
                         }
                         let Resource::DeallocToken {
                             base: resource_base,
-                            size: resource_size,
-                            alignment: resource_alignment,
+                            layout: resource_layout,
                         } = resource
                         else {
                             continue;
@@ -2976,12 +2965,14 @@ impl<'tcx> Verifier<'tcx> {
                                         resource_base,
                                     ),
                                 )?,
-                                self.solver
-                                    .int_term(&size)
-                                    .eq(Int::from_u64(*resource_size)),
-                                self.solver
-                                    .int_term(&alignment)
-                                    .eq(Int::from_u64(*resource_alignment)),
+                                self.solver_result(
+                                    span,
+                                    self.solver.eq_for_spec_ty(
+                                        &layout_spec_ty(),
+                                        &layout,
+                                        resource_layout,
+                                    ),
+                                )?,
                             ])),
                             env: candidate.env.clone(),
                         });
@@ -3233,41 +3224,10 @@ impl<'tcx> Verifier<'tcx> {
                 state.heap.push(Resource::PointsTo { addr, ty, value });
                 Ok(())
             }
-            TypedRawPattern::DeallocToken {
-                base,
-                size,
-                alignment,
-            } => {
+            TypedRawPattern::DeallocToken { base, layout } => {
                 let base = self.contract_expr_to_value(current, spec, base)?;
-                let size = self.contract_expr_to_value(current, spec, size)?;
-                let alignment = self.contract_expr_to_value(current, spec, alignment)?;
-                let Some(size) = self
-                    .solver
-                    .int_term(&size)
-                    .as_i64()
-                    .and_then(|value| u64::try_from(value).ok())
-                else {
-                    return Err(self.unsupported_result(
-                        span,
-                        "DeallocToken size must be a concrete usize".to_owned(),
-                    ));
-                };
-                let Some(alignment) = self
-                    .solver
-                    .int_term(&alignment)
-                    .as_i64()
-                    .and_then(|value| u64::try_from(value).ok())
-                else {
-                    return Err(self.unsupported_result(
-                        span,
-                        "DeallocToken alignment must be a concrete usize".to_owned(),
-                    ));
-                };
-                state.heap.push(Resource::DeallocToken {
-                    base,
-                    size,
-                    alignment,
-                });
+                let layout = self.contract_expr_to_value(current, spec, layout)?;
+                state.heap.push(Resource::DeallocToken { base, layout });
                 Ok(())
             }
         }
@@ -7648,14 +7608,9 @@ fn collect_typed_raw_pattern_pure_fn_refs(pattern: &TypedRawPattern, out: &mut B
             collect_typed_expr_pure_fn_refs(ty, out);
             collect_typed_value_pattern_pure_fn_refs(value, out);
         }
-        TypedRawPattern::DeallocToken {
-            base,
-            size,
-            alignment,
-        } => {
+        TypedRawPattern::DeallocToken { base, layout } => {
             collect_typed_expr_pure_fn_refs(base, out);
-            collect_typed_expr_pure_fn_refs(size, out);
-            collect_typed_expr_pure_fn_refs(alignment, out);
+            collect_typed_expr_pure_fn_refs(layout, out);
         }
     }
 }

@@ -500,7 +500,7 @@ the unsafe block converts the updated resources back into safe Rust state.
 The initial unsafe heap model is address-based and has only two resource forms:
 
 ```text
-DeallocToken(base: usize, size: usize, alignment: usize)
+DeallocToken(base: usize, layout: Layout)
 PointsTo(addr: usize, ty: RustTy, value: Option<T>)
 ```
 
@@ -509,7 +509,7 @@ while `Ptr.addr` is the byte address accessed by the pointer. There is no
 separate allocation identifier in the current model; allocation identity is
 represented by the allocation's base address.
 
-`DeallocToken(base, size, alignment)` is a linear deallocation capability for
+`DeallocToken(base, layout)` is a linear deallocation capability for
 the allocation whose base address and deallocation layout are described by the
 token. It is not a dereferenceability witness, and ordinary raw reads and writes
 do not require it. It is intended to be consumed only by deallocation APIs.
@@ -550,7 +550,7 @@ The intended contract for a future typed deallocation API is:
 ```text
 dealloc<T>(p)
 requires:
-  DeallocToken(p.addr, layout(T).size, layout(T).align)
+  DeallocToken(p.addr, layout_of({type T}))
   * PointsTo(p.addr, {type T}, Option::None)
 ensures:
   emp
@@ -672,7 +672,7 @@ A raw assertion checks a `RawPattern`. The initial raw patterns
 are `emp`,
 `PointsTo(addr_expr, rust_ty_expr, option_value_expr)`,
 the shorthand `*ptr |-> option_value_pattern`,
-`DeallocToken(base_expr, size_expr, alignment_expr)`, and separating
+`DeallocToken(base_expr, layout_expr)`, and separating
 conjunction `left * right`; parentheses may be used freely to group raw
 patterns.
 `emp` is the empty raw pattern: it matches without requiring any heap resource,

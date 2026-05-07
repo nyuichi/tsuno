@@ -3,7 +3,7 @@ fn rejects_stack_dealloc_token_reify() {
     let p = &raw mut x;
 
     unsafe {
-        //@ raw assert DeallocToken({p}.addr, 4usize, 4usize);
+        //@ raw assert DeallocToken({p}.addr, Layout { size: 4usize, align: 4usize });
         let _keep = p;
     }
 }

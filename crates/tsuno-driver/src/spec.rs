@@ -341,8 +341,7 @@ pub enum RawPattern {
     },
     DeallocToken {
         base: Expr,
-        size: Expr,
-        alignment: Expr,
+        layout: Expr,
     },
 }
 
@@ -464,6 +463,13 @@ pub fn ptr_spec_ty() -> SpecTy {
             },
         ],
     })
+}
+
+pub fn layout_spec_ty() -> SpecTy {
+    SpecTy::Struct {
+        name: "Layout".to_owned(),
+        args: Vec::new(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

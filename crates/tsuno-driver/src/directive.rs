@@ -265,15 +265,14 @@ fn parse_raw_pattern(text: &str) -> Result<RawPattern, ParseError> {
     }
     if let Some(args) = atom_args(text, "DeallocToken") {
         let args = split_top_level_args(args)?;
-        if args.len() != 3 {
+        if args.len() != 2 {
             return Err(ParseError::new(
-                "`DeallocToken` raw pattern expects three arguments",
+                "`DeallocToken` raw pattern expects two arguments",
             ));
         }
         return Ok(RawPattern::DeallocToken {
             base: parse_raw_assert_expr(args[0])?,
-            size: parse_raw_assert_expr(args[1])?,
-            alignment: parse_raw_assert_expr(args[2])?,
+            layout: parse_raw_assert_expr(args[1])?,
         });
     }
     Err(ParseError::new(
