@@ -1961,7 +1961,7 @@ impl Parser {
     }
 
     fn parse_eq(&mut self) -> Result<Expr, ParseError> {
-        let mut expr = self.parse_cmp()?;
+        let mut expr = self.parse_bitand()?;
         loop {
             let op = if self.eat(&Token::EqEq) {
                 Some(BinaryOp::Eq)
@@ -1973,9 +1973,22 @@ impl Parser {
             let Some(op) = op else {
                 break;
             };
-            let rhs = self.parse_cmp()?;
+            let rhs = self.parse_bitand()?;
             expr = Expr::Binary {
                 op,
+                lhs: Box::new(expr),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_bitand(&mut self) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_cmp()?;
+        while self.eat(&Token::Amp) {
+            let rhs = self.parse_cmp()?;
+            expr = Expr::Binary {
+                op: BinaryOp::BitAnd,
                 lhs: Box::new(expr),
                 rhs: Box::new(rhs),
             };
@@ -2126,13 +2139,43 @@ impl Parser {
             }
             if self.next_is_ident("as") {
                 self.cursor += 1;
-                let (enum_name, ctor_name, type_args) = self.parse_variant_selector_path()?;
-                expr = Expr::VariantSelector {
-                    base: Box::new(expr),
-                    enum_name,
-                    ctor_name,
-                    type_args,
-                };
+                let is_variant_selector = matches!(
+                    (
+                        self.tokens.get(self.cursor),
+                        self.tokens.get(self.cursor + 1)
+                    ),
+                    (Some(Token::Ident(_)), Some(Token::ColonColon))
+                );
+                if is_variant_selector {
+                    let (enum_name, ctor_name, type_args) = self.parse_variant_selector_path()?;
+                    expr = Expr::VariantSelector {
+                        base: Box::new(expr),
+                        enum_name,
+                        ctor_name,
+                        type_args,
+                    };
+                } else {
+                    let ty = self.parse_spec_ty()?;
+                    if !matches!(
+                        ty,
+                        SpecTy::I8
+                            | SpecTy::I16
+                            | SpecTy::I32
+                            | SpecTy::I64
+                            | SpecTy::Isize
+                            | SpecTy::U8
+                            | SpecTy::U16
+                            | SpecTy::U32
+                            | SpecTy::U64
+                            | SpecTy::Usize
+                    ) {
+                        return Err(ParseError::new("expected integer spec type after `as`"));
+                    }
+                    expr = Expr::Cast {
+                        arg: Box::new(expr),
+                        ty,
+                    };
+                }
                 continue;
             }
             break;
@@ -2819,7 +2862,17 @@ impl<'a> GhostBlockParser<'a> {
         params: Vec<PureFnParam>,
     ) -> Result<PureFnDef, ParseError> {
         self.expect_arrow()?;
-        let result_ty = self.parse_spec_ty_annotation(&type_params, &['{'])?;
+        let result_ty = self.parse_spec_ty_annotation(&type_params, &['{', ';'])?;
+        self.skip_ws();
+        if self.eat_char(';') {
+            return Ok(PureFnDef {
+                name,
+                type_params,
+                params,
+                result_ty,
+                body: None,
+            });
+        }
         self.expect_char('{')?;
         let body = self.parse_braced_body()?;
         Ok(PureFnDef {
@@ -2827,7 +2880,11 @@ impl<'a> GhostBlockParser<'a> {
             type_params: type_params.clone(),
             params,
             result_ty,
-            body: parse_raw_expr_with_type_params("pure function body", body.trim(), &type_params)?,
+            body: Some(parse_raw_expr_with_type_params(
+                "pure function body",
+                body.trim(),
+                &type_params,
+            )?),
         })
     }
 
@@ -3689,14 +3746,14 @@ fn add1(x: i32) -> i32 {
                     ty: SpecTy::I32,
                 }],
                 result_ty: SpecTy::I32,
-                body: Expr::Binary {
+                body: Some(Expr::Binary {
                     op: BinaryOp::Add,
                     lhs: Box::new(Expr::Var("x".to_owned())),
                     rhs: Box::new(Expr::Int(IntLiteral {
                         digits: "1".to_owned(),
                         suffix: Some(IntSuffix::I32),
                     })),
-                },
+                }),
             }]
         );
     }
@@ -3839,14 +3896,14 @@ fn add1_done(x: i32)
                         ty: SpecTy::I32,
                     }],
                     result_ty: SpecTy::I32,
-                    body: Expr::Binary {
+                    body: Some(Expr::Binary {
                         op: BinaryOp::Add,
                         lhs: Box::new(Expr::Var("x".to_owned())),
                         rhs: Box::new(Expr::Int(IntLiteral {
                             digits: "1".to_owned(),
                             suffix: Some(IntSuffix::I32),
                         })),
-                    },
+                    }),
                 }],
                 lemmas: vec![LemmaDef {
                     name: "add1_done".to_owned(),
@@ -4047,7 +4104,7 @@ fn singleton(x: i32) -> IntList {
                         name: "IntList".to_owned(),
                         args: vec![],
                     },
-                    body: Expr::Call {
+                    body: Some(Expr::Call {
                         func: "IntList::Cons".to_owned(),
                         type_args: vec![],
                         args: vec![
@@ -4058,7 +4115,7 @@ fn singleton(x: i32) -> IntList {
                                 args: vec![],
                             },
                         ],
-                    },
+                    }),
                 }],
                 lemmas: vec![],
             }

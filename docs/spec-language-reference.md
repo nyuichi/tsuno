@@ -175,6 +175,8 @@ StructName { field: value }
 xs[i]
 expr.field
 expr.0
+expr as Ty
+isize::MAX
 *expr
 -expr
 !expr
@@ -182,6 +184,7 @@ lhs + rhs
 lhs - rhs
 lhs * rhs
 lhs % rhs
+lhs & rhs
 lhs ++ rhs
 lhs == rhs
 lhs != rhs
@@ -200,13 +203,15 @@ The operator precedence, from tightest to loosest, is:
 ```text
 1. postfix        .field   .0   [i]
 2. unary          !   -   *
-3. multiplicative *   %
-4. additive       +   -
-5. sequence concat ++
-6. comparison     <   <=   >   >=
-7. equality       ==   !=
-8. conjunction    &&
-9. disjunction    ||
+3. cast           as
+4. multiplicative *   %
+5. additive       +   -
+6. sequence concat ++
+7. bitwise and    &
+8. comparison     <   <=   >   >=
+9. equality       ==   !=
+10. conjunction   &&
+11. disjunction   ||
 ```
 
 Binary operators are left-associative within each precedence level.
@@ -352,6 +357,13 @@ produced by comparisons, equality, logical operators, and predicate calls.
 
 Equality and inequality require matching spec types. Equality on `Ref<T>` and `Mut<T>` is currently rejected.
 
+Integer expressions can be cast with `expr as Ty`, where `Ty` is an integer
+spec type. A cast whose range check is statically false makes verification
+fail. A cast whose range check is not statically provable is currently reported
+as unsupported instead of being assumed. The builtin associated constant
+`isize::MAX` is available as an `isize` value and is simplified for the target
+pointer width.
+
 ## 5. References, Fields, Tuples, and Sequences
 
 The prelude declares the reference and pointer model types used for Rust
@@ -383,7 +395,19 @@ struct Mut<T> {
     fin: T,
     ptr: Ptr,
 }
+
+struct Layout {
+    size: usize,
+    align: usize,
+} where align != 0usize &&
+    (align & (align - 1usize)) == 0usize &&
+    size + align - 1usize <= (isize::MAX as usize);
 ```
+
+The prelude also declares `fn layout_of(ty: RustTy) -> Layout;` as an
+uninterpreted pure function. Layout facts can be supplied by ordinary lemmas
+whose bodies assume contradiction; for example, the prelude includes a lemma proving
+`layout_of({type i32}) == Layout { size: 4usize, align: 4usize }`.
 
 Enum variant selectors use `expr as Enum::Ctor` or
 `expr as Enum::Ctor::<T, ...>`. The selector projects the payload of the named
@@ -800,6 +824,7 @@ Supported items:
 - `enum`
 - `struct`
 - pure functions: `fn name<T>(args...) -> Ty { expr }`
+- uninterpreted pure function declarations: `fn name<T>(args...) -> Ty;`
 - lemmas: `fn name<T>(args...) req <expr> ens <expr> { stmts }`
 - unsafe lemmas:
   `unsafe fn name<T>(args...) req <expr> raw req <pattern> ens <expr> raw ens <pattern> { stmts }`

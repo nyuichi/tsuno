@@ -3574,8 +3574,11 @@ impl<'tcx> Verifier<'tcx> {
         self.solver_result_at_report_span(self.solver.declare_pure_fn(
             &pure_fn.name,
             &param_tys,
-            &pure_fn.body.ty,
+            &pure_fn.result_ty,
         ))?;
+        let Some(body) = &pure_fn.body else {
+            return Ok(());
+        };
         let params = self.solver_result_at_report_span(self.solver.pure_fn_params(
             &pure_fn.name,
             &params,
@@ -3587,7 +3590,7 @@ impl<'tcx> Verifier<'tcx> {
             .map(|(_, value)| value.clone())
             .collect::<Vec<_>>();
         let spec = HashMap::new();
-        let body = self.contract_expr_to_value(&current, &spec, &pure_fn.body)?;
+        let body = self.contract_expr_to_value(&current, &spec, body)?;
         self.solver_result_at_report_span(self.solver.define_pure_fn(&pure_fn.name, &vars, &body))?;
         Ok(())
     }
@@ -4974,7 +4977,11 @@ impl<'tcx> Verifier<'tcx> {
                             )
                         })
                 }
-                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Rem => {
+                BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::BitAnd
+                | BinaryOp::Rem => {
                     let value = self.spec_expr_to_value(state, expr, resolved)?;
                     Ok(self.solver.bool_term(&value))
                 }
@@ -5072,6 +5079,10 @@ impl<'tcx> Verifier<'tcx> {
                 let value = self.spec_expr_to_value(state, base, resolved)?;
                 self.variant_selector_to_value(value, &base.ty, *ctor_index, &expr.ty)
             }
+            TypedExprKind::Cast { arg } => {
+                let value = self.spec_expr_to_value(state, arg, resolved)?;
+                self.cast_spec_value(value, &expr.ty, self.control_span(state.ctrl))
+            }
             TypedExprKind::Index { base, index } => {
                 let value = self.spec_expr_to_value(state, base, resolved)?;
                 let index_value = self.spec_expr_to_value(state, index, resolved)?;
@@ -5137,7 +5148,11 @@ impl<'tcx> Verifier<'tcx> {
                             )
                         })
                 }
-                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Rem => {
+                BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::BitAnd
+                | BinaryOp::Rem => {
                     let value = self.contract_expr_to_value(current, spec, expr)?;
                     Ok(self.solver.bool_term(&value))
                 }
@@ -5230,6 +5245,10 @@ impl<'tcx> Verifier<'tcx> {
             } => {
                 let value = self.contract_expr_to_value(current, spec, base)?;
                 self.variant_selector_to_value(value, &base.ty, *ctor_index, &expr.ty)
+            }
+            TypedExprKind::Cast { arg } => {
+                let value = self.contract_expr_to_value(current, spec, arg)?;
+                self.cast_spec_value(value, &expr.ty, self.report_span())
             }
             TypedExprKind::Index { base, index } => {
                 let value = self.contract_expr_to_value(current, spec, base)?;
@@ -5337,11 +5356,14 @@ impl<'tcx> Verifier<'tcx> {
         if pure_fn.params.len() != values.len() {
             return Ok(None);
         }
+        let Some(body) = &pure_fn.body else {
+            return Ok(None);
+        };
         let mut env = HashMap::new();
         for (param, value) in pure_fn.params.iter().zip(values.iter()) {
             env.insert(param.name.clone(), value.clone());
         }
-        self.try_eval_ground_pure_expr(&pure_fn.body, &env, span)
+        self.try_eval_ground_pure_expr(body, &env, span)
     }
 
     fn eval_builtin_pure_call(
@@ -5351,6 +5373,14 @@ impl<'tcx> Verifier<'tcx> {
         span: Span,
     ) -> Result<Option<SymValue>, VerificationResult> {
         match (func, values) {
+            ("isize::MAX", []) => {
+                let (_, upper) = self.pointer_sized_int_bounds(true)?;
+                Ok(Some(self.solver.wrap_int(&upper)))
+            }
+            ("isize::MAX", _) => Err(self.unsupported_result(
+                span,
+                format!("builtin pure function `{func}` expects 0 arguments"),
+            )),
             ("seq_len", [value]) => {
                 let length = self.solver_result(span, self.solver.seq_len_int(value))?;
                 if let Some(length) = Solver::simplify_int(&length).as_i64()
@@ -5495,6 +5525,12 @@ impl<'tcx> Verifier<'tcx> {
                     return Ok(None);
                 };
                 Some(self.variant_selector_to_value(value, &base.ty, *ctor_index, &expr.ty)?)
+            }
+            TypedExprKind::Cast { arg } => {
+                let Some(value) = self.try_eval_ground_pure_expr(arg, env, span)? else {
+                    return Ok(None);
+                };
+                Some(self.cast_spec_value(value, &expr.ty, span)?)
             }
             TypedExprKind::Index { base, index } => {
                 let Some(value) = self.try_eval_ground_pure_expr(base, env, span)? else {
@@ -5979,6 +6015,35 @@ impl<'tcx> Verifier<'tcx> {
         self.solver.decimal_int_value(digits).map_err(|_| {
             self.unsupported_result(span, format!("invalid integer literal `{digits}`"))
         })
+    }
+
+    fn cast_spec_value(
+        &self,
+        value: SymValue,
+        target: &SpecTy,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let term = self.solver.int_term(&value);
+        if let Some((lower, upper)) = self
+            .solver
+            .int_bounds(target)
+            .map_err(|err| self.unsupported_result(span, err))?
+        {
+            let in_range = Solver::simplify_bool(&Bool::and(&[&term.ge(lower), &term.le(upper)]));
+            match in_range.as_bool() {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(self.fail_result(span, "spec integer cast overflowed".to_owned()));
+                }
+                None => {
+                    return Err(self.unsupported_result(
+                        span,
+                        "spec integer cast range is not statically provable".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(self.solver.wrap_int(&term))
     }
 
     fn solver_result<T>(
@@ -7308,7 +7373,9 @@ fn collect_needed_pure_fns(
             continue;
         };
         let mut refs = BTreeSet::new();
-        collect_typed_expr_pure_fn_refs(&pure_fn.body, &mut refs);
+        if let Some(body) = &pure_fn.body {
+            collect_typed_expr_pure_fn_refs(body, &mut refs);
+        }
         for reference in refs {
             if needed.insert(reference.clone()) {
                 agenda.push_back(reference);
@@ -7479,6 +7546,7 @@ fn collect_typed_expr_pure_fn_refs(expr: &TypedExpr, out: &mut BTreeSet<String>)
         TypedExprKind::Field { base, .. }
         | TypedExprKind::TupleField { base, .. }
         | TypedExprKind::VariantSelector { base, .. }
+        | TypedExprKind::Cast { arg: base }
         | TypedExprKind::Unary { arg: base, .. } => collect_typed_expr_pure_fn_refs(base, out),
         TypedExprKind::Index { base, index } => {
             collect_typed_expr_pure_fn_refs(base, out);
@@ -7614,24 +7682,26 @@ mod tests {
             TypedPureFnDef {
                 name: "id".to_owned(),
                 params: Vec::new(),
-                body: TypedExpr {
+                result_ty: SpecTy::I32,
+                body: Some(TypedExpr {
                     ty: SpecTy::I32,
                     kind: TypedExprKind::Int(crate::spec::IntLiteral {
                         digits: "1".to_owned(),
                         suffix: Some(crate::spec::IntSuffix::I32),
                     }),
-                },
+                }),
             },
             TypedPureFnDef {
                 name: "unused".to_owned(),
                 params: Vec::new(),
-                body: TypedExpr {
+                result_ty: SpecTy::I32,
+                body: Some(TypedExpr {
                     ty: SpecTy::I32,
                     kind: TypedExprKind::Int(crate::spec::IntLiteral {
                         digits: "0".to_owned(),
                         suffix: Some(crate::spec::IntSuffix::I32),
                     }),
-                },
+                }),
             },
         ];
         let needed =

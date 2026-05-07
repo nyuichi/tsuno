@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::spec::{
     BinaryOp, EnumDef, RustTyKey, SpecTy, StructTy, UnaryOp, option_spec_ty, ptr_spec_ty,
 };
-use z3::ast::{self, Ast, Bool, Dynamic, Int, Seq as Z3Seq};
+use z3::ast::{self, Ast, BV, Bool, Dynamic, Int, Seq as Z3Seq};
 use z3::{
     Config, Context, DeclKind, FuncDecl, Pattern, RecFuncDecl, SatResult, Solver as Z3Solver, Sort,
     SortKind, Symbol,
@@ -1286,6 +1286,11 @@ impl Solver {
             BinaryOp::Add => self.wrap_int(&(self.int_term(lhs) + self.int_term(rhs))),
             BinaryOp::Sub => self.wrap_int(&(self.int_term(lhs) - self.int_term(rhs))),
             BinaryOp::Mul => self.wrap_int(&(self.int_term(lhs) * self.int_term(rhs))),
+            BinaryOp::BitAnd => {
+                let lhs = BV::from_int(&self.int_term(lhs), self.pointer_width_bits as u32);
+                let rhs = BV::from_int(&self.int_term(rhs), self.pointer_width_bits as u32);
+                self.wrap_int(&(lhs & rhs).to_int(false))
+            }
             BinaryOp::Rem if matches!(lhs_ty, SpecTy::Enum { name, args } if name == "Nat" && args.is_empty()) => {
                 self.wrap_int(&(self.nat_to_int_term_with_z3(lhs, solver)? % self.int_term(rhs)))
             }
@@ -1318,6 +1323,7 @@ impl Solver {
             | BinaryOp::Add
             | BinaryOp::Sub
             | BinaryOp::Mul
+            | BinaryOp::BitAnd
             | BinaryOp::Rem
             | BinaryOp::Concat => {
                 return Ok(None);

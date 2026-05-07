@@ -36,6 +36,10 @@ pub enum Expr {
         ctor_name: String,
         type_args: Vec<SpecTy>,
     },
+    Cast {
+        arg: Box<Expr>,
+        ty: SpecTy,
+    },
     Index {
         base: Box<Expr>,
         index: Box<Expr>,
@@ -127,6 +131,9 @@ pub enum TypedExprKind {
         enum_name: String,
         ctor_name: String,
         ctor_index: usize,
+    },
+    Cast {
+        arg: Box<TypedExpr>,
     },
     Index {
         base: Box<TypedExpr>,
@@ -274,7 +281,7 @@ pub struct PureFnDef {
     pub type_params: Vec<String>,
     pub params: Vec<PureFnParam>,
     pub result_ty: SpecTy,
-    pub body: Expr,
+    pub body: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -474,6 +481,7 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Rem,
+    BitAnd,
     Concat,
     Eq,
     Ne,
