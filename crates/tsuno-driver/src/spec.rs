@@ -436,33 +436,17 @@ pub fn option_spec_ty(inner: SpecTy) -> SpecTy {
 }
 
 pub fn provenance_spec_ty() -> SpecTy {
-    SpecTy::Record(StructTy {
+    SpecTy::Struct {
         name: "Provenance".to_owned(),
-        fields: vec![StructFieldTy {
-            name: "base".to_owned(),
-            ty: SpecTy::Usize,
-        }],
-    })
+        args: Vec::new(),
+    }
 }
 
 pub fn ptr_spec_ty() -> SpecTy {
-    SpecTy::Record(StructTy {
+    SpecTy::Struct {
         name: "Ptr".to_owned(),
-        fields: vec![
-            StructFieldTy {
-                name: "addr".to_owned(),
-                ty: SpecTy::Usize,
-            },
-            StructFieldTy {
-                name: "prov".to_owned(),
-                ty: option_spec_ty(provenance_spec_ty()),
-            },
-            StructFieldTy {
-                name: "ty".to_owned(),
-                ty: SpecTy::RustTy,
-            },
-        ],
-    })
+        args: Vec::new(),
+    }
 }
 
 pub fn layout_spec_ty() -> SpecTy {

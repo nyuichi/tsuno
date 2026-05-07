@@ -2176,6 +2176,10 @@ impl Solver {
                 Ok(Some(bool_conjoin(forms)))
             }
             SpecTy::Struct { name, args } => {
+                let composite = self.composite_encoding(ty, solver)?;
+                if name == "Ptr" {
+                    return Ok(Some(self.tag_formula(&composite, 0, value)?));
+                }
                 let struct_def = self
                     .struct_defs
                     .borrow()
@@ -2188,7 +2192,6 @@ impl Solver {
                     .cloned()
                     .zip(args.iter().cloned())
                     .collect::<BTreeMap<_, _>>();
-                let composite = self.composite_encoding(ty, solver)?;
                 let mut forms = vec![self.tag_formula(&composite, 0, value)?];
                 for (index, field_ty) in struct_def.fields.iter().enumerate() {
                     let field = self.project_composite_field(&composite, value, index)?;

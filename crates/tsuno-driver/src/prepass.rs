@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::ControlFlow;
+use std::sync::OnceLock;
 
 use crate::directive::{
     CollectedFunctionDirectives, DirectiveAttach, DirectiveError, DirectiveKind, FunctionDirective,
@@ -1766,6 +1767,74 @@ fn try_instantiate_spec_ty(ty: &SpecTy, bindings: &HashMap<String, SpecTy>) -> O
             inner, bindings,
         )?))),
     }
+}
+
+fn prelude_struct_defs() -> &'static HashMap<String, StructDef> {
+    static STRUCTS: OnceLock<HashMap<String, StructDef>> = OnceLock::new();
+    STRUCTS.get_or_init(|| {
+        let mut enum_defs = Vec::new();
+        let mut struct_defs = Vec::new();
+        let mut pure_fn_defs = Vec::new();
+        let mut lemma_defs = Vec::new();
+        collect_ghost_items_in_source(
+            PRELUDE_GHOST_SOURCE,
+            DUMMY_SP,
+            &mut enum_defs,
+            &mut struct_defs,
+            &mut pure_fn_defs,
+            &mut lemma_defs,
+        )
+        .unwrap_or_else(|err| panic!("prelude ghost source must parse: {}", err.message));
+        let enums = enum_defs
+            .into_iter()
+            .map(|def| (def.name.clone(), def))
+            .collect::<HashMap<_, _>>();
+        let raw_structs = struct_defs
+            .into_iter()
+            .map(|def| (def.name.clone(), def))
+            .collect::<HashMap<_, _>>();
+        raw_structs
+            .values()
+            .map(|def| {
+                normalize_struct_def(def, &enums, &raw_structs)
+                    .map(|def| (def.name.clone(), def))
+                    .expect("prelude struct definitions must normalize")
+            })
+            .collect()
+    })
+}
+
+fn prelude_struct_fields_for_ty(ty: &SpecTy) -> Result<Option<Vec<StructFieldTy>>, String> {
+    let SpecTy::Struct { name, args } = ty else {
+        return Ok(None);
+    };
+    let Some(def) = prelude_struct_defs().get(name) else {
+        return Ok(None);
+    };
+    if def.type_params.len() != args.len() {
+        return Err(format!(
+            "spec struct `{name}` expects {} type arguments, found {}",
+            def.type_params.len(),
+            args.len()
+        ));
+    }
+    let bindings = def
+        .type_params
+        .iter()
+        .cloned()
+        .zip(args.iter().cloned())
+        .collect::<HashMap<_, _>>();
+    def.fields
+        .iter()
+        .map(|field| {
+            Ok(StructFieldTy {
+                name: field.name.clone(),
+                ty: try_instantiate_spec_ty(&field.ty, &bindings)
+                    .ok_or_else(|| format!("unbound spec type parameter in `{name}`"))?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()
+        .map(Some)
 }
 
 fn infer_type_param_bindings(
@@ -4606,16 +4675,29 @@ fn type_named_field_expr(base: TypedExpr, name: &str) -> Result<TypedExpr, Strin
         }
         _ => {}
     }
-    let SpecTy::Record(struct_ty) = &base.ty else {
-        return Err(format!(
-            "field access requires a struct, found `{}`",
-            display_spec_ty(&base.ty)
-        ));
+    let (struct_name, fields) = match &base.ty {
+        SpecTy::Record(struct_ty) => (struct_ty.name.clone(), struct_ty.fields.clone()),
+        SpecTy::Struct {
+            name: struct_name, ..
+        } => (
+            struct_name.clone(),
+            prelude_struct_fields_for_ty(&base.ty)?
+                .ok_or_else(|| format!("unknown spec struct `{struct_name}`"))?,
+        ),
+        _ => {
+            return Err(format!(
+                "field access requires a struct, found `{}`",
+                display_spec_ty(&base.ty)
+            ));
+        }
     };
-    let Some((index, field_ty)) = struct_ty.field(name) else {
+    let Some((index, field_ty)) = fields
+        .iter()
+        .enumerate()
+        .find(|(_, field)| field.name == name)
+    else {
         return Err(format!(
-            "struct `{}` does not have a field named `{name}`",
-            struct_ty.name
+            "struct `{struct_name}` does not have a field named `{name}`"
         ));
     };
     Ok(TypedExpr {

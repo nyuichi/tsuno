@@ -6283,7 +6283,7 @@ impl<'tcx> Verifier<'tcx> {
         match spec_ty {
             SpecTy::Ref(inner) => self.ref_ptr(value, inner, span),
             SpecTy::Mut(inner) => self.mut_ptr(value, inner, span),
-            SpecTy::Record(struct_ty) if struct_ty.name == "Ptr" => Ok(value.clone()),
+            SpecTy::Struct { name, .. } if name == "Ptr" => Ok(value.clone()),
             _ => Err(self.unsupported_result(
                 span,
                 format!("raw pointer requested through non-pointer place `{spec_ty:?}`"),
@@ -6859,6 +6859,9 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(Some(bool_and(formulas)))
             }
             SpecTy::Struct { name, .. } => {
+                if name == "Ptr" {
+                    return Ok(Some(self.composite_tag_formula(ty, value, 0, span)?));
+                }
                 let fields = self.struct_fields_for_ty(ty, span)?;
                 let view = self.composite_ctor_view(ty, value, 0, span)?;
                 let mut formulas = vec![view.tag];
@@ -7130,6 +7133,9 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(bool_and(formulas))
             }
             SpecTy::Struct { .. } => {
+                if matches!(ty, SpecTy::Struct { name, .. } if name == "Ptr") {
+                    return self.composite_tag_formula(ty, value, 0, span);
+                }
                 let fields = self.struct_fields_for_ty(ty, span)?;
                 let view = self.composite_ctor_view(ty, value, 0, span)?;
                 let mut formulas = Vec::with_capacity(fields.len() + 1);
