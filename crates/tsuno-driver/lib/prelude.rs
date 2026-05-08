@@ -41,13 +41,13 @@ lem layout_of_i32()
     assume false;
 }
 
-unsafe extern fn core::intrinsics::read_via_copy<T>(ptr: *const T) -> T
+unsafe fn core::intrinsics::read_via_copy<T>(ptr: *const T) -> T
   raw req *ptr |-?-> Option::<T>::Some(?old)
   raw ens *ptr |-?-> Option::<T>::Some(old)
   ens result == old
 ;
 
-unsafe extern fn core::intrinsics::write_via_move<T>(ptr: *mut T, value: T) -> ()
+unsafe fn core::intrinsics::write_via_move<T>(ptr: *mut T, value: T) -> ()
   raw req *ptr |-?-> ?old
   raw ens *ptr |-?-> Option::<T>::Some(value)
 ;

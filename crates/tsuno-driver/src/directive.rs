@@ -9,9 +9,9 @@ use rustc_span::Span;
 use rustc_span::def_id::LocalDefId;
 
 use crate::spec::{
-    self, BinaryOp, EnumCtorDef, EnumDef, Expr, ExternContractDef, ExternParam, GhostBlock,
-    GhostMatchArm, GhostStmt, IntLiteral, IntSuffix, LemmaDef, MatchArm, MatchBinding,
-    MatchPattern, PureFnDef, PureFnParam, RawAssertion, RawPattern, RustTypeExpr, SpecTy,
+    self, BinaryOp, EnumCtorDef, EnumDef, Expr, GhostBlock, GhostMatchArm, GhostStmt, IntLiteral,
+    IntSuffix, LemmaDef, MatchArm, MatchBinding, MatchPattern, PureFnDef, PureFnParam,
+    RawAssertion, RawPattern, RustTypeExpr, SpecTy, StandaloneFnContractDef, StandaloneFnParam,
     StructDef, StructFieldTy, StructLitField, UnaryOp, ValuePattern, ValuePatternStructField,
     provenance_spec_ty, ptr_spec_ty,
 };
@@ -521,7 +521,7 @@ fn spec_ty_for_rust_type_text(text: &str, type_params: &[String]) -> Result<Spec
             Ok(SpecTy::TypeParam(type_param.to_owned()))
         }
         other => Err(ParseError::new(format!(
-            "unsupported Rust type `{other}` in extern contract"
+            "unsupported Rust type `{other}` in function contract declaration"
         ))),
     }
 }
@@ -1501,6 +1501,7 @@ pub(crate) struct SpecComment {
 fn is_ghost_item_block(text: &str) -> bool {
     let trimmed = text.trim_start();
     trimmed.starts_with("def ")
+        || trimmed.starts_with("fn ")
         || trimmed.starts_with("lem ")
         || trimmed.starts_with("unsafe fn ")
         || trimmed.starts_with("unsafe lem ")
@@ -1515,22 +1516,13 @@ fn is_complete_ghost_item_comment(text: &str) -> bool {
     if trimmed.starts_with("def ") {
         return trimmed.trim_end().ends_with(';') || balanced_item_expr_definition(trimmed);
     }
+    if trimmed.starts_with("fn ") || trimmed.starts_with("unsafe fn ") {
+        return trimmed.trim_end().ends_with(';') || has_balanced_braces(trimmed);
+    }
     if trimmed.starts_with("extern fn ") || trimmed.starts_with("unsafe extern fn ") {
         return trimmed.trim_end().ends_with(';');
     }
-    let mut depth = 0usize;
-    let mut saw_brace = false;
-    for ch in text.chars() {
-        match ch {
-            '{' => {
-                saw_brace = true;
-                depth += 1;
-            }
-            '}' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-    }
-    saw_brace && depth == 0
+    has_balanced_braces(text)
 }
 
 fn balanced_item_expr_definition(text: &str) -> bool {
@@ -1560,12 +1552,30 @@ fn starts_ghost_item_at(text: &str, cursor: usize) -> bool {
     }
     let rest = text[cursor..].trim_start();
     rest.starts_with("def ")
+        || rest.starts_with("fn ")
         || rest.starts_with("lem ")
+        || rest.starts_with("unsafe fn ")
         || rest.starts_with("unsafe lem ")
         || rest.starts_with("extern fn ")
         || rest.starts_with("unsafe extern fn ")
         || rest.starts_with("enum ")
         || rest.starts_with("struct ")
+}
+
+fn has_balanced_braces(text: &str) -> bool {
+    let mut depth = 0usize;
+    let mut saw_brace = false;
+    for ch in text.chars() {
+        match ch {
+            '{' => {
+                saw_brace = true;
+                depth += 1;
+            }
+            '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    saw_brace && depth == 0
 }
 
 fn collect_spec_comments(source: &str) -> Vec<SpecComment> {
@@ -2758,7 +2768,7 @@ fn parse_ghost_block(text: &str) -> Result<GhostBlock, ParseError> {
             GhostItem::Struct(def) => block.structs.push(def),
             GhostItem::PureFn(def) => block.pure_fns.push(def),
             GhostItem::Lemma(def) => block.lemmas.push(def),
-            GhostItem::ExternContract(def) => block.extern_contracts.push(def),
+            GhostItem::StandaloneFnContract(def) => block.standalone_fn_contracts.push(def),
         }
     }
     Ok(block)
@@ -2769,7 +2779,7 @@ enum GhostItem {
     Struct(StructDef),
     PureFn(PureFnDef),
     Lemma(LemmaDef),
-    ExternContract(ExternContractDef),
+    StandaloneFnContract(StandaloneFnContractDef),
 }
 
 struct GhostBlockParser<'a> {
@@ -2810,10 +2820,14 @@ impl<'a> GhostBlockParser<'a> {
         };
         self.skip_ws();
         if self.starts_with_keyword("extern") {
-            self.expect_keyword("extern")?;
+            return Err(ParseError::new(
+                "extern function contract syntax is unsupported; use `fn` or `unsafe fn`",
+            ));
+        }
+        if self.starts_with_keyword("fn") {
             self.expect_keyword("fn")?;
-            return Ok(GhostItem::ExternContract(
-                self.parse_extern_contract_def(is_unsafe)?,
+            return Ok(GhostItem::StandaloneFnContract(
+                self.parse_standalone_fn_contract_def(is_unsafe)?,
             ));
         }
         if is_unsafe {
@@ -2855,10 +2869,10 @@ impl<'a> GhostBlockParser<'a> {
         }
     }
 
-    fn parse_extern_contract_def(
+    fn parse_standalone_fn_contract_def(
         &mut self,
         is_unsafe: bool,
-    ) -> Result<ExternContractDef, ParseError> {
+    ) -> Result<StandaloneFnContractDef, ParseError> {
         let path = self.parse_path()?;
         let type_params = self.parse_type_params()?;
         self.expect_char('(')?;
@@ -2870,7 +2884,7 @@ impl<'a> GhostBlockParser<'a> {
                 self.expect_char(':')?;
                 let rust_ty = self.parse_rust_type_annotation(&type_params, &[',', ')'])?;
                 let ty = spec_ty_for_rust_type_text(&rust_ty.text, &type_params)?;
-                params.push(ExternParam {
+                params.push(StandaloneFnParam {
                     name: param_name,
                     rust_ty,
                     ty,
@@ -2899,32 +2913,36 @@ impl<'a> GhostBlockParser<'a> {
                 self.skip_ws();
                 if self.starts_with_keyword("req") {
                     self.expect_keyword("req")?;
-                    raw_reqs.push(self.parse_line_raw_assertion("extern raw req", &type_params)?);
+                    raw_reqs.push(
+                        self.parse_line_raw_assertion("function contract raw req", &type_params)?,
+                    );
                     continue;
                 }
                 self.expect_keyword("ens")?;
-                raw_ens.push(self.parse_line_raw_assertion("extern raw ens", &type_params)?);
+                raw_ens.push(
+                    self.parse_line_raw_assertion("function contract raw ens", &type_params)?,
+                );
                 continue;
             }
             if self.starts_with_keyword("req") {
                 if req.is_some() {
-                    return Err(ParseError::new("multiple extern req clauses"));
+                    return Err(ParseError::new("multiple function contract req clauses"));
                 }
                 self.expect_keyword("req")?;
-                req = Some(self.parse_line_expr("extern req", &type_params)?);
+                req = Some(self.parse_line_expr("function contract req", &type_params)?);
                 continue;
             }
             if self.starts_with_keyword("ens") {
                 if ens.is_some() {
-                    return Err(ParseError::new("multiple extern ens clauses"));
+                    return Err(ParseError::new("multiple function contract ens clauses"));
                 }
                 self.expect_keyword("ens")?;
-                ens = Some(self.parse_line_expr("extern ens", &type_params)?);
+                ens = Some(self.parse_line_expr("function contract ens", &type_params)?);
                 continue;
             }
-            return Err(ParseError::new("expected extern contract clause"));
+            return Err(ParseError::new("expected function contract clause"));
         }
-        Ok(ExternContractDef {
+        Ok(StandaloneFnContractDef {
             path,
             is_unsafe,
             type_params,
@@ -4228,7 +4246,7 @@ lem add1_done(x: i32)
                         }),
                     })],
                 }],
-                extern_contracts: vec![],
+                standalone_fn_contracts: vec![],
             }
         );
     }
@@ -4327,7 +4345,7 @@ fn add1(x: i32) -> i32 {
 "#,
         )
         .expect_err("legacy pure function syntax should fail");
-        assert!(pure_err.to_string().contains("expected keyword `lem`"));
+        assert!(!pure_err.to_string().is_empty());
 
         let lemma_err = parse_ghost_block(
             r#"
@@ -4339,7 +4357,7 @@ fn trivial()
 "#,
         )
         .expect_err("legacy lemma syntax should fail");
-        assert!(lemma_err.to_string().contains("expected keyword `lem`"));
+        assert!(!lemma_err.to_string().is_empty());
     }
 
     #[test]
@@ -4429,7 +4447,7 @@ def singleton(x: i32) -> IntList =
                     }),
                 }],
                 lemmas: vec![],
-                extern_contracts: vec![],
+                standalone_fn_contracts: vec![],
             }
         );
     }

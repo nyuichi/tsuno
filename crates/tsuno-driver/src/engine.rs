@@ -117,7 +117,7 @@ pub struct Verifier<'tcx> {
     tcx: TyCtxt<'tcx>,
     context: VerifierContext<'tcx>,
     contracts: HashMap<LocalDefId, FunctionContract>,
-    extern_contracts: HashMap<String, FunctionContract>,
+    standalone_fn_contracts: HashMap<String, FunctionContract>,
     pure_fns: HashMap<String, TypedPureFnDef>,
     lemmas: HashMap<String, TypedLemmaDef>,
     structs: HashMap<String, crate::spec::StructDef>,
@@ -197,7 +197,7 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
         ghosts,
         functions,
         contracts,
-        extern_contracts,
+        standalone_fn_contracts,
     } = program;
     let tcx_capture = UnsafeCallbackArg(tcx);
     let ghosts_capture = UnsafeCallbackArg(&ghosts);
@@ -238,7 +238,7 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
 
     let mut results = Vec::new();
     let contracts_capture = UnsafeCallbackArg(&contracts);
-    let extern_contracts_capture = UnsafeCallbackArg(&extern_contracts);
+    let standalone_fn_contracts_capture = UnsafeCallbackArg(&standalone_fn_contracts);
     for function in functions {
         let body = tcx
             .mir_drops_elaborated_and_const_checked(function.def_id)
@@ -256,8 +256,8 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
             let tcx = tcx_capture.get();
             let ghosts = ghosts_capture.get();
             let contracts = contracts_capture.get().clone();
-            let extern_contracts = extern_contracts_capture.get().clone();
-            let mut verifier = Verifier::new(tcx, contracts, extern_contracts);
+            let standalone_fn_contracts = standalone_fn_contracts_capture.get().clone();
+            let mut verifier = Verifier::new(tcx, contracts, standalone_fn_contracts);
             verifier.structs = ghosts.structs.clone();
             verifier.struct_invariants = ghosts.struct_invariants.clone();
             verifier.enum_invariants = ghosts.enum_invariants.clone();
@@ -289,13 +289,13 @@ impl<'tcx> Verifier<'tcx> {
     pub fn new(
         tcx: TyCtxt<'tcx>,
         contracts: HashMap<LocalDefId, FunctionContract>,
-        extern_contracts: HashMap<String, FunctionContract>,
+        standalone_fn_contracts: HashMap<String, FunctionContract>,
     ) -> Self {
         Self {
             tcx,
             context: VerifierContext::Ghost,
             contracts,
-            extern_contracts,
+            standalone_fn_contracts,
             pure_fns: HashMap::new(),
             lemmas: HashMap::new(),
             structs: HashMap::new(),
@@ -385,6 +385,7 @@ impl<'tcx> Verifier<'tcx> {
         let DirectivePrepass {
             loop_contracts,
             control_point_directives,
+            explicit_function_contract: _,
             function_contract,
             unsafe_blocks,
         } = prepass;
@@ -5958,12 +5959,12 @@ impl<'tcx> Verifier<'tcx> {
             if let Some(contract) = self.contracts.get(&local_def_id).cloned() {
                 return Ok(Some(contract));
             }
-            if let Some(contract) = self.extern_contracts.get(&path).cloned() {
+            if let Some(contract) = self.standalone_fn_contracts.get(&path).cloned() {
                 return Ok(Some(contract));
             }
             return Err(self.missing_local_contract_result(local_def_id, span));
         }
-        Ok(self.extern_contracts.get(&path).cloned())
+        Ok(self.standalone_fn_contracts.get(&path).cloned())
     }
 
     fn called_def_id(&self, func: &Operand<'tcx>) -> Option<DefId> {
@@ -8328,6 +8329,7 @@ mod tests {
                     })],
                 )]),
             },
+            explicit_function_contract: true,
             function_contract: Some(FunctionContract {
                 params: Vec::new(),
                 req: NormalizedPredicate {

@@ -5,7 +5,7 @@ This document describes the spec language that is implemented today. It covers o
 The language appears in two places:
 
 - directives written in spec comments, such as `//@ let`, `//@ req`, `//@ ens`, `//@ assert`, `//@ assume`, `//@ inv`, and `//@ lemma_name(...)`
-- ghost item blocks written as `/*@ ... */` whose contents begin with `def`, `lem`, `unsafe lem`, `unsafe extern fn`, `enum`, or `struct`
+- ghost item blocks written as `/*@ ... */` whose contents begin with `def`, `lem`, `unsafe lem`, `fn`, `unsafe fn`, `enum`, or `struct`
 
 ## 1. Where Spec Code Appears
 
@@ -408,15 +408,21 @@ uninterpreted pure function. Layout facts can be supplied by ordinary lemmas
 whose bodies assume contradiction; for example, the prelude includes a lemma proving
 `layout_of({type i32}) == Layout { size: 4usize, align: 4usize }`.
 
-The prelude can also declare contracts for external Rust functions. An external
-contract is a ghost item of the form `unsafe extern fn path::to::item<T>(...) ->
-ResultTy`, followed by ordinary `req`/`ens` and raw `raw req`/`raw ens` clauses,
-and terminated by `;`. The parameter and result types use Rust type syntax,
-while ordinary contract expressions see the corresponding spec model values.
+The prelude can also declare standalone contracts for Rust functions. A
+standalone function contract is a ghost item of the form
+`fn path::to::item<T>(...) -> ResultTy` or
+`unsafe fn path::to::item<T>(...) -> ResultTy`, followed by ordinary `req`/`ens`
+clauses and, for unsafe functions, raw `raw req`/`raw ens` clauses, and
+terminated by `;`. The parameter and result types use Rust type syntax, while
+ordinary contract expressions see the corresponding spec model values.
+Standalone contracts may target existing safe or unsafe Rust functions. If the
+target function body also has inline contract directives, the duplicate
+declaration is rejected. The old `extern fn` and `unsafe extern fn` ghost item
+forms are not accepted.
 
 ```rust
 /*@
-unsafe extern fn core::intrinsics::read_via_copy<T>(ptr: *const T) -> T
+unsafe fn core::intrinsics::read_via_copy<T>(ptr: *const T) -> T
   raw req *ptr |-?-> Option::<T>::Some(?old)
   raw ens *ptr |-?-> Option::<T>::Some(old)
   ens result == old
@@ -649,11 +655,11 @@ materializes resources back into the caller heap after the call. If a
 caller path condition after the call. The `result` variable is available in both
 the raw pattern and the `where` clause of `raw ens`.
 
-The same call-site rule is used for external functions with ghost extern
-contracts. The verifier looks up the callee's Rust path, instantiates any Rust
-generic type arguments into the ghost contract, checks ordinary and raw
-preconditions, and then assumes ordinary and raw postconditions. Unsafe external
-functions without a matching extern contract are rejected.
+The same call-site rule is used for functions with standalone ghost contracts.
+The verifier looks up the callee's Rust path, instantiates any Rust generic type
+arguments into the ghost contract, checks ordinary and raw preconditions, and
+then assumes ordinary and raw postconditions. Unsafe functions without either an
+inline contract or a matching standalone contract are rejected.
 
 Unsafe lemmas use the same raw contract model as unsafe functions. They are
 declared as ghost items with `unsafe lem`, spec parameters, optional ordinary
