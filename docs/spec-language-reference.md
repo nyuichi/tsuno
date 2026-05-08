@@ -409,6 +409,22 @@ uninterpreted pure function. Layout facts can be supplied by ordinary lemmas
 whose bodies assume contradiction; for example, the prelude includes a lemma proving
 `layout_of({type i32}) == Layout { size: 4usize, align: 4usize }`.
 
+The prelude can also declare contracts for external Rust functions. An external
+contract is a ghost item of the form `unsafe extern fn path::to::item<T>(...) ->
+ResultTy`, followed by ordinary `req`/`ens` and raw `raw req`/`raw ens` clauses,
+and terminated by `;`. The parameter and result types are spec-language types;
+raw pointer parameters are therefore written as `Ptr`.
+
+```rust
+/*@
+unsafe extern fn core::intrinsics::read_via_copy<T>(ptr: Ptr) -> T
+  raw req PointsTo(ptr.addr, {type T}, Option::<T>::Some(?old))
+  raw ens PointsTo(ptr.addr, {type T}, Option::<T>::Some(old))
+  ens result == old
+;
+*/
+```
+
 Enum variant selectors use `expr as Enum::Ctor` or
 `expr as Enum::Ctor::<T, ...>`. The selector projects the payload of the named
 variant without adding a runtime check or a tag assumption. If `expr` is not
@@ -633,6 +649,12 @@ materializes resources back into the caller heap after the call. If a
 `raw ens` has a `where` clause, that boolean condition is also added to the
 caller path condition after the call. The `result` variable is available in both
 the raw pattern and the `where` clause of `raw ens`.
+
+The same call-site rule is used for external functions with ghost extern
+contracts. The verifier looks up the callee's Rust path, instantiates any Rust
+generic type arguments into the ghost contract, checks ordinary and raw
+preconditions, and then assumes ordinary and raw postconditions. Unsafe external
+functions without a matching extern contract are rejected.
 
 Unsafe lemmas use the same raw contract model as unsafe functions. They are
 declared as ghost items with `unsafe fn`, spec parameters, optional ordinary

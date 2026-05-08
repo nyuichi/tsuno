@@ -32,7 +32,9 @@ use rustc_middle::mir::{
     Operand, Place, PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnOp,
 };
 use rustc_middle::ty::layout::TyAndLayout;
-use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
+use rustc_middle::ty::{
+    self, GenericArgKind, GenericArgsRef, GenericParamDefKind, Ty, TyCtxt, TyKind,
+};
 use rustc_span::source_map::Spanned;
 use rustc_span::{DUMMY_SP, Span};
 use z3::SatResult;
@@ -88,8 +90,7 @@ pub struct State {
 #[derive(Debug, Clone)]
 struct Allocation {
     base_addr: SymValue,
-    size: u64,
-    align: u64,
+    layout: SymValue,
 }
 
 struct AssertionFailure {
@@ -116,6 +117,7 @@ pub struct Verifier<'tcx> {
     tcx: TyCtxt<'tcx>,
     context: VerifierContext<'tcx>,
     contracts: HashMap<LocalDefId, FunctionContract>,
+    extern_contracts: HashMap<String, FunctionContract>,
     pure_fns: HashMap<String, TypedPureFnDef>,
     lemmas: HashMap<String, TypedLemmaDef>,
     structs: HashMap<String, crate::spec::StructDef>,
@@ -195,13 +197,14 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
         ghosts,
         functions,
         contracts,
+        extern_contracts,
     } = program;
     let tcx_capture = UnsafeCallbackArg(tcx);
     let ghosts_capture = UnsafeCallbackArg(&ghosts);
     let prepass_error = with_z3_context(move || {
         let tcx = tcx_capture.get();
         let ghosts = ghosts_capture.get();
-        let mut verifier = Verifier::new(tcx, HashMap::new());
+        let mut verifier = Verifier::new(tcx, HashMap::new(), HashMap::new());
         verifier.structs = ghosts.structs.clone();
         verifier.struct_invariants = ghosts.struct_invariants.clone();
         verifier.enum_invariants = ghosts.enum_invariants.clone();
@@ -235,6 +238,7 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
 
     let mut results = Vec::new();
     let contracts_capture = UnsafeCallbackArg(&contracts);
+    let extern_contracts_capture = UnsafeCallbackArg(&extern_contracts);
     for function in functions {
         let body = tcx
             .mir_drops_elaborated_and_const_checked(function.def_id)
@@ -252,7 +256,8 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
             let tcx = tcx_capture.get();
             let ghosts = ghosts_capture.get();
             let contracts = contracts_capture.get().clone();
-            let mut verifier = Verifier::new(tcx, contracts);
+            let extern_contracts = extern_contracts_capture.get().clone();
+            let mut verifier = Verifier::new(tcx, contracts, extern_contracts);
             verifier.structs = ghosts.structs.clone();
             verifier.struct_invariants = ghosts.struct_invariants.clone();
             verifier.enum_invariants = ghosts.enum_invariants.clone();
@@ -281,11 +286,16 @@ pub fn verify<'tcx>(tcx: TyCtxt<'tcx>, program: ProgramPrepass) -> Vec<Verificat
 }
 
 impl<'tcx> Verifier<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, contracts: HashMap<LocalDefId, FunctionContract>) -> Self {
+    pub fn new(
+        tcx: TyCtxt<'tcx>,
+        contracts: HashMap<LocalDefId, FunctionContract>,
+        extern_contracts: HashMap<String, FunctionContract>,
+    ) -> Self {
         Self {
             tcx,
             context: VerifierContext::Ghost,
             contracts,
+            extern_contracts,
             pure_fns: HashMap::new(),
             lemmas: HashMap::new(),
             structs: HashMap::new(),
@@ -388,7 +398,6 @@ impl<'tcx> Verifier<'tcx> {
             control_point_directives,
             unsafe_blocks,
         }));
-
         let initial_state = match self.initial_state() {
             Ok(Some(state)) => state,
             Ok(None) => return self.pass_result("all assertions discharged"),
@@ -1012,20 +1021,17 @@ impl<'tcx> Verifier<'tcx> {
         target: Option<BasicBlock>,
         span: Span,
     ) -> Result<Vec<State>, VerificationResult> {
-        let callee = self.called_local_def_id(func);
-        if let Some(local_def_id) = callee {
-            let contract = self
-                .contracts
-                .get(&local_def_id)
-                .ok_or_else(|| self.missing_local_contract_result(local_def_id, span))?;
-            let env = self.call_env(&state, args, contract, span, HashMap::new())?;
+        if let Some(contract) = self.called_contract(func, span)? {
+            let contract = self.instantiate_called_contract(func, &contract, span)?;
+            let type_spec = self.called_contract_type_spec(func, span)?;
+            let env = self.call_env(&state, args, &contract, span, type_spec)?;
             let spec =
                 self.bind_contract_spec_values(&env.current, &env.spec, &contract.req.bindings)?;
             let req_env = CallEnv {
                 current: env.current.clone(),
                 spec: spec.clone(),
             };
-            let req = self.contract_req_formula(contract, &req_env, span)?;
+            let req = self.contract_req_formula(&contract, &req_env, span)?;
             self.assert_constraint(
                 &mut state,
                 req,
@@ -1039,10 +1045,10 @@ impl<'tcx> Verifier<'tcx> {
             let result_value = self.fresh_for_rust_ty(result_ty, "call_result")?;
             self.write_place(&mut state, destination, result_value.clone(), span)?;
             self.abstract_call_mut_args(&mut state, args, span)?;
-            let mut env = self.call_env(&state, args, contract, span, spec)?;
+            let mut env = self.call_env(&state, args, &contract, span, spec)?;
             self.consume_call_move_args(&mut state, args, span)?;
             env.current.insert("result".to_owned(), result_value);
-            let ens = self.contract_ens_formula(contract, &env, span)?;
+            let ens = self.contract_ens_formula(&contract, &env, span)?;
             if !self.assume_path_condition(&mut state, ens) {
                 return Ok(Vec::new());
             }
@@ -1073,25 +1079,11 @@ impl<'tcx> Verifier<'tcx> {
         call: UnsafeCall<'_, 'tcx>,
     ) -> Result<Vec<UnsafeState>, VerificationResult> {
         let span = call.span;
-        let callee = self.called_local_def_id(call.func);
-        if let Some(local_def_id) = callee {
-            if !self.fn_def_is_unsafe(local_def_id.to_def_id())
-                && self
-                    .called_def_id(call.func)
-                    .is_some_and(|def_id| self.fn_def_is_unsafe(def_id))
-            {
-                return Err(self.unsupported_result(
-                    span,
-                    "unsafe function calls inside unsafe blocks require a local contract"
-                        .to_owned(),
-                ));
-            }
-            let contract = self
-                .contracts
-                .get(&local_def_id)
-                .ok_or_else(|| self.missing_local_contract_result(local_def_id, span))?;
+        if let Some(contract) = self.called_contract(call.func, span)? {
+            let contract = self.instantiate_called_contract(call.func, &contract, span)?;
+            let type_spec = self.called_contract_type_spec(call.func, span)?;
             let call_env =
-                self.unsafe_call_env(&mut state, call.args, contract, span, HashMap::new())?;
+                self.unsafe_call_env(&mut state, call.args, &contract, span, type_spec)?;
             let spec = self.bind_contract_spec_values(
                 &call_env.current,
                 &call_env.spec,
@@ -1101,7 +1093,7 @@ impl<'tcx> Verifier<'tcx> {
                 current: call_env.current.clone(),
                 spec: spec.clone(),
             };
-            let req = self.contract_req_formula(contract, &req_env, span)?;
+            let req = self.contract_req_formula(&contract, &req_env, span)?;
             self.unsafe_assert_constraint(&mut state, req, span, "precondition failed".to_owned())?;
             let mut spec = spec;
             for resource_req in &contract.raw_reqs {
@@ -1125,12 +1117,13 @@ impl<'tcx> Verifier<'tcx> {
                 span,
             )?;
             self.unsafe_abstract_call_mut_args(&mut state, bridge, call.args, span)?;
-            let mut call_env = self.unsafe_call_env(&mut state, call.args, contract, span, spec)?;
+            let mut call_env =
+                self.unsafe_call_env(&mut state, call.args, &contract, span, spec)?;
             self.unsafe_consume_call_move_args(&mut state, bridge, call.args, span)?;
             call_env
                 .current
                 .insert("result".to_owned(), result_value.clone());
-            let ens = self.contract_ens_formula(contract, &call_env, span)?;
+            let ens = self.contract_ens_formula(&contract, &call_env, span)?;
             if !self.assume_unsafe_path_condition(&mut state, ens) {
                 return Ok(Vec::new());
             }
@@ -1763,14 +1756,10 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<(), VerificationResult> {
         self.remove_unsafe_local_allocation(state, local);
         let ty = self.body().local_decls[local].ty;
-        let (size, align) = self.layout_size_align_bytes(ty, span)?;
+        let layout = self.layout_value_for_ty(ty, span)?;
         let base_addr =
             self.fresh_for_spec_ty(&SpecTy::Usize, &format!("{hint}_{}_base", local.as_usize()))?;
-        let alloc = Allocation {
-            base_addr,
-            size,
-            align,
-        };
+        let alloc = Allocation { base_addr, layout };
 
         let other_allocs = state.allocs.values().cloned().collect::<Vec<_>>();
         for other in &other_allocs {
@@ -1778,12 +1767,10 @@ impl<'tcx> Verifier<'tcx> {
                 state,
                 self.allocation_distinct_formula(&alloc, other, span)?,
             );
-            if alloc.size != 0 && other.size != 0 {
-                self.add_unsafe_path_condition(
-                    state,
-                    self.allocation_non_overlapping_formula(&alloc, other),
-                );
-            }
+            self.add_unsafe_path_condition(
+                state,
+                self.allocation_non_overlapping_formula(&alloc, other, span)?,
+            );
         }
         self.add_unsafe_allocation_facts(state, &alloc, span)?;
         state.allocs.insert(local, alloc);
@@ -1833,7 +1820,7 @@ impl<'tcx> Verifier<'tcx> {
             return Ok(());
         }
 
-        let addr = alloc.base_addr;
+        let addr = alloc.base_addr.clone();
         state.heap.push(Resource::PointsTo {
             addr: addr.clone(),
             ty,
@@ -1841,11 +1828,16 @@ impl<'tcx> Verifier<'tcx> {
         });
         let addr_int = self.solver.int_term(&addr);
         self.add_unsafe_path_condition(state, addr_int.eq(Int::from_i64(0)).not());
+        self.add_unsafe_path_condition(
+            state,
+            addr_int
+                .modulo(
+                    self.solver
+                        .int_term(&self.allocation_align_value(&alloc, span)?),
+                )
+                .eq(0),
+        );
         let ty = self.body().local_decls[local].ty;
-        let (_, align) = self.layout_size_align_bytes(ty, span)?;
-        if align > 1 {
-            self.add_unsafe_path_condition(state, addr_int.modulo(Int::from_u64(align)).eq(0));
-        }
         let spec_ty = self.spec_ty_for_place_ty(ty, span)?;
         if let Some(formula) = self.spec_ty_formula(&spec_ty, &value, span)? {
             self.add_unsafe_path_condition(state, formula);
@@ -1867,6 +1859,17 @@ impl<'tcx> Verifier<'tcx> {
             } else {
                 None
             }
+        })
+    }
+
+    fn is_stack_points_to_resource(
+        &self,
+        state: &UnsafeState,
+        addr: &SymValue,
+        ty: &SymValue,
+    ) -> bool {
+        state.allocs.iter().any(|(local, alloc)| {
+            alloc.base_addr == *addr && self.local_rust_ty_model_value(*local) == *ty
         })
     }
 
@@ -2662,13 +2665,17 @@ impl<'tcx> Verifier<'tcx> {
             condition: Bool::from_bool(true),
             env: HashMap::new(),
         };
+        let env = CallEnv {
+            current: current.clone(),
+            spec: spec.clone(),
+        };
         let matches = self.match_contract_raw_pattern(
             state,
-            current,
-            spec,
+            &env,
             &assertion.pattern,
             span,
             vec![initial],
+            check,
         )?;
         let mut possible = 0;
         let mut definite = Vec::new();
@@ -2734,22 +2741,22 @@ impl<'tcx> Verifier<'tcx> {
     fn match_contract_raw_pattern(
         &self,
         state: &UnsafeState,
-        current: &HashMap<String, SymValue>,
-        spec: &HashMap<String, SymValue>,
+        env: &CallEnv,
         pattern: &TypedRawPattern,
         span: Span,
         candidates: Vec<RawPatternMatch>,
+        check: ResourceContractCheck,
     ) -> Result<Vec<RawPatternMatch>, VerificationResult> {
         match pattern {
             TypedRawPattern::Emp => Ok(candidates),
             TypedRawPattern::Star(lhs, rhs) => {
                 let lhs_matches =
-                    self.match_contract_raw_pattern(state, current, spec, lhs, span, candidates)?;
-                self.match_contract_raw_pattern(state, current, spec, rhs, span, lhs_matches)
+                    self.match_contract_raw_pattern(state, env, lhs, span, candidates, check)?;
+                self.match_contract_raw_pattern(state, env, rhs, span, lhs_matches, check)
             }
             TypedRawPattern::PointsTo { addr, ty, value } => {
-                let addr_value = self.contract_expr_to_value(current, spec, addr)?;
-                let ty_value = self.contract_expr_to_value(current, spec, ty)?;
+                let addr_value = self.contract_expr_to_value(&env.current, &env.spec, addr)?;
+                let ty_value = self.contract_expr_to_value(&env.current, &env.spec, ty)?;
                 let mut out = Vec::new();
                 for candidate in candidates {
                     for (index, resource) in state.heap.iter().enumerate() {
@@ -2764,15 +2771,20 @@ impl<'tcx> Verifier<'tcx> {
                         else {
                             continue;
                         };
+                        if matches!(check, ResourceContractCheck::Postcondition)
+                            && self.is_stack_points_to_resource(state, resource_addr, resource_ty)
+                        {
+                            continue;
+                        }
                         let actual_value = self.resource_option_value(
                             resource_value.as_ref(),
                             typed_value_pattern_ty(value),
                         )?;
-                        let mut next_spec = spec.clone();
+                        let mut next_spec = env.spec.clone();
                         next_spec.extend(candidate.env.clone());
                         let mut next_env = candidate.env.clone();
                         let value_condition = self.match_contract_value_pattern(
-                            current,
+                            &env.current,
                             &next_spec,
                             value,
                             &actual_value,
@@ -2810,8 +2822,8 @@ impl<'tcx> Verifier<'tcx> {
                 Ok(out)
             }
             TypedRawPattern::DeallocToken { base, layout } => {
-                let base = self.contract_expr_to_value(current, spec, base)?;
-                let layout = self.contract_expr_to_value(current, spec, layout)?;
+                let base = self.contract_expr_to_value(&env.current, &env.spec, base)?;
+                let layout = self.contract_expr_to_value(&env.current, &env.spec, layout)?;
                 let mut out = Vec::new();
                 for candidate in candidates {
                     for (index, resource) in state.heap.iter().enumerate() {
@@ -5158,7 +5170,10 @@ impl<'tcx> Verifier<'tcx> {
         match &expr.kind {
             TypedExprKind::Bool(value) => Ok(self.solver.bool_value(*value)),
             TypedExprKind::Int(value) => self.value_decimal_int(&value.digits, self.report_span()),
-            TypedExprKind::RustType(key) => Ok(self.solver.rust_ty_value(key)),
+            TypedExprKind::RustType(key) => Ok(spec
+                .get(key.as_str())
+                .cloned()
+                .unwrap_or_else(|| self.solver.rust_ty_value(key))),
             TypedExprKind::SeqLit(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
@@ -5930,18 +5945,378 @@ impl<'tcx> Verifier<'tcx> {
         Solver::bool_contains_marker(expr, &marker)
     }
 
-    fn called_local_def_id(&self, func: &Operand<'tcx>) -> Option<LocalDefId> {
-        self.called_def_id(func)?.as_local()
+    fn called_contract(
+        &self,
+        func: &Operand<'tcx>,
+        span: Span,
+    ) -> Result<Option<FunctionContract>, VerificationResult> {
+        let Some(def_id) = self.called_def_id(func) else {
+            return Ok(None);
+        };
+        let path = self.tcx.def_path_str(def_id);
+        if let Some(local_def_id) = def_id.as_local() {
+            if let Some(contract) = self.contracts.get(&local_def_id).cloned() {
+                return Ok(Some(contract));
+            }
+            if let Some(contract) = self.extern_contracts.get(&path).cloned() {
+                return Ok(Some(contract));
+            }
+            return Err(self.missing_local_contract_result(local_def_id, span));
+        }
+        Ok(self.extern_contracts.get(&path).cloned())
     }
 
     fn called_def_id(&self, func: &Operand<'tcx>) -> Option<DefId> {
+        self.called_def_id_and_args(func).map(|(def_id, _)| def_id)
+    }
+
+    fn called_def_id_and_args(
+        &self,
+        func: &Operand<'tcx>,
+    ) -> Option<(DefId, GenericArgsRef<'tcx>)> {
         let Operand::Constant(constant) = func else {
             return None;
         };
-        let TyKind::FnDef(def_id, _) = *constant.const_.ty().kind() else {
+        let TyKind::FnDef(def_id, args) = *constant.const_.ty().kind() else {
             return None;
         };
-        Some(def_id)
+        Some((def_id, args))
+    }
+
+    fn called_contract_type_spec(
+        &self,
+        func: &Operand<'tcx>,
+        span: Span,
+    ) -> Result<HashMap<String, SymValue>, VerificationResult> {
+        let Some((def_id, args)) = self.called_def_id_and_args(func) else {
+            return Ok(HashMap::new());
+        };
+        let generics = self.tcx.generics_of(def_id);
+        let mut spec = HashMap::new();
+        for param in &generics.own_params {
+            if !matches!(param.kind, GenericParamDefKind::Type { .. }) {
+                continue;
+            }
+            let Some(arg) = args.get(param.index as usize) else {
+                continue;
+            };
+            let GenericArgKind::Type(ty) = arg.kind() else {
+                return Err(self.unsupported_result(
+                    span,
+                    format!("generic argument for `{}` is not a type", param.name),
+                ));
+            };
+            spec.insert(param.name.to_string(), self.rust_ty_model_value(ty));
+        }
+        Ok(spec)
+    }
+
+    fn called_contract_type_bindings(
+        &self,
+        func: &Operand<'tcx>,
+        span: Span,
+    ) -> Result<HashMap<String, SpecTy>, VerificationResult> {
+        let Some((def_id, args)) = self.called_def_id_and_args(func) else {
+            return Ok(HashMap::new());
+        };
+        let generics = self.tcx.generics_of(def_id);
+        let mut bindings = HashMap::new();
+        for param in &generics.own_params {
+            if !matches!(param.kind, GenericParamDefKind::Type { .. }) {
+                continue;
+            }
+            let Some(arg) = args.get(param.index as usize) else {
+                continue;
+            };
+            let GenericArgKind::Type(ty) = arg.kind() else {
+                return Err(self.unsupported_result(
+                    span,
+                    format!("generic argument for `{}` is not a type", param.name),
+                ));
+            };
+            bindings.insert(param.name.to_string(), self.spec_ty_for_place_ty(ty, span)?);
+        }
+        Ok(bindings)
+    }
+
+    fn instantiate_called_contract(
+        &self,
+        func: &Operand<'tcx>,
+        contract: &FunctionContract,
+        span: Span,
+    ) -> Result<FunctionContract, VerificationResult> {
+        let bindings = self.called_contract_type_bindings(func, span)?;
+        if bindings.is_empty() {
+            return Ok(contract.clone());
+        }
+        Ok(FunctionContract {
+            params: contract
+                .params
+                .iter()
+                .map(|param| {
+                    Ok(ContractParam {
+                        name: param.name.clone(),
+                        ty: self.instantiate_spec_ty(&param.ty, &bindings, span)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, VerificationResult>>()?,
+            req: self.instantiate_normalized_predicate(&contract.req, &bindings, span)?,
+            req_span: contract.req_span.clone(),
+            raw_reqs: contract
+                .raw_reqs
+                .iter()
+                .map(|assertion| {
+                    self.instantiate_raw_assertion_contract(assertion, &bindings, span)
+                })
+                .collect::<Result<Vec<_>, VerificationResult>>()?,
+            ens: self.instantiate_typed_expr(&contract.ens, &bindings, span)?,
+            ens_span: contract.ens_span.clone(),
+            raw_ens: contract
+                .raw_ens
+                .iter()
+                .map(|assertion| {
+                    self.instantiate_raw_assertion_contract(assertion, &bindings, span)
+                })
+                .collect::<Result<Vec<_>, VerificationResult>>()?,
+            result: self.instantiate_spec_ty(&contract.result, &bindings, span)?,
+        })
+    }
+
+    fn instantiate_normalized_predicate(
+        &self,
+        predicate: &NormalizedPredicate,
+        bindings: &HashMap<String, SpecTy>,
+        span: Span,
+    ) -> Result<NormalizedPredicate, VerificationResult> {
+        Ok(NormalizedPredicate {
+            bindings: predicate
+                .bindings
+                .iter()
+                .map(|binding| {
+                    Ok(NormalizedBinding {
+                        name: binding.name.clone(),
+                        value: self.instantiate_typed_expr(&binding.value, bindings, span)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, VerificationResult>>()?,
+            condition: self.instantiate_typed_expr(&predicate.condition, bindings, span)?,
+        })
+    }
+
+    fn instantiate_raw_assertion_contract(
+        &self,
+        assertion: &RawAssertionContract,
+        bindings: &HashMap<String, SpecTy>,
+        span: Span,
+    ) -> Result<RawAssertionContract, VerificationResult> {
+        Ok(RawAssertionContract {
+            pattern: self.instantiate_raw_pattern(&assertion.pattern, bindings, span)?,
+            condition: self.instantiate_typed_expr(&assertion.condition, bindings, span)?,
+            resolution: assertion.resolution.clone(),
+            assertion_span: assertion.assertion_span.clone(),
+        })
+    }
+
+    fn instantiate_raw_pattern(
+        &self,
+        pattern: &TypedRawPattern,
+        bindings: &HashMap<String, SpecTy>,
+        span: Span,
+    ) -> Result<TypedRawPattern, VerificationResult> {
+        Ok(match pattern {
+            TypedRawPattern::Emp => TypedRawPattern::Emp,
+            TypedRawPattern::Star(lhs, rhs) => TypedRawPattern::Star(
+                Box::new(self.instantiate_raw_pattern(lhs, bindings, span)?),
+                Box::new(self.instantiate_raw_pattern(rhs, bindings, span)?),
+            ),
+            TypedRawPattern::PointsTo { addr, ty, value } => TypedRawPattern::PointsTo {
+                addr: self.instantiate_typed_expr(addr, bindings, span)?,
+                ty: self.instantiate_typed_expr(ty, bindings, span)?,
+                value: self.instantiate_value_pattern(value, bindings, span)?,
+            },
+            TypedRawPattern::DeallocToken { base, layout } => TypedRawPattern::DeallocToken {
+                base: self.instantiate_typed_expr(base, bindings, span)?,
+                layout: self.instantiate_typed_expr(layout, bindings, span)?,
+            },
+        })
+    }
+
+    fn instantiate_value_pattern(
+        &self,
+        pattern: &TypedValuePattern,
+        bindings: &HashMap<String, SpecTy>,
+        span: Span,
+    ) -> Result<TypedValuePattern, VerificationResult> {
+        Ok(match pattern {
+            TypedValuePattern::Bind { name, ty } => TypedValuePattern::Bind {
+                name: name.clone(),
+                ty: self.instantiate_spec_ty(ty, bindings, span)?,
+            },
+            TypedValuePattern::Expr(expr) => {
+                TypedValuePattern::Expr(self.instantiate_typed_expr(expr, bindings, span)?)
+            }
+            TypedValuePattern::SeqLit { ty, items } => TypedValuePattern::SeqLit {
+                ty: self.instantiate_spec_ty(ty, bindings, span)?,
+                items: items
+                    .iter()
+                    .map(|item| self.instantiate_value_pattern(item, bindings, span))
+                    .collect::<Result<Vec<_>, VerificationResult>>()?,
+            },
+            TypedValuePattern::StructLit { ty, fields } => TypedValuePattern::StructLit {
+                ty: self.instantiate_spec_ty(ty, bindings, span)?,
+                fields: fields
+                    .iter()
+                    .map(|field| self.instantiate_value_pattern(field, bindings, span))
+                    .collect::<Result<Vec<_>, VerificationResult>>()?,
+            },
+            TypedValuePattern::CtorCall {
+                ty,
+                ctor_index,
+                args,
+            } => TypedValuePattern::CtorCall {
+                ty: self.instantiate_spec_ty(ty, bindings, span)?,
+                ctor_index: *ctor_index,
+                args: args
+                    .iter()
+                    .map(|arg| self.instantiate_value_pattern(arg, bindings, span))
+                    .collect::<Result<Vec<_>, VerificationResult>>()?,
+            },
+        })
+    }
+
+    fn instantiate_typed_expr(
+        &self,
+        expr: &TypedExpr,
+        bindings: &HashMap<String, SpecTy>,
+        span: Span,
+    ) -> Result<TypedExpr, VerificationResult> {
+        let ty = self.instantiate_spec_ty(&expr.ty, bindings, span)?;
+        let kind = match &expr.kind {
+            TypedExprKind::Bool(value) => TypedExprKind::Bool(*value),
+            TypedExprKind::Int(value) => TypedExprKind::Int(value.clone()),
+            TypedExprKind::Var(name) => TypedExprKind::Var(name.clone()),
+            TypedExprKind::RustVar(name) => TypedExprKind::RustVar(name.clone()),
+            TypedExprKind::RustType(key) => TypedExprKind::RustType(key.clone()),
+            TypedExprKind::SeqLit(items) => TypedExprKind::SeqLit(
+                items
+                    .iter()
+                    .map(|item| self.instantiate_typed_expr(item, bindings, span))
+                    .collect::<Result<Vec<_>, VerificationResult>>()?,
+            ),
+            TypedExprKind::StructLit { fields } => TypedExprKind::StructLit {
+                fields: fields
+                    .iter()
+                    .map(|field| self.instantiate_typed_expr(field, bindings, span))
+                    .collect::<Result<Vec<_>, VerificationResult>>()?,
+            },
+            TypedExprKind::Match {
+                scrutinee,
+                arms,
+                default,
+            } => TypedExprKind::Match {
+                scrutinee: Box::new(self.instantiate_typed_expr(scrutinee, bindings, span)?),
+                arms: arms
+                    .iter()
+                    .map(|arm| {
+                        Ok(crate::spec::TypedMatchArm {
+                            ctor_index: arm.ctor_index,
+                            enum_name: arm.enum_name.clone(),
+                            ctor_name: arm.ctor_name.clone(),
+                            bindings: arm
+                                .bindings
+                                .iter()
+                                .map(|binding| {
+                                    self.instantiate_match_binding(binding, bindings, span)
+                                })
+                                .collect::<Result<Vec<_>, VerificationResult>>()?,
+                            body: self.instantiate_typed_expr(&arm.body, bindings, span)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, VerificationResult>>()?,
+                default: default
+                    .as_ref()
+                    .map(|expr| {
+                        self.instantiate_typed_expr(expr, bindings, span)
+                            .map(Box::new)
+                    })
+                    .transpose()?,
+            },
+            TypedExprKind::PureCall { func, args } => TypedExprKind::PureCall {
+                func: func.clone(),
+                args: args
+                    .iter()
+                    .map(|arg| self.instantiate_typed_expr(arg, bindings, span))
+                    .collect::<Result<Vec<_>, VerificationResult>>()?,
+            },
+            TypedExprKind::CtorCall {
+                enum_name,
+                ctor_name,
+                ctor_index,
+                args,
+            } => TypedExprKind::CtorCall {
+                enum_name: enum_name.clone(),
+                ctor_name: ctor_name.clone(),
+                ctor_index: *ctor_index,
+                args: args
+                    .iter()
+                    .map(|arg| self.instantiate_typed_expr(arg, bindings, span))
+                    .collect::<Result<Vec<_>, VerificationResult>>()?,
+            },
+            TypedExprKind::Field { base, name, index } => TypedExprKind::Field {
+                base: Box::new(self.instantiate_typed_expr(base, bindings, span)?),
+                name: name.clone(),
+                index: *index,
+            },
+            TypedExprKind::TupleField { base, index } => TypedExprKind::TupleField {
+                base: Box::new(self.instantiate_typed_expr(base, bindings, span)?),
+                index: *index,
+            },
+            TypedExprKind::VariantSelector {
+                base,
+                enum_name,
+                ctor_name,
+                ctor_index,
+            } => TypedExprKind::VariantSelector {
+                base: Box::new(self.instantiate_typed_expr(base, bindings, span)?),
+                enum_name: enum_name.clone(),
+                ctor_name: ctor_name.clone(),
+                ctor_index: *ctor_index,
+            },
+            TypedExprKind::Cast { arg } => TypedExprKind::Cast {
+                arg: Box::new(self.instantiate_typed_expr(arg, bindings, span)?),
+            },
+            TypedExprKind::Index { base, index } => TypedExprKind::Index {
+                base: Box::new(self.instantiate_typed_expr(base, bindings, span)?),
+                index: Box::new(self.instantiate_typed_expr(index, bindings, span)?),
+            },
+            TypedExprKind::Unary { op, arg } => TypedExprKind::Unary {
+                op: *op,
+                arg: Box::new(self.instantiate_typed_expr(arg, bindings, span)?),
+            },
+            TypedExprKind::Binary { op, lhs, rhs } => TypedExprKind::Binary {
+                op: *op,
+                lhs: Box::new(self.instantiate_typed_expr(lhs, bindings, span)?),
+                rhs: Box::new(self.instantiate_typed_expr(rhs, bindings, span)?),
+            },
+        };
+        Ok(TypedExpr { ty, kind })
+    }
+
+    fn instantiate_match_binding(
+        &self,
+        binding: &TypedMatchBinding,
+        bindings: &HashMap<String, SpecTy>,
+        span: Span,
+    ) -> Result<TypedMatchBinding, VerificationResult> {
+        Ok(match binding {
+            TypedMatchBinding::Var { name, ty } => TypedMatchBinding::Var {
+                name: name.clone(),
+                ty: self.instantiate_spec_ty(ty, bindings, span)?,
+            },
+            TypedMatchBinding::Wildcard { ty } => TypedMatchBinding::Wildcard {
+                ty: self.instantiate_spec_ty(ty, bindings, span)?,
+            },
+        })
     }
 
     fn fn_def_is_unsafe(&self, def_id: DefId) -> bool {
@@ -6142,14 +6517,10 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<(), VerificationResult> {
         state.allocs.remove(&local);
         let ty = self.body().local_decls[local].ty;
-        let (size, align) = self.layout_size_align_bytes(ty, span)?;
+        let layout = self.layout_value_for_ty(ty, span)?;
         let base_addr =
             self.fresh_for_spec_ty(&SpecTy::Usize, &format!("{hint}_{}_base", local.as_usize()))?;
-        let alloc = Allocation {
-            base_addr,
-            size,
-            align,
-        };
+        let alloc = Allocation { base_addr, layout };
 
         self.add_path_condition(state, self.allocation_bounds_formula(&alloc, span)?);
         let other_allocs = state.allocs.values().cloned().collect::<Vec<_>>();
@@ -6158,19 +6529,17 @@ impl<'tcx> Verifier<'tcx> {
                 state,
                 self.allocation_distinct_formula(&alloc, other, span)?,
             );
-            if alloc.size != 0 && other.size != 0 {
-                self.add_path_condition(
-                    state,
-                    self.allocation_non_overlapping_formula(&alloc, other),
-                );
-            }
+            self.add_path_condition(
+                state,
+                self.allocation_non_overlapping_formula(&alloc, other, span)?,
+            );
         }
         state.allocs.insert(local, alloc);
         Ok(())
     }
 
     fn allocations_are_identical(&self, lhs: &Allocation, rhs: &Allocation) -> bool {
-        lhs.size == rhs.size && lhs.align == rhs.align && lhs.base_addr == rhs.base_addr
+        lhs.layout == rhs.layout && lhs.base_addr == rhs.base_addr
     }
 
     fn allocation_equality_formula(
@@ -6179,14 +6548,51 @@ impl<'tcx> Verifier<'tcx> {
         rhs: &Allocation,
         span: Span,
     ) -> Result<Bool, VerificationResult> {
-        if lhs.size != rhs.size || lhs.align != rhs.align {
+        if lhs.layout == rhs.layout {
+            return self.solver_result(
+                span,
+                self.solver
+                    .eq_for_spec_ty(&SpecTy::Usize, &lhs.base_addr, &rhs.base_addr),
+            );
+        }
+        let lhs_size = self
+            .solver
+            .int_term(&self.allocation_size_value(lhs, span)?);
+        let rhs_size = self
+            .solver
+            .int_term(&self.allocation_size_value(rhs, span)?);
+        let lhs_align = self
+            .solver
+            .int_term(&self.allocation_align_value(lhs, span)?);
+        let rhs_align = self
+            .solver
+            .int_term(&self.allocation_align_value(rhs, span)?);
+        if let (Some(lhs), Some(rhs)) = (
+            Self::concrete_nonnegative_i64(&lhs_size),
+            Self::concrete_nonnegative_i64(&rhs_size),
+        ) && lhs != rhs
+        {
             return Ok(Bool::from_bool(false));
         }
-        self.solver_result(
-            span,
-            self.solver
-                .eq_for_spec_ty(&SpecTy::Usize, &lhs.base_addr, &rhs.base_addr),
-        )
+        if let (Some(lhs), Some(rhs)) = (
+            Self::concrete_nonnegative_i64(&lhs_align),
+            Self::concrete_nonnegative_i64(&rhs_align),
+        ) && lhs != rhs
+        {
+            return Ok(Bool::from_bool(false));
+        }
+        Ok(bool_and(vec![
+            self.solver_result(
+                span,
+                self.solver
+                    .eq_for_spec_ty(&SpecTy::Usize, &lhs.base_addr, &rhs.base_addr),
+            )?,
+            self.solver_result(
+                span,
+                self.solver
+                    .eq_for_spec_ty(&layout_spec_ty(), &lhs.layout, &rhs.layout),
+            )?,
+        ]))
     }
 
     fn allocation_distinct_formula(
@@ -6214,21 +6620,83 @@ impl<'tcx> Verifier<'tcx> {
             formulas.push(base_in_range);
         }
         let (_, usize_max) = self.pointer_sized_int_bounds(false)?;
-        let end = self.solver.int_term(&alloc.base_addr) + Int::from_u64(alloc.size);
+        let size = self.allocation_size_value(alloc, span)?;
+        let align_value = self.allocation_align_value(alloc, span)?;
+        let end = self.solver.int_term(&alloc.base_addr) + self.solver.int_term(&size);
         formulas.push(end.le(usize_max));
-        if alloc.align > 1 {
-            let base = self.solver.int_term(&alloc.base_addr);
-            formulas.push(base.modulo(Int::from_u64(alloc.align)).eq(0));
+        let base = self.solver.int_term(&alloc.base_addr);
+        let align = self.solver.int_term(&align_value);
+        match Self::concrete_nonnegative_i64(&align) {
+            Some(1..) => {
+                if !matches!(Self::concrete_nonnegative_i64(&align), Some(1)) {
+                    formulas.push(base.modulo(align).eq(0));
+                }
+            }
+            _ => {
+                formulas.push(align.gt(Int::from_u64(0)));
+                formulas.push(base.modulo(align).eq(0));
+            }
         }
         Ok(bool_and(formulas))
     }
 
-    fn allocation_non_overlapping_formula(&self, alloc: &Allocation, other: &Allocation) -> Bool {
+    fn allocation_size_value(
+        &self,
+        alloc: &Allocation,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        self.layout_size_value(&alloc.layout, span)
+    }
+
+    fn allocation_align_value(
+        &self,
+        alloc: &Allocation,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        self.layout_align_value(&alloc.layout, span)
+    }
+
+    fn allocation_non_overlapping_formula(
+        &self,
+        alloc: &Allocation,
+        other: &Allocation,
+        span: Span,
+    ) -> Result<Bool, VerificationResult> {
         let alloc_base = self.solver.int_term(&alloc.base_addr);
-        let alloc_end = alloc_base.clone() + Int::from_u64(alloc.size);
+        let alloc_size = self
+            .solver
+            .int_term(&self.allocation_size_value(alloc, span)?);
+        if matches!(Self::concrete_nonnegative_i64(&alloc_size), Some(0)) {
+            return Ok(Bool::from_bool(true));
+        }
+        let alloc_end = alloc_base.clone() + alloc_size.clone();
         let other_base = self.solver.int_term(&other.base_addr);
-        let other_end = other_base.clone() + Int::from_u64(other.size);
-        Bool::or(&[&alloc_end.le(&other_base), &other_end.le(alloc_base)])
+        let other_size = self
+            .solver
+            .int_term(&self.allocation_size_value(other, span)?);
+        if matches!(Self::concrete_nonnegative_i64(&other_size), Some(0)) {
+            return Ok(Bool::from_bool(true));
+        }
+        let other_end = other_base.clone() + other_size.clone();
+        if Self::concrete_nonnegative_i64(&alloc_size).is_some()
+            && Self::concrete_nonnegative_i64(&other_size).is_some()
+        {
+            return Ok(Bool::or(&[
+                &alloc_end.le(&other_base),
+                &other_end.le(alloc_base),
+            ]));
+        }
+        Ok(Bool::or(&[
+            &alloc_size.eq(Int::from_u64(0)),
+            &other_size.eq(Int::from_u64(0)),
+            &alloc_end.le(&other_base),
+            &other_end.le(alloc_base),
+        ]))
+    }
+
+    fn concrete_nonnegative_i64(value: &Int) -> Option<i64> {
+        let value = Solver::simplify_int(value).as_i64()?;
+        (value >= 0).then_some(value)
     }
 
     fn ptr_for_place(
@@ -6377,6 +6845,66 @@ impl<'tcx> Verifier<'tcx> {
             }
             Err(err) => Err(err),
         }
+    }
+
+    fn layout_value_for_ty(
+        &self,
+        ty: Ty<'tcx>,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        match self.layout_size_align_bytes(ty, span) {
+            Ok((size, align)) => self.construct_composite(
+                &layout_spec_ty(),
+                &[
+                    self.solver.wrap_int(&Int::from_u64(size)),
+                    self.solver.wrap_int(&Int::from_u64(align)),
+                ],
+            ),
+            Err(err) if matches!(ty.kind(), TyKind::Param(_)) => {
+                let ty_value = self.rust_ty_model_value(ty);
+                self.layout_of_type_value(ty_value, span)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn layout_of_type_value(
+        &self,
+        ty: SymValue,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        if let Some(value) = self.solver_result(
+            span,
+            self.solver
+                .apply_pure_fn("layout_of", std::slice::from_ref(&ty)),
+        )? {
+            return Ok(value);
+        }
+        self.solver_result(
+            span,
+            self.solver
+                .declare_pure_fn("layout_of", &[SpecTy::RustTy], &layout_spec_ty()),
+        )?;
+        self.solver_result(span, self.solver.apply_pure_fn("layout_of", &[ty]))?
+            .ok_or_else(|| {
+                self.unsupported_result(span, "unknown pure function `layout_of`".to_owned())
+            })
+    }
+
+    fn layout_size_value(
+        &self,
+        layout: &SymValue,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        self.decode_composite_field(&layout_spec_ty(), layout, 0, span)
+    }
+
+    fn layout_align_value(
+        &self,
+        layout: &SymValue,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        self.decode_composite_field(&layout_spec_ty(), layout, 1, span)
     }
 
     fn ptr_without_provenance(
@@ -7472,13 +8000,9 @@ impl CallEnv {
             .iter()
             .zip(verifier.body().local_decls.indices().skip(1))
         {
-            let value = state.store.get(&local).cloned().ok_or_else(|| {
-                verifier.unsupported_result(
-                    verifier.control_span(state.ctrl),
-                    format!("missing local {}", local.as_usize()),
-                )
-            })?;
-            current.insert(param.name.clone(), value);
+            if let Some(value) = state.store.get(&local).cloned() {
+                current.insert(param.name.clone(), value);
+            }
         }
         if let Some(result) = state.store.get(&Local::from_usize(0)).cloned() {
             current.insert("result".to_owned(), result.clone());

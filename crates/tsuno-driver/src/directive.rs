@@ -9,10 +9,11 @@ use rustc_span::Span;
 use rustc_span::def_id::LocalDefId;
 
 use crate::spec::{
-    self, BinaryOp, EnumCtorDef, EnumDef, Expr, GhostBlock, GhostMatchArm, GhostStmt, IntLiteral,
-    IntSuffix, LemmaDef, MatchArm, MatchBinding, MatchPattern, PureFnDef, PureFnParam,
-    RawAssertion, RawPattern, RustTypeExpr, SpecTy, StructDef, StructFieldTy, StructLitField,
-    UnaryOp, ValuePattern, ValuePatternStructField, provenance_spec_ty, ptr_spec_ty,
+    self, BinaryOp, EnumCtorDef, EnumDef, Expr, ExternContractDef, GhostBlock, GhostMatchArm,
+    GhostStmt, IntLiteral, IntSuffix, LemmaDef, MatchArm, MatchBinding, MatchPattern, PureFnDef,
+    PureFnParam, RawAssertion, RawPattern, RustTypeExpr, SpecTy, StructDef, StructFieldTy,
+    StructLitField, UnaryOp, ValuePattern, ValuePatternStructField, provenance_spec_ty,
+    ptr_spec_ty,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,28 +228,35 @@ fn parse_raw_assert_directive(text: &str, span: Span) -> Result<DirectivePayload
 }
 
 fn parse_raw_assertion(text: &str) -> Result<RawAssertion, ParseError> {
+    parse_raw_assertion_with_type_params(text, &[])
+}
+
+fn parse_raw_assertion_with_type_params(
+    text: &str,
+    type_params: &[String],
+) -> Result<RawAssertion, ParseError> {
     let text = text.trim().strip_suffix(';').unwrap_or(text.trim()).trim();
     let (pattern, condition) = split_raw_assert_where(text);
-    let pattern = parse_raw_pattern(pattern)?;
+    let pattern = parse_raw_pattern(pattern, type_params)?;
     let condition = match condition {
-        Some(condition) => parse_raw_assert_expr(condition)?,
+        Some(condition) => parse_raw_assert_expr(condition, type_params)?,
         None => spec::Expr::Bool(true),
     };
     Ok(RawAssertion { pattern, condition })
 }
 
-fn parse_raw_pattern(text: &str) -> Result<RawPattern, ParseError> {
+fn parse_raw_pattern(text: &str, type_params: &[String]) -> Result<RawPattern, ParseError> {
     let text = strip_enclosing_parens(text.trim());
     if text == "emp" {
         return Ok(RawPattern::Emp);
     }
     if let Some(index) = top_level_star(text) {
-        let lhs = parse_raw_pattern(&text[..index])?;
-        let rhs = parse_raw_pattern(&text[index + 1..])?;
+        let lhs = parse_raw_pattern(&text[..index], type_params)?;
+        let rhs = parse_raw_pattern(&text[index + 1..], type_params)?;
         return Ok(RawPattern::Star(Box::new(lhs), Box::new(rhs)));
     }
     if let Some(index) = top_level_points_to_arrow(text) {
-        return parse_points_to_sugar(&text[..index], &text[index + "|->".len()..]);
+        return parse_points_to_sugar(&text[..index], &text[index + "|->".len()..], type_params);
     }
     if let Some(args) = atom_args(text, "PointsTo") {
         let args = split_top_level_args(args)?;
@@ -258,9 +266,9 @@ fn parse_raw_pattern(text: &str) -> Result<RawPattern, ParseError> {
             ));
         }
         return Ok(RawPattern::PointsTo {
-            addr: parse_raw_assert_expr(args[0])?,
-            ty: parse_raw_assert_expr(args[1])?,
-            value: parse_value_pattern(args[2])?,
+            addr: parse_raw_assert_expr(args[0], type_params)?,
+            ty: parse_raw_assert_expr(args[1], type_params)?,
+            value: parse_value_pattern(args[2], type_params)?,
         });
     }
     if let Some(args) = atom_args(text, "DeallocToken") {
@@ -271,8 +279,8 @@ fn parse_raw_pattern(text: &str) -> Result<RawPattern, ParseError> {
             ));
         }
         return Ok(RawPattern::DeallocToken {
-            base: parse_raw_assert_expr(args[0])?,
-            layout: parse_raw_assert_expr(args[1])?,
+            base: parse_raw_assert_expr(args[0], type_params)?,
+            layout: parse_raw_assert_expr(args[1], type_params)?,
         });
     }
     Err(ParseError::new(
@@ -280,7 +288,11 @@ fn parse_raw_pattern(text: &str) -> Result<RawPattern, ParseError> {
     ))
 }
 
-fn parse_points_to_sugar(lhs: &str, rhs: &str) -> Result<RawPattern, ParseError> {
+fn parse_points_to_sugar(
+    lhs: &str,
+    rhs: &str,
+    type_params: &[String],
+) -> Result<RawPattern, ParseError> {
     let lhs = strip_enclosing_parens(lhs.trim());
     let Some(pointer) = lhs.strip_prefix('*').map(str::trim) else {
         return Err(ParseError::new(
@@ -294,7 +306,7 @@ fn parse_points_to_sugar(lhs: &str, rhs: &str) -> Result<RawPattern, ParseError>
     }
     Ok(RawPattern::PointsToSugar {
         pointer: pointer.to_owned(),
-        value: parse_value_pattern(rhs)?,
+        value: parse_value_pattern(rhs, type_params)?,
     })
 }
 
@@ -325,9 +337,9 @@ fn split_raw_assert_where(text: &str) -> (&str, Option<&str>) {
     (text, None)
 }
 
-fn parse_value_pattern(text: &str) -> Result<ValuePattern, ParseError> {
+fn parse_value_pattern(text: &str, type_params: &[String]) -> Result<ValuePattern, ParseError> {
     let (rewritten, binders) = rewrite_pattern_binders(text)?;
-    let expr = parse_raw_assert_expr(&rewritten)?;
+    let expr = parse_raw_assert_expr(&rewritten, type_params)?;
     Ok(expr_to_value_pattern(expr, &binders).0)
 }
 
@@ -477,8 +489,8 @@ fn value_pattern_to_expr(pattern: ValuePattern) -> Option<spec::Expr> {
     }
 }
 
-fn parse_raw_assert_expr(text: &str) -> Result<spec::Expr, ParseError> {
-    parse_source_expr("raw assert", text.trim())
+fn parse_raw_assert_expr(text: &str, type_params: &[String]) -> Result<spec::Expr, ParseError> {
+    parse_source_expr_with_type_params("raw assert", text.trim(), type_params)
         .map_err(|err| ParseError::new(render_parse_error(DirectiveKind::RawAssert, err)))
 }
 
@@ -1458,11 +1470,17 @@ fn is_ghost_item_block(text: &str) -> bool {
     let trimmed = text.trim_start();
     trimmed.starts_with("fn ")
         || trimmed.starts_with("unsafe fn ")
+        || trimmed.starts_with("extern fn ")
+        || trimmed.starts_with("unsafe extern fn ")
         || trimmed.starts_with("enum ")
         || trimmed.starts_with("struct ")
 }
 
 fn is_complete_ghost_item_comment(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("extern fn ") || trimmed.starts_with("unsafe extern fn ") {
+        return trimmed.trim_end().ends_with(';');
+    }
     let mut depth = 0usize;
     let mut saw_brace = false;
     for ch in text.chars() {
@@ -2311,6 +2329,20 @@ impl Parser {
     }
 
     fn parse_spec_ty(&mut self) -> Result<SpecTy, ParseError> {
+        if self.eat(&Token::LParen) {
+            if self.eat(&Token::RParen) {
+                return Ok(SpecTy::Tuple(Vec::new()));
+            }
+            let mut items = Vec::new();
+            loop {
+                items.push(self.parse_spec_ty()?);
+                if self.eat(&Token::RParen) {
+                    break;
+                }
+                self.expect(&Token::Comma)?;
+            }
+            return Ok(SpecTy::Tuple(items));
+        }
         let Some(Token::Ident(ident)) = self.next().cloned() else {
             return Err(ParseError::new("expected a type argument"));
         };
@@ -2654,6 +2686,7 @@ fn parse_ghost_block(text: &str) -> Result<GhostBlock, ParseError> {
             GhostItem::Struct(def) => block.structs.push(def),
             GhostItem::PureFn(def) => block.pure_fns.push(def),
             GhostItem::Lemma(def) => block.lemmas.push(def),
+            GhostItem::ExternContract(def) => block.extern_contracts.push(def),
         }
     }
     Ok(block)
@@ -2664,6 +2697,7 @@ enum GhostItem {
     Struct(StructDef),
     PureFn(PureFnDef),
     Lemma(LemmaDef),
+    ExternContract(ExternContractDef),
 }
 
 struct GhostBlockParser<'a> {
@@ -2702,6 +2736,14 @@ impl<'a> GhostBlockParser<'a> {
         } else {
             false
         };
+        self.skip_ws();
+        if self.starts_with_keyword("extern") {
+            self.expect_keyword("extern")?;
+            self.expect_keyword("fn")?;
+            return Ok(GhostItem::ExternContract(
+                self.parse_extern_contract_def(is_unsafe)?,
+            ));
+        }
         self.expect_keyword("fn")?;
         let name = self.parse_ident()?;
         let type_params = self.parse_type_params()?;
@@ -2738,6 +2780,98 @@ impl<'a> GhostBlockParser<'a> {
             type_params,
             params,
         )?))
+    }
+
+    fn parse_path(&mut self) -> Result<String, ParseError> {
+        let mut path = self.parse_ident()?;
+        loop {
+            self.skip_ws();
+            if !self.text[self.cursor..].starts_with("::") {
+                return Ok(path);
+            }
+            self.cursor += 2;
+            path.push_str("::");
+            path.push_str(&self.parse_ident()?);
+        }
+    }
+
+    fn parse_extern_contract_def(
+        &mut self,
+        is_unsafe: bool,
+    ) -> Result<ExternContractDef, ParseError> {
+        let path = self.parse_path()?;
+        let type_params = self.parse_type_params()?;
+        self.expect_char('(')?;
+        let mut params = Vec::new();
+        self.skip_ws();
+        if !self.eat_char(')') {
+            loop {
+                let param_name = self.parse_ident()?;
+                self.expect_char(':')?;
+                let ty = self.parse_spec_ty_annotation(&type_params, &[',', ')'])?;
+                params.push(PureFnParam {
+                    name: param_name,
+                    ty,
+                });
+                self.skip_ws();
+                if self.eat_char(')') {
+                    break;
+                }
+                self.expect_char(',')?;
+            }
+        }
+        self.expect_arrow()?;
+        let result_ty = self.parse_spec_ty_annotation(&type_params, &[';', '\n'])?;
+        let mut req = None;
+        let mut raw_reqs = Vec::new();
+        let mut ens = None;
+        let mut raw_ens = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.eat_char(';') {
+                break;
+            }
+            if self.starts_with_keyword("raw") {
+                self.expect_keyword("raw")?;
+                self.skip_ws();
+                if self.starts_with_keyword("req") {
+                    self.expect_keyword("req")?;
+                    raw_reqs.push(self.parse_line_raw_assertion("extern raw req", &type_params)?);
+                    continue;
+                }
+                self.expect_keyword("ens")?;
+                raw_ens.push(self.parse_line_raw_assertion("extern raw ens", &type_params)?);
+                continue;
+            }
+            if self.starts_with_keyword("req") {
+                if req.is_some() {
+                    return Err(ParseError::new("multiple extern req clauses"));
+                }
+                self.expect_keyword("req")?;
+                req = Some(self.parse_line_expr("extern req", &type_params)?);
+                continue;
+            }
+            if self.starts_with_keyword("ens") {
+                if ens.is_some() {
+                    return Err(ParseError::new("multiple extern ens clauses"));
+                }
+                self.expect_keyword("ens")?;
+                ens = Some(self.parse_line_expr("extern ens", &type_params)?);
+                continue;
+            }
+            return Err(ParseError::new("expected extern contract clause"));
+        }
+        Ok(ExternContractDef {
+            path,
+            is_unsafe,
+            type_params,
+            params,
+            result_ty,
+            req: req.unwrap_or(Expr::Bool(true)),
+            raw_reqs,
+            ens: ens.unwrap_or(Expr::Bool(true)),
+            raw_ens,
+        })
     }
 
     fn parse_enum_def(&mut self) -> Result<EnumDef, ParseError> {
@@ -2908,11 +3042,11 @@ impl<'a> GhostBlockParser<'a> {
                 self.skip_ws();
                 if self.starts_with_keyword("req") {
                     self.expect_keyword("req")?;
-                    raw_reqs.push(self.parse_line_raw_assertion("lemma raw req")?);
+                    raw_reqs.push(self.parse_line_raw_assertion("lemma raw req", &type_params)?);
                     continue;
                 }
                 self.expect_keyword("ens")?;
-                raw_ens.push(self.parse_line_raw_assertion("lemma raw ens")?);
+                raw_ens.push(self.parse_line_raw_assertion("lemma raw ens", &type_params)?);
                 continue;
             }
             if self.starts_with_keyword("req") {
@@ -3108,10 +3242,14 @@ impl<'a> GhostBlockParser<'a> {
         parse_source_expr_with_type_params(kind, text, type_params)
     }
 
-    fn parse_line_raw_assertion(&mut self, kind: &str) -> Result<RawAssertion, ParseError> {
+    fn parse_line_raw_assertion(
+        &mut self,
+        kind: &str,
+        type_params: &[String],
+    ) -> Result<RawAssertion, ParseError> {
         let (text, next) = self.parse_line_expr_text(self.text, self.cursor)?;
         self.cursor = next;
-        parse_raw_assertion(text)
+        parse_raw_assertion_with_type_params(text, type_params)
             .map_err(|err| ParseError::new(err.to_string().replace("//@ raw assert", kind)))
     }
 
@@ -3948,6 +4086,7 @@ fn add1_done(x: i32)
                         }),
                     })],
                 }],
+                extern_contracts: vec![],
             }
         );
     }
@@ -4117,6 +4256,7 @@ fn singleton(x: i32) -> IntList {
                     }),
                 }],
                 lemmas: vec![],
+                extern_contracts: vec![],
             }
         );
     }
