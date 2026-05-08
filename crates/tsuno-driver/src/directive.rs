@@ -9,11 +9,11 @@ use rustc_span::Span;
 use rustc_span::def_id::LocalDefId;
 
 use crate::spec::{
-    self, BinaryOp, EnumCtorDef, EnumDef, Expr, ExternContractDef, GhostBlock, GhostMatchArm,
-    GhostStmt, IntLiteral, IntSuffix, LemmaDef, MatchArm, MatchBinding, MatchPattern, PureFnDef,
-    PureFnParam, RawAssertion, RawPattern, RustTypeExpr, SpecTy, StructDef, StructFieldTy,
-    StructLitField, UnaryOp, ValuePattern, ValuePatternStructField, provenance_spec_ty,
-    ptr_spec_ty,
+    self, BinaryOp, EnumCtorDef, EnumDef, Expr, ExternContractDef, ExternParam, GhostBlock,
+    GhostMatchArm, GhostStmt, IntLiteral, IntSuffix, LemmaDef, MatchArm, MatchBinding,
+    MatchPattern, PureFnDef, PureFnParam, RawAssertion, RawPattern, RustTypeExpr, SpecTy,
+    StructDef, StructFieldTy, StructLitField, UnaryOp, ValuePattern, ValuePatternStructField,
+    provenance_spec_ty, ptr_spec_ty,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,7 +256,7 @@ fn parse_raw_pattern(text: &str, type_params: &[String]) -> Result<RawPattern, P
         return Ok(RawPattern::Star(Box::new(lhs), Box::new(rhs)));
     }
     if let Some(index) = top_level_points_to_arrow(text) {
-        return parse_points_to_sugar(&text[..index], &text[index + "|->".len()..], type_params);
+        return parse_points_to_sugar(&text[..index], &text[index + "|-?->".len()..], type_params);
     }
     if let Some(args) = atom_args(text, "PointsTo") {
         let args = split_top_level_args(args)?;
@@ -296,12 +296,12 @@ fn parse_points_to_sugar(
     let lhs = strip_enclosing_parens(lhs.trim());
     let Some(pointer) = lhs.strip_prefix('*').map(str::trim) else {
         return Err(ParseError::new(
-            "`|->` raw pattern must have the form `*ptr |-> value`",
+            "`|-?->` raw pattern must have the form `*ptr |-?-> value`",
         ));
     };
     if !is_ident(pointer) {
         return Err(ParseError::new(
-            "`|->` raw pattern pointer must be a Rust local name",
+            "`|-?->` raw pattern pointer must be a Rust local name",
         ));
     }
     Ok(RawPattern::PointsToSugar {
@@ -494,6 +494,38 @@ fn parse_raw_assert_expr(text: &str, type_params: &[String]) -> Result<spec::Exp
         .map_err(|err| ParseError::new(render_parse_error(DirectiveKind::RawAssert, err)))
 }
 
+fn spec_ty_for_rust_type_text(text: &str, type_params: &[String]) -> Result<SpecTy, ParseError> {
+    match text.trim() {
+        "()" => Ok(SpecTy::Tuple(vec![])),
+        "bool" => Ok(SpecTy::Bool),
+        "i8" => Ok(SpecTy::I8),
+        "i16" => Ok(SpecTy::I16),
+        "i32" => Ok(SpecTy::I32),
+        "i64" => Ok(SpecTy::I64),
+        "isize" => Ok(SpecTy::Isize),
+        "u8" => Ok(SpecTy::U8),
+        "u16" => Ok(SpecTy::U16),
+        "u32" => Ok(SpecTy::U32),
+        "u64" => Ok(SpecTy::U64),
+        "usize" => Ok(SpecTy::Usize),
+        raw if raw.starts_with("*const ") || raw.starts_with("*mut ") => Ok(ptr_spec_ty()),
+        raw if raw.starts_with("&mut ") => Ok(SpecTy::Mut(Box::new(spec_ty_for_rust_type_text(
+            raw.trim_start_matches("&mut ").trim(),
+            type_params,
+        )?))),
+        raw if raw.starts_with('&') => Ok(SpecTy::Ref(Box::new(spec_ty_for_rust_type_text(
+            raw.trim_start_matches('&').trim(),
+            type_params,
+        )?))),
+        type_param if type_params.iter().any(|param| param == type_param) => {
+            Ok(SpecTy::TypeParam(type_param.to_owned()))
+        }
+        other => Err(ParseError::new(format!(
+            "unsupported Rust type `{other}` in extern contract"
+        ))),
+    }
+}
+
 fn strip_enclosing_parens(mut text: &str) -> &str {
     loop {
         let trimmed = text.trim();
@@ -546,7 +578,7 @@ fn top_level_points_to_arrow(text: &str) -> Option<usize> {
         match ch {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            '|' if depth == 0 && text[index..].starts_with("|->") => return Some(index),
+            '|' if depth == 0 && text[index..].starts_with("|-?->") => return Some(index),
             _ => {}
         }
         index += ch.len_utf8();
@@ -1468,8 +1500,10 @@ pub(crate) struct SpecComment {
 
 fn is_ghost_item_block(text: &str) -> bool {
     let trimmed = text.trim_start();
-    trimmed.starts_with("fn ")
+    trimmed.starts_with("def ")
+        || trimmed.starts_with("lem ")
         || trimmed.starts_with("unsafe fn ")
+        || trimmed.starts_with("unsafe lem ")
         || trimmed.starts_with("extern fn ")
         || trimmed.starts_with("unsafe extern fn ")
         || trimmed.starts_with("enum ")
@@ -1478,6 +1512,9 @@ fn is_ghost_item_block(text: &str) -> bool {
 
 fn is_complete_ghost_item_comment(text: &str) -> bool {
     let trimmed = text.trim_start();
+    if trimmed.starts_with("def ") {
+        return trimmed.trim_end().ends_with(';') || balanced_item_expr_definition(trimmed);
+    }
     if trimmed.starts_with("extern fn ") || trimmed.starts_with("unsafe extern fn ") {
         return trimmed.trim_end().ends_with(';');
     }
@@ -1494,6 +1531,41 @@ fn is_complete_ghost_item_comment(text: &str) -> bool {
         }
     }
     saw_brace && depth == 0
+}
+
+fn balanced_item_expr_definition(text: &str) -> bool {
+    let Some(index) = text.find('=') else {
+        return false;
+    };
+    if text[index + 1..].trim().is_empty() {
+        return false;
+    }
+    let mut depth = 0usize;
+    for ch in text[index + 1..].chars() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+fn starts_ghost_item_at(text: &str, cursor: usize) -> bool {
+    let Some(prefix) = text[..cursor].chars().next_back() else {
+        return false;
+    };
+    if prefix != '\n' && prefix != '\r' {
+        return false;
+    }
+    let rest = text[cursor..].trim_start();
+    rest.starts_with("def ")
+        || rest.starts_with("lem ")
+        || rest.starts_with("unsafe lem ")
+        || rest.starts_with("extern fn ")
+        || rest.starts_with("unsafe extern fn ")
+        || rest.starts_with("enum ")
+        || rest.starts_with("struct ")
 }
 
 fn collect_spec_comments(source: &str) -> Vec<SpecComment> {
@@ -2744,42 +2816,30 @@ impl<'a> GhostBlockParser<'a> {
                 self.parse_extern_contract_def(is_unsafe)?,
             ));
         }
-        self.expect_keyword("fn")?;
+        if is_unsafe {
+            self.expect_keyword("lem")?;
+            return Ok(GhostItem::Lemma(self.parse_lemma_item(true)?));
+        }
+        if self.starts_with_keyword("def") {
+            self.expect_keyword("def")?;
+            return Ok(GhostItem::PureFn(self.parse_pure_fn_item()?));
+        }
+        self.expect_keyword("lem")?;
+        Ok(GhostItem::Lemma(self.parse_lemma_item(false)?))
+    }
+
+    fn parse_pure_fn_item(&mut self) -> Result<PureFnDef, ParseError> {
         let name = self.parse_ident()?;
         let type_params = self.parse_type_params()?;
-        self.expect_char('(')?;
-        let mut params = Vec::new();
-        self.skip_ws();
-        if !self.eat_char(')') {
-            loop {
-                let param_name = self.parse_ident()?;
-                self.expect_char(':')?;
-                let ty = self.parse_spec_ty_annotation(&type_params, &[',', ')'])?;
-                params.push(PureFnParam {
-                    name: param_name,
-                    ty,
-                });
-                self.skip_ws();
-                if self.eat_char(')') {
-                    break;
-                }
-                self.expect_char(',')?;
-            }
-        }
-        self.skip_ws();
-        if self.text[self.cursor..].starts_with("->") {
-            return Ok(GhostItem::PureFn(self.parse_pure_fn_def(
-                name,
-                type_params,
-                params,
-            )?));
-        }
-        Ok(GhostItem::Lemma(self.parse_lemma_def(
-            name,
-            is_unsafe,
-            type_params,
-            params,
-        )?))
+        let params = self.parse_spec_params(&type_params)?;
+        self.parse_pure_fn_def(name, type_params, params)
+    }
+
+    fn parse_lemma_item(&mut self, is_unsafe: bool) -> Result<LemmaDef, ParseError> {
+        let name = self.parse_ident()?;
+        let type_params = self.parse_type_params()?;
+        let params = self.parse_spec_params(&type_params)?;
+        self.parse_lemma_def(name, is_unsafe, type_params, params)
     }
 
     fn parse_path(&mut self) -> Result<String, ParseError> {
@@ -2808,9 +2868,11 @@ impl<'a> GhostBlockParser<'a> {
             loop {
                 let param_name = self.parse_ident()?;
                 self.expect_char(':')?;
-                let ty = self.parse_spec_ty_annotation(&type_params, &[',', ')'])?;
-                params.push(PureFnParam {
+                let rust_ty = self.parse_rust_type_annotation(&type_params, &[',', ')'])?;
+                let ty = spec_ty_for_rust_type_text(&rust_ty.text, &type_params)?;
+                params.push(ExternParam {
                     name: param_name,
+                    rust_ty,
                     ty,
                 });
                 self.skip_ws();
@@ -2821,7 +2883,8 @@ impl<'a> GhostBlockParser<'a> {
             }
         }
         self.expect_arrow()?;
-        let result_ty = self.parse_spec_ty_annotation(&type_params, &[';', '\n'])?;
+        let result_rust_ty = self.parse_rust_type_annotation(&type_params, &[';', '\n'])?;
+        let result_ty = spec_ty_for_rust_type_text(&result_rust_ty.text, &type_params)?;
         let mut req = None;
         let mut raw_reqs = Vec::new();
         let mut ens = None;
@@ -2866,6 +2929,7 @@ impl<'a> GhostBlockParser<'a> {
             is_unsafe,
             type_params,
             params,
+            result_rust_ty,
             result_ty,
             req: req.unwrap_or(Expr::Bool(true)),
             raw_reqs,
@@ -2995,7 +3059,7 @@ impl<'a> GhostBlockParser<'a> {
         params: Vec<PureFnParam>,
     ) -> Result<PureFnDef, ParseError> {
         self.expect_arrow()?;
-        let result_ty = self.parse_spec_ty_annotation(&type_params, &['{', ';'])?;
+        let result_ty = self.parse_spec_ty_annotation(&type_params, &['=', ';'])?;
         self.skip_ws();
         if self.eat_char(';') {
             return Ok(PureFnDef {
@@ -3006,8 +3070,8 @@ impl<'a> GhostBlockParser<'a> {
                 body: None,
             });
         }
-        self.expect_char('{')?;
-        let body = self.parse_braced_body()?;
+        self.expect_char('=')?;
+        let body = self.parse_item_expr_body()?;
         Ok(PureFnDef {
             name,
             type_params: type_params.clone(),
@@ -3099,6 +3163,32 @@ impl<'a> GhostBlockParser<'a> {
         }
     }
 
+    fn parse_spec_params(
+        &mut self,
+        type_params: &[String],
+    ) -> Result<Vec<PureFnParam>, ParseError> {
+        self.expect_char('(')?;
+        let mut params = Vec::new();
+        self.skip_ws();
+        if !self.eat_char(')') {
+            loop {
+                let param_name = self.parse_ident()?;
+                self.expect_char(':')?;
+                let ty = self.parse_spec_ty_annotation(type_params, &[',', ')'])?;
+                params.push(PureFnParam {
+                    name: param_name,
+                    ty,
+                });
+                self.skip_ws();
+                if self.eat_char(')') {
+                    break;
+                }
+                self.expect_char(',')?;
+            }
+        }
+        Ok(params)
+    }
+
     fn parse_braced_body(&mut self) -> Result<&'a str, ParseError> {
         let body_start = self.cursor;
         let mut depth = 1usize;
@@ -3117,6 +3207,44 @@ impl<'a> GhostBlockParser<'a> {
             }
         }
         Err(ParseError::new("unclosed `{` in pure function block"))
+    }
+
+    fn parse_item_expr_body(&mut self) -> Result<&'a str, ParseError> {
+        self.skip_ws();
+        let start = self.cursor;
+        let mut cursor = self.cursor;
+        let mut depth = 0usize;
+        while cursor < self.text.len() {
+            if depth == 0 && starts_ghost_item_at(self.text, cursor) {
+                let text = self.text[start..cursor].trim_end();
+                if text.is_empty() {
+                    return Err(ParseError::new("expected pure function body"));
+                }
+                self.cursor = cursor;
+                return Ok(text);
+            }
+            let ch = self.text[cursor..].chars().next().expect("char");
+            match ch {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                ';' if depth == 0 => {
+                    let text = self.text[start..cursor].trim_end();
+                    if text.is_empty() {
+                        return Err(ParseError::new("expected pure function body"));
+                    }
+                    self.cursor = cursor + 1;
+                    return Ok(text);
+                }
+                _ => {}
+            }
+            cursor += ch.len_utf8();
+        }
+        let text = self.text[start..cursor].trim_end();
+        if text.is_empty() {
+            return Err(ParseError::new("expected pure function body"));
+        }
+        self.cursor = cursor;
+        Ok(text)
     }
 
     fn parse_lemma_body(
@@ -3261,6 +3389,24 @@ impl<'a> GhostBlockParser<'a> {
         let (text, next) = self.capture_until_top_level_char(terminators)?;
         self.cursor = next;
         parse_spec_ty_text_with_params(text, type_params)
+    }
+
+    fn parse_rust_type_annotation(
+        &mut self,
+        type_params: &[String],
+        terminators: &[char],
+    ) -> Result<RustTypeExpr, ParseError> {
+        let (text, next) = self.capture_until_top_level_char(terminators)?;
+        let expr = parse_raw_expr_with_type_params(
+            "extern Rust type",
+            &format!("{{type {text}}}"),
+            type_params,
+        )?;
+        self.cursor = next;
+        match expr {
+            Expr::RustType(ty) => Ok(ty),
+            _ => Err(ParseError::new("expected Rust type")),
+        }
     }
 
     fn parse_line_expr_text(
@@ -3867,9 +4013,8 @@ mod tests {
     fn parses_pure_function_block() {
         let defs = parse_pure_fn_block(
             r#"
-fn add1(x: i32) -> i32 {
+def add1(x: i32) -> i32 =
     x + 1i32
-}
 "#,
         )
         .expect("pure fn block");
@@ -3899,9 +4044,8 @@ fn add1(x: i32) -> i32 {
     fn parses_generic_seq_types_in_pure_function_block() {
         let defs = parse_pure_fn_block(
             r#"
-fn is_rev(x: Seq<i32>) -> bool {
+def is_rev(x: Seq<i32>) -> bool =
     true
-}
 "#,
         )
         .expect("generic sequence type should parse");
@@ -3984,9 +4128,8 @@ enum Small {
     fn parses_generic_pure_function_definition() {
         let block = parse_ghost_block(
             r#"
-fn id<T>(xs: Seq<T>) -> Seq<T> {
+def id<T>(xs: Seq<T>) -> Seq<T> =
     xs
-}
 "#,
         )
         .expect("generic pure function should parse");
@@ -4007,11 +4150,10 @@ fn id<T>(xs: Seq<T>) -> Seq<T> {
     fn parses_lemma_block() {
         let block = parse_ghost_block(
             r#"
-fn add1(x: i32) -> i32 {
+def add1(x: i32) -> i32 =
     x + 1i32
-}
 
-fn add1_done(x: i32)
+lem add1_done(x: i32)
   req true
   ens add1(x) == x + 1i32
 {
@@ -4100,7 +4242,7 @@ enum List<T> {
     Cons(T, List<T>),
 }
 
-fn check(xs: List<i32>)
+lem check(xs: List<i32>)
   req true
   ens true
 {
@@ -4122,7 +4264,7 @@ fn check(xs: List<i32>)
     fn parses_generic_lemma_definition_and_call() {
         let block = parse_ghost_block(
             r#"
-fn refl<T>(xs: Seq<T>)
+lem refl<T>(xs: Seq<T>)
   req true
   ens true
 {
@@ -4158,7 +4300,7 @@ fn refl<T>(xs: Seq<T>)
     fn parses_unsafe_lemma_raw_contracts() {
         let block = parse_ghost_block(
             r#"
-unsafe fn preserves_cell(p: Ptr)
+unsafe lem preserves_cell(p: Ptr)
   raw req PointsTo(p.addr, {type i32}, Option::Some(?old)) where old == 0i32
   raw ens PointsTo(p.addr, {type i32}, Option::Some(?new)) where new == old
   req true
@@ -4173,6 +4315,38 @@ unsafe fn preserves_cell(p: Ptr)
         assert_eq!(block.lemmas.len(), 1);
         assert_eq!(block.lemmas[0].raw_reqs.len(), 1);
         assert_eq!(block.lemmas[0].raw_ens.len(), 1);
+    }
+
+    #[test]
+    fn rejects_legacy_fn_ghost_items() {
+        let pure_err = parse_ghost_block(
+            r#"
+fn add1(x: i32) -> i32 {
+    x + 1i32
+}
+"#,
+        )
+        .expect_err("legacy pure function syntax should fail");
+        assert!(pure_err.to_string().contains("expected keyword `lem`"));
+
+        let lemma_err = parse_ghost_block(
+            r#"
+fn trivial()
+  req true
+  ens true
+{
+}
+"#,
+        )
+        .expect_err("legacy lemma syntax should fail");
+        assert!(lemma_err.to_string().contains("expected keyword `lem`"));
+    }
+
+    #[test]
+    fn rejects_legacy_points_to_arrow() {
+        let err = super::parse_raw_assertion("*p |-> Option::Some(?v)")
+            .expect_err("legacy points-to arrow should fail");
+        assert!(err.to_string().contains("raw assertion must be"));
     }
 
     #[test]
@@ -4198,9 +4372,8 @@ enum IntList {
     Cons(i32, IntList),
 }
 
-fn singleton(x: i32) -> IntList {
+def singleton(x: i32) -> IntList =
     IntList::Cons(x, IntList::Nil)
-}
 "#,
         )
         .expect("ghost block");
@@ -4270,9 +4443,8 @@ enum List<T> {
     Cons(T, List<T>),
 }
 
-fn singleton(x: i32) -> List<i32> {
+def singleton(x: i32) -> List<i32> =
     List::Cons(x, List::Nil)
-}
 "#,
         );
         assert!(block.is_ok(), "{block:?}");
@@ -4287,12 +4459,11 @@ enum List<T> {
     Cons(T, List<T>),
 }
 
-fn len(xs: List<i32>) -> i32 {
+def len(xs: List<i32>) -> i32 =
     match xs {
         List::Nil => 0i32,
         List::Cons(_, xs0) => 1i32 + len(xs0),
     }
-}
 "#,
         );
         assert!(block.is_ok(), "{block:?}");
@@ -4301,7 +4472,7 @@ fn len(xs: List<i32>) -> i32 {
     #[test]
     fn parses_line_comment_style_lemma_items() {
         let source = r#"
-//@ fn line_comment_lemma(n: Nat)
+//@ lem line_comment_lemma(n: Nat)
 //@   req true
 //@   ens true
 //@ {}
@@ -4312,7 +4483,7 @@ fn f() -> i32 {
     0
 }
 
-/*@ fn mixed_comment_lemma(n: Nat) */
+/*@ lem mixed_comment_lemma(n: Nat) */
 //@   req true
 /*@   ens true */
 //@ {}

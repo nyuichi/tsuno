@@ -8,8 +8,8 @@ struct Pair {
 
 unsafe fn replace<T>(dst: *mut T, src: T) -> T
 //@ let replacement = {src};
-//@ raw req *dst |-> Option::Some(?old);
-//@ raw ens *dst |-> Option::Some(?new) where new == replacement;
+//@ raw req *dst |-?-> Option::Some(?old);
+//@ raw ens *dst |-?-> Option::Some(?new) where new == replacement;
 //@ ens result == old
 {
     unsafe {
@@ -21,8 +21,8 @@ unsafe fn replace<T>(dst: *mut T, src: T) -> T
 
 unsafe fn caller_i32(p: *mut i32, src: i32) -> i32
 //@ let replacement = {src};
-//@ raw req *p |-> Option::Some(?old);
-//@ raw ens *p |-> Option::Some(?new) where new == replacement;
+//@ raw req *p |-?-> Option::Some(?old);
+//@ raw ens *p |-?-> Option::Some(?new) where new == replacement;
 //@ ens result == old
 {
     unsafe { replace::<i32>(p, src) }
@@ -30,8 +30,8 @@ unsafe fn caller_i32(p: *mut i32, src: i32) -> i32
 
 unsafe fn caller_pair(p: *mut Pair, src: Pair) -> Pair
 //@ let replacement = {src};
-//@ raw req *p |-> Option::Some(?old);
-//@ raw ens *p |-> Option::Some(?new) where new == replacement;
+//@ raw req *p |-?-> Option::Some(?old);
+//@ raw ens *p |-?-> Option::Some(?new) where new == replacement;
 //@ ens result == old
 {
     unsafe { replace::<Pair>(p, src) }

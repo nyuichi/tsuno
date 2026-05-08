@@ -277,6 +277,13 @@ pub struct PureFnParam {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternParam {
+    pub name: String,
+    pub rust_ty: RustTypeExpr,
+    pub ty: SpecTy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PureFnDef {
     pub name: String,
     pub type_params: Vec<String>,
@@ -325,7 +332,8 @@ pub struct ExternContractDef {
     pub path: String,
     pub is_unsafe: bool,
     pub type_params: Vec<String>,
-    pub params: Vec<PureFnParam>,
+    pub params: Vec<ExternParam>,
+    pub result_rust_ty: RustTypeExpr,
     pub result_ty: SpecTy,
     pub req: Expr,
     pub raw_reqs: Vec<RawAssertion>,

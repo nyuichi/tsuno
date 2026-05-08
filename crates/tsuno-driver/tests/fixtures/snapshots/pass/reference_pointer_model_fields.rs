@@ -1,11 +1,9 @@
 /*@
-fn ref_model_value(r: Ref<i32>) -> i32 {
+def ref_model_value(r: Ref<i32>) -> i32 =
     *r
-}
 
-fn mut_model_value(r: Mut<i32>) -> i32 {
+def mut_model_value(r: Mut<i32>) -> i32 =
     *r
-}
 */
 
 fn reference_pointer_model_fields(x: &i32, p: *const i32) {

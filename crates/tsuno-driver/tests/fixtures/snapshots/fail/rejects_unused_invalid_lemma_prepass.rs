@@ -1,5 +1,5 @@
 /*@
-fn bad(x: i32)
+lem bad(x: i32)
   req true
   ens true
 {

@@ -1,5 +1,5 @@
 /*@
-fn bad(xs: List<i32>)
+lem bad(xs: List<i32>)
   req true
   ens true
 {

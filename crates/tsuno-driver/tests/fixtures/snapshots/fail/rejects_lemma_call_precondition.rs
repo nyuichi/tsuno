@@ -1,5 +1,5 @@
 /*@
-fn need_zero(x: i32)
+lem need_zero(x: i32)
   req {x} == 0
   ens true
 {

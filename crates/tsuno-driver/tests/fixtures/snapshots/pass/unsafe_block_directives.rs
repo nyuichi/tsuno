@@ -1,5 +1,5 @@
 /*@
-fn keeps_value(x: i32)
+lem keeps_value(x: i32)
   req x == 7
   ens x == 7
 {

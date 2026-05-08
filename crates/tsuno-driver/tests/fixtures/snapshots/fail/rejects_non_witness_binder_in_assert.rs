@@ -1,7 +1,6 @@
 /*@
-fn is_zero(x: i32) -> bool {
+def is_zero(x: i32) -> bool =
     x == 0i32
-}
 */
 
 fn main() {

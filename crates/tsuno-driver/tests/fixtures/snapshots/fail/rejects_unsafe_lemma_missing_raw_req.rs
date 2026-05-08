@@ -1,5 +1,5 @@
 /*@
-unsafe fn needs_i32_cell(p: Ptr)
+unsafe lem needs_i32_cell(p: Ptr)
   raw req PointsTo(p.addr, {type i32}, Option::Some(?old)) where old == 0i32
   raw ens PointsTo(p.addr, {type i32}, Option::Some(?v)) where v == old
 {

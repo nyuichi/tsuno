@@ -32,24 +32,24 @@ struct Layout {
     (align & (align - 1usize)) == 0usize &&
     size + align - 1usize <= (isize::MAX as usize);
 
-fn layout_of(ty: RustTy) -> Layout;
+def layout_of(ty: RustTy) -> Layout;
 
-fn layout_of_i32()
+lem layout_of_i32()
   req true
   ens layout_of({type i32}) == Layout { size: 4usize, align: 4usize }
 {
     assume false;
 }
 
-unsafe extern fn core::intrinsics::read_via_copy<T>(ptr: Ptr) -> T
-  raw req PointsTo(ptr.addr, {type T}, Option::<T>::Some(?old))
-  raw ens PointsTo(ptr.addr, {type T}, Option::<T>::Some(old))
+unsafe extern fn core::intrinsics::read_via_copy<T>(ptr: *const T) -> T
+  raw req *ptr |-?-> Option::<T>::Some(?old)
+  raw ens *ptr |-?-> Option::<T>::Some(old)
   ens result == old
 ;
 
-unsafe extern fn core::intrinsics::write_via_move<T>(ptr: Ptr, value: T) -> ()
-  raw req PointsTo(ptr.addr, {type T}, ?old)
-  raw ens PointsTo(ptr.addr, {type T}, Option::<T>::Some(value))
+unsafe extern fn core::intrinsics::write_via_move<T>(ptr: *mut T, value: T) -> ()
+  raw req *ptr |-?-> ?old
+  raw ens *ptr |-?-> Option::<T>::Some(value)
 ;
 
 enum Nat {
@@ -62,43 +62,37 @@ enum List<T> {
     Cons(T, List<T>),
 }
 
-fn nat_add(x: Nat, y: Nat) -> Nat {
+def nat_add(x: Nat, y: Nat) -> Nat =
     match x {
         Nat::Zero => y,
         Nat::Succ(x0) => Nat::Succ(nat_add(x0, y)),
     }
-}
 
-fn nat_bit0(n: Nat) -> Nat {
+def nat_bit0(n: Nat) -> Nat =
     nat_add(n, n)
-}
 
-fn nat_bit1(n: Nat) -> Nat {
+def nat_bit1(n: Nat) -> Nat =
     Nat::Succ(nat_bit0(n))
-}
 
-fn nat_to_i32(n: Nat) -> i32 {
+def nat_to_i32(n: Nat) -> i32 =
     match n {
         Nat::Zero => 0i32,
         Nat::Succ(n0) => 1i32 + nat_to_i32(n0),
     }
-}
 
-fn list_len(xs: List<i32>) -> Nat {
+def list_len(xs: List<i32>) -> Nat =
     match xs {
         List::Nil => Nat::Zero,
         List::Cons(_, xs0) => Nat::Succ(list_len(xs0)),
     }
-}
 
-fn list_append(xs: List<i32>, ys: List<i32>) -> List<i32> {
+def list_append(xs: List<i32>, ys: List<i32>) -> List<i32> =
     match xs {
         List::Nil => ys,
         List::Cons(x, xs0) => List::Cons(x, list_append(xs0, ys)),
     }
-}
 
-fn nat_add_zero_right(n: Nat)
+lem nat_add_zero_right(n: Nat)
   req true
   ens nat_add(n, Nat::Zero) == n
 {
@@ -113,7 +107,7 @@ fn nat_add_zero_right(n: Nat)
     }
 }
 
-fn nat_add_assoc(x: Nat, y: Nat, z: Nat)
+lem nat_add_assoc(x: Nat, y: Nat, z: Nat)
   req true
   ens nat_add(nat_add(x, y), z) == nat_add(x, nat_add(y, z))
 {
@@ -128,7 +122,7 @@ fn nat_add_assoc(x: Nat, y: Nat, z: Nat)
     }
 }
 
-fn list_append_nil_right(xs: List<i32>)
+lem list_append_nil_right(xs: List<i32>)
   req true
   ens list_append(xs, List::<i32>::Nil) == xs
 {
@@ -143,7 +137,7 @@ fn list_append_nil_right(xs: List<i32>)
     }
 }
 
-fn list_append_assoc(xs: List<i32>, ys: List<i32>, zs: List<i32>)
+lem list_append_assoc(xs: List<i32>, ys: List<i32>, zs: List<i32>)
   req true
   ens list_append(list_append(xs, ys), zs) == list_append(xs, list_append(ys, zs))
 {
@@ -158,7 +152,7 @@ fn list_append_assoc(xs: List<i32>, ys: List<i32>, zs: List<i32>)
     }
 }
 
-fn list_len_append(xs: List<i32>, ys: List<i32>)
+lem list_len_append(xs: List<i32>, ys: List<i32>)
   req true
   ens list_len(list_append(xs, ys)) == nat_add(list_len(xs), list_len(ys))
 {
@@ -173,32 +167,30 @@ fn list_len_append(xs: List<i32>, ys: List<i32>)
     }
 }
 
-fn seq_rev_prefix<T>(xs: Seq<T>, n: Nat, acc: Seq<T>) -> Seq<T> {
+def seq_rev_prefix<T>(xs: Seq<T>, n: Nat, acc: Seq<T>) -> Seq<T> =
     match n {
         Nat::Zero => acc,
         Nat::Succ(m) => seq_rev_prefix(xs, m, acc ++ [xs[m]]),
     }
-}
 
-fn seq_rev<T>(xs: Seq<T>) -> Seq<T> {
+def seq_rev<T>(xs: Seq<T>) -> Seq<T> =
     seq_rev_prefix(xs, seq_len(xs), [])
-}
 
-fn seq_rev_empty<T>(xs: Seq<T>)
+lem seq_rev_empty<T>(xs: Seq<T>)
   req xs == []
   ens seq_rev(xs) == []
 {
     assert seq_rev(xs) == [];
 }
 
-fn seq_concat_assoc<T>(xs: Seq<T>, ys: Seq<T>, zs: Seq<T>)
+lem seq_concat_assoc<T>(xs: Seq<T>, ys: Seq<T>, zs: Seq<T>)
   req true
   ens (xs ++ ys) ++ zs == xs ++ (ys ++ zs)
 {
     assert (xs ++ ys) ++ zs == xs ++ (ys ++ zs);
 }
 
-fn seq_concat_empty_right<T>(xs: Seq<T>)
+lem seq_concat_empty_right<T>(xs: Seq<T>)
   req true
   ens xs ++ [] == xs
 {

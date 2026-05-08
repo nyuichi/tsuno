@@ -1,6 +1,6 @@
 fn main() {
     /*@
-    fn trivial_nat(n: Nat)
+    lem trivial_nat(n: Nat)
       req true
       ens true
     {

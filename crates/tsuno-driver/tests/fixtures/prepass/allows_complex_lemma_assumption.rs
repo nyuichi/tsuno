@@ -1,5 +1,5 @@
 /*@
-fn bad_assume(x: i64, y: i64, z: i64)
+lem bad_assume(x: i64, y: i64, z: i64)
   req x >= -1000000i64 && x <= 1000000i64 && y >= -1000000i64 && y <= 1000000i64 && z >= -1000000i64 && z <= 1000000i64
   ens true
 {

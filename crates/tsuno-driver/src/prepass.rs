@@ -10,10 +10,10 @@ use crate::directive::{
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
-    EnumDef, Expr, ExternContractDef, GhostMatchArm, LemmaDef, MatchBinding, MatchPattern,
-    PureFnDef, PureFnParam, RawAssertion, RawPattern, RustTyKey, RustTypeExpr, SpecTy, StructDef,
-    StructFieldTy, StructTy, TypedExpr, TypedExprKind, TypedMatchArm, TypedMatchBinding,
-    ValuePattern, layout_spec_ty, option_spec_ty, ptr_spec_ty,
+    EnumDef, Expr, ExternContractDef, ExternParam, GhostMatchArm, LemmaDef, MatchBinding,
+    MatchPattern, PureFnDef, PureFnParam, RawAssertion, RawPattern, RustTyKey, RustTypeExpr,
+    SpecTy, StructDef, StructFieldTy, StructTy, TypedExpr, TypedExprKind, TypedMatchArm,
+    TypedMatchBinding, ValuePattern, layout_spec_ty, option_spec_ty, ptr_spec_ty,
 };
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{
@@ -1692,8 +1692,20 @@ fn normalize_extern_contract_def(
         params: def
             .params
             .iter()
-            .map(|param| normalize_pure_fn_param(param, enum_defs, struct_defs, &type_params))
-            .collect::<Result<Vec<_>, _>>()?,
+            .map(|param| {
+                Ok(ExternParam {
+                    name: param.name.clone(),
+                    rust_ty: param.rust_ty.clone(),
+                    ty: resolve_named_struct_spec_ty(
+                        &param.ty,
+                        enum_defs,
+                        struct_defs,
+                        &type_params,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+        result_rust_ty: def.result_rust_ty.clone(),
         result_ty: resolve_named_struct_spec_ty(
             &def.result_ty,
             enum_defs,
@@ -6582,7 +6594,7 @@ fn typed_lemma_raw_pattern(
             Ok(TypedRawPattern::PointsTo { addr, ty, value })
         }
         RawPattern::PointsToSugar { .. } => {
-            Err("`|->` raw sugar in unsafe lemmas is unsupported; use `PointsTo(...)`".to_owned())
+            Err("`|-?->` raw sugar in unsafe lemmas is unsupported; use `PointsTo(...)`".to_owned())
         }
         RawPattern::DeallocToken { base, layout } => Ok(TypedRawPattern::DeallocToken {
             base: typed_contract_raw_expr(
@@ -6705,7 +6717,7 @@ fn typed_contract_raw_pattern<'tcx>(
                 TyKind::RawPtr(pointee, _) => *pointee,
                 _ => {
                     return Err(format!(
-                        "`|->` raw pattern requires a raw pointer, found `{}`",
+                        "`|-?->` raw pattern requires a raw pointer, found `{}`",
                         display_spec_ty(&spec_ty_for_rust_ty(tcx, pointer_ty)?)
                     ));
                 }
@@ -7185,7 +7197,7 @@ fn typed_raw_pattern_into(
                 TyKind::RawPtr(pointee, _) => *pointee,
                 _ => {
                     return Err(format!(
-                        "`|->` raw pattern requires a raw pointer, found `{}`",
+                        "`|-?->` raw pattern requires a raw pointer, found `{}`",
                         display_spec_ty(&spec_ty_for_rust_ty(ctx.tcx, pointer_ty)?)
                     ));
                 }
@@ -7569,6 +7581,138 @@ fn typed_value_pattern(
             })
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_extern_raw_assertions(
+    assertions: &[RawAssertion],
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    rust_params: &HashMap<String, RustTypeExpr>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    result_rust_ty: &RustTypeExpr,
+    inferred: &mut SpecTypeInference,
+) -> Result<Vec<RawAssertionContract>, String> {
+    let mut out = Vec::with_capacity(assertions.len());
+    for assertion in assertions {
+        let pattern = typed_extern_raw_pattern(
+            &assertion.pattern,
+            pure_fns,
+            enum_defs,
+            spec_scope,
+            params,
+            rust_params,
+            allow_result,
+            result_ty,
+            result_rust_ty,
+            inferred,
+        )?;
+        let condition = typed_contract_expr_with_expected(
+            &assertion.condition,
+            pure_fns,
+            enum_defs,
+            &HashSet::new(),
+            spec_scope,
+            params,
+            allow_result,
+            result_ty,
+            inferred,
+            true,
+            Some(&SpecTy::Bool),
+        )?;
+        out.push(RawAssertionContract {
+            pattern,
+            condition,
+            resolution: ResolvedExprEnv::default(),
+            assertion_span: "extern raw contract".to_owned(),
+        });
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_extern_raw_pattern(
+    pattern: &RawPattern,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    rust_params: &HashMap<String, RustTypeExpr>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    result_rust_ty: &RustTypeExpr,
+    inferred: &mut SpecTypeInference,
+) -> Result<TypedRawPattern, String> {
+    match pattern {
+        RawPattern::PointsToSugar { pointer, value } => {
+            let pointer_rust_ty = if allow_result && pointer == "result" {
+                result_rust_ty
+            } else {
+                rust_params
+                    .get(pointer)
+                    .ok_or_else(|| format!("unresolved pointer `{pointer}` in raw contract"))?
+            };
+            let pointee_text = raw_pointer_pointee_text(&pointer_rust_ty.text)?;
+            let type_params = contract_type_param_scope(params, result_ty);
+            let pointee_ty = rust_ty_key_to_spec_ty(pointee_text, &type_params)?;
+            let addr = TypedExpr {
+                ty: SpecTy::Usize,
+                kind: TypedExprKind::Field {
+                    base: Box::new(TypedExpr {
+                        ty: ptr_spec_ty(),
+                        kind: TypedExprKind::Var(pointer.clone()),
+                    }),
+                    name: "addr".to_owned(),
+                    index: 0,
+                },
+            };
+            let ty = TypedExpr {
+                ty: SpecTy::RustTy,
+                kind: TypedExprKind::RustType(RustTyKey::new(pointee_text.to_owned())),
+            };
+            let value = typed_contract_value_pattern(
+                value,
+                &option_spec_ty(pointee_ty),
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?;
+            Ok(TypedRawPattern::PointsTo { addr, ty, value })
+        }
+        RawPattern::Emp
+        | RawPattern::Star(_, _)
+        | RawPattern::PointsTo { .. }
+        | RawPattern::DeallocToken { .. } => typed_lemma_raw_pattern(
+            pattern,
+            pure_fns,
+            enum_defs,
+            spec_scope,
+            params,
+            allow_result,
+            result_ty,
+            inferred,
+        ),
+    }
+}
+
+fn raw_pointer_pointee_text(text: &str) -> Result<&str, String> {
+    let text = text.trim();
+    text.strip_prefix("*const ")
+        .or_else(|| text.strip_prefix("*mut "))
+        .map(str::trim)
+        .ok_or_else(|| {
+            format!(
+                "`|-?->` raw pattern requires a raw pointer, found `{}`",
+                text
+            )
+        })
 }
 
 fn ensure_raw_expr_ty(expr: &TypedExpr, expected: &SpecTy, label: &str) -> Result<(), String> {
@@ -9156,6 +9300,11 @@ fn type_extern_contracts(
             .iter()
             .map(|param| (param.name.clone(), param.ty.clone()))
             .collect();
+        let rust_param_tys: HashMap<_, _> = def
+            .params
+            .iter()
+            .map(|param| (param.name.clone(), param.rust_ty.clone()))
+            .collect();
         let params = def
             .params
             .iter()
@@ -9260,14 +9409,16 @@ fn type_extern_contracts(
                 }
             })
         })?;
-        let raw_reqs = typed_lemma_raw_assertions(
+        let raw_reqs = typed_extern_raw_assertions(
             &def.raw_reqs,
             pure_fns,
             enum_defs,
             &mut type_scope,
             &param_tys,
+            &rust_param_tys,
             false,
             &def.result_ty,
+            &def.result_rust_ty,
             &mut inferred,
         )
         .map_err(|message| LoopPrepassError {
@@ -9298,14 +9449,16 @@ fn type_extern_contracts(
                 message: format!("extern contract `{}` ens: {message}", def.path),
             })
         })?;
-        let raw_ens = typed_lemma_raw_assertions(
+        let raw_ens = typed_extern_raw_assertions(
             &def.raw_ens,
             pure_fns,
             enum_defs,
             &mut type_scope,
             &param_tys,
+            &rust_param_tys,
             true,
             &def.result_ty,
+            &def.result_rust_ty,
             &mut inferred,
         )
         .map_err(|message| LoopPrepassError {
