@@ -41,6 +41,17 @@ fn layout_of_i32()
     assume false;
 }
 
+unsafe extern fn core::intrinsics::read_via_copy<T>(ptr: Ptr) -> T
+  raw req PointsTo(ptr.addr, {type T}, Option::<T>::Some(?old))
+  raw ens PointsTo(ptr.addr, {type T}, Option::<T>::Some(old))
+  ens result == old
+;
+
+unsafe extern fn core::intrinsics::write_via_move<T>(ptr: Ptr, value: T) -> ()
+  raw req PointsTo(ptr.addr, {type T}, ?old)
+  raw ens PointsTo(ptr.addr, {type T}, Option::<T>::Some(value))
+;
+
 enum Nat {
     Zero,
     Succ(Nat),

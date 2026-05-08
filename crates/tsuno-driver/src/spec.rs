@@ -321,6 +321,19 @@ pub struct LemmaDef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternContractDef {
+    pub path: String,
+    pub is_unsafe: bool,
+    pub type_params: Vec<String>,
+    pub params: Vec<PureFnParam>,
+    pub result_ty: SpecTy,
+    pub req: Expr,
+    pub raw_reqs: Vec<RawAssertion>,
+    pub ens: Expr,
+    pub raw_ens: Vec<RawAssertion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawAssertion {
     pub pattern: RawPattern,
     pub condition: Expr,
@@ -373,6 +386,7 @@ pub struct GhostBlock {
     pub structs: Vec<StructDef>,
     pub pure_fns: Vec<PureFnDef>,
     pub lemmas: Vec<LemmaDef>,
+    pub extern_contracts: Vec<ExternContractDef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

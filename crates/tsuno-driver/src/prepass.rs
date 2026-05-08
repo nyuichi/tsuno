@@ -10,10 +10,10 @@ use crate::directive::{
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
-    EnumDef, Expr, GhostMatchArm, LemmaDef, MatchBinding, MatchPattern, PureFnDef, PureFnParam,
-    RawAssertion, RawPattern, RustTyKey, RustTypeExpr, SpecTy, StructDef, StructFieldTy, StructTy,
-    TypedExpr, TypedExprKind, TypedMatchArm, TypedMatchBinding, ValuePattern, layout_spec_ty,
-    option_spec_ty, ptr_spec_ty,
+    EnumDef, Expr, ExternContractDef, GhostMatchArm, LemmaDef, MatchBinding, MatchPattern,
+    PureFnDef, PureFnParam, RawAssertion, RawPattern, RustTyKey, RustTypeExpr, SpecTy, StructDef,
+    StructFieldTy, StructTy, TypedExpr, TypedExprKind, TypedMatchArm, TypedMatchBinding,
+    ValuePattern, layout_spec_ty, option_spec_ty, ptr_spec_ty,
 };
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{
@@ -244,8 +244,10 @@ struct RawGlobalGhostPrepass {
     pub structs: HashMap<String, StructDef>,
     pub pure_fns: HashMap<String, PureFnDef>,
     pub lemmas: HashMap<String, LemmaDef>,
+    pub extern_contracts: HashMap<String, ExternContractDef>,
     pure_fn_order: Vec<String>,
     lemma_order: Vec<String>,
+    extern_contract_order: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +258,7 @@ pub struct GlobalGhostPrepass {
     pub enum_invariants: HashMap<String, TypedEnumInvariant>,
     pub typed_pure_fns: Vec<TypedPureFnDef>,
     pub typed_lemmas: Vec<TypedLemmaDef>,
+    pub extern_contracts: HashMap<String, FunctionContract>,
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +283,7 @@ pub struct ProgramPrepass {
     pub ghosts: GlobalGhostPrepass,
     pub functions: Vec<FunctionPrepass>,
     pub contracts: HashMap<LocalDefId, FunctionContract>,
+    pub extern_contracts: HashMap<String, FunctionContract>,
 }
 
 impl LoopContracts {
@@ -390,6 +394,7 @@ pub fn compute_program_prepass<'tcx>(
 
     if errors.is_empty() {
         Ok(ProgramPrepass {
+            extern_contracts: ghosts.extern_contracts.clone(),
             ghosts,
             functions,
             contracts,
@@ -417,6 +422,7 @@ fn compute_raw_global_ghost_prepass<'tcx>(
     let mut struct_defs = Vec::new();
     let mut pure_fn_defs = Vec::new();
     let mut lemma_defs = Vec::new();
+    let mut extern_contract_defs = Vec::new();
     for (span, source) in sources {
         collect_ghost_items_in_source(
             &source,
@@ -425,6 +431,7 @@ fn compute_raw_global_ghost_prepass<'tcx>(
             &mut struct_defs,
             &mut pure_fn_defs,
             &mut lemma_defs,
+            &mut extern_contract_defs,
         )?;
     }
 
@@ -485,13 +492,31 @@ fn compute_raw_global_ghost_prepass<'tcx>(
         lemma_order.push(lemma.name);
     }
 
+    let mut extern_contracts = HashMap::new();
+    let mut extern_contract_order = Vec::with_capacity(extern_contract_defs.len());
+    for def in extern_contract_defs {
+        if extern_contracts
+            .insert(def.path.clone(), def.clone())
+            .is_some()
+        {
+            return Err(LoopPrepassError {
+                span: anchor_span,
+                display_span: None,
+                message: format!("duplicate extern contract `{}`", def.path),
+            });
+        }
+        extern_contract_order.push(def.path);
+    }
+
     Ok(RawGlobalGhostPrepass {
         enums,
         structs,
         pure_fns,
         lemmas,
+        extern_contracts,
         pure_fn_order,
         lemma_order,
+        extern_contract_order,
     })
 }
 
@@ -548,6 +573,13 @@ fn type_global_ghost_prepass(
         &raw.enums,
         anchor_span,
     )?;
+    let extern_contracts = type_extern_contracts(
+        &raw.extern_contracts,
+        &raw.extern_contract_order,
+        &raw.pure_fns,
+        &raw.enums,
+        anchor_span,
+    )?;
     Ok(GlobalGhostPrepass {
         enums: raw.enums.clone(),
         structs: raw.structs.clone(),
@@ -555,6 +587,7 @@ fn type_global_ghost_prepass(
         enum_invariants,
         typed_pure_fns,
         typed_lemmas,
+        extern_contracts,
     })
 }
 
@@ -601,13 +634,28 @@ fn normalize_global_ghost_prepass(
                 })
         })
         .collect::<Result<HashMap<_, _>, _>>()?;
+    let extern_contracts = raw
+        .extern_contracts
+        .iter()
+        .map(|(path, def)| {
+            normalize_extern_contract_def(def, &raw.enums, &structs)
+                .map(|def| (path.clone(), def))
+                .map_err(|message| LoopPrepassError {
+                    span: anchor_span,
+                    display_span: None,
+                    message: format!("extern contract `{}`: {message}", def.path),
+                })
+        })
+        .collect::<Result<HashMap<_, _>, _>>()?;
     Ok(RawGlobalGhostPrepass {
         enums: raw.enums.clone(),
         structs,
         pure_fns,
         lemmas,
+        extern_contracts,
         pure_fn_order: raw.pure_fn_order.clone(),
         lemma_order: raw.lemma_order.clone(),
+        extern_contract_order: raw.extern_contract_order.clone(),
     })
 }
 
@@ -1631,6 +1679,34 @@ fn normalize_lemma_def(
     })
 }
 
+fn normalize_extern_contract_def(
+    def: &ExternContractDef,
+    enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
+) -> Result<ExternContractDef, String> {
+    let type_params = def.type_params.iter().cloned().collect::<HashSet<_>>();
+    Ok(ExternContractDef {
+        path: def.path.clone(),
+        is_unsafe: def.is_unsafe,
+        type_params: def.type_params.clone(),
+        params: def
+            .params
+            .iter()
+            .map(|param| normalize_pure_fn_param(param, enum_defs, struct_defs, &type_params))
+            .collect::<Result<Vec<_>, _>>()?,
+        result_ty: resolve_named_struct_spec_ty(
+            &def.result_ty,
+            enum_defs,
+            struct_defs,
+            &type_params,
+        )?,
+        req: def.req.clone(),
+        raw_reqs: def.raw_reqs.clone(),
+        ens: def.ens.clone(),
+        raw_ens: def.raw_ens.clone(),
+    })
+}
+
 fn validate_named_spec_ty(
     ty: &SpecTy,
     enum_defs: &HashMap<String, EnumDef>,
@@ -1776,6 +1852,7 @@ fn prelude_struct_defs() -> &'static HashMap<String, StructDef> {
         let mut struct_defs = Vec::new();
         let mut pure_fn_defs = Vec::new();
         let mut lemma_defs = Vec::new();
+        let mut extern_contract_defs = Vec::new();
         collect_ghost_items_in_source(
             PRELUDE_GHOST_SOURCE,
             DUMMY_SP,
@@ -1783,6 +1860,7 @@ fn prelude_struct_defs() -> &'static HashMap<String, StructDef> {
             &mut struct_defs,
             &mut pure_fn_defs,
             &mut lemma_defs,
+            &mut extern_contract_defs,
         )
         .unwrap_or_else(|err| panic!("prelude ghost source must parse: {}", err.message));
         let enums = enum_defs
@@ -2612,7 +2690,10 @@ fn explicit_enum_type_bindings(
             type_args.len()
         ));
     }
-    let scope = HashSet::new();
+    let mut scope = HashSet::new();
+    for type_arg in type_args {
+        collect_spec_ty_type_params(type_arg, &mut scope);
+    }
     for type_arg in type_args {
         validate_named_spec_ty(type_arg, enum_defs, &scope)?;
     }
@@ -2622,6 +2703,46 @@ fn explicit_enum_type_bindings(
         .cloned()
         .zip(type_args.iter().cloned())
         .collect())
+}
+
+fn collect_spec_ty_type_params(ty: &SpecTy, out: &mut HashSet<String>) {
+    match ty {
+        SpecTy::Seq(inner) | SpecTy::Ref(inner) | SpecTy::Mut(inner) => {
+            collect_spec_ty_type_params(inner, out);
+        }
+        SpecTy::Tuple(items) => {
+            for item in items {
+                collect_spec_ty_type_params(item, out);
+            }
+        }
+        SpecTy::Struct { args, .. } | SpecTy::Enum { args, .. } => {
+            for arg in args {
+                collect_spec_ty_type_params(arg, out);
+            }
+        }
+        SpecTy::Record(record) => {
+            for field in &record.fields {
+                collect_spec_ty_type_params(&field.ty, out);
+            }
+        }
+        SpecTy::TypeParam(name) => {
+            out.insert(name.clone());
+        }
+        SpecTy::Bool
+        | SpecTy::RustTy
+        | SpecTy::Int
+        | SpecTy::IntLiteral
+        | SpecTy::I8
+        | SpecTy::I16
+        | SpecTy::I32
+        | SpecTy::I64
+        | SpecTy::Isize
+        | SpecTy::U8
+        | SpecTy::U16
+        | SpecTy::U32
+        | SpecTy::U64
+        | SpecTy::Usize => {}
+    }
 }
 
 fn instantiate_enum_result_ty(
@@ -6217,7 +6338,7 @@ fn infer_raw_pattern_types_into(
             if value_pattern_contains_bind(value) {
                 let ty_ty =
                     typed_raw_expr(ty, pure_fns, enum_defs, spec_scope, local_tys, inferred)?;
-                let expected = option_spec_ty_for_rust_ty_expr(&ty_ty)?;
+                let expected = option_spec_ty_for_rust_ty_expr(&ty_ty, &HashSet::new())?;
                 infer_value_pattern_types(
                     value, &expected, pure_fns, enum_defs, spec_scope, local_tys, inferred,
                 )?;
@@ -6445,7 +6566,8 @@ fn typed_lemma_raw_pattern(
                 inferred,
                 Some(&SpecTy::RustTy),
             )?;
-            let expected = option_spec_ty_for_rust_ty_expr(&ty)?;
+            let type_params = contract_type_param_scope(params, result_ty);
+            let expected = option_spec_ty_for_rust_ty_expr(&ty, &type_params)?;
             let value = typed_contract_value_pattern(
                 value,
                 &expected,
@@ -6556,7 +6678,8 @@ fn typed_contract_raw_pattern<'tcx>(
                 inferred,
                 Some(&SpecTy::RustTy),
             )?;
-            let expected = option_spec_ty_for_rust_ty_expr(&ty)?;
+            let type_params = contract_type_param_scope(params, result_ty);
+            let expected = option_spec_ty_for_rust_ty_expr(&ty, &type_params)?;
             let value = typed_contract_value_pattern(
                 value,
                 &expected,
@@ -7025,7 +7148,7 @@ fn typed_raw_pattern_into(
             )?;
             ensure_raw_expr_ty(&ty, &SpecTy::RustTy, "PointsTo type")?;
             let value = if value_pattern_contains_bind(value) {
-                let expected = option_spec_ty_for_rust_ty_expr(&ty)?;
+                let expected = option_spec_ty_for_rust_ty_expr(&ty, &HashSet::new())?;
                 typed_value_pattern(
                     value,
                     &expected,
@@ -7483,14 +7606,32 @@ fn value_pattern_contains_bind(pattern: &ValuePattern) -> bool {
     }
 }
 
-fn option_spec_ty_for_rust_ty_expr(expr: &TypedExpr) -> Result<SpecTy, String> {
+fn contract_type_param_scope(
+    params: &HashMap<String, SpecTy>,
+    result_ty: &SpecTy,
+) -> HashSet<String> {
+    let mut type_params = HashSet::new();
+    for ty in params.values() {
+        collect_spec_ty_type_params(ty, &mut type_params);
+    }
+    collect_spec_ty_type_params(result_ty, &mut type_params);
+    type_params
+}
+
+fn option_spec_ty_for_rust_ty_expr(
+    expr: &TypedExpr,
+    type_params: &HashSet<String>,
+) -> Result<SpecTy, String> {
     let TypedExprKind::RustType(key) = &expr.kind else {
         return Err("PointsTo type must be a concrete Rust type expression".to_owned());
     };
-    Ok(option_spec_ty(rust_ty_key_to_spec_ty(key.as_str())?))
+    Ok(option_spec_ty(rust_ty_key_to_spec_ty(
+        key.as_str(),
+        type_params,
+    )?))
 }
 
-fn rust_ty_key_to_spec_ty(key: &str) -> Result<SpecTy, String> {
+fn rust_ty_key_to_spec_ty(key: &str, type_params: &HashSet<String>) -> Result<SpecTy, String> {
     match key {
         "bool" => Ok(SpecTy::Bool),
         "i8" => Ok(SpecTy::I8),
@@ -7506,10 +7647,15 @@ fn rust_ty_key_to_spec_ty(key: &str) -> Result<SpecTy, String> {
         raw if raw.starts_with("*const ") || raw.starts_with("*mut ") => Ok(ptr_spec_ty()),
         raw if raw.starts_with("&mut ") => Ok(SpecTy::Mut(Box::new(rust_ty_key_to_spec_ty(
             raw.trim_start_matches("&mut ").trim(),
+            type_params,
         )?))),
         raw if raw.starts_with('&') => Ok(SpecTy::Ref(Box::new(rust_ty_key_to_spec_ty(
             raw.trim_start_matches('&').trim(),
+            type_params,
         )?))),
+        type_param if type_params.contains(type_param) => {
+            Ok(SpecTy::TypeParam(type_param.to_owned()))
+        }
         other => Err(format!(
             "unsupported PointsTo Rust type expression `{other}` in raw pattern"
         )),
@@ -8962,6 +9108,228 @@ fn type_lemmas(
     Ok(typed)
 }
 
+fn type_extern_contracts(
+    extern_contracts: &HashMap<String, ExternContractDef>,
+    declaration_order: &[String],
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    span: Span,
+) -> Result<HashMap<String, FunctionContract>, LoopPrepassError> {
+    let mut typed = HashMap::new();
+    for path in declaration_order {
+        let def = extern_contracts
+            .get(path)
+            .expect("extern contract declaration order must stay in sync");
+        let type_param_scope: HashSet<_> = def.type_params.iter().cloned().collect();
+        for param in &def.params {
+            validate_named_spec_ty(&param.ty, enum_defs, &type_param_scope).map_err(|message| {
+                LoopPrepassError {
+                    span,
+                    display_span: None,
+                    message: format!(
+                        "extern contract `{}` parameter `{}`: {message}",
+                        def.path, param.name
+                    ),
+                }
+            })?;
+        }
+        validate_named_spec_ty(&def.result_ty, enum_defs, &type_param_scope).map_err(
+            |message| LoopPrepassError {
+                span,
+                display_span: None,
+                message: format!("extern contract `{}` result: {message}", def.path),
+            },
+        )?;
+        if !def.is_unsafe && (!def.raw_reqs.is_empty() || !def.raw_ens.is_empty()) {
+            return Err(LoopPrepassError {
+                span,
+                display_span: None,
+                message: format!(
+                    "extern contract `{}` raw contracts are only supported on unsafe extern functions",
+                    def.path
+                ),
+            });
+        }
+
+        let param_tys: HashMap<_, _> = def
+            .params
+            .iter()
+            .map(|param| (param.name.clone(), param.ty.clone()))
+            .collect();
+        let params = def
+            .params
+            .iter()
+            .map(|param| ContractParam {
+                name: param.name.clone(),
+                ty: param.ty.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut inferred = SpecTypeInference::default();
+        let mut infer_scope = SpecScope::default();
+        infer_contract_expr_types_in_scope(
+            &def.req,
+            pure_fns,
+            enum_defs,
+            &type_param_scope,
+            &mut infer_scope,
+            &param_tys,
+            false,
+            &def.result_ty,
+            &mut inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span,
+            display_span: None,
+            message: format!("extern contract `{}` req: {message}", def.path),
+        })?;
+        let mut ens_infer_scope = infer_scope.clone();
+        for resource_req in &def.raw_reqs {
+            infer_contract_raw_assertion(
+                resource_req,
+                pure_fns,
+                enum_defs,
+                &mut ens_infer_scope,
+                &param_tys,
+                false,
+                &def.result_ty,
+                &mut inferred,
+            )
+            .map_err(|message| LoopPrepassError {
+                span,
+                display_span: None,
+                message: format!("extern contract `{}` raw req: {message}", def.path),
+            })?;
+        }
+        infer_contract_expr_types_in_scope(
+            &def.ens,
+            pure_fns,
+            enum_defs,
+            &type_param_scope,
+            &mut ens_infer_scope,
+            &param_tys,
+            true,
+            &def.result_ty,
+            &mut inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span,
+            display_span: None,
+            message: format!("extern contract `{}` ens: {message}", def.path),
+        })?;
+        for raw_ens in &def.raw_ens {
+            infer_contract_raw_assertion(
+                raw_ens,
+                pure_fns,
+                enum_defs,
+                &mut ens_infer_scope,
+                &param_tys,
+                true,
+                &def.result_ty,
+                &mut inferred,
+            )
+            .map_err(|message| LoopPrepassError {
+                span,
+                display_span: None,
+                message: format!("extern contract `{}` raw ens: {message}", def.path),
+            })?;
+        }
+
+        let mut type_scope = SpecScope::default();
+        let req = typed_contract_expr_in_scope(
+            &def.req,
+            pure_fns,
+            enum_defs,
+            &type_param_scope,
+            &mut type_scope,
+            &param_tys,
+            false,
+            &def.result_ty,
+            &mut inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span,
+            display_span: None,
+            message: format!("extern contract `{}` req: {message}", def.path),
+        })
+        .and_then(|expr| {
+            normalize_assert_like_predicate(expr, "extern req").map_err(|message| {
+                LoopPrepassError {
+                    span,
+                    display_span: None,
+                    message: format!("extern contract `{}` req: {message}", def.path),
+                }
+            })
+        })?;
+        let raw_reqs = typed_lemma_raw_assertions(
+            &def.raw_reqs,
+            pure_fns,
+            enum_defs,
+            &mut type_scope,
+            &param_tys,
+            false,
+            &def.result_ty,
+            &mut inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span,
+            display_span: None,
+            message: format!("extern contract `{}` raw req: {message}", def.path),
+        })?;
+        let ens = typed_contract_expr_in_scope(
+            &def.ens,
+            pure_fns,
+            enum_defs,
+            &type_param_scope,
+            &mut type_scope,
+            &param_tys,
+            true,
+            &def.result_ty,
+            &mut inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span,
+            display_span: None,
+            message: format!("extern contract `{}` ens: {message}", def.path),
+        })
+        .and_then(|expr| {
+            ensure_bind_free_predicate(expr, "extern ens").map_err(|message| LoopPrepassError {
+                span,
+                display_span: None,
+                message: format!("extern contract `{}` ens: {message}", def.path),
+            })
+        })?;
+        let raw_ens = typed_lemma_raw_assertions(
+            &def.raw_ens,
+            pure_fns,
+            enum_defs,
+            &mut type_scope,
+            &param_tys,
+            true,
+            &def.result_ty,
+            &mut inferred,
+        )
+        .map_err(|message| LoopPrepassError {
+            span,
+            display_span: None,
+            message: format!("extern contract `{}` raw ens: {message}", def.path),
+        })?;
+        typed.insert(
+            def.path.clone(),
+            FunctionContract {
+                params,
+                req,
+                req_span: format!("extern contract `{}` req", def.path),
+                raw_reqs,
+                ens,
+                ens_span: format!("extern contract `{}` ens", def.path),
+                raw_ens,
+                result: def.result_ty.clone(),
+            },
+        );
+    }
+    Ok(typed)
+}
+
 fn lemma_call_parts(expr: &Expr) -> Result<(&str, &[SpecTy], &[Expr]), String> {
     match expr {
         Expr::Call {
@@ -9217,6 +9585,7 @@ fn collect_ghost_items_in_source(
     structs: &mut Vec<StructDef>,
     pure_fns: &mut Vec<PureFnDef>,
     lemmas: &mut Vec<LemmaDef>,
+    extern_contracts: &mut Vec<ExternContractDef>,
 ) -> Result<(), LoopPrepassError> {
     for parsed in collect_ghost_blocks(source).map_err(|err| LoopPrepassError {
         span: error_span,
@@ -9227,6 +9596,7 @@ fn collect_ghost_items_in_source(
         structs.extend(parsed.structs);
         pure_fns.extend(parsed.pure_fns);
         lemmas.extend(parsed.lemmas);
+        extern_contracts.extend(parsed.extern_contracts);
     }
     Ok(())
 }
@@ -10582,6 +10952,7 @@ mod tests {
                 }),
             }],
             typed_lemmas: Vec::new(),
+            extern_contracts: HashMap::new(),
         };
 
         assert_eq!(ghosts.typed_pure_fns.len(), 1);
