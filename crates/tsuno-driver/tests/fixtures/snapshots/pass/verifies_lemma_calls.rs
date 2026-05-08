@@ -1,12 +1,12 @@
 /*@
-fn proves_42(x: i32)
+lem proves_42(x: i32)
   req true
   ens x == 42
 {
     assume false;
 }
 
-fn nested(x: i32)
+lem nested(x: i32)
   req true
   ens x == 42
 {

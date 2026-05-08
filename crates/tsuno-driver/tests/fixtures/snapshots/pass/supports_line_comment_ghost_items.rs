@@ -1,9 +1,9 @@
-//@ fn line_comment_lemma(n: Nat)
+//@ lem line_comment_lemma(n: Nat)
 //@   req true
 //@   ens true
 //@ {}
 
-/*@ fn mixed_comment_lemma(n: Nat) */
+/*@ lem mixed_comment_lemma(n: Nat) */
 //@   req true
 /*@   ens true */
 //@ {}

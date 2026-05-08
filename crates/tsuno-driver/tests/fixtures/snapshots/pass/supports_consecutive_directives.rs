@@ -1,5 +1,5 @@
 /*@
-fn proves_42(x: i32)
+lem proves_42(x: i32)
   req true
   ens x == 42
 {

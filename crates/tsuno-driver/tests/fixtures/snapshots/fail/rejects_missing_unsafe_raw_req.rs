@@ -1,6 +1,6 @@
 unsafe fn needs_points_to(p: *mut i32)
-//@ raw req *p |-> Option::Some(1i32);
-//@ raw ens *p |-> Option::Some(1i32);
+//@ raw req *p |-?-> Option::Some(1i32);
+//@ raw ens *p |-?-> Option::Some(1i32);
 {
 }
 

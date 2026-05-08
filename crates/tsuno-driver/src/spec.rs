@@ -277,6 +277,13 @@ pub struct PureFnParam {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandaloneFnParam {
+    pub name: String,
+    pub rust_ty: RustTypeExpr,
+    pub ty: SpecTy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PureFnDef {
     pub name: String,
     pub type_params: Vec<String>,
@@ -321,11 +328,12 @@ pub struct LemmaDef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternContractDef {
+pub struct StandaloneFnContractDef {
     pub path: String,
     pub is_unsafe: bool,
     pub type_params: Vec<String>,
-    pub params: Vec<PureFnParam>,
+    pub params: Vec<StandaloneFnParam>,
+    pub result_rust_ty: RustTypeExpr,
     pub result_ty: SpecTy,
     pub req: Expr,
     pub raw_reqs: Vec<RawAssertion>,
@@ -386,7 +394,7 @@ pub struct GhostBlock {
     pub structs: Vec<StructDef>,
     pub pure_fns: Vec<PureFnDef>,
     pub lemmas: Vec<LemmaDef>,
-    pub extern_contracts: Vec<ExternContractDef>,
+    pub standalone_fn_contracts: Vec<StandaloneFnContractDef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

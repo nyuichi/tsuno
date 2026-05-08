@@ -1,12 +1,12 @@
 /*@
-fn first(x: i32)
+lem first(x: i32)
   req true
   ens true
 {
     second(x);
 }
 
-fn second(x: i32)
+lem second(x: i32)
   req true
   ens true
 {

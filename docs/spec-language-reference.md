@@ -5,7 +5,7 @@ This document describes the spec language that is implemented today. It covers o
 The language appears in two places:
 
 - directives written in spec comments, such as `//@ let`, `//@ req`, `//@ ens`, `//@ assert`, `//@ assume`, `//@ inv`, and `//@ lemma_name(...)`
-- ghost item blocks written as `/*@ ... */` whose contents begin with `fn` or `enum`
+- ghost item blocks written as `/*@ ... */` whose contents begin with `def`, `lem`, `unsafe lem`, `fn`, `unsafe fn`, `enum`, or `struct`
 
 ## 1. Where Spec Code Appears
 
@@ -113,21 +113,20 @@ Inside ghost blocks, ordinary ghost parameters and local names are written bare.
 
 ```rust
 /*@
-fn add1(x: i32) -> i32 {
+def add1(x: i32) -> i32 =
     x + 1i32
-}
 */
 ```
 
 Ghost item blocks can also be written with line comments, or by mixing line and block comments.
 
 ```rust
-//@ fn trivial(n: Nat)
+//@ lem trivial(n: Nat)
 //@   req true
 //@   ens true
 //@ {}
 
-/*@ fn also_trivial(n: Nat) */
+/*@ lem also_trivial(n: Nat) */
 //@   req true
 /*@   ens true */
 //@ {}
@@ -336,7 +335,7 @@ enum List<T> {
     Cons(T, List<T>),
 }
 
-fn len(xs: List<i32>) -> i32 { ... }
+def len(xs: List<i32>) -> i32 = ...
 ```
 
 `Int` is an unbounded mathematical integer. Integer literals may be unsuffixed
@@ -404,22 +403,28 @@ struct Layout {
     size + align - 1usize <= (isize::MAX as usize);
 ```
 
-The prelude also declares `fn layout_of(ty: RustTy) -> Layout;` as an
+The prelude also declares `def layout_of(ty: RustTy) -> Layout;` as an
 uninterpreted pure function. Layout facts can be supplied by ordinary lemmas
 whose bodies assume contradiction; for example, the prelude includes a lemma proving
 `layout_of({type i32}) == Layout { size: 4usize, align: 4usize }`.
 
-The prelude can also declare contracts for external Rust functions. An external
-contract is a ghost item of the form `unsafe extern fn path::to::item<T>(...) ->
-ResultTy`, followed by ordinary `req`/`ens` and raw `raw req`/`raw ens` clauses,
-and terminated by `;`. The parameter and result types are spec-language types;
-raw pointer parameters are therefore written as `Ptr`.
+The prelude can also declare standalone contracts for Rust functions. A
+standalone function contract is a ghost item of the form
+`fn path::to::item<T>(...) -> ResultTy` or
+`unsafe fn path::to::item<T>(...) -> ResultTy`, followed by ordinary `req`/`ens`
+clauses and, for unsafe functions, raw `raw req`/`raw ens` clauses, and
+terminated by `;`. The parameter and result types use Rust type syntax, while
+ordinary contract expressions see the corresponding spec model values.
+Standalone contracts may target existing safe or unsafe Rust functions. If the
+target function body also has inline contract directives, the duplicate
+declaration is rejected. The old `extern fn` and `unsafe extern fn` ghost item
+forms are not accepted.
 
 ```rust
 /*@
-unsafe extern fn core::intrinsics::read_via_copy<T>(ptr: Ptr) -> T
-  raw req PointsTo(ptr.addr, {type T}, Option::<T>::Some(?old))
-  raw ens PointsTo(ptr.addr, {type T}, Option::<T>::Some(old))
+unsafe fn core::intrinsics::read_via_copy<T>(ptr: *const T) -> T
+  raw req *ptr |-?-> Option::<T>::Some(?old)
+  raw ens *ptr |-?-> Option::<T>::Some(old)
   ens result == old
 ;
 */
@@ -620,8 +625,8 @@ written with `raw req` and `raw ens`.
 
 ```rust
 unsafe fn write_i32(p: *mut i32)
-//@ raw req *p |-> Option::Some(?old)
-//@ raw ens *p |-> Option::Some(42i32) where old >= 0i32
+//@ raw req *p |-?-> Option::Some(?old)
+//@ raw ens *p |-?-> Option::Some(42i32) where old >= 0i32
 {
     // ...
 }
@@ -650,19 +655,19 @@ materializes resources back into the caller heap after the call. If a
 caller path condition after the call. The `result` variable is available in both
 the raw pattern and the `where` clause of `raw ens`.
 
-The same call-site rule is used for external functions with ghost extern
-contracts. The verifier looks up the callee's Rust path, instantiates any Rust
-generic type arguments into the ghost contract, checks ordinary and raw
-preconditions, and then assumes ordinary and raw postconditions. Unsafe external
-functions without a matching extern contract are rejected.
+The same call-site rule is used for functions with standalone ghost contracts.
+The verifier looks up the callee's Rust path, instantiates any Rust generic type
+arguments into the ghost contract, checks ordinary and raw preconditions, and
+then assumes ordinary and raw postconditions. Unsafe functions without either an
+inline contract or a matching standalone contract are rejected.
 
 Unsafe lemmas use the same raw contract model as unsafe functions. They are
-declared as ghost items with `unsafe fn`, spec parameters, optional ordinary
+declared as ghost items with `unsafe lem`, spec parameters, optional ordinary
 `req` and `ens` clauses, and optional `raw req` and `raw ens` clauses:
 
 ```rust
 /*@
-unsafe fn keep_i32_cell(p: Ptr)
+unsafe lem keep_i32_cell(p: Ptr)
   raw req PointsTo(p.addr, {type i32}, Option::Some(?old))
   raw ens PointsTo(p.addr, {type i32}, Option::Some(?v)) where v == old
 {
@@ -687,20 +692,20 @@ in safe code. Unsafe code also supports raw assertions:
 ```rust
 //@ raw assert PointsTo({p}.addr, {type i32}, Option::Some(42i32));
 //@ raw assert PointsTo({p}.addr, {type i32}, Option::Some(?v)) where v > 0i32;
-//@ raw assert *p |-> Option::Some(?v) where v > 0i32;
+//@ raw assert *p |-?-> Option::Some(?v) where v > 0i32;
 ```
 
 A raw assertion checks a `RawPattern`. The initial raw patterns
 are `emp`,
 `PointsTo(addr_expr, rust_ty_expr, option_value_expr)`,
-the shorthand `*ptr |-> option_value_pattern`,
+the shorthand `*ptr |-?-> option_value_pattern`,
 `DeallocToken(base_expr, layout_expr)`, and separating
 conjunction `left * right`; parentheses may be used freely to group raw
 patterns.
 `emp` is the empty raw pattern: it matches without requiring any heap resource,
 consumes no resource in `raw req` or `raw ens`, and materializes no resource.
 It may be combined with other raw patterns as in `emp * R` or `R * emp`.
-`*ptr |-> value` is accepted only when `ptr` is a Rust local, function
+`*ptr |-?-> value` is accepted only when `ptr` is a Rust local, function
 parameter, or allowed `result` binding whose type is a raw pointer `*const T` or
 `*mut T`; it is desugared before unsafe execution to
 `PointsTo({ptr}.addr, {type T}, value)`, so the unsafe engine only sees
@@ -817,14 +822,13 @@ enum List<T> {
     Cons(T, List<T>),
 }
 
-fn len(xs: List<i32>) -> i32 {
+def len(xs: List<i32>) -> i32 =
     match xs {
         List::Nil => 0i32,
         List::Cons(_, xs0) => 1i32 + len(xs0),
     }
-}
 
-fn append_len(xs: List<i32>, ys: List<i32>)
+lem append_len(xs: List<i32>, ys: List<i32>)
   req true
   ens len(append(xs, ys)) == len(xs) + len(ys)
 {
@@ -845,11 +849,11 @@ Supported items:
 
 - `enum`
 - `struct`
-- pure functions: `fn name<T>(args...) -> Ty { expr }`
-- uninterpreted pure function declarations: `fn name<T>(args...) -> Ty;`
-- lemmas: `fn name<T>(args...) req <expr> ens <expr> { stmts }`
+- pure functions: `def name<T>(args...) -> Ty = expr`
+- uninterpreted pure function declarations: `def name<T>(args...) -> Ty;`
+- lemmas: `lem name<T>(args...) req <expr> ens <expr> { stmts }`
 - unsafe lemmas:
-  `unsafe fn name<T>(args...) req <expr> raw req <pattern> ens <expr> raw ens <pattern> { stmts }`
+  `unsafe lem name<T>(args...) req <expr> raw req <pattern> ens <expr> raw ens <pattern> { stmts }`
 
 Pure function bodies are expression bodies. Lemma bodies are statement bodies.
 
@@ -873,12 +877,11 @@ append_len::<i32>(xs, ys);
 `match` expressions are supported in pure function bodies.
 
 ```rust
-fn len(xs: List<i32>) -> i32 {
+def len(xs: List<i32>) -> i32 =
     match xs {
         List::Nil => 0i32,
         List::Cons(_, xs0) => 1i32 + len(xs0),
     }
-}
 ```
 
 Lemma bodies support statement-level `match`.

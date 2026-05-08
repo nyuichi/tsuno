@@ -10,10 +10,10 @@ use crate::directive::{
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
-    EnumDef, Expr, ExternContractDef, GhostMatchArm, LemmaDef, MatchBinding, MatchPattern,
-    PureFnDef, PureFnParam, RawAssertion, RawPattern, RustTyKey, RustTypeExpr, SpecTy, StructDef,
-    StructFieldTy, StructTy, TypedExpr, TypedExprKind, TypedMatchArm, TypedMatchBinding,
-    ValuePattern, layout_spec_ty, option_spec_ty, ptr_spec_ty,
+    EnumDef, Expr, GhostMatchArm, LemmaDef, MatchBinding, MatchPattern, PureFnDef, PureFnParam,
+    RawAssertion, RawPattern, RustTyKey, RustTypeExpr, SpecTy, StandaloneFnContractDef,
+    StandaloneFnParam, StructDef, StructFieldTy, StructTy, TypedExpr, TypedExprKind, TypedMatchArm,
+    TypedMatchBinding, ValuePattern, layout_spec_ty, option_spec_ty, ptr_spec_ty,
 };
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{
@@ -234,6 +234,7 @@ pub struct FunctionContract {
 pub struct DirectivePrepass {
     pub loop_contracts: LoopContracts,
     pub control_point_directives: ControlPointDirectives,
+    pub explicit_function_contract: bool,
     pub function_contract: Option<FunctionContract>,
     pub unsafe_blocks: Vec<Span>,
 }
@@ -244,10 +245,10 @@ struct RawGlobalGhostPrepass {
     pub structs: HashMap<String, StructDef>,
     pub pure_fns: HashMap<String, PureFnDef>,
     pub lemmas: HashMap<String, LemmaDef>,
-    pub extern_contracts: HashMap<String, ExternContractDef>,
+    pub standalone_fn_contracts: HashMap<String, StandaloneFnContractDef>,
     pure_fn_order: Vec<String>,
     lemma_order: Vec<String>,
-    extern_contract_order: Vec<String>,
+    standalone_fn_contract_order: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -258,7 +259,7 @@ pub struct GlobalGhostPrepass {
     pub enum_invariants: HashMap<String, TypedEnumInvariant>,
     pub typed_pure_fns: Vec<TypedPureFnDef>,
     pub typed_lemmas: Vec<TypedLemmaDef>,
-    pub extern_contracts: HashMap<String, FunctionContract>,
+    pub standalone_fn_contracts: HashMap<String, FunctionContract>,
 }
 
 #[derive(Debug, Clone)]
@@ -283,7 +284,7 @@ pub struct ProgramPrepass {
     pub ghosts: GlobalGhostPrepass,
     pub functions: Vec<FunctionPrepass>,
     pub contracts: HashMap<LocalDefId, FunctionContract>,
-    pub extern_contracts: HashMap<String, FunctionContract>,
+    pub standalone_fn_contracts: HashMap<String, FunctionContract>,
 }
 
 impl LoopContracts {
@@ -380,7 +381,27 @@ pub fn compute_program_prepass<'tcx>(
         let def_id = item.owner_id.def_id;
         let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
         match compute_function_prepass(tcx, def_id, item.span, &body.borrow(), &raw_ghosts) {
-            Ok(prepass) => {
+            Ok(mut prepass) => {
+                let path = tcx.def_path_str(def_id.to_def_id());
+                if prepass.explicit_function_contract
+                    && raw_ghosts.standalone_fn_contracts.contains_key(&path)
+                {
+                    errors.push(VerificationResult {
+                        function: path.clone(),
+                        status: VerificationStatus::Unsupported,
+                        span: tcx
+                            .sess
+                            .source_map()
+                            .span_to_diagnostic_string(item.span),
+                        message: "function contract is declared both on the function body and in a standalone contract declaration".to_owned(),
+                    });
+                    continue;
+                }
+                if !prepass.explicit_function_contract
+                    && let Some(contract) = ghosts.standalone_fn_contracts.get(&path)
+                {
+                    prepass.function_contract = Some(contract.clone());
+                }
                 let contract = prepass
                     .function_contract
                     .clone()
@@ -394,7 +415,7 @@ pub fn compute_program_prepass<'tcx>(
 
     if errors.is_empty() {
         Ok(ProgramPrepass {
-            extern_contracts: ghosts.extern_contracts.clone(),
+            standalone_fn_contracts: ghosts.standalone_fn_contracts.clone(),
             ghosts,
             functions,
             contracts,
@@ -422,7 +443,7 @@ fn compute_raw_global_ghost_prepass<'tcx>(
     let mut struct_defs = Vec::new();
     let mut pure_fn_defs = Vec::new();
     let mut lemma_defs = Vec::new();
-    let mut extern_contract_defs = Vec::new();
+    let mut standalone_fn_contract_defs = Vec::new();
     for (span, source) in sources {
         collect_ghost_items_in_source(
             &source,
@@ -431,7 +452,7 @@ fn compute_raw_global_ghost_prepass<'tcx>(
             &mut struct_defs,
             &mut pure_fn_defs,
             &mut lemma_defs,
-            &mut extern_contract_defs,
+            &mut standalone_fn_contract_defs,
         )?;
     }
 
@@ -492,20 +513,20 @@ fn compute_raw_global_ghost_prepass<'tcx>(
         lemma_order.push(lemma.name);
     }
 
-    let mut extern_contracts = HashMap::new();
-    let mut extern_contract_order = Vec::with_capacity(extern_contract_defs.len());
-    for def in extern_contract_defs {
-        if extern_contracts
+    let mut standalone_fn_contracts = HashMap::new();
+    let mut standalone_fn_contract_order = Vec::with_capacity(standalone_fn_contract_defs.len());
+    for def in standalone_fn_contract_defs {
+        if standalone_fn_contracts
             .insert(def.path.clone(), def.clone())
             .is_some()
         {
             return Err(LoopPrepassError {
                 span: anchor_span,
                 display_span: None,
-                message: format!("duplicate extern contract `{}`", def.path),
+                message: format!("duplicate function contract declaration `{}`", def.path),
             });
         }
-        extern_contract_order.push(def.path);
+        standalone_fn_contract_order.push(def.path);
     }
 
     Ok(RawGlobalGhostPrepass {
@@ -513,10 +534,10 @@ fn compute_raw_global_ghost_prepass<'tcx>(
         structs,
         pure_fns,
         lemmas,
-        extern_contracts,
+        standalone_fn_contracts,
         pure_fn_order,
         lemma_order,
-        extern_contract_order,
+        standalone_fn_contract_order,
     })
 }
 
@@ -573,9 +594,9 @@ fn type_global_ghost_prepass(
         &raw.enums,
         anchor_span,
     )?;
-    let extern_contracts = type_extern_contracts(
-        &raw.extern_contracts,
-        &raw.extern_contract_order,
+    let standalone_fn_contracts = type_standalone_fn_contracts(
+        &raw.standalone_fn_contracts,
+        &raw.standalone_fn_contract_order,
         &raw.pure_fns,
         &raw.enums,
         anchor_span,
@@ -587,7 +608,7 @@ fn type_global_ghost_prepass(
         enum_invariants,
         typed_pure_fns,
         typed_lemmas,
-        extern_contracts,
+        standalone_fn_contracts,
     })
 }
 
@@ -634,16 +655,16 @@ fn normalize_global_ghost_prepass(
                 })
         })
         .collect::<Result<HashMap<_, _>, _>>()?;
-    let extern_contracts = raw
-        .extern_contracts
+    let standalone_fn_contracts = raw
+        .standalone_fn_contracts
         .iter()
         .map(|(path, def)| {
-            normalize_extern_contract_def(def, &raw.enums, &structs)
+            normalize_standalone_fn_contract_def(def, &raw.enums, &structs)
                 .map(|def| (path.clone(), def))
                 .map_err(|message| LoopPrepassError {
                     span: anchor_span,
                     display_span: None,
-                    message: format!("extern contract `{}`: {message}", def.path),
+                    message: format!("function contract declaration `{}`: {message}", def.path),
                 })
         })
         .collect::<Result<HashMap<_, _>, _>>()?;
@@ -652,10 +673,10 @@ fn normalize_global_ghost_prepass(
         structs,
         pure_fns,
         lemmas,
-        extern_contracts,
+        standalone_fn_contracts,
         pure_fn_order: raw.pure_fn_order.clone(),
         lemma_order: raw.lemma_order.clone(),
-        extern_contract_order: raw.extern_contract_order.clone(),
+        standalone_fn_contract_order: raw.standalone_fn_contract_order.clone(),
     })
 }
 
@@ -1679,21 +1700,33 @@ fn normalize_lemma_def(
     })
 }
 
-fn normalize_extern_contract_def(
-    def: &ExternContractDef,
+fn normalize_standalone_fn_contract_def(
+    def: &StandaloneFnContractDef,
     enum_defs: &HashMap<String, EnumDef>,
     struct_defs: &HashMap<String, StructDef>,
-) -> Result<ExternContractDef, String> {
+) -> Result<StandaloneFnContractDef, String> {
     let type_params = def.type_params.iter().cloned().collect::<HashSet<_>>();
-    Ok(ExternContractDef {
+    Ok(StandaloneFnContractDef {
         path: def.path.clone(),
         is_unsafe: def.is_unsafe,
         type_params: def.type_params.clone(),
         params: def
             .params
             .iter()
-            .map(|param| normalize_pure_fn_param(param, enum_defs, struct_defs, &type_params))
-            .collect::<Result<Vec<_>, _>>()?,
+            .map(|param| {
+                Ok(StandaloneFnParam {
+                    name: param.name.clone(),
+                    rust_ty: param.rust_ty.clone(),
+                    ty: resolve_named_struct_spec_ty(
+                        &param.ty,
+                        enum_defs,
+                        struct_defs,
+                        &type_params,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+        result_rust_ty: def.result_rust_ty.clone(),
         result_ty: resolve_named_struct_spec_ty(
             &def.result_ty,
             enum_defs,
@@ -1852,7 +1885,7 @@ fn prelude_struct_defs() -> &'static HashMap<String, StructDef> {
         let mut struct_defs = Vec::new();
         let mut pure_fn_defs = Vec::new();
         let mut lemma_defs = Vec::new();
-        let mut extern_contract_defs = Vec::new();
+        let mut standalone_fn_contract_defs = Vec::new();
         collect_ghost_items_in_source(
             PRELUDE_GHOST_SOURCE,
             DUMMY_SP,
@@ -1860,7 +1893,7 @@ fn prelude_struct_defs() -> &'static HashMap<String, StructDef> {
             &mut struct_defs,
             &mut pure_fn_defs,
             &mut lemma_defs,
-            &mut extern_contract_defs,
+            &mut standalone_fn_contract_defs,
         )
         .unwrap_or_else(|err| panic!("prelude ghost source must parse: {}", err.message));
         let enums = enum_defs
@@ -5829,6 +5862,11 @@ fn compute_directives<'tcx>(
         result_rust_ty,
         &mut inferred,
     )?;
+    let explicit_function_contract = req_directive.is_some()
+        || ens_directive.is_some()
+        || !raw_req_directives.is_empty()
+        || !raw_ens_directives.is_empty()
+        || !contract_lets.is_empty();
     let function_contract = match (
         req_directive,
         ens_directive,
@@ -6027,6 +6065,7 @@ fn compute_directives<'tcx>(
     Ok(DirectivePrepass {
         loop_contracts,
         control_point_directives,
+        explicit_function_contract,
         function_contract,
         unsafe_blocks,
     })
@@ -6582,7 +6621,7 @@ fn typed_lemma_raw_pattern(
             Ok(TypedRawPattern::PointsTo { addr, ty, value })
         }
         RawPattern::PointsToSugar { .. } => {
-            Err("`|->` raw sugar in unsafe lemmas is unsupported; use `PointsTo(...)`".to_owned())
+            Err("`|-?->` raw sugar in unsafe lemmas is unsupported; use `PointsTo(...)`".to_owned())
         }
         RawPattern::DeallocToken { base, layout } => Ok(TypedRawPattern::DeallocToken {
             base: typed_contract_raw_expr(
@@ -6705,7 +6744,7 @@ fn typed_contract_raw_pattern<'tcx>(
                 TyKind::RawPtr(pointee, _) => *pointee,
                 _ => {
                     return Err(format!(
-                        "`|->` raw pattern requires a raw pointer, found `{}`",
+                        "`|-?->` raw pattern requires a raw pointer, found `{}`",
                         display_spec_ty(&spec_ty_for_rust_ty(tcx, pointer_ty)?)
                     ));
                 }
@@ -7185,7 +7224,7 @@ fn typed_raw_pattern_into(
                 TyKind::RawPtr(pointee, _) => *pointee,
                 _ => {
                     return Err(format!(
-                        "`|->` raw pattern requires a raw pointer, found `{}`",
+                        "`|-?->` raw pattern requires a raw pointer, found `{}`",
                         display_spec_ty(&spec_ty_for_rust_ty(ctx.tcx, pointer_ty)?)
                     ));
                 }
@@ -7569,6 +7608,138 @@ fn typed_value_pattern(
             })
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_standalone_fn_raw_assertions(
+    assertions: &[RawAssertion],
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    rust_params: &HashMap<String, RustTypeExpr>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    result_rust_ty: &RustTypeExpr,
+    inferred: &mut SpecTypeInference,
+) -> Result<Vec<RawAssertionContract>, String> {
+    let mut out = Vec::with_capacity(assertions.len());
+    for assertion in assertions {
+        let pattern = typed_standalone_fn_raw_pattern(
+            &assertion.pattern,
+            pure_fns,
+            enum_defs,
+            spec_scope,
+            params,
+            rust_params,
+            allow_result,
+            result_ty,
+            result_rust_ty,
+            inferred,
+        )?;
+        let condition = typed_contract_expr_with_expected(
+            &assertion.condition,
+            pure_fns,
+            enum_defs,
+            &HashSet::new(),
+            spec_scope,
+            params,
+            allow_result,
+            result_ty,
+            inferred,
+            true,
+            Some(&SpecTy::Bool),
+        )?;
+        out.push(RawAssertionContract {
+            pattern,
+            condition,
+            resolution: ResolvedExprEnv::default(),
+            assertion_span: "function contract raw clause".to_owned(),
+        });
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_standalone_fn_raw_pattern(
+    pattern: &RawPattern,
+    pure_fns: &HashMap<String, PureFnDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    spec_scope: &mut SpecScope,
+    params: &HashMap<String, SpecTy>,
+    rust_params: &HashMap<String, RustTypeExpr>,
+    allow_result: bool,
+    result_ty: &SpecTy,
+    result_rust_ty: &RustTypeExpr,
+    inferred: &mut SpecTypeInference,
+) -> Result<TypedRawPattern, String> {
+    match pattern {
+        RawPattern::PointsToSugar { pointer, value } => {
+            let pointer_rust_ty = if allow_result && pointer == "result" {
+                result_rust_ty
+            } else {
+                rust_params
+                    .get(pointer)
+                    .ok_or_else(|| format!("unresolved pointer `{pointer}` in raw contract"))?
+            };
+            let pointee_text = raw_pointer_pointee_text(&pointer_rust_ty.text)?;
+            let type_params = contract_type_param_scope(params, result_ty);
+            let pointee_ty = rust_ty_key_to_spec_ty(pointee_text, &type_params)?;
+            let addr = TypedExpr {
+                ty: SpecTy::Usize,
+                kind: TypedExprKind::Field {
+                    base: Box::new(TypedExpr {
+                        ty: ptr_spec_ty(),
+                        kind: TypedExprKind::Var(pointer.clone()),
+                    }),
+                    name: "addr".to_owned(),
+                    index: 0,
+                },
+            };
+            let ty = TypedExpr {
+                ty: SpecTy::RustTy,
+                kind: TypedExprKind::RustType(RustTyKey::new(pointee_text.to_owned())),
+            };
+            let value = typed_contract_value_pattern(
+                value,
+                &option_spec_ty(pointee_ty),
+                pure_fns,
+                enum_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?;
+            Ok(TypedRawPattern::PointsTo { addr, ty, value })
+        }
+        RawPattern::Emp
+        | RawPattern::Star(_, _)
+        | RawPattern::PointsTo { .. }
+        | RawPattern::DeallocToken { .. } => typed_lemma_raw_pattern(
+            pattern,
+            pure_fns,
+            enum_defs,
+            spec_scope,
+            params,
+            allow_result,
+            result_ty,
+            inferred,
+        ),
+    }
+}
+
+fn raw_pointer_pointee_text(text: &str) -> Result<&str, String> {
+    let text = text.trim();
+    text.strip_prefix("*const ")
+        .or_else(|| text.strip_prefix("*mut "))
+        .map(str::trim)
+        .ok_or_else(|| {
+            format!(
+                "`|-?->` raw pattern requires a raw pointer, found `{}`",
+                text
+            )
+        })
 }
 
 fn ensure_raw_expr_ty(expr: &TypedExpr, expected: &SpecTy, label: &str) -> Result<(), String> {
@@ -9108,8 +9279,8 @@ fn type_lemmas(
     Ok(typed)
 }
 
-fn type_extern_contracts(
-    extern_contracts: &HashMap<String, ExternContractDef>,
+fn type_standalone_fn_contracts(
+    standalone_fn_contracts: &HashMap<String, StandaloneFnContractDef>,
     declaration_order: &[String],
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
@@ -9117,9 +9288,9 @@ fn type_extern_contracts(
 ) -> Result<HashMap<String, FunctionContract>, LoopPrepassError> {
     let mut typed = HashMap::new();
     for path in declaration_order {
-        let def = extern_contracts
+        let def = standalone_fn_contracts
             .get(path)
-            .expect("extern contract declaration order must stay in sync");
+            .expect("function contract declaration order must stay in sync");
         let type_param_scope: HashSet<_> = def.type_params.iter().cloned().collect();
         for param in &def.params {
             validate_named_spec_ty(&param.ty, enum_defs, &type_param_scope).map_err(|message| {
@@ -9127,7 +9298,7 @@ fn type_extern_contracts(
                     span,
                     display_span: None,
                     message: format!(
-                        "extern contract `{}` parameter `{}`: {message}",
+                        "function contract declaration `{}` parameter `{}`: {message}",
                         def.path, param.name
                     ),
                 }
@@ -9137,7 +9308,10 @@ fn type_extern_contracts(
             |message| LoopPrepassError {
                 span,
                 display_span: None,
-                message: format!("extern contract `{}` result: {message}", def.path),
+                message: format!(
+                    "function contract declaration `{}` result: {message}",
+                    def.path
+                ),
             },
         )?;
         if !def.is_unsafe && (!def.raw_reqs.is_empty() || !def.raw_ens.is_empty()) {
@@ -9145,7 +9319,7 @@ fn type_extern_contracts(
                 span,
                 display_span: None,
                 message: format!(
-                    "extern contract `{}` raw contracts are only supported on unsafe extern functions",
+                    "function contract declaration `{}` raw contracts are only supported on unsafe functions",
                     def.path
                 ),
             });
@@ -9155,6 +9329,11 @@ fn type_extern_contracts(
             .params
             .iter()
             .map(|param| (param.name.clone(), param.ty.clone()))
+            .collect();
+        let rust_param_tys: HashMap<_, _> = def
+            .params
+            .iter()
+            .map(|param| (param.name.clone(), param.rust_ty.clone()))
             .collect();
         let params = def
             .params
@@ -9180,7 +9359,10 @@ fn type_extern_contracts(
         .map_err(|message| LoopPrepassError {
             span,
             display_span: None,
-            message: format!("extern contract `{}` req: {message}", def.path),
+            message: format!(
+                "function contract declaration `{}` req: {message}",
+                def.path
+            ),
         })?;
         let mut ens_infer_scope = infer_scope.clone();
         for resource_req in &def.raw_reqs {
@@ -9197,7 +9379,10 @@ fn type_extern_contracts(
             .map_err(|message| LoopPrepassError {
                 span,
                 display_span: None,
-                message: format!("extern contract `{}` raw req: {message}", def.path),
+                message: format!(
+                    "function contract declaration `{}` raw req: {message}",
+                    def.path
+                ),
             })?;
         }
         infer_contract_expr_types_in_scope(
@@ -9214,7 +9399,10 @@ fn type_extern_contracts(
         .map_err(|message| LoopPrepassError {
             span,
             display_span: None,
-            message: format!("extern contract `{}` ens: {message}", def.path),
+            message: format!(
+                "function contract declaration `{}` ens: {message}",
+                def.path
+            ),
         })?;
         for raw_ens in &def.raw_ens {
             infer_contract_raw_assertion(
@@ -9230,7 +9418,10 @@ fn type_extern_contracts(
             .map_err(|message| LoopPrepassError {
                 span,
                 display_span: None,
-                message: format!("extern contract `{}` raw ens: {message}", def.path),
+                message: format!(
+                    "function contract declaration `{}` raw ens: {message}",
+                    def.path
+                ),
             })?;
         }
 
@@ -9249,31 +9440,42 @@ fn type_extern_contracts(
         .map_err(|message| LoopPrepassError {
             span,
             display_span: None,
-            message: format!("extern contract `{}` req: {message}", def.path),
+            message: format!(
+                "function contract declaration `{}` req: {message}",
+                def.path
+            ),
         })
         .and_then(|expr| {
-            normalize_assert_like_predicate(expr, "extern req").map_err(|message| {
+            normalize_assert_like_predicate(expr, "function contract req").map_err(|message| {
                 LoopPrepassError {
                     span,
                     display_span: None,
-                    message: format!("extern contract `{}` req: {message}", def.path),
+                    message: format!(
+                        "function contract declaration `{}` req: {message}",
+                        def.path
+                    ),
                 }
             })
         })?;
-        let raw_reqs = typed_lemma_raw_assertions(
+        let raw_reqs = typed_standalone_fn_raw_assertions(
             &def.raw_reqs,
             pure_fns,
             enum_defs,
             &mut type_scope,
             &param_tys,
+            &rust_param_tys,
             false,
             &def.result_ty,
+            &def.result_rust_ty,
             &mut inferred,
         )
         .map_err(|message| LoopPrepassError {
             span,
             display_span: None,
-            message: format!("extern contract `{}` raw req: {message}", def.path),
+            message: format!(
+                "function contract declaration `{}` raw req: {message}",
+                def.path
+            ),
         })?;
         let ens = typed_contract_expr_in_scope(
             &def.ens,
@@ -9289,39 +9491,52 @@ fn type_extern_contracts(
         .map_err(|message| LoopPrepassError {
             span,
             display_span: None,
-            message: format!("extern contract `{}` ens: {message}", def.path),
+            message: format!(
+                "function contract declaration `{}` ens: {message}",
+                def.path
+            ),
         })
         .and_then(|expr| {
-            ensure_bind_free_predicate(expr, "extern ens").map_err(|message| LoopPrepassError {
-                span,
-                display_span: None,
-                message: format!("extern contract `{}` ens: {message}", def.path),
+            ensure_bind_free_predicate(expr, "function contract ens").map_err(|message| {
+                LoopPrepassError {
+                    span,
+                    display_span: None,
+                    message: format!(
+                        "function contract declaration `{}` ens: {message}",
+                        def.path
+                    ),
+                }
             })
         })?;
-        let raw_ens = typed_lemma_raw_assertions(
+        let raw_ens = typed_standalone_fn_raw_assertions(
             &def.raw_ens,
             pure_fns,
             enum_defs,
             &mut type_scope,
             &param_tys,
+            &rust_param_tys,
             true,
             &def.result_ty,
+            &def.result_rust_ty,
             &mut inferred,
         )
         .map_err(|message| LoopPrepassError {
             span,
             display_span: None,
-            message: format!("extern contract `{}` raw ens: {message}", def.path),
+            message: format!(
+                "function contract declaration `{}` raw ens: {message}",
+                def.path
+            ),
         })?;
         typed.insert(
             def.path.clone(),
             FunctionContract {
                 params,
                 req,
-                req_span: format!("extern contract `{}` req", def.path),
+                req_span: format!("function contract declaration `{}` req", def.path),
                 raw_reqs,
                 ens,
-                ens_span: format!("extern contract `{}` ens", def.path),
+                ens_span: format!("function contract declaration `{}` ens", def.path),
                 raw_ens,
                 result: def.result_ty.clone(),
             },
@@ -9585,7 +9800,7 @@ fn collect_ghost_items_in_source(
     structs: &mut Vec<StructDef>,
     pure_fns: &mut Vec<PureFnDef>,
     lemmas: &mut Vec<LemmaDef>,
-    extern_contracts: &mut Vec<ExternContractDef>,
+    standalone_fn_contracts: &mut Vec<StandaloneFnContractDef>,
 ) -> Result<(), LoopPrepassError> {
     for parsed in collect_ghost_blocks(source).map_err(|err| LoopPrepassError {
         span: error_span,
@@ -9596,7 +9811,7 @@ fn collect_ghost_items_in_source(
         structs.extend(parsed.structs);
         pure_fns.extend(parsed.pure_fns);
         lemmas.extend(parsed.lemmas);
-        extern_contracts.extend(parsed.extern_contracts);
+        standalone_fn_contracts.extend(parsed.standalone_fn_contracts);
     }
     Ok(())
 }
@@ -10952,7 +11167,7 @@ mod tests {
                 }),
             }],
             typed_lemmas: Vec::new(),
-            extern_contracts: HashMap::new(),
+            standalone_fn_contracts: HashMap::new(),
         };
 
         assert_eq!(ghosts.typed_pure_fns.len(), 1);

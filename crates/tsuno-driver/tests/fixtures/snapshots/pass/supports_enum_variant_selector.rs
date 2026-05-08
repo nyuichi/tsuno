@@ -9,9 +9,8 @@ enum Maybe<T> {
     Some(T),
 }
 
-fn singleton(x: i32) -> MyList<i32> {
+def singleton(x: i32) -> MyList<i32> =
     MyList::<i32>::Cons(x, MyList::<i32>::Nil)
-}
 */
 
 fn supports_struct_variant_selector(x: i32) {
