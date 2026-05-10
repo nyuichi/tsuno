@@ -4761,14 +4761,6 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 self.construct_composite(spec_ty, &updated)
             }
-            SpecTy::Record(struct_ty) => {
-                let mut updated = Vec::with_capacity(struct_ty.fields.len());
-                for (index, field_ty) in struct_ty.fields.iter().enumerate() {
-                    let field_value = self.project_field(value.clone(), spec_ty, index, span)?;
-                    updated.push(self.dangle_value(&field_ty.ty, &field_value, span)?);
-                }
-                self.construct_composite(spec_ty, &updated)
-            }
             SpecTy::Struct { .. } => {
                 let fields = self.struct_fields_for_ty(spec_ty, span)?;
                 let mut updated = Vec::with_capacity(fields.len());
@@ -6893,7 +6885,9 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<SymValue, VerificationResult> {
         let field_len = match payload_ty {
             SpecTy::Tuple(items) => items.len(),
-            SpecTy::Record(struct_ty) => struct_ty.fields.len(),
+            SpecTy::Struct { .. } => self
+                .struct_fields_for_ty(payload_ty, self.report_span())?
+                .len(),
             _ => {
                 return Err(self.unsupported_result(
                     self.report_span(),
@@ -7017,7 +7011,6 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<Option<usize>, VerificationResult> {
         Ok(match ty {
             SpecTy::Tuple(items) => Some(items.len()),
-            SpecTy::Record(struct_ty) => Some(struct_ty.fields.len()),
             SpecTy::Struct { .. } => Some(self.struct_fields_for_ty(ty, span)?.len()),
             _ => None,
         })
@@ -7031,7 +7024,6 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<Option<SpecTy>, VerificationResult> {
         Ok(match ty {
             SpecTy::Tuple(items) => items.get(index).cloned(),
-            SpecTy::Record(struct_ty) => struct_ty.fields.get(index).map(|field| field.ty.clone()),
             SpecTy::Struct { .. } => self
                 .struct_fields_for_ty(ty, span)?
                 .get(index)
@@ -7252,32 +7244,6 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(Some(bool_and(formulas)))
             }
-            SpecTy::Record(struct_ty) => {
-                if let Some(formula) =
-                    self.direct_struct_invariant_formula(ty, struct_ty, value, span)?
-                {
-                    let mut formulas = vec![formula];
-                    if let Some(user_formula) =
-                        self.user_struct_invariant_formula(ty, struct_ty, value, span)?
-                    {
-                        formulas.push(user_formula);
-                    }
-                    return Ok(Some(bool_and(formulas)));
-                }
-                let view = self.composite_ctor_view(ty, value, 0, span)?;
-                let mut formulas = vec![view.tag];
-                for (field, (_, field_value)) in struct_ty.fields.iter().zip(view.fields) {
-                    if let Some(formula) = self.spec_ty_formula(&field.ty, &field_value, span)? {
-                        formulas.push(formula);
-                    }
-                }
-                if let Some(user_formula) =
-                    self.user_struct_invariant_formula(ty, struct_ty, value, span)?
-                {
-                    formulas.push(user_formula);
-                }
-                Ok(Some(bool_and(formulas)))
-            }
             SpecTy::Struct { name, .. } => {
                 if name == "Ptr" {
                     return Ok(Some(self.composite_tag_formula(ty, value, 0, span)?));
@@ -7389,22 +7355,6 @@ impl<'tcx> Verifier<'tcx> {
                 .map(|item| self.instantiate_spec_ty(item, bindings, span))
                 .collect::<Result<Vec<_>, _>>()
                 .map(SpecTy::Tuple),
-            SpecTy::Record(struct_ty) => struct_ty
-                .fields
-                .iter()
-                .map(|field| {
-                    Ok(StructFieldTy {
-                        name: field.name.clone(),
-                        ty: self.instantiate_spec_ty(&field.ty, bindings, span)?,
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map(|fields| {
-                    SpecTy::Record(crate::spec::StructTy {
-                        name: struct_ty.name.clone(),
-                        fields,
-                    })
-                }),
             SpecTy::Struct { name, args } => args
                 .iter()
                 .map(|arg| self.instantiate_spec_ty(arg, bindings, span))
@@ -7431,57 +7381,6 @@ impl<'tcx> Verifier<'tcx> {
                 self.instantiate_spec_ty(inner, bindings, span)?,
             ))),
         }
-    }
-
-    fn direct_struct_invariant_formula(
-        &self,
-        ty: &SpecTy,
-        struct_ty: &crate::spec::StructTy,
-        value: &SymValue,
-        span: Span,
-    ) -> Result<Option<Bool>, VerificationResult> {
-        let Some(fields) = self
-            .solver
-            .direct_composite_fields_for_ty(ty, value)
-            .map_err(|err| self.unsupported_result(span, err))?
-        else {
-            return Ok(None);
-        };
-        let mut formulas = Vec::new();
-        for (field, field_value) in struct_ty.fields.iter().zip(fields) {
-            if let Some(formula) = self.spec_ty_formula(&field.ty, &field_value, span)? {
-                formulas.push(formula);
-            }
-        }
-        Ok(Some(bool_and(formulas)))
-    }
-
-    fn user_struct_invariant_formula(
-        &self,
-        ty: &SpecTy,
-        struct_ty: &crate::spec::StructTy,
-        value: &SymValue,
-        span: Span,
-    ) -> Result<Option<Bool>, VerificationResult> {
-        let Some(invariant) = self.struct_invariants.get(&struct_ty.name) else {
-            return Ok(None);
-        };
-        let mut env = HashMap::new();
-        for field in &invariant.fields {
-            let Some((index, _)) = struct_ty.field(&field.name) else {
-                return Err(self.unsupported_result(
-                    span,
-                    format!(
-                        "struct `{}` invariant field `{}` is missing",
-                        struct_ty.name, field.name
-                    ),
-                ));
-            };
-            let field_value = self.project_field(value.clone(), ty, index, span)?;
-            env.insert(field.name.clone(), field_value);
-        }
-        self.contract_expr_to_bool(&env, &HashMap::new(), &invariant.condition)
-            .map(Some)
     }
 
     fn resolve_formula_for_spec_ty(
@@ -7533,22 +7432,6 @@ impl<'tcx> Verifier<'tcx> {
                 formulas.push(view.tag);
                 for (field_ty, (_, field)) in items.iter().zip(view.fields) {
                     formulas.push(self.resolve_formula_for_spec_ty(field_ty, &field, span)?);
-                }
-                Ok(bool_and(formulas))
-            }
-            SpecTy::Record(struct_ty) => {
-                if struct_ty.name == "Ptr" {
-                    return self.composite_tag_formula(ty, value, 0, span);
-                }
-                let view = self.composite_ctor_view(ty, value, 0, span)?;
-                let mut formulas = Vec::with_capacity(struct_ty.fields.len() + 1);
-                formulas.push(view.tag);
-                for (field, (_, field_value)) in struct_ty.fields.iter().zip(view.fields) {
-                    formulas.push(self.resolve_formula_for_spec_ty(
-                        &field.ty,
-                        &field_value,
-                        span,
-                    )?);
                 }
                 Ok(bool_and(formulas))
             }
@@ -8146,10 +8029,6 @@ fn spec_ty_contains_mut_ref(ty: &SpecTy) -> bool {
         SpecTy::Ref(inner) => spec_ty_contains_mut_ref(inner),
         SpecTy::Seq(inner) => spec_ty_contains_mut_ref(inner),
         SpecTy::Tuple(items) => items.iter().any(spec_ty_contains_mut_ref),
-        SpecTy::Record(struct_ty) => struct_ty
-            .fields
-            .iter()
-            .any(|field| spec_ty_contains_mut_ref(&field.ty)),
         _ => false,
     }
 }

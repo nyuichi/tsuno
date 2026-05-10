@@ -263,7 +263,6 @@ pub enum SpecTy {
     Seq(Box<SpecTy>),
     Tuple(Vec<SpecTy>),
     Struct { name: String, args: Vec<SpecTy> },
-    Record(StructTy),
     Enum { name: String, args: Vec<SpecTy> },
     TypeParam(String),
     Ref(Box<SpecTy>),
@@ -427,21 +426,6 @@ pub struct StructDef {
     pub type_params: Vec<String>,
     pub fields: Vec<StructFieldTy>,
     pub invariant: Option<Expr>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct StructTy {
-    pub name: String,
-    pub fields: Vec<StructFieldTy>,
-}
-
-impl StructTy {
-    pub fn field(&self, name: &str) -> Option<(usize, &StructFieldTy)> {
-        self.fields
-            .iter()
-            .enumerate()
-            .find(|(_, field)| field.name == name)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
