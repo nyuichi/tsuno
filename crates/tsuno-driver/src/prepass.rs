@@ -150,6 +150,17 @@ struct RawTypingCtx<'a, 'tcx> {
     local_tys: &'a HashMap<String, SpecTy>,
 }
 
+impl<'a, 'tcx> RawTypingCtx<'a, 'tcx> {
+    fn call_ctx<'b>(&'b self, type_param_scope: &'b HashSet<String>) -> SpecCallContext<'b> {
+        SpecCallContext::new(
+            self.pure_fns,
+            self.enum_defs,
+            self.struct_defs,
+            type_param_scope,
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ControlPointDirective {
     Let(LetBindingContract),
@@ -273,6 +284,11 @@ pub struct TypedStructInvariant {
 pub struct TypedEnumInvariant {
     pub condition: TypedExpr,
 }
+
+type TypedTypeInvariants = (
+    HashMap<String, TypedStructInvariant>,
+    HashMap<String, TypedEnumInvariant>,
+);
 
 #[derive(Debug, Clone)]
 pub struct FunctionPrepass {
@@ -838,13 +854,7 @@ fn type_type_invariants(
     enums: &HashMap<String, EnumDef>,
     pure_fns: &HashMap<String, PureFnDef>,
     anchor_span: Span,
-) -> Result<
-    (
-        HashMap<String, TypedStructInvariant>,
-        HashMap<String, TypedEnumInvariant>,
-    ),
-    LoopPrepassError,
-> {
+) -> Result<TypedTypeInvariants, LoopPrepassError> {
     let mut struct_invariants = HashMap::new();
     for def in structs.values() {
         let Some(invariant) = &def.invariant else {
@@ -1133,6 +1143,22 @@ struct SpecCallContext<'a> {
     enum_defs: &'a HashMap<String, EnumDef>,
     struct_defs: &'a HashMap<String, StructDef>,
     type_param_scope: &'a HashSet<String>,
+}
+
+impl<'a> SpecCallContext<'a> {
+    fn new(
+        pure_fns: &'a HashMap<String, PureFnDef>,
+        enum_defs: &'a HashMap<String, EnumDef>,
+        struct_defs: &'a HashMap<String, StructDef>,
+        type_param_scope: &'a HashSet<String>,
+    ) -> Self {
+        Self {
+            pure_fns,
+            enum_defs,
+            struct_defs,
+            type_param_scope,
+        }
+    }
 }
 
 struct ExprResolutionContext<'a> {
@@ -3718,65 +3744,23 @@ fn infer_contract_expr_types_with_expected(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn infer_body_expr_types(
     expr: &Expr,
-    pure_fns: &HashMap<String, PureFnDef>,
-    enum_defs: &HashMap<String, EnumDef>,
-    struct_defs: &HashMap<String, StructDef>,
-    kind: DirectiveKind,
-    spec_scope: &mut SpecScope,
-    local_tys: &HashMap<String, SpecTy>,
-    inferred: &mut SpecTypeInference,
-) -> Result<InferredExprTy, String> {
-    let type_param_scope = HashSet::new();
-    infer_body_expr_types_in_scope(
-        expr,
-        pure_fns,
-        enum_defs,
-        struct_defs,
-        &type_param_scope,
-        kind,
-        spec_scope,
-        local_tys,
-        inferred,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn infer_body_expr_types_in_scope(
-    expr: &Expr,
-    pure_fns: &HashMap<String, PureFnDef>,
-    enum_defs: &HashMap<String, EnumDef>,
-    struct_defs: &HashMap<String, StructDef>,
-    type_param_scope: &HashSet<String>,
+    call_ctx: SpecCallContext<'_>,
     kind: DirectiveKind,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
 ) -> Result<InferredExprTy, String> {
     infer_body_expr_types_with_expected(
-        expr,
-        pure_fns,
-        enum_defs,
-        struct_defs,
-        type_param_scope,
-        kind,
-        spec_scope,
-        local_tys,
-        inferred,
-        false,
-        None,
+        expr, call_ctx, kind, spec_scope, local_tys, inferred, false, None,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn infer_body_expr_types_with_expected(
     expr: &Expr,
-    pure_fns: &HashMap<String, PureFnDef>,
-    enum_defs: &HashMap<String, EnumDef>,
-    struct_defs: &HashMap<String, StructDef>,
-    type_param_scope: &HashSet<String>,
+    call_ctx: SpecCallContext<'_>,
     kind: DirectiveKind,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
@@ -3821,21 +3805,13 @@ fn infer_body_expr_types_with_expected(
         Expr::Match { .. } => Err(unsupported_match_expr_message()),
         _ => infer_common_expr_types_with_expected(
             expr,
-            SpecCallContext {
-                pure_fns,
-                enum_defs,
-                struct_defs,
-                type_param_scope,
-            },
+            call_ctx,
             inferred,
             expected,
             &mut |expr, expected, inferred| {
                 infer_body_expr_types_with_expected(
                     expr,
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
-                    type_param_scope,
+                    call_ctx,
                     kind,
                     spec_scope,
                     local_tys,
@@ -4390,65 +4366,23 @@ fn typed_contract_expr_with_expected(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn typed_body_expr(
     expr: &Expr,
-    pure_fns: &HashMap<String, PureFnDef>,
-    enum_defs: &HashMap<String, EnumDef>,
-    struct_defs: &HashMap<String, StructDef>,
-    kind: DirectiveKind,
-    spec_scope: &mut SpecScope,
-    local_tys: &HashMap<String, SpecTy>,
-    inferred: &mut SpecTypeInference,
-) -> Result<TypedExpr, String> {
-    let type_param_scope = HashSet::new();
-    typed_body_expr_in_scope(
-        expr,
-        pure_fns,
-        enum_defs,
-        struct_defs,
-        &type_param_scope,
-        kind,
-        spec_scope,
-        local_tys,
-        inferred,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn typed_body_expr_in_scope(
-    expr: &Expr,
-    pure_fns: &HashMap<String, PureFnDef>,
-    enum_defs: &HashMap<String, EnumDef>,
-    struct_defs: &HashMap<String, StructDef>,
-    type_param_scope: &HashSet<String>,
+    call_ctx: SpecCallContext<'_>,
     kind: DirectiveKind,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
 ) -> Result<TypedExpr, String> {
     typed_body_expr_with_expected(
-        expr,
-        pure_fns,
-        enum_defs,
-        struct_defs,
-        type_param_scope,
-        kind,
-        spec_scope,
-        local_tys,
-        inferred,
-        false,
-        None,
+        expr, call_ctx, kind, spec_scope, local_tys, inferred, false, None,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn typed_body_expr_with_expected(
     expr: &Expr,
-    pure_fns: &HashMap<String, PureFnDef>,
-    enum_defs: &HashMap<String, EnumDef>,
-    struct_defs: &HashMap<String, StructDef>,
-    type_param_scope: &HashSet<String>,
+    call_ctx: SpecCallContext<'_>,
     kind: DirectiveKind,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
@@ -4461,7 +4395,7 @@ fn typed_body_expr_with_expected(
             ty: SpecTy::Bool,
             kind: TypedExprKind::Bool(*value),
         }),
-        Expr::Int(lit) => type_int_expr_as(lit, expected, enum_defs),
+        Expr::Int(lit) => type_int_expr_as(lit, expected, call_ctx.enum_defs),
         Expr::RustType(expr) => Ok(typed_rust_type_expr(expr)),
         Expr::Var(name) => {
             if spec_scope.visible.contains(name) {
@@ -4499,10 +4433,7 @@ fn typed_body_expr_with_expected(
         Expr::SeqLit(items) => type_seq_lit_expr(items, expected, &mut |item, expected| {
             typed_body_expr_with_expected(
                 item,
-                pure_fns,
-                enum_defs,
-                struct_defs,
-                type_param_scope,
+                call_ctx,
                 kind,
                 spec_scope,
                 local_tys,
@@ -4515,14 +4446,11 @@ fn typed_body_expr_with_expected(
             name,
             fields,
             expected,
-            struct_defs,
+            call_ctx.struct_defs,
             &mut |value, expected| {
                 typed_body_expr_with_expected(
                     value,
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
-                    type_param_scope,
+                    call_ctx,
                     kind,
                     spec_scope,
                     local_tys,
@@ -4538,22 +4466,19 @@ fn typed_body_expr_with_expected(
             type_args,
             args,
         } => {
-            if let Some((enum_def, ctor_index)) = lookup_enum_ctor(enum_defs, func) {
+            if let Some((enum_def, ctor_index)) = lookup_enum_ctor(call_ctx.enum_defs, func) {
                 type_ctor_call(
                     func,
                     enum_def,
                     ctor_index,
                     type_args,
                     args,
-                    enum_defs,
+                    call_ctx.enum_defs,
                     expected,
                     &mut |arg, expected| {
                         typed_body_expr_with_expected(
                             arg,
-                            pure_fns,
-                            enum_defs,
-                            struct_defs,
-                            type_param_scope,
+                            call_ctx,
                             kind,
                             spec_scope,
                             local_tys,
@@ -4564,41 +4489,24 @@ fn typed_body_expr_with_expected(
                     },
                 )
             } else {
-                type_pure_call(
-                    func,
-                    type_args,
-                    args,
-                    SpecCallContext {
-                        pure_fns,
-                        enum_defs,
-                        struct_defs,
-                        type_param_scope,
-                    },
-                    &mut |arg, expected| {
-                        typed_body_expr_with_expected(
-                            arg,
-                            pure_fns,
-                            enum_defs,
-                            struct_defs,
-                            type_param_scope,
-                            kind,
-                            spec_scope,
-                            local_tys,
-                            inferred,
-                            allow_bare_names,
-                            expected,
-                        )
-                    },
-                )
+                type_pure_call(func, type_args, args, call_ctx, &mut |arg, expected| {
+                    typed_body_expr_with_expected(
+                        arg,
+                        call_ctx,
+                        kind,
+                        spec_scope,
+                        local_tys,
+                        inferred,
+                        allow_bare_names,
+                        expected,
+                    )
+                })
             }
         }
         Expr::Field { base, name } => {
             let base = typed_body_expr_with_expected(
                 expr_base(base),
-                pure_fns,
-                enum_defs,
-                struct_defs,
-                type_param_scope,
+                call_ctx,
                 kind,
                 spec_scope,
                 local_tys,
@@ -4606,15 +4514,12 @@ fn typed_body_expr_with_expected(
                 allow_bare_names,
                 None,
             )?;
-            type_named_field_expr(base, name, struct_defs)
+            type_named_field_expr(base, name, call_ctx.struct_defs)
         }
         Expr::TupleField { base, index } => {
             let base = typed_body_expr_with_expected(
                 expr_base(base),
-                pure_fns,
-                enum_defs,
-                struct_defs,
-                type_param_scope,
+                call_ctx,
                 kind,
                 spec_scope,
                 local_tys,
@@ -4632,10 +4537,7 @@ fn typed_body_expr_with_expected(
         } => {
             let base = typed_body_expr_with_expected(
                 expr_base(base),
-                pure_fns,
-                enum_defs,
-                struct_defs,
-                type_param_scope,
+                call_ctx,
                 kind,
                 spec_scope,
                 local_tys,
@@ -4648,17 +4550,14 @@ fn typed_body_expr_with_expected(
                 enum_name,
                 ctor_name,
                 type_args,
-                enum_defs,
-                struct_defs,
+                call_ctx.enum_defs,
+                call_ctx.struct_defs,
             )
         }
         Expr::Index { base, index } => type_seq_index_expr(base, index, &mut |expr, expected| {
             typed_body_expr_with_expected(
                 expr,
-                pure_fns,
-                enum_defs,
-                struct_defs,
-                type_param_scope,
+                call_ctx,
                 kind,
                 spec_scope,
                 local_tys,
@@ -4670,10 +4569,7 @@ fn typed_body_expr_with_expected(
         Expr::Deref { base } => {
             let base = typed_body_expr_with_expected(
                 base,
-                pure_fns,
-                enum_defs,
-                struct_defs,
-                type_param_scope,
+                call_ctx,
                 kind,
                 spec_scope,
                 local_tys,
@@ -4686,10 +4582,7 @@ fn typed_body_expr_with_expected(
         Expr::Cast { arg, ty } => {
             let arg = typed_body_expr_with_expected(
                 arg,
-                pure_fns,
-                enum_defs,
-                struct_defs,
-                type_param_scope,
+                call_ctx,
                 kind,
                 spec_scope,
                 local_tys,
@@ -4702,10 +4595,7 @@ fn typed_body_expr_with_expected(
         Expr::Unary { op, arg } => {
             let arg = typed_body_expr_with_expected(
                 arg,
-                pure_fns,
-                enum_defs,
-                struct_defs,
-                type_param_scope,
+                call_ctx,
                 kind,
                 spec_scope,
                 local_tys,
@@ -4749,10 +4639,7 @@ fn typed_body_expr_with_expected(
         Expr::Binary { op, lhs, rhs } => {
             let lhs = typed_body_expr_with_expected(
                 lhs,
-                pure_fns,
-                enum_defs,
-                struct_defs,
-                type_param_scope,
+                call_ctx,
                 kind,
                 spec_scope,
                 local_tys,
@@ -4772,10 +4659,7 @@ fn typed_body_expr_with_expected(
             };
             let rhs = typed_body_expr_with_expected(
                 rhs,
-                pure_fns,
-                enum_defs,
-                struct_defs,
-                type_param_scope,
+                call_ctx,
                 kind,
                 spec_scope,
                 local_tys,
@@ -5584,6 +5468,12 @@ fn compute_directives<'tcx>(
                 display_span: Some(directive.span_text.clone()),
                 message,
             })?;
+        let directive_call_ctx = SpecCallContext::new(
+            pure_fns,
+            enum_defs,
+            struct_defs,
+            &directive_type_param_scope,
+        );
         match directive.kind {
             DirectiveKind::LemmaCall => {
                 infer_lemma_call(
@@ -5609,9 +5499,7 @@ fn compute_directives<'tcx>(
                 let (name, value) = directive.let_binding().expect("let directive payload");
                 let inferred_ty = infer_body_expr_types(
                     value,
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
+                    directive_call_ctx,
                     directive.kind,
                     &mut body_infer_scope,
                     &local_tys,
@@ -5655,9 +5543,7 @@ fn compute_directives<'tcx>(
             _ => {
                 infer_body_expr_types(
                     directive.expr(),
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
+                    directive_call_ctx,
                     directive.kind,
                     &mut body_infer_scope,
                     &local_tys,
@@ -5840,6 +5726,12 @@ fn compute_directives<'tcx>(
                 display_span: Some(directive.span_text.clone()),
                 message,
             })?;
+        let directive_call_ctx = SpecCallContext::new(
+            pure_fns,
+            enum_defs,
+            struct_defs,
+            &directive_type_param_scope,
+        );
         match directive.kind {
             DirectiveKind::LemmaCall => {
                 let contract = typed_lemma_call(
@@ -5867,9 +5759,7 @@ fn compute_directives<'tcx>(
                 let (name, value) = directive.let_binding().expect("let directive payload");
                 let typed = typed_body_expr(
                     value,
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
+                    directive_call_ctx,
                     directive.kind,
                     &mut body_type_scope,
                     &local_tys,
@@ -5918,10 +5808,7 @@ fn compute_directives<'tcx>(
                 typed_body_raw_assertions.insert(directive.span_text.clone(), typed);
                 let condition = typed_body_expr_with_expected(
                     &assertion.condition,
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
-                    &HashSet::new(),
+                    directive_call_ctx,
                     directive.kind,
                     &mut body_type_scope,
                     &local_tys,
@@ -5939,9 +5826,7 @@ fn compute_directives<'tcx>(
             _ => {
                 let typed = typed_body_expr(
                     directive.expr(),
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
+                    directive_call_ctx,
                     directive.kind,
                     &mut body_type_scope,
                     &local_tys,
@@ -6515,20 +6400,18 @@ fn infer_raw_pattern_types(
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
 ) -> Result<(), String> {
+    let type_param_scope = HashSet::new();
+    let call_ctx = SpecCallContext::new(pure_fns, enum_defs, struct_defs, &type_param_scope);
     infer_raw_pattern_types_into(
         &assertion.pattern,
-        pure_fns,
-        enum_defs,
-        struct_defs,
+        call_ctx,
         spec_scope,
         local_tys,
         inferred,
     )?;
     let condition_ty = infer_body_expr_types(
         &assertion.condition,
-        pure_fns,
-        enum_defs,
-        struct_defs,
+        call_ctx,
         DirectiveKind::RawAssert,
         spec_scope,
         local_tys,
@@ -6542,9 +6425,7 @@ fn infer_raw_pattern_types(
 
 fn infer_raw_pattern_types_into(
     pattern: &RawPattern,
-    pure_fns: &HashMap<String, PureFnDef>,
-    enum_defs: &HashMap<String, EnumDef>,
-    struct_defs: &HashMap<String, StructDef>,
+    call_ctx: SpecCallContext<'_>,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
@@ -6552,32 +6433,14 @@ fn infer_raw_pattern_types_into(
     match pattern {
         RawPattern::Emp => Ok(()),
         RawPattern::Star(lhs, rhs) => {
-            infer_raw_pattern_types_into(
-                lhs,
-                pure_fns,
-                enum_defs,
-                struct_defs,
-                spec_scope,
-                local_tys,
-                inferred,
-            )?;
-            infer_raw_pattern_types_into(
-                rhs,
-                pure_fns,
-                enum_defs,
-                struct_defs,
-                spec_scope,
-                local_tys,
-                inferred,
-            )
+            infer_raw_pattern_types_into(lhs, call_ctx, spec_scope, local_tys, inferred)?;
+            infer_raw_pattern_types_into(rhs, call_ctx, spec_scope, local_tys, inferred)
         }
         RawPattern::PointsTo { addr, ty, value } => {
             for expr in [addr, ty] {
                 infer_body_expr_types(
                     expr,
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
+                    call_ctx,
                     DirectiveKind::RawAssert,
                     spec_scope,
                     local_tys,
@@ -6585,32 +6448,15 @@ fn infer_raw_pattern_types_into(
                 )?;
             }
             if value_pattern_contains_bind(value) {
-                let ty_ty = typed_raw_expr(
-                    ty,
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
-                    spec_scope,
-                    local_tys,
-                    inferred,
-                )?;
+                let ty_ty = typed_raw_expr(ty, call_ctx, spec_scope, local_tys, inferred)?;
                 let expected = option_spec_ty_for_rust_ty_expr(&ty_ty, &HashSet::new())?;
                 infer_value_pattern_types(
-                    value,
-                    &expected,
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
-                    spec_scope,
-                    local_tys,
-                    inferred,
+                    value, &expected, call_ctx, spec_scope, local_tys, inferred,
                 )?;
             } else if let ValuePattern::Expr(expr) = value {
                 infer_body_expr_types(
                     expr,
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
+                    call_ctx,
                     DirectiveKind::RawAssert,
                     spec_scope,
                     local_tys,
@@ -6627,9 +6473,7 @@ fn infer_raw_pattern_types_into(
             if let ValuePattern::Expr(expr) = value {
                 infer_body_expr_types(
                     expr,
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
+                    call_ctx,
                     DirectiveKind::RawAssert,
                     spec_scope,
                     local_tys,
@@ -6642,9 +6486,7 @@ fn infer_raw_pattern_types_into(
             for expr in [base, layout] {
                 infer_body_expr_types(
                     expr,
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
+                    call_ctx,
                     DirectiveKind::RawAssert,
                     spec_scope,
                     local_tys,
@@ -7421,6 +7263,8 @@ fn typed_raw_pattern_into(
     spec_scope: &mut SpecScope,
     inferred: &mut SpecTypeInference,
 ) -> Result<TypedRawPattern, String> {
+    let type_param_scope = HashSet::new();
+    let call_ctx = ctx.call_ctx(&type_param_scope);
     match pattern {
         RawPattern::Emp => Ok(TypedRawPattern::Emp),
         RawPattern::Star(lhs, rhs) => Ok(TypedRawPattern::Star(
@@ -7428,48 +7272,22 @@ fn typed_raw_pattern_into(
             Box::new(typed_raw_pattern_into(rhs, ctx, spec_scope, inferred)?),
         )),
         RawPattern::PointsTo { addr, ty, value } => {
-            let addr = typed_raw_expr(
-                addr,
-                ctx.pure_fns,
-                ctx.enum_defs,
-                ctx.struct_defs,
-                spec_scope,
-                ctx.local_tys,
-                inferred,
-            )?;
+            let addr = typed_raw_expr(addr, call_ctx, spec_scope, ctx.local_tys, inferred)?;
             ensure_raw_expr_ty(&addr, &SpecTy::Usize, "PointsTo address")?;
-            let ty = typed_raw_expr(
-                ty,
-                ctx.pure_fns,
-                ctx.enum_defs,
-                ctx.struct_defs,
-                spec_scope,
-                ctx.local_tys,
-                inferred,
-            )?;
+            let ty = typed_raw_expr(ty, call_ctx, spec_scope, ctx.local_tys, inferred)?;
             ensure_raw_expr_ty(&ty, &SpecTy::RustTy, "PointsTo type")?;
             let value = if value_pattern_contains_bind(value) {
                 let expected = option_spec_ty_for_rust_ty_expr(&ty, &HashSet::new())?;
                 typed_value_pattern(
                     value,
                     &expected,
-                    ctx.pure_fns,
-                    ctx.enum_defs,
-                    ctx.struct_defs,
+                    call_ctx,
                     spec_scope,
                     ctx.local_tys,
                     inferred,
                 )?
             } else if let ValuePattern::Expr(expr) = value {
-                let typed = typed_raw_expr(
-                    expr,
-                    ctx.pure_fns,
-                    ctx.enum_defs,
-                    ctx.struct_defs,
-                    spec_scope,
-                    ctx.local_tys,
-                    inferred,
-                )?;
+                let typed = typed_raw_expr(expr, call_ctx, spec_scope, ctx.local_tys, inferred)?;
                 ensure_option_raw_value(&typed)?;
                 TypedValuePattern::Expr(typed)
             } else {
@@ -7516,9 +7334,7 @@ fn typed_raw_pattern_into(
                 typed_value_pattern(
                     value,
                     &expected,
-                    ctx.pure_fns,
-                    ctx.enum_defs,
-                    ctx.struct_defs,
+                    call_ctx,
                     spec_scope,
                     ctx.local_tys,
                     inferred,
@@ -7526,10 +7342,7 @@ fn typed_raw_pattern_into(
             } else if let ValuePattern::Expr(expr) = value {
                 let typed = typed_body_expr_with_expected(
                     expr,
-                    ctx.pure_fns,
-                    ctx.enum_defs,
-                    ctx.struct_defs,
-                    &HashSet::new(),
+                    call_ctx,
                     DirectiveKind::RawAssert,
                     spec_scope,
                     ctx.local_tys,
@@ -7545,21 +7358,11 @@ fn typed_raw_pattern_into(
             Ok(TypedRawPattern::PointsTo { addr, ty, value })
         }
         RawPattern::DeallocToken { base, layout } => {
-            let base = typed_raw_expr(
-                base,
-                ctx.pure_fns,
-                ctx.enum_defs,
-                ctx.struct_defs,
-                spec_scope,
-                ctx.local_tys,
-                inferred,
-            )?;
+            let base = typed_raw_expr(base, call_ctx, spec_scope, ctx.local_tys, inferred)?;
             ensure_raw_expr_ty(&base, &SpecTy::Usize, "DeallocToken base")?;
             let layout = typed_raw_expr_with_expected(
                 layout,
-                ctx.pure_fns,
-                ctx.enum_defs,
-                ctx.struct_defs,
+                call_ctx,
                 spec_scope,
                 ctx.local_tys,
                 inferred,
@@ -7573,18 +7376,14 @@ fn typed_raw_pattern_into(
 
 fn typed_raw_expr(
     expr: &Expr,
-    pure_fns: &HashMap<String, PureFnDef>,
-    enum_defs: &HashMap<String, EnumDef>,
-    struct_defs: &HashMap<String, StructDef>,
+    call_ctx: SpecCallContext<'_>,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
 ) -> Result<TypedExpr, String> {
     typed_body_expr(
         expr,
-        pure_fns,
-        enum_defs,
-        struct_defs,
+        call_ctx,
         DirectiveKind::RawAssert,
         spec_scope,
         local_tys,
@@ -7592,12 +7391,9 @@ fn typed_raw_expr(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn typed_raw_expr_with_expected(
     expr: &Expr,
-    pure_fns: &HashMap<String, PureFnDef>,
-    enum_defs: &HashMap<String, EnumDef>,
-    struct_defs: &HashMap<String, StructDef>,
+    call_ctx: SpecCallContext<'_>,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
@@ -7605,10 +7401,7 @@ fn typed_raw_expr_with_expected(
 ) -> Result<TypedExpr, String> {
     typed_body_expr_with_expected(
         expr,
-        pure_fns,
-        enum_defs,
-        struct_defs,
-        &HashSet::new(),
+        call_ctx,
         DirectiveKind::RawAssert,
         spec_scope,
         local_tys,
@@ -7618,13 +7411,10 @@ fn typed_raw_expr_with_expected(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn infer_value_pattern_types(
     pattern: &ValuePattern,
     expected: &SpecTy,
-    pure_fns: &HashMap<String, PureFnDef>,
-    enum_defs: &HashMap<String, EnumDef>,
-    struct_defs: &HashMap<String, StructDef>,
+    call_ctx: SpecCallContext<'_>,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
@@ -7639,10 +7429,7 @@ fn infer_value_pattern_types(
         ValuePattern::Expr(expr) => {
             infer_body_expr_types_with_expected(
                 expr,
-                pure_fns,
-                enum_defs,
-                struct_defs,
-                &HashSet::new(),
+                call_ctx,
                 DirectiveKind::RawAssert,
                 spec_scope,
                 local_tys,
@@ -7660,21 +7447,12 @@ fn infer_value_pattern_types(
                 ));
             };
             for item in items {
-                infer_value_pattern_types(
-                    item,
-                    inner,
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
-                    spec_scope,
-                    local_tys,
-                    inferred,
-                )?;
+                infer_value_pattern_types(item, inner, call_ctx, spec_scope, local_tys, inferred)?;
             }
             Ok(())
         }
         ValuePattern::StructLit { name, fields } => {
-            let struct_fields = raw_pattern_struct_fields(expected, name, struct_defs)?;
+            let struct_fields = raw_pattern_struct_fields(expected, name, call_ctx.struct_defs)?;
             for field in fields {
                 let field_ty = struct_fields
                     .iter()
@@ -7683,9 +7461,7 @@ fn infer_value_pattern_types(
                 infer_value_pattern_types(
                     &field.value,
                     &field_ty.ty,
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
+                    call_ctx,
                     spec_scope,
                     local_tys,
                     inferred,
@@ -7698,9 +7474,10 @@ fn infer_value_pattern_types(
             type_args,
             args,
         } => {
-            let (enum_def, _) = lookup_enum_ctor(enum_defs, func)
+            let (enum_def, _) = lookup_enum_ctor(call_ctx.enum_defs, func)
                 .ok_or_else(|| format!("unknown constructor `{func}`"))?;
-            let mut bindings = explicit_enum_type_bindings(func, enum_def, type_args, enum_defs)?;
+            let mut bindings =
+                explicit_enum_type_bindings(func, enum_def, type_args, call_ctx.enum_defs)?;
             let _ = seed_enum_type_param_bindings(enum_def, expected, &mut bindings)?;
             let (_, ctor) = enum_def
                 .ctor(func.rsplit("::").next().unwrap_or(func))
@@ -7718,9 +7495,7 @@ fn infer_value_pattern_types(
                 infer_value_pattern_types(
                     arg,
                     &expected_field_ty,
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
+                    call_ctx,
                     spec_scope,
                     local_tys,
                     inferred,
@@ -7780,13 +7555,10 @@ fn raw_pattern_struct_fields(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn typed_value_pattern(
     pattern: &ValuePattern,
     expected: &SpecTy,
-    pure_fns: &HashMap<String, PureFnDef>,
-    enum_defs: &HashMap<String, EnumDef>,
-    struct_defs: &HashMap<String, StructDef>,
+    call_ctx: SpecCallContext<'_>,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
@@ -7804,10 +7576,7 @@ fn typed_value_pattern(
         }
         ValuePattern::Expr(expr) => Ok(TypedValuePattern::Expr(typed_body_expr_with_expected(
             expr,
-            pure_fns,
-            enum_defs,
-            struct_defs,
-            &HashSet::new(),
+            call_ctx,
             DirectiveKind::RawAssert,
             spec_scope,
             local_tys,
@@ -7825,14 +7594,7 @@ fn typed_value_pattern(
             let mut typed_items = Vec::with_capacity(items.len());
             for item in items {
                 typed_items.push(typed_value_pattern(
-                    item,
-                    inner,
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
-                    spec_scope,
-                    local_tys,
-                    inferred,
+                    item, inner, call_ctx, spec_scope, local_tys, inferred,
                 )?);
             }
             Ok(TypedValuePattern::SeqLit {
@@ -7841,7 +7603,7 @@ fn typed_value_pattern(
             })
         }
         ValuePattern::StructLit { name, fields } => {
-            let struct_fields = raw_pattern_struct_fields(expected, name, struct_defs)?;
+            let struct_fields = raw_pattern_struct_fields(expected, name, call_ctx.struct_defs)?;
             let mut typed_fields = Vec::with_capacity(fields.len());
             for field in fields {
                 let field_ty = struct_fields
@@ -7851,9 +7613,7 @@ fn typed_value_pattern(
                 typed_fields.push(typed_value_pattern(
                     &field.value,
                     &field_ty.ty,
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
+                    call_ctx,
                     spec_scope,
                     local_tys,
                     inferred,
@@ -7869,9 +7629,10 @@ fn typed_value_pattern(
             type_args,
             args,
         } => {
-            let (enum_def, ctor_index) = lookup_enum_ctor(enum_defs, func)
+            let (enum_def, ctor_index) = lookup_enum_ctor(call_ctx.enum_defs, func)
                 .ok_or_else(|| format!("unknown constructor `{func}`"))?;
-            let mut bindings = explicit_enum_type_bindings(func, enum_def, type_args, enum_defs)?;
+            let mut bindings =
+                explicit_enum_type_bindings(func, enum_def, type_args, call_ctx.enum_defs)?;
             let _ = seed_enum_type_param_bindings(enum_def, expected, &mut bindings)?;
             let (_, ctor) = enum_def
                 .ctor(func.rsplit("::").next().unwrap_or(func))
@@ -7892,9 +7653,7 @@ fn typed_value_pattern(
                 typed_args.push(typed_value_pattern(
                     arg,
                     &expected_field_ty,
-                    pure_fns,
-                    enum_defs,
-                    struct_defs,
+                    call_ctx,
                     spec_scope,
                     local_tys,
                     inferred,
@@ -8326,10 +8085,7 @@ fn infer_lemma_call(
         let expected = try_instantiate_spec_ty(&param.ty, &bindings);
         let arg_ty = infer_body_expr_types_with_expected(
             arg,
-            call_ctx.pure_fns,
-            call_ctx.enum_defs,
-            call_ctx.struct_defs,
-            call_ctx.type_param_scope,
+            call_ctx,
             DirectiveKind::LemmaCall,
             spec_scope,
             local_tys,
@@ -8387,10 +8143,7 @@ fn typed_lemma_call(
         let expected = try_instantiate_spec_ty(&param.ty, &bindings);
         let typed = typed_body_expr_with_expected(
             arg,
-            call_ctx.pure_fns,
-            call_ctx.enum_defs,
-            call_ctx.struct_defs,
-            call_ctx.type_param_scope,
+            call_ctx,
             DirectiveKind::LemmaCall,
             spec_scope,
             local_tys,
@@ -11198,6 +10951,10 @@ mod tests {
                 body: Some(Expr::Var("xs".to_owned())),
             },
         )]);
+        let enum_defs = HashMap::new();
+        let struct_defs = HashMap::new();
+        let type_param_scope = HashSet::new();
+        let call_ctx = SpecCallContext::new(&pure_fns, &enum_defs, &struct_defs, &type_param_scope);
 
         let inferred = infer_body_expr_types_with_expected(
             &Expr::Call {
@@ -11208,10 +10965,7 @@ mod tests {
                     suffix: Some(crate::spec::IntSuffix::I32),
                 })])],
             },
-            &pure_fns,
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashSet::new(),
+            call_ctx,
             DirectiveKind::Assert,
             &mut SpecScope::default(),
             &HashMap::new(),
@@ -11242,6 +10996,10 @@ mod tests {
                 body: Some(Expr::Var("xs".to_owned())),
             },
         )]);
+        let enum_defs = HashMap::new();
+        let struct_defs = HashMap::new();
+        let type_param_scope = HashSet::new();
+        let call_ctx = SpecCallContext::new(&pure_fns, &enum_defs, &struct_defs, &type_param_scope);
 
         let typed = typed_body_expr(
             &Expr::Binary {
@@ -11259,9 +11017,7 @@ mod tests {
                     suffix: Some(crate::spec::IntSuffix::I32),
                 })])),
             },
-            &pure_fns,
-            &HashMap::new(),
-            &HashMap::new(),
+            call_ctx,
             DirectiveKind::Assert,
             &mut SpecScope::default(),
             &HashMap::new(),
