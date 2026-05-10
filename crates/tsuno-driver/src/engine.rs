@@ -4619,14 +4619,15 @@ impl<'tcx> Verifier<'tcx> {
             }
             PlaceElem::Field(field, _) => {
                 let next = self.project_field(value, spec_ty, field.index(), span)?;
-                let Some(field_spec_ty) = self.composite_spec_field_ty(spec_ty, field.index())
+                let Some(field_spec_ty) =
+                    self.composite_spec_field_ty(spec_ty, field.index(), span)?
                 else {
                     return Err(self.unsupported_result(
                         span,
                         "field projection on non-composite place".to_owned(),
                     ));
                 };
-                self.read_projection(next, field_spec_ty, &projection[1..], mode, span)
+                self.read_projection(next, &field_spec_ty, &projection[1..], mode, span)
             }
             other => {
                 Err(self
@@ -4696,13 +4697,16 @@ impl<'tcx> Verifier<'tcx> {
             }
             PlaceElem::Field(field, _) => {
                 let index = field.index();
-                let field_count = self.composite_spec_field_count(spec_ty).ok_or_else(|| {
-                    self.unsupported_result(
-                        span,
-                        "field assignment on non-composite place".to_owned(),
-                    )
-                })?;
-                let Some(field_spec_ty) = self.composite_spec_field_ty(spec_ty, index) else {
+                let field_count =
+                    self.composite_spec_field_count(spec_ty, span)?
+                        .ok_or_else(|| {
+                            self.unsupported_result(
+                                span,
+                                "field assignment on non-composite place".to_owned(),
+                            )
+                        })?;
+                let Some(field_spec_ty) = self.composite_spec_field_ty(spec_ty, index, span)?
+                else {
                     return Err(
                         self.unsupported_result(span, "field index out of range".to_owned())
                     );
@@ -4714,7 +4718,7 @@ impl<'tcx> Verifier<'tcx> {
                     if current_index == index {
                         items.push(self.write_projection(
                             field_value,
-                            field_spec_ty,
+                            &field_spec_ty,
                             &projection[1..],
                             replacement.clone(),
                             span,
@@ -7006,20 +7010,34 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn composite_spec_field_count(&self, ty: &SpecTy) -> Option<usize> {
-        match ty {
+    fn composite_spec_field_count(
+        &self,
+        ty: &SpecTy,
+        span: Span,
+    ) -> Result<Option<usize>, VerificationResult> {
+        Ok(match ty {
             SpecTy::Tuple(items) => Some(items.len()),
             SpecTy::Record(struct_ty) => Some(struct_ty.fields.len()),
+            SpecTy::Struct { .. } => Some(self.struct_fields_for_ty(ty, span)?.len()),
             _ => None,
-        }
+        })
     }
 
-    fn composite_spec_field_ty<'a>(&self, ty: &'a SpecTy, index: usize) -> Option<&'a SpecTy> {
-        match ty {
-            SpecTy::Tuple(items) => items.get(index),
-            SpecTy::Record(struct_ty) => struct_ty.fields.get(index).map(|field| &field.ty),
+    fn composite_spec_field_ty(
+        &self,
+        ty: &SpecTy,
+        index: usize,
+        span: Span,
+    ) -> Result<Option<SpecTy>, VerificationResult> {
+        Ok(match ty {
+            SpecTy::Tuple(items) => items.get(index).cloned(),
+            SpecTy::Record(struct_ty) => struct_ty.fields.get(index).map(|field| field.ty.clone()),
+            SpecTy::Struct { .. } => self
+                .struct_fields_for_ty(ty, span)?
+                .get(index)
+                .map(|field| field.ty.clone()),
             _ => None,
-        }
+        })
     }
 
     fn fresh_name(&self, hint: &str) -> String {

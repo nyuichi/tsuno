@@ -146,6 +146,7 @@ struct RawTypingCtx<'a, 'tcx> {
     resolution: &'a ResolvedExprEnv,
     pure_fns: &'a HashMap<String, PureFnDef>,
     enum_defs: &'a HashMap<String, EnumDef>,
+    struct_defs: &'a HashMap<String, StructDef>,
     local_tys: &'a HashMap<String, SpecTy>,
 }
 
@@ -330,7 +331,7 @@ pub fn compute_program_prepass<'tcx>(
     tcx: TyCtxt<'tcx>,
 ) -> Result<ProgramPrepass, Vec<VerificationResult>> {
     let anchor_span = global_ghost_anchor_span(tcx);
-    let raw_ghosts = match compute_raw_global_ghost_prepass(tcx, anchor_span) {
+    let mut raw_ghosts = match compute_raw_global_ghost_prepass(tcx, anchor_span) {
         Ok(ghosts) => ghosts,
         Err(error) => {
             return Err(vec![VerificationResult {
@@ -343,6 +344,16 @@ pub fn compute_program_prepass<'tcx>(
             }]);
         }
     };
+    if let Err(error) = collect_rust_struct_defs(tcx, &mut raw_ghosts.structs, anchor_span) {
+        return Err(vec![VerificationResult {
+            function: "prepass".to_owned(),
+            status: VerificationStatus::Unsupported,
+            span: error
+                .display_span
+                .unwrap_or_else(|| tcx.sess.source_map().span_to_diagnostic_string(error.span)),
+            message: error.message,
+        }]);
+    }
     let raw_ghosts = match normalize_global_ghost_prepass(&raw_ghosts, anchor_span) {
         Ok(ghosts) => ghosts,
         Err(error) => {
@@ -541,6 +552,90 @@ fn compute_raw_global_ghost_prepass<'tcx>(
     })
 }
 
+fn collect_rust_struct_defs<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    struct_defs: &mut HashMap<String, StructDef>,
+    anchor_span: Span,
+) -> Result<(), LoopPrepassError> {
+    let mut visiting = HashSet::new();
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
+        let rustc_hir::ItemKind::Fn { .. } = item.kind else {
+            continue;
+        };
+        let def_id = item.owner_id.def_id;
+        let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
+        for local in body.borrow().local_decls.iter() {
+            collect_rust_struct_defs_for_ty(tcx, local.ty, struct_defs, &mut visiting).map_err(
+                |message| LoopPrepassError {
+                    span: anchor_span,
+                    display_span: None,
+                    message,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_rust_struct_defs_for_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+    struct_defs: &mut HashMap<String, StructDef>,
+    visiting: &mut HashSet<String>,
+) -> Result<(), String> {
+    match ty.kind() {
+        TyKind::Ref(_, inner, _) => {
+            collect_rust_struct_defs_for_ty(tcx, *inner, struct_defs, visiting)
+        }
+        TyKind::Tuple(fields) => {
+            for field in fields.iter() {
+                collect_rust_struct_defs_for_ty(tcx, field, struct_defs, visiting)?;
+            }
+            Ok(())
+        }
+        TyKind::Adt(adt_def, args) => {
+            if tcx.def_path_str(adt_def.did()) == "std::vec::Vec" {
+                if let Some(inner) = args.types().next() {
+                    collect_rust_struct_defs_for_ty(tcx, inner, struct_defs, visiting)?;
+                }
+                return Ok(());
+            }
+            if !adt_def.is_struct() {
+                return Ok(());
+            }
+            if !args.is_empty() {
+                return Err(format!("generic structs are unsupported: {ty:?}"));
+            }
+            let name = tcx.def_path_str(adt_def.did());
+            if struct_defs.contains_key(&name) || !visiting.insert(name.clone()) {
+                return Ok(());
+            }
+            let mut fields = Vec::new();
+            for field in adt_def.non_enum_variant().fields.iter() {
+                let field_ty = field.ty(tcx, args);
+                collect_rust_struct_defs_for_ty(tcx, field_ty, struct_defs, visiting)?;
+                fields.push(StructFieldTy {
+                    name: field.name.to_string(),
+                    ty: spec_ty_for_rust_ty(tcx, field_ty)?,
+                });
+            }
+            visiting.remove(&name);
+            struct_defs.insert(
+                name.clone(),
+                StructDef {
+                    name,
+                    type_params: Vec::new(),
+                    fields,
+                    invariant: None,
+                },
+            );
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn validate_global_spec_comment_positions<'tcx>(tcx: TyCtxt<'tcx>) -> Result<(), LoopPrepassError> {
     let mut files: HashMap<_, (String, Vec<(usize, usize)>)> = HashMap::new();
     for item_id in tcx.hir_free_items() {
@@ -584,7 +679,13 @@ fn type_global_ghost_prepass(
     raw: &RawGlobalGhostPrepass,
     anchor_span: Span,
 ) -> Result<GlobalGhostPrepass, LoopPrepassError> {
-    let typed_pure_fns = type_pure_fns(&raw.pure_fns, &raw.pure_fn_order, &raw.enums, anchor_span)?;
+    let typed_pure_fns = type_pure_fns(
+        &raw.pure_fns,
+        &raw.pure_fn_order,
+        &raw.enums,
+        &raw.structs,
+        anchor_span,
+    )?;
     let (struct_invariants, enum_invariants) =
         type_type_invariants(&raw.structs, &raw.enums, &raw.pure_fns, anchor_span)?;
     let typed_lemmas = type_lemmas(
@@ -592,6 +693,7 @@ fn type_global_ghost_prepass(
         &raw.lemma_order,
         &raw.pure_fns,
         &raw.enums,
+        &raw.structs,
         anchor_span,
     )?;
     let standalone_fn_contracts = type_standalone_fn_contracts(
@@ -599,6 +701,7 @@ fn type_global_ghost_prepass(
         &raw.standalone_fn_contract_order,
         &raw.pure_fns,
         &raw.enums,
+        &raw.structs,
         anchor_span,
     )?;
     Ok(GlobalGhostPrepass {
@@ -707,6 +810,7 @@ fn type_type_invariants(
             invariant,
             pure_fns,
             enums,
+            structs,
             &type_params,
             &mut SpecScope::default(),
             &params,
@@ -755,6 +859,7 @@ fn type_type_invariants(
             invariant,
             pure_fns,
             enums,
+            structs,
             &type_params,
             &mut SpecScope::default(),
             &params,
@@ -976,6 +1081,7 @@ fn bind_free_normalized_predicate(
 struct SpecCallContext<'a> {
     pure_fns: &'a HashMap<String, PureFnDef>,
     enum_defs: &'a HashMap<String, EnumDef>,
+    struct_defs: &'a HashMap<String, StructDef>,
     type_param_scope: &'a HashSet<String>,
 }
 
@@ -1474,15 +1580,11 @@ pub fn spec_ty_for_rust_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<Spec
             if !args.is_empty() {
                 return Err(format!("generic structs are unsupported: {ty:?}"));
             }
-            let mut fields = Vec::new();
             let name = tcx.def_path_str(adt_def.did());
-            for field in adt_def.non_enum_variant().fields.iter() {
-                fields.push(StructFieldTy {
-                    name: field.name.to_string(),
-                    ty: spec_ty_for_rust_ty(tcx, field.ty(tcx, args))?,
-                });
-            }
-            Ok(SpecTy::Record(StructTy { name, fields }))
+            Ok(SpecTy::Struct {
+                name,
+                args: Vec::new(),
+            })
         }
         other => Err(format!("unsupported type {other:?}")),
     }
@@ -1915,11 +2017,17 @@ fn prelude_struct_defs() -> &'static HashMap<String, StructDef> {
     })
 }
 
-fn prelude_struct_fields_for_ty(ty: &SpecTy) -> Result<Option<Vec<StructFieldTy>>, String> {
+fn struct_fields_for_ty(
+    ty: &SpecTy,
+    struct_defs: &HashMap<String, StructDef>,
+) -> Result<Option<Vec<StructFieldTy>>, String> {
     let SpecTy::Struct { name, args } = ty else {
         return Ok(None);
     };
-    let Some(def) = prelude_struct_defs().get(name) else {
+    let Some(def) = struct_defs
+        .get(name)
+        .or_else(|| prelude_struct_defs().get(name))
+    else {
         return Ok(None);
     };
     if def.type_params.len() != args.len() {
@@ -2903,6 +3011,7 @@ fn infer_match_expr_types(
     default: Option<&Expr>,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     type_param_scope: &HashSet<String>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
@@ -2916,6 +3025,7 @@ fn infer_match_expr_types(
         scrutinee,
         pure_fns,
         enum_defs,
+        struct_defs,
         type_param_scope,
         spec_scope,
         params,
@@ -2975,6 +3085,7 @@ fn infer_match_expr_types(
             &arm.body,
             pure_fns,
             enum_defs,
+            struct_defs,
             type_param_scope,
             &mut arm_scope,
             &arm_params,
@@ -2996,6 +3107,7 @@ fn infer_match_expr_types(
             default,
             pure_fns,
             enum_defs,
+            struct_defs,
             type_param_scope,
             &mut default_scope,
             params,
@@ -3025,6 +3137,7 @@ fn typed_match_expr(
     default: Option<&Expr>,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     type_param_scope: &HashSet<String>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
@@ -3038,6 +3151,7 @@ fn typed_match_expr(
         scrutinee,
         pure_fns,
         enum_defs,
+        struct_defs,
         type_param_scope,
         spec_scope,
         params,
@@ -3099,6 +3213,7 @@ fn typed_match_expr(
             &arm.body,
             pure_fns,
             enum_defs,
+            struct_defs,
             type_param_scope,
             &mut arm_scope,
             &arm_params,
@@ -3127,6 +3242,7 @@ fn typed_match_expr(
             default,
             pure_fns,
             enum_defs,
+            struct_defs,
             type_param_scope,
             &mut default_scope,
             params,
@@ -3257,6 +3373,7 @@ fn infer_contract_expr_types_in_scope(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     type_param_scope: &HashSet<String>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
@@ -3268,6 +3385,7 @@ fn infer_contract_expr_types_in_scope(
         expr,
         pure_fns,
         enum_defs,
+        struct_defs,
         type_param_scope,
         spec_scope,
         params,
@@ -3358,6 +3476,7 @@ fn infer_common_expr_types_with_expected(
         Expr::Field { base, name } => Ok(Some(infer_named_field_expr_type(
             infer_expr(base, None, inferred)?,
             name,
+            call_ctx.struct_defs,
         )?)),
         Expr::TupleField { base, .. } => Ok(Some(infer_tuple_field_expr_type(infer_expr(
             base, None, inferred,
@@ -3500,6 +3619,7 @@ fn infer_runtime_contract_expr_types(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
     allow_result: bool,
@@ -3511,6 +3631,7 @@ fn infer_runtime_contract_expr_types(
         expr,
         pure_fns,
         enum_defs,
+        struct_defs,
         &type_param_scope,
         spec_scope,
         params,
@@ -3525,6 +3646,7 @@ fn infer_runtime_contract_expr_types_in_scope(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     type_param_scope: &HashSet<String>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
@@ -3536,6 +3658,7 @@ fn infer_runtime_contract_expr_types_in_scope(
         expr,
         pure_fns,
         enum_defs,
+        struct_defs,
         type_param_scope,
         spec_scope,
         params,
@@ -3552,6 +3675,7 @@ fn infer_contract_expr_types_with_expected(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     type_param_scope: &HashSet<String>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
@@ -3609,6 +3733,7 @@ fn infer_contract_expr_types_with_expected(
             default.as_deref(),
             pure_fns,
             enum_defs,
+            struct_defs,
             type_param_scope,
             spec_scope,
             params,
@@ -3623,6 +3748,7 @@ fn infer_contract_expr_types_with_expected(
             SpecCallContext {
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
             },
             inferred,
@@ -3632,6 +3758,7 @@ fn infer_contract_expr_types_with_expected(
                     expr,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     type_param_scope,
                     spec_scope,
                     params,
@@ -3647,10 +3774,12 @@ fn infer_contract_expr_types_with_expected(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn infer_body_expr_types(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     kind: DirectiveKind,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
@@ -3661,6 +3790,7 @@ fn infer_body_expr_types(
         expr,
         pure_fns,
         enum_defs,
+        struct_defs,
         &type_param_scope,
         kind,
         spec_scope,
@@ -3674,6 +3804,7 @@ fn infer_body_expr_types_in_scope(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     type_param_scope: &HashSet<String>,
     kind: DirectiveKind,
     spec_scope: &mut SpecScope,
@@ -3684,6 +3815,7 @@ fn infer_body_expr_types_in_scope(
         expr,
         pure_fns,
         enum_defs,
+        struct_defs,
         type_param_scope,
         kind,
         spec_scope,
@@ -3699,6 +3831,7 @@ fn infer_body_expr_types_with_expected(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     type_param_scope: &HashSet<String>,
     kind: DirectiveKind,
     spec_scope: &mut SpecScope,
@@ -3747,6 +3880,7 @@ fn infer_body_expr_types_with_expected(
             SpecCallContext {
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
             },
             inferred,
@@ -3756,6 +3890,7 @@ fn infer_body_expr_types_with_expected(
                     expr,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     type_param_scope,
                     kind,
                     spec_scope,
@@ -3777,13 +3912,23 @@ fn expr_base(base: &Expr) -> &Expr {
 fn infer_named_field_expr_type(
     base_ty: InferredExprTy,
     name: &str,
+    struct_defs: &HashMap<String, StructDef>,
 ) -> Result<InferredExprTy, String> {
     match base_ty {
         InferredExprTy::Known(SpecTy::Record(struct_ty)) => Ok(struct_ty
             .field(name)
             .map(|(_, field)| InferredExprTy::Known(field.ty.clone()))
             .unwrap_or(InferredExprTy::Unknown)),
-        InferredExprTy::Known(SpecTy::Struct { .. }) => Ok(InferredExprTy::Unknown),
+        InferredExprTy::Known(ty @ SpecTy::Struct { .. }) => {
+            Ok(struct_fields_for_ty(&ty, struct_defs)?
+                .and_then(|fields| {
+                    fields
+                        .into_iter()
+                        .find(|field| field.name == name)
+                        .map(|field| InferredExprTy::Known(field.ty))
+                })
+                .unwrap_or(InferredExprTy::Unknown))
+        }
         InferredExprTy::Known(SpecTy::Ref(inner)) if name == "deref" => {
             Ok(InferredExprTy::Known(*inner))
         }
@@ -3808,7 +3953,7 @@ fn infer_tuple_field_expr_type(base_ty: InferredExprTy) -> Result<InferredExprTy
     match base_ty {
         InferredExprTy::Known(SpecTy::Tuple(_)) => Ok(InferredExprTy::Unknown),
         InferredExprTy::SpecVar(_) | InferredExprTy::Unknown => Ok(InferredExprTy::Unknown),
-        InferredExprTy::Known(SpecTy::Record(_)) => {
+        InferredExprTy::Known(SpecTy::Record(_)) | InferredExprTy::Known(SpecTy::Struct { .. }) => {
             Err("tuple field access is not supported on struct types".to_owned())
         }
         InferredExprTy::Known(other) => Err(format!(
@@ -3836,6 +3981,7 @@ fn typed_contract_expr_in_scope(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     type_param_scope: &HashSet<String>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
@@ -3847,6 +3993,7 @@ fn typed_contract_expr_in_scope(
         expr,
         pure_fns,
         enum_defs,
+        struct_defs,
         type_param_scope,
         spec_scope,
         params,
@@ -3863,6 +4010,7 @@ fn typed_runtime_contract_expr(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
     allow_result: bool,
@@ -3874,6 +4022,7 @@ fn typed_runtime_contract_expr(
         expr,
         pure_fns,
         enum_defs,
+        struct_defs,
         &type_param_scope,
         spec_scope,
         params,
@@ -3888,6 +4037,7 @@ fn typed_runtime_contract_expr_in_scope(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     type_param_scope: &HashSet<String>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
@@ -3899,6 +4049,7 @@ fn typed_runtime_contract_expr_in_scope(
         expr,
         pure_fns,
         enum_defs,
+        struct_defs,
         type_param_scope,
         spec_scope,
         params,
@@ -3915,6 +4066,7 @@ fn typed_contract_expr_with_expected(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     type_param_scope: &HashSet<String>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
@@ -3979,6 +4131,7 @@ fn typed_contract_expr_with_expected(
                 item,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 spec_scope,
                 params,
@@ -3995,6 +4148,7 @@ fn typed_contract_expr_with_expected(
                     value,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     type_param_scope,
                     spec_scope,
                     params,
@@ -4016,6 +4170,7 @@ fn typed_contract_expr_with_expected(
             default.as_deref(),
             pure_fns,
             enum_defs,
+            struct_defs,
             type_param_scope,
             spec_scope,
             params,
@@ -4044,6 +4199,7 @@ fn typed_contract_expr_with_expected(
                             arg,
                             pure_fns,
                             enum_defs,
+                            struct_defs,
                             type_param_scope,
                             spec_scope,
                             params,
@@ -4063,6 +4219,7 @@ fn typed_contract_expr_with_expected(
                     SpecCallContext {
                         pure_fns,
                         enum_defs,
+                        struct_defs,
                         type_param_scope,
                     },
                     &mut |arg, expected| {
@@ -4070,6 +4227,7 @@ fn typed_contract_expr_with_expected(
                             arg,
                             pure_fns,
                             enum_defs,
+                            struct_defs,
                             type_param_scope,
                             spec_scope,
                             params,
@@ -4088,6 +4246,7 @@ fn typed_contract_expr_with_expected(
                 base,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 spec_scope,
                 params,
@@ -4097,13 +4256,14 @@ fn typed_contract_expr_with_expected(
                 allow_bare_names,
                 None,
             )?;
-            type_named_field_expr(base, name)
+            type_named_field_expr(base, name, struct_defs)
         }
         Expr::TupleField { base, index } => {
             let base = typed_contract_expr_with_expected(
                 base,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 spec_scope,
                 params,
@@ -4125,6 +4285,7 @@ fn typed_contract_expr_with_expected(
                 base,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 spec_scope,
                 params,
@@ -4141,6 +4302,7 @@ fn typed_contract_expr_with_expected(
                 expr,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 spec_scope,
                 params,
@@ -4156,6 +4318,7 @@ fn typed_contract_expr_with_expected(
                 base,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 spec_scope,
                 params,
@@ -4172,6 +4335,7 @@ fn typed_contract_expr_with_expected(
                 arg,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 spec_scope,
                 params,
@@ -4188,6 +4352,7 @@ fn typed_contract_expr_with_expected(
                 arg,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 spec_scope,
                 params,
@@ -4235,6 +4400,7 @@ fn typed_contract_expr_with_expected(
                 lhs,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 spec_scope,
                 params,
@@ -4258,6 +4424,7 @@ fn typed_contract_expr_with_expected(
                 rhs,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 spec_scope,
                 params,
@@ -4272,10 +4439,12 @@ fn typed_contract_expr_with_expected(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn typed_body_expr(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     kind: DirectiveKind,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
@@ -4286,6 +4455,7 @@ fn typed_body_expr(
         expr,
         pure_fns,
         enum_defs,
+        struct_defs,
         &type_param_scope,
         kind,
         spec_scope,
@@ -4299,6 +4469,7 @@ fn typed_body_expr_in_scope(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     type_param_scope: &HashSet<String>,
     kind: DirectiveKind,
     spec_scope: &mut SpecScope,
@@ -4309,6 +4480,7 @@ fn typed_body_expr_in_scope(
         expr,
         pure_fns,
         enum_defs,
+        struct_defs,
         type_param_scope,
         kind,
         spec_scope,
@@ -4324,6 +4496,7 @@ fn typed_body_expr_with_expected(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     type_param_scope: &HashSet<String>,
     kind: DirectiveKind,
     spec_scope: &mut SpecScope,
@@ -4377,6 +4550,7 @@ fn typed_body_expr_with_expected(
                 item,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 kind,
                 spec_scope,
@@ -4392,6 +4566,7 @@ fn typed_body_expr_with_expected(
                     value,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     type_param_scope,
                     kind,
                     spec_scope,
@@ -4422,6 +4597,7 @@ fn typed_body_expr_with_expected(
                             arg,
                             pure_fns,
                             enum_defs,
+                            struct_defs,
                             type_param_scope,
                             kind,
                             spec_scope,
@@ -4440,6 +4616,7 @@ fn typed_body_expr_with_expected(
                     SpecCallContext {
                         pure_fns,
                         enum_defs,
+                        struct_defs,
                         type_param_scope,
                     },
                     &mut |arg, expected| {
@@ -4447,6 +4624,7 @@ fn typed_body_expr_with_expected(
                             arg,
                             pure_fns,
                             enum_defs,
+                            struct_defs,
                             type_param_scope,
                             kind,
                             spec_scope,
@@ -4464,6 +4642,7 @@ fn typed_body_expr_with_expected(
                 expr_base(base),
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 kind,
                 spec_scope,
@@ -4472,13 +4651,14 @@ fn typed_body_expr_with_expected(
                 allow_bare_names,
                 None,
             )?;
-            type_named_field_expr(base, name)
+            type_named_field_expr(base, name, struct_defs)
         }
         Expr::TupleField { base, index } => {
             let base = typed_body_expr_with_expected(
                 expr_base(base),
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 kind,
                 spec_scope,
@@ -4499,6 +4679,7 @@ fn typed_body_expr_with_expected(
                 expr_base(base),
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 kind,
                 spec_scope,
@@ -4514,6 +4695,7 @@ fn typed_body_expr_with_expected(
                 expr,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 kind,
                 spec_scope,
@@ -4528,6 +4710,7 @@ fn typed_body_expr_with_expected(
                 base,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 kind,
                 spec_scope,
@@ -4543,6 +4726,7 @@ fn typed_body_expr_with_expected(
                 arg,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 kind,
                 spec_scope,
@@ -4558,6 +4742,7 @@ fn typed_body_expr_with_expected(
                 arg,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 kind,
                 spec_scope,
@@ -4604,6 +4789,7 @@ fn typed_body_expr_with_expected(
                 lhs,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 kind,
                 spec_scope,
@@ -4626,6 +4812,7 @@ fn typed_body_expr_with_expected(
                 rhs,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 type_param_scope,
                 kind,
                 spec_scope,
@@ -4769,7 +4956,11 @@ fn type_binary_expr(
     }
 }
 
-fn type_named_field_expr(base: TypedExpr, name: &str) -> Result<TypedExpr, String> {
+fn type_named_field_expr(
+    base: TypedExpr,
+    name: &str,
+    struct_defs: &HashMap<String, StructDef>,
+) -> Result<TypedExpr, String> {
     match (base.ty.clone(), name) {
         (SpecTy::Ref(inner), "deref") => {
             return Ok(TypedExpr {
@@ -4835,7 +5026,7 @@ fn type_named_field_expr(base: TypedExpr, name: &str) -> Result<TypedExpr, Strin
             name: struct_name, ..
         } => (
             struct_name.clone(),
-            prelude_struct_fields_for_ty(&base.ty)?
+            struct_fields_for_ty(&base.ty, struct_defs)?
                 .ok_or_else(|| format!("unknown spec struct `{struct_name}`"))?,
         ),
         _ => {
@@ -5067,6 +5258,7 @@ fn compute_directives<'tcx>(
     ghosts: &RawGlobalGhostPrepass,
 ) -> Result<DirectivePrepass, LoopPrepassError> {
     let enum_defs = &ghosts.enums;
+    let struct_defs = &ghosts.structs;
     let pure_fns = &ghosts.pure_fns;
     let lemma_defs = &ghosts.lemmas;
     let binding_info = collect_hir_binding_info(tcx, def_id)?;
@@ -5324,6 +5516,7 @@ fn compute_directives<'tcx>(
             value,
             pure_fns,
             enum_defs,
+            struct_defs,
             &mut contract_infer_scope,
             &param_tys,
             false,
@@ -5354,6 +5547,7 @@ fn compute_directives<'tcx>(
             directive.expr(),
             pure_fns,
             enum_defs,
+            struct_defs,
             &mut contract_infer_scope,
             &param_tys,
             false,
@@ -5371,6 +5565,7 @@ fn compute_directives<'tcx>(
             directive.raw_assertion().expect("raw req payload"),
             pure_fns,
             enum_defs,
+            struct_defs,
             &mut contract_infer_scope,
             &param_tys,
             false,
@@ -5419,6 +5614,7 @@ fn compute_directives<'tcx>(
                     SpecCallContext {
                         pure_fns,
                         enum_defs,
+                        struct_defs,
                         type_param_scope: &directive_type_param_scope,
                     },
                     &mut body_infer_scope,
@@ -5437,6 +5633,7 @@ fn compute_directives<'tcx>(
                     value,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     directive.kind,
                     &mut body_infer_scope,
                     &local_tys,
@@ -5466,6 +5663,7 @@ fn compute_directives<'tcx>(
                     directive.raw_assertion().expect("raw assertion payload"),
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     &mut body_infer_scope,
                     &local_tys,
                     &mut inferred,
@@ -5481,6 +5679,7 @@ fn compute_directives<'tcx>(
                     directive.expr(),
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     directive.kind,
                     &mut body_infer_scope,
                     &local_tys,
@@ -5499,6 +5698,7 @@ fn compute_directives<'tcx>(
             directive.expr(),
             pure_fns,
             enum_defs,
+            struct_defs,
             &mut contract_infer_scope,
             &param_tys,
             true,
@@ -5516,6 +5716,7 @@ fn compute_directives<'tcx>(
             directive.raw_assertion().expect("raw ens payload"),
             pure_fns,
             enum_defs,
+            struct_defs,
             &mut contract_infer_scope,
             &param_tys,
             true,
@@ -5540,6 +5741,7 @@ fn compute_directives<'tcx>(
             value,
             pure_fns,
             enum_defs,
+            struct_defs,
             &mut contract_type_scope,
             &param_tys,
             false,
@@ -5569,6 +5771,7 @@ fn compute_directives<'tcx>(
                 directive.expr(),
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 &mut scope,
                 &param_tys,
                 false,
@@ -5596,6 +5799,7 @@ fn compute_directives<'tcx>(
         &raw_req_directives,
         pure_fns,
         enum_defs,
+        struct_defs,
         &mut contract_type_scope,
         &param_tys,
         &param_rust_tys,
@@ -5615,6 +5819,7 @@ fn compute_directives<'tcx>(
                 directive.expr(),
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 &mut scope,
                 &param_tys,
                 false,
@@ -5666,6 +5871,7 @@ fn compute_directives<'tcx>(
                     SpecCallContext {
                         pure_fns,
                         enum_defs,
+                        struct_defs,
                         type_param_scope: &directive_type_param_scope,
                     },
                     &mut body_type_scope,
@@ -5685,6 +5891,7 @@ fn compute_directives<'tcx>(
                     value,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     directive.kind,
                     &mut body_type_scope,
                     &local_tys,
@@ -5720,6 +5927,7 @@ fn compute_directives<'tcx>(
                     resolution,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     local_tys: &local_tys,
                 };
                 let typed =
@@ -5734,6 +5942,7 @@ fn compute_directives<'tcx>(
                     &assertion.condition,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     &HashSet::new(),
                     directive.kind,
                     &mut body_type_scope,
@@ -5754,6 +5963,7 @@ fn compute_directives<'tcx>(
                     directive.expr(),
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     directive.kind,
                     &mut body_type_scope,
                     &local_tys,
@@ -5810,6 +6020,7 @@ fn compute_directives<'tcx>(
                     req.expr(),
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     &mut scope,
                     &param_tys,
                     false,
@@ -5826,6 +6037,7 @@ fn compute_directives<'tcx>(
                 directive.expr(),
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 &mut scope,
                 &param_tys,
                 true,
@@ -5854,6 +6066,7 @@ fn compute_directives<'tcx>(
         &raw_ens_directives,
         pure_fns,
         enum_defs,
+        struct_defs,
         &mut contract_type_scope,
         &param_tys,
         &param_rust_tys,
@@ -6319,6 +6532,7 @@ fn infer_raw_pattern_types(
     assertion: &RawAssertion,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
@@ -6327,6 +6541,7 @@ fn infer_raw_pattern_types(
         &assertion.pattern,
         pure_fns,
         enum_defs,
+        struct_defs,
         spec_scope,
         local_tys,
         inferred,
@@ -6335,6 +6550,7 @@ fn infer_raw_pattern_types(
         &assertion.condition,
         pure_fns,
         enum_defs,
+        struct_defs,
         DirectiveKind::RawAssert,
         spec_scope,
         local_tys,
@@ -6350,6 +6566,7 @@ fn infer_raw_pattern_types_into(
     pattern: &RawPattern,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
@@ -6358,9 +6575,23 @@ fn infer_raw_pattern_types_into(
         RawPattern::Emp => Ok(()),
         RawPattern::Star(lhs, rhs) => {
             infer_raw_pattern_types_into(
-                lhs, pure_fns, enum_defs, spec_scope, local_tys, inferred,
+                lhs,
+                pure_fns,
+                enum_defs,
+                struct_defs,
+                spec_scope,
+                local_tys,
+                inferred,
             )?;
-            infer_raw_pattern_types_into(rhs, pure_fns, enum_defs, spec_scope, local_tys, inferred)
+            infer_raw_pattern_types_into(
+                rhs,
+                pure_fns,
+                enum_defs,
+                struct_defs,
+                spec_scope,
+                local_tys,
+                inferred,
+            )
         }
         RawPattern::PointsTo { addr, ty, value } => {
             for expr in [addr, ty] {
@@ -6368,6 +6599,7 @@ fn infer_raw_pattern_types_into(
                     expr,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     DirectiveKind::RawAssert,
                     spec_scope,
                     local_tys,
@@ -6375,17 +6607,32 @@ fn infer_raw_pattern_types_into(
                 )?;
             }
             if value_pattern_contains_bind(value) {
-                let ty_ty =
-                    typed_raw_expr(ty, pure_fns, enum_defs, spec_scope, local_tys, inferred)?;
+                let ty_ty = typed_raw_expr(
+                    ty,
+                    pure_fns,
+                    enum_defs,
+                    struct_defs,
+                    spec_scope,
+                    local_tys,
+                    inferred,
+                )?;
                 let expected = option_spec_ty_for_rust_ty_expr(&ty_ty, &HashSet::new())?;
                 infer_value_pattern_types(
-                    value, &expected, pure_fns, enum_defs, spec_scope, local_tys, inferred,
+                    value,
+                    &expected,
+                    pure_fns,
+                    enum_defs,
+                    struct_defs,
+                    spec_scope,
+                    local_tys,
+                    inferred,
                 )?;
             } else if let ValuePattern::Expr(expr) = value {
                 infer_body_expr_types(
                     expr,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     DirectiveKind::RawAssert,
                     spec_scope,
                     local_tys,
@@ -6404,6 +6651,7 @@ fn infer_raw_pattern_types_into(
                     expr,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     DirectiveKind::RawAssert,
                     spec_scope,
                     local_tys,
@@ -6418,6 +6666,7 @@ fn infer_raw_pattern_types_into(
                     expr,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     DirectiveKind::RawAssert,
                     spec_scope,
                     local_tys,
@@ -6444,6 +6693,7 @@ fn typed_contract_raw_assertions<'tcx>(
     directives: &[&FunctionDirective],
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
     rust_params: &HashMap<String, Ty<'tcx>>,
@@ -6460,6 +6710,7 @@ fn typed_contract_raw_assertions<'tcx>(
             &assertion.pattern,
             pure_fns,
             enum_defs,
+            struct_defs,
             spec_scope,
             params,
             rust_params,
@@ -6477,6 +6728,7 @@ fn typed_contract_raw_assertions<'tcx>(
             &assertion.condition,
             pure_fns,
             enum_defs,
+            struct_defs,
             &HashSet::new(),
             spec_scope,
             params,
@@ -6506,6 +6758,7 @@ fn typed_lemma_raw_assertions(
     assertions: &[RawAssertion],
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
     allow_result: bool,
@@ -6518,6 +6771,7 @@ fn typed_lemma_raw_assertions(
             &assertion.pattern,
             pure_fns,
             enum_defs,
+            struct_defs,
             spec_scope,
             params,
             allow_result,
@@ -6528,6 +6782,7 @@ fn typed_lemma_raw_assertions(
             &assertion.condition,
             pure_fns,
             enum_defs,
+            struct_defs,
             &HashSet::new(),
             spec_scope,
             params,
@@ -6552,6 +6807,7 @@ fn typed_lemma_raw_pattern(
     pattern: &RawPattern,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
     allow_result: bool,
@@ -6565,6 +6821,7 @@ fn typed_lemma_raw_pattern(
                 lhs,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 allow_result,
@@ -6575,6 +6832,7 @@ fn typed_lemma_raw_pattern(
                 rhs,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 allow_result,
@@ -6587,6 +6845,7 @@ fn typed_lemma_raw_pattern(
                 addr,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 allow_result,
@@ -6598,6 +6857,7 @@ fn typed_lemma_raw_pattern(
                 ty,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 allow_result,
@@ -6612,6 +6872,7 @@ fn typed_lemma_raw_pattern(
                 &expected,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 allow_result,
@@ -6628,6 +6889,7 @@ fn typed_lemma_raw_pattern(
                 base,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 allow_result,
@@ -6639,6 +6901,7 @@ fn typed_lemma_raw_pattern(
                 layout,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 allow_result,
@@ -6656,6 +6919,7 @@ fn typed_contract_raw_pattern<'tcx>(
     pattern: &RawPattern,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
     rust_params: &HashMap<String, Ty<'tcx>>,
@@ -6672,6 +6936,7 @@ fn typed_contract_raw_pattern<'tcx>(
                 lhs,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 rust_params,
@@ -6685,6 +6950,7 @@ fn typed_contract_raw_pattern<'tcx>(
                 rhs,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 rust_params,
@@ -6699,6 +6965,7 @@ fn typed_contract_raw_pattern<'tcx>(
                 addr,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 allow_result,
@@ -6710,6 +6977,7 @@ fn typed_contract_raw_pattern<'tcx>(
                 ty,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 allow_result,
@@ -6724,6 +6992,7 @@ fn typed_contract_raw_pattern<'tcx>(
                 &expected,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 allow_result,
@@ -6778,6 +7047,7 @@ fn typed_contract_raw_pattern<'tcx>(
                 &expected,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 allow_result,
@@ -6791,6 +7061,7 @@ fn typed_contract_raw_pattern<'tcx>(
                 base,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 allow_result,
@@ -6802,6 +7073,7 @@ fn typed_contract_raw_pattern<'tcx>(
                 layout,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 allow_result,
@@ -6818,6 +7090,7 @@ fn typed_contract_raw_expr(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
     allow_result: bool,
@@ -6829,6 +7102,7 @@ fn typed_contract_raw_expr(
         expr,
         pure_fns,
         enum_defs,
+        struct_defs,
         &HashSet::new(),
         spec_scope,
         params,
@@ -6846,6 +7120,7 @@ fn typed_contract_value_pattern(
     expected: &SpecTy,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
     allow_result: bool,
@@ -6867,6 +7142,7 @@ fn typed_contract_value_pattern(
             expr,
             pure_fns,
             enum_defs,
+            struct_defs,
             spec_scope,
             params,
             allow_result,
@@ -6888,6 +7164,7 @@ fn typed_contract_value_pattern(
                     inner,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     spec_scope,
                     params,
                     allow_result,
@@ -6901,28 +7178,19 @@ fn typed_contract_value_pattern(
             })
         }
         ValuePattern::StructLit { name, fields } => {
-            let SpecTy::Record(struct_ty) = expected else {
-                return Err(format!(
-                    "struct raw pattern `{name}` requires a struct type, got {}",
-                    display_spec_ty(expected)
-                ));
-            };
-            if &struct_ty.name != name {
-                return Err(format!(
-                    "struct raw pattern `{name}` does not match `{}`",
-                    struct_ty.name
-                ));
-            }
+            let struct_fields = raw_pattern_struct_fields(expected, name, struct_defs)?;
             let mut typed_fields = Vec::with_capacity(fields.len());
             for field in fields {
-                let (_, field_ty) = struct_ty
-                    .field(&field.name)
+                let field_ty = struct_fields
+                    .iter()
+                    .find(|item| item.name == field.name)
                     .ok_or_else(|| format!("unknown field `{}` in `{name}`", field.name))?;
                 typed_fields.push(typed_contract_value_pattern(
                     &field.value,
                     &field_ty.ty,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     spec_scope,
                     params,
                     allow_result,
@@ -6965,6 +7233,7 @@ fn typed_contract_value_pattern(
                     &expected_field_ty,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     spec_scope,
                     params,
                     allow_result,
@@ -6986,6 +7255,7 @@ fn infer_contract_raw_assertion(
     assertion: &RawAssertion,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
     allow_result: bool,
@@ -6996,6 +7266,7 @@ fn infer_contract_raw_assertion(
         &assertion.pattern,
         pure_fns,
         enum_defs,
+        struct_defs,
         spec_scope,
         params,
         allow_result,
@@ -7006,6 +7277,7 @@ fn infer_contract_raw_assertion(
         &assertion.condition,
         pure_fns,
         enum_defs,
+        struct_defs,
         &HashSet::new(),
         spec_scope,
         params,
@@ -7023,6 +7295,7 @@ fn infer_contract_raw_pattern_types(
     pattern: &RawPattern,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
     allow_result: bool,
@@ -7036,6 +7309,7 @@ fn infer_contract_raw_pattern_types(
                 lhs,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 allow_result,
@@ -7046,6 +7320,7 @@ fn infer_contract_raw_pattern_types(
                 rhs,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 allow_result,
@@ -7059,6 +7334,7 @@ fn infer_contract_raw_pattern_types(
                     expr,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     &HashSet::new(),
                     spec_scope,
                     params,
@@ -7073,6 +7349,7 @@ fn infer_contract_raw_pattern_types(
                 value,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 allow_result,
@@ -7084,6 +7361,7 @@ fn infer_contract_raw_pattern_types(
             value,
             pure_fns,
             enum_defs,
+            struct_defs,
             spec_scope,
             params,
             allow_result,
@@ -7095,6 +7373,7 @@ fn infer_contract_raw_pattern_types(
                 base,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 &HashSet::new(),
                 spec_scope,
                 params,
@@ -7108,6 +7387,7 @@ fn infer_contract_raw_pattern_types(
                 layout,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 &HashSet::new(),
                 spec_scope,
                 params,
@@ -7127,6 +7407,7 @@ fn infer_contract_value_pattern(
     pattern: &ValuePattern,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
     allow_result: bool,
@@ -7140,6 +7421,7 @@ fn infer_contract_value_pattern(
             expr,
             pure_fns,
             enum_defs,
+            struct_defs,
             &HashSet::new(),
             spec_scope,
             params,
@@ -7172,6 +7454,7 @@ fn typed_raw_pattern_into(
                 addr,
                 ctx.pure_fns,
                 ctx.enum_defs,
+                ctx.struct_defs,
                 spec_scope,
                 ctx.local_tys,
                 inferred,
@@ -7181,6 +7464,7 @@ fn typed_raw_pattern_into(
                 ty,
                 ctx.pure_fns,
                 ctx.enum_defs,
+                ctx.struct_defs,
                 spec_scope,
                 ctx.local_tys,
                 inferred,
@@ -7193,6 +7477,7 @@ fn typed_raw_pattern_into(
                     &expected,
                     ctx.pure_fns,
                     ctx.enum_defs,
+                    ctx.struct_defs,
                     spec_scope,
                     ctx.local_tys,
                     inferred,
@@ -7202,6 +7487,7 @@ fn typed_raw_pattern_into(
                     expr,
                     ctx.pure_fns,
                     ctx.enum_defs,
+                    ctx.struct_defs,
                     spec_scope,
                     ctx.local_tys,
                     inferred,
@@ -7254,6 +7540,7 @@ fn typed_raw_pattern_into(
                     &expected,
                     ctx.pure_fns,
                     ctx.enum_defs,
+                    ctx.struct_defs,
                     spec_scope,
                     ctx.local_tys,
                     inferred,
@@ -7263,6 +7550,7 @@ fn typed_raw_pattern_into(
                     expr,
                     ctx.pure_fns,
                     ctx.enum_defs,
+                    ctx.struct_defs,
                     &HashSet::new(),
                     DirectiveKind::RawAssert,
                     spec_scope,
@@ -7283,6 +7571,7 @@ fn typed_raw_pattern_into(
                 base,
                 ctx.pure_fns,
                 ctx.enum_defs,
+                ctx.struct_defs,
                 spec_scope,
                 ctx.local_tys,
                 inferred,
@@ -7292,6 +7581,7 @@ fn typed_raw_pattern_into(
                 layout,
                 ctx.pure_fns,
                 ctx.enum_defs,
+                ctx.struct_defs,
                 spec_scope,
                 ctx.local_tys,
                 inferred,
@@ -7307,6 +7597,7 @@ fn typed_raw_expr(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
@@ -7315,6 +7606,7 @@ fn typed_raw_expr(
         expr,
         pure_fns,
         enum_defs,
+        struct_defs,
         DirectiveKind::RawAssert,
         spec_scope,
         local_tys,
@@ -7322,10 +7614,12 @@ fn typed_raw_expr(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn typed_raw_expr_with_expected(
     expr: &Expr,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
@@ -7335,6 +7629,7 @@ fn typed_raw_expr_with_expected(
         expr,
         pure_fns,
         enum_defs,
+        struct_defs,
         &HashSet::new(),
         DirectiveKind::RawAssert,
         spec_scope,
@@ -7345,11 +7640,13 @@ fn typed_raw_expr_with_expected(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn infer_value_pattern_types(
     pattern: &ValuePattern,
     expected: &SpecTy,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
@@ -7366,6 +7663,7 @@ fn infer_value_pattern_types(
                 expr,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 &HashSet::new(),
                 DirectiveKind::RawAssert,
                 spec_scope,
@@ -7385,33 +7683,31 @@ fn infer_value_pattern_types(
             };
             for item in items {
                 infer_value_pattern_types(
-                    item, inner, pure_fns, enum_defs, spec_scope, local_tys, inferred,
+                    item,
+                    inner,
+                    pure_fns,
+                    enum_defs,
+                    struct_defs,
+                    spec_scope,
+                    local_tys,
+                    inferred,
                 )?;
             }
             Ok(())
         }
         ValuePattern::StructLit { name, fields } => {
-            let SpecTy::Record(struct_ty) = expected else {
-                return Err(format!(
-                    "struct raw pattern `{name}` requires a struct type, got {}",
-                    display_spec_ty(expected)
-                ));
-            };
-            if &struct_ty.name != name {
-                return Err(format!(
-                    "struct raw pattern `{name}` does not match `{}`",
-                    struct_ty.name
-                ));
-            }
+            let struct_fields = raw_pattern_struct_fields(expected, name, struct_defs)?;
             for field in fields {
-                let (_, field_ty) = struct_ty
-                    .field(&field.name)
+                let field_ty = struct_fields
+                    .iter()
+                    .find(|item| item.name == field.name)
                     .ok_or_else(|| format!("unknown field `{}` in `{name}`", field.name))?;
                 infer_value_pattern_types(
                     &field.value,
                     &field_ty.ty,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     spec_scope,
                     local_tys,
                     inferred,
@@ -7446,6 +7742,7 @@ fn infer_value_pattern_types(
                     &expected_field_ty,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     spec_scope,
                     local_tys,
                     inferred,
@@ -7483,11 +7780,40 @@ fn bind_value_pattern_vars(
     Ok(())
 }
 
+fn raw_pattern_struct_fields(
+    expected: &SpecTy,
+    name: &str,
+    struct_defs: &HashMap<String, StructDef>,
+) -> Result<Vec<StructFieldTy>, String> {
+    match expected {
+        SpecTy::Record(struct_ty) if struct_ty.name == name => Ok(struct_ty.fields.clone()),
+        SpecTy::Record(struct_ty) => Err(format!(
+            "struct raw pattern `{name}` does not match `{}`",
+            struct_ty.name
+        )),
+        SpecTy::Struct {
+            name: struct_name, ..
+        } if struct_name == name => struct_fields_for_ty(expected, struct_defs)?
+            .ok_or_else(|| format!("unknown spec struct `{struct_name}`")),
+        SpecTy::Struct {
+            name: struct_name, ..
+        } => Err(format!(
+            "struct raw pattern `{name}` does not match `{struct_name}`"
+        )),
+        other => Err(format!(
+            "struct raw pattern `{name}` requires a struct type, got {}",
+            display_spec_ty(other)
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn typed_value_pattern(
     pattern: &ValuePattern,
     expected: &SpecTy,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
     inferred: &mut SpecTypeInference,
@@ -7507,6 +7833,7 @@ fn typed_value_pattern(
             expr,
             pure_fns,
             enum_defs,
+            struct_defs,
             &HashSet::new(),
             DirectiveKind::RawAssert,
             spec_scope,
@@ -7525,7 +7852,14 @@ fn typed_value_pattern(
             let mut typed_items = Vec::with_capacity(items.len());
             for item in items {
                 typed_items.push(typed_value_pattern(
-                    item, inner, pure_fns, enum_defs, spec_scope, local_tys, inferred,
+                    item,
+                    inner,
+                    pure_fns,
+                    enum_defs,
+                    struct_defs,
+                    spec_scope,
+                    local_tys,
+                    inferred,
                 )?);
             }
             Ok(TypedValuePattern::SeqLit {
@@ -7534,28 +7868,19 @@ fn typed_value_pattern(
             })
         }
         ValuePattern::StructLit { name, fields } => {
-            let SpecTy::Record(struct_ty) = expected else {
-                return Err(format!(
-                    "struct raw pattern `{name}` requires a struct type, got {}",
-                    display_spec_ty(expected)
-                ));
-            };
-            if &struct_ty.name != name {
-                return Err(format!(
-                    "struct raw pattern `{name}` does not match `{}`",
-                    struct_ty.name
-                ));
-            }
+            let struct_fields = raw_pattern_struct_fields(expected, name, struct_defs)?;
             let mut typed_fields = Vec::with_capacity(fields.len());
             for field in fields {
-                let (_, field_ty) = struct_ty
-                    .field(&field.name)
+                let field_ty = struct_fields
+                    .iter()
+                    .find(|item| item.name == field.name)
                     .ok_or_else(|| format!("unknown field `{}` in `{name}`", field.name))?;
                 typed_fields.push(typed_value_pattern(
                     &field.value,
                     &field_ty.ty,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     spec_scope,
                     local_tys,
                     inferred,
@@ -7596,6 +7921,7 @@ fn typed_value_pattern(
                     &expected_field_ty,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     spec_scope,
                     local_tys,
                     inferred,
@@ -7615,6 +7941,7 @@ fn typed_standalone_fn_raw_assertions(
     assertions: &[RawAssertion],
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
     rust_params: &HashMap<String, RustTypeExpr>,
@@ -7629,6 +7956,7 @@ fn typed_standalone_fn_raw_assertions(
             &assertion.pattern,
             pure_fns,
             enum_defs,
+            struct_defs,
             spec_scope,
             params,
             rust_params,
@@ -7641,6 +7969,7 @@ fn typed_standalone_fn_raw_assertions(
             &assertion.condition,
             pure_fns,
             enum_defs,
+            struct_defs,
             &HashSet::new(),
             spec_scope,
             params,
@@ -7665,6 +7994,7 @@ fn typed_standalone_fn_raw_pattern(
     pattern: &RawPattern,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     spec_scope: &mut SpecScope,
     params: &HashMap<String, SpecTy>,
     rust_params: &HashMap<String, RustTypeExpr>,
@@ -7705,6 +8035,7 @@ fn typed_standalone_fn_raw_pattern(
                 &option_spec_ty(pointee_ty),
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 spec_scope,
                 params,
                 allow_result,
@@ -7720,6 +8051,7 @@ fn typed_standalone_fn_raw_pattern(
             pattern,
             pure_fns,
             enum_defs,
+            struct_defs,
             spec_scope,
             params,
             allow_result,
@@ -8023,6 +8355,7 @@ fn infer_lemma_call(
             arg,
             call_ctx.pure_fns,
             call_ctx.enum_defs,
+            call_ctx.struct_defs,
             call_ctx.type_param_scope,
             DirectiveKind::LemmaCall,
             spec_scope,
@@ -8083,6 +8416,7 @@ fn typed_lemma_call(
             arg,
             call_ctx.pure_fns,
             call_ctx.enum_defs,
+            call_ctx.struct_defs,
             call_ctx.type_param_scope,
             DirectiveKind::LemmaCall,
             spec_scope,
@@ -8318,6 +8652,7 @@ fn type_pure_fns(
     pure_fns: &HashMap<String, PureFnDef>,
     declaration_order: &[String],
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     span: Span,
 ) -> Result<Vec<TypedPureFnDef>, LoopPrepassError> {
     let mut available_pure_fns = HashMap::new();
@@ -8375,6 +8710,7 @@ fn type_pure_fns(
             raw_body,
             &available_pure_fns,
             enum_defs,
+            struct_defs,
             &type_param_scope,
             &mut infer_scope,
             &param_tys,
@@ -8392,6 +8728,7 @@ fn type_pure_fns(
             raw_body,
             &available_pure_fns,
             enum_defs,
+            struct_defs,
             &type_param_scope,
             &mut type_scope,
             &param_tys,
@@ -8477,6 +8814,7 @@ fn infer_lemma_stmts(
     all_lemmas: &HashMap<String, LemmaDef>,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     type_param_scope: &HashSet<String>,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
@@ -8490,6 +8828,7 @@ fn infer_lemma_stmts(
                     expr,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     type_param_scope,
                     spec_scope,
                     local_tys,
@@ -8525,6 +8864,7 @@ fn infer_lemma_stmts(
                         arg,
                         pure_fns,
                         enum_defs,
+                        struct_defs,
                         type_param_scope,
                         spec_scope,
                         local_tys,
@@ -8559,6 +8899,7 @@ fn infer_lemma_stmts(
                     scrutinee,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     type_param_scope,
                     spec_scope,
                     local_tys,
@@ -8621,6 +8962,7 @@ fn infer_lemma_stmts(
                         all_lemmas,
                         pure_fns,
                         enum_defs,
+                        struct_defs,
                         type_param_scope,
                         &mut arm_scope,
                         &arm_tys,
@@ -8636,6 +8978,7 @@ fn infer_lemma_stmts(
                         all_lemmas,
                         pure_fns,
                         enum_defs,
+                        struct_defs,
                         type_param_scope,
                         &mut default_scope,
                         local_tys,
@@ -8660,6 +9003,7 @@ fn typed_lemma_stmts(
     all_lemmas: &HashMap<String, LemmaDef>,
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     type_param_scope: &HashSet<String>,
     spec_scope: &mut SpecScope,
     local_tys: &HashMap<String, SpecTy>,
@@ -8674,6 +9018,7 @@ fn typed_lemma_stmts(
                     expr,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     type_param_scope,
                     spec_scope,
                     local_tys,
@@ -8691,6 +9036,7 @@ fn typed_lemma_stmts(
                     expr,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     type_param_scope,
                     spec_scope,
                     local_tys,
@@ -8730,6 +9076,7 @@ fn typed_lemma_stmts(
                         arg,
                         pure_fns,
                         enum_defs,
+                        struct_defs,
                         type_param_scope,
                         spec_scope,
                         local_tys,
@@ -8772,6 +9119,7 @@ fn typed_lemma_stmts(
                     scrutinee,
                     pure_fns,
                     enum_defs,
+                    struct_defs,
                     type_param_scope,
                     spec_scope,
                     local_tys,
@@ -8835,6 +9183,7 @@ fn typed_lemma_stmts(
                         all_lemmas,
                         pure_fns,
                         enum_defs,
+                        struct_defs,
                         type_param_scope,
                         &mut arm_scope,
                         &arm_tys,
@@ -8855,6 +9204,7 @@ fn typed_lemma_stmts(
                         all_lemmas,
                         pure_fns,
                         enum_defs,
+                        struct_defs,
                         type_param_scope,
                         &mut default_scope,
                         local_tys,
@@ -9030,6 +9380,7 @@ fn type_lemmas(
     declaration_order: &[String],
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     span: Span,
 ) -> Result<Vec<TypedLemmaDef>, LoopPrepassError> {
     let mut typed = Vec::with_capacity(declaration_order.len());
@@ -9083,6 +9434,7 @@ fn type_lemmas(
             &lemma.req,
             pure_fns,
             enum_defs,
+            struct_defs,
             &type_param_scope,
             &mut infer_scope,
             &param_tys,
@@ -9101,6 +9453,7 @@ fn type_lemmas(
                 resource_req,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 &mut body_infer_scope,
                 &param_tys,
                 false,
@@ -9119,6 +9472,7 @@ fn type_lemmas(
             lemmas,
             pure_fns,
             enum_defs,
+            struct_defs,
             &type_param_scope,
             &mut body_infer_scope,
             &param_tys,
@@ -9134,6 +9488,7 @@ fn type_lemmas(
             &lemma.ens,
             pure_fns,
             enum_defs,
+            struct_defs,
             &type_param_scope,
             &mut body_infer_scope,
             &param_tys,
@@ -9152,6 +9507,7 @@ fn type_lemmas(
             &lemma.req,
             pure_fns,
             enum_defs,
+            struct_defs,
             &type_param_scope,
             &mut type_scope,
             &param_tys,
@@ -9175,6 +9531,7 @@ fn type_lemmas(
             &lemma.raw_reqs,
             pure_fns,
             enum_defs,
+            struct_defs,
             &mut type_scope,
             &param_tys,
             false,
@@ -9192,6 +9549,7 @@ fn type_lemmas(
             lemmas,
             pure_fns,
             enum_defs,
+            struct_defs,
             &type_param_scope,
             &mut type_scope,
             &param_tys,
@@ -9207,6 +9565,7 @@ fn type_lemmas(
             &lemma.ens,
             pure_fns,
             enum_defs,
+            struct_defs,
             &type_param_scope,
             &mut type_scope,
             &param_tys,
@@ -9231,6 +9590,7 @@ fn type_lemmas(
                 raw_ens,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 &mut body_infer_scope,
                 &param_tys,
                 false,
@@ -9247,6 +9607,7 @@ fn type_lemmas(
             &lemma.raw_ens,
             pure_fns,
             enum_defs,
+            struct_defs,
             &mut type_scope,
             &param_tys,
             false,
@@ -9284,6 +9645,7 @@ fn type_standalone_fn_contracts(
     declaration_order: &[String],
     pure_fns: &HashMap<String, PureFnDef>,
     enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
     span: Span,
 ) -> Result<HashMap<String, FunctionContract>, LoopPrepassError> {
     let mut typed = HashMap::new();
@@ -9349,6 +9711,7 @@ fn type_standalone_fn_contracts(
             &def.req,
             pure_fns,
             enum_defs,
+            struct_defs,
             &type_param_scope,
             &mut infer_scope,
             &param_tys,
@@ -9370,6 +9733,7 @@ fn type_standalone_fn_contracts(
                 resource_req,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 &mut ens_infer_scope,
                 &param_tys,
                 false,
@@ -9389,6 +9753,7 @@ fn type_standalone_fn_contracts(
             &def.ens,
             pure_fns,
             enum_defs,
+            struct_defs,
             &type_param_scope,
             &mut ens_infer_scope,
             &param_tys,
@@ -9409,6 +9774,7 @@ fn type_standalone_fn_contracts(
                 raw_ens,
                 pure_fns,
                 enum_defs,
+                struct_defs,
                 &mut ens_infer_scope,
                 &param_tys,
                 true,
@@ -9430,6 +9796,7 @@ fn type_standalone_fn_contracts(
             &def.req,
             pure_fns,
             enum_defs,
+            struct_defs,
             &type_param_scope,
             &mut type_scope,
             &param_tys,
@@ -9461,6 +9828,7 @@ fn type_standalone_fn_contracts(
             &def.raw_reqs,
             pure_fns,
             enum_defs,
+            struct_defs,
             &mut type_scope,
             &param_tys,
             &rust_param_tys,
@@ -9481,6 +9849,7 @@ fn type_standalone_fn_contracts(
             &def.ens,
             pure_fns,
             enum_defs,
+            struct_defs,
             &type_param_scope,
             &mut type_scope,
             &param_tys,
@@ -9512,6 +9881,7 @@ fn type_standalone_fn_contracts(
             &def.raw_ens,
             pure_fns,
             enum_defs,
+            struct_defs,
             &mut type_scope,
             &param_tys,
             &rust_param_tys,
@@ -9833,6 +10203,7 @@ fn validate_function_contract_expr_prepass(
         SpecCallContext {
             pure_fns,
             enum_defs,
+            struct_defs: prelude_struct_defs(),
             type_param_scope,
         },
         spec_scope,
@@ -10240,6 +10611,7 @@ fn resolve_expr_env_in_scope(
         call_ctx: SpecCallContext {
             pure_fns,
             enum_defs,
+            struct_defs: prelude_struct_defs(),
             type_param_scope,
         },
         binding_info,
@@ -10685,6 +11057,7 @@ mod tests {
             SpecCallContext {
                 pure_fns: &pure_fns,
                 enum_defs: &HashMap::new(),
+                struct_defs: &HashMap::new(),
                 type_param_scope: &HashSet::new(),
             },
             &mut |expr, expected| {
@@ -10736,6 +11109,7 @@ mod tests {
             SpecCallContext {
                 pure_fns: &pure_fns,
                 enum_defs: &HashMap::new(),
+                struct_defs: &HashMap::new(),
                 type_param_scope: &HashSet::new(),
             },
             &mut |expr, expected| {
@@ -10779,6 +11153,7 @@ mod tests {
             SpecCallContext {
                 pure_fns: &pure_fns,
                 enum_defs: &HashMap::new(),
+                struct_defs: &HashMap::new(),
                 type_param_scope: &HashSet::new(),
             },
             &mut |expr, expected| {
@@ -10822,6 +11197,7 @@ mod tests {
             },
             &pure_fns,
             &HashMap::new(),
+            &HashMap::new(),
             &HashSet::new(),
             &mut SpecScope::default(),
             &HashMap::new(),
@@ -10860,6 +11236,7 @@ mod tests {
                 })])],
             },
             &pure_fns,
+            &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),
             DirectiveKind::Assert,
@@ -10910,6 +11287,7 @@ mod tests {
                 })])),
             },
             &pure_fns,
+            &HashMap::new(),
             &HashMap::new(),
             DirectiveKind::Assert,
             &mut SpecScope::default(),
@@ -10970,6 +11348,7 @@ mod tests {
             &expr,
             &HashMap::new(),
             &enum_defs,
+            &HashMap::new(),
             &HashSet::new(),
             &mut SpecScope::default(),
             &HashMap::new(),
@@ -11046,6 +11425,7 @@ mod tests {
             &expr,
             &HashMap::new(),
             &enum_defs,
+            &HashMap::new(),
             &HashSet::new(),
             &mut SpecScope::default(),
             &params,
@@ -11089,6 +11469,7 @@ mod tests {
             SpecCallContext {
                 pure_fns: &HashMap::new(),
                 enum_defs: &HashMap::new(),
+                struct_defs: &HashMap::new(),
                 type_param_scope: &HashSet::new(),
             },
             &mut SpecScope::default(),
@@ -11105,6 +11486,7 @@ mod tests {
     fn runtime_contract_interpolation_becomes_rust_var() {
         let typed = typed_runtime_contract_expr(
             &Expr::Interpolated("x".to_owned()),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &mut SpecScope::default(),
@@ -11128,6 +11510,7 @@ mod tests {
     fn runtime_postcondition_result_stays_spec_var() {
         let typed = typed_runtime_contract_expr(
             &Expr::Var("result".to_owned()),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &mut SpecScope::default(),
