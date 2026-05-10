@@ -1913,7 +1913,17 @@ impl<'tcx> Verifier<'tcx> {
             Rvalue::UnaryOp(op, operand) => {
                 let value = self.unsafe_eval_operand(state, bridge, operand, span)?;
                 let operand_ty = operand.ty(&self.body().local_decls, self.tcx);
-                self.lower_unsafe_unary_value(state, *op, operand_ty, &value, span)
+                let (value, int_term) = self.lower_unary_value_for_eval(*op, &value, span)?;
+                if let Some(term) = int_term {
+                    self.require_unsafe_int_invariant(
+                        state,
+                        operand_ty,
+                        &term,
+                        span,
+                        "type invariant does not hold".to_owned(),
+                    )?;
+                }
+                Ok(value)
             }
             Rvalue::Aggregate(kind, operands) => match **kind {
                 AggregateKind::Tuple => {
@@ -2077,20 +2087,18 @@ impl<'tcx> Verifier<'tcx> {
         let lhs_value = self.unsafe_eval_operand(state, bridge, lhs, span)?;
         let rhs_value = self.unsafe_eval_operand(state, bridge, rhs, span)?;
         let lhs_ty = lhs.ty(&self.body().local_decls, self.tcx);
-        match op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul => {
-                let result = self.lower_int_binary_value(op, &lhs_value, &rhs_value, span)?;
-                self.require_unsafe_int_invariant(
-                    state,
-                    lhs_ty,
-                    &result.term,
-                    span,
-                    "type invariant does not hold".to_owned(),
-                )?;
-                Ok(result.value)
-            }
-            _ => self.lower_binary_value(op, lhs_ty, &lhs_value, &rhs_value, span),
+        let (value, int_term) =
+            self.lower_binary_value_for_eval(op, lhs_ty, &lhs_value, &rhs_value, span)?;
+        if let Some(term) = int_term {
+            self.require_unsafe_int_invariant(
+                state,
+                lhs_ty,
+                &term,
+                span,
+                "type invariant does not hold".to_owned(),
+            )?;
         }
+        Ok(value)
     }
 
     fn unsafe_eval_checked_binary_op(
@@ -2105,7 +2113,6 @@ impl<'tcx> Verifier<'tcx> {
         let lhs_value = self.unsafe_eval_operand(state, bridge, lhs, span)?;
         let rhs_value = self.unsafe_eval_operand(state, bridge, rhs, span)?;
         let result_ty = lhs.ty(&self.body().local_decls, self.tcx);
-        let result_spec_ty = self.spec_ty_for_place_ty(result_ty, span)?;
         let result = self.lower_checked_binary_value(op, &lhs_value, &rhs_value, span)?;
         self.require_unsafe_int_invariant(
             state,
@@ -2114,40 +2121,7 @@ impl<'tcx> Verifier<'tcx> {
             span,
             "type invariant does not hold".to_owned(),
         )?;
-        let result_value = result.value;
-        let overflow_value = self.overflow_value_for_result(result_ty, &result_value, span)?;
-        self.solver_result(
-            span,
-            self.solver
-                .checked_result_tuple_value(result_spec_ty, result_value, overflow_value),
-        )
-    }
-
-    fn lower_unsafe_unary_value(
-        &self,
-        state: &mut UnsafeState,
-        op: UnOp,
-        operand_ty: Ty<'tcx>,
-        value: &SymValue,
-        span: Span,
-    ) -> Result<SymValue, VerificationResult> {
-        match op {
-            UnOp::Not => Ok(self.solver.lower_bool_not_value(value)),
-            UnOp::Neg => {
-                let result = self.solver.lower_int_neg_value(value);
-                self.require_unsafe_int_invariant(
-                    state,
-                    operand_ty,
-                    &result.term,
-                    span,
-                    "type invariant does not hold".to_owned(),
-                )?;
-                Ok(result.value)
-            }
-            other => {
-                Err(self.unsupported_result(span, format!("unsupported unary operator {other:?}")))
-            }
-        }
+        self.checked_binary_result_value(result_ty, result.value, span)
     }
 
     fn lower_int_binary_value(
@@ -2156,23 +2130,84 @@ impl<'tcx> Verifier<'tcx> {
         lhs: &SymValue,
         rhs: &SymValue,
         span: Span,
+        allow_checked_ops: bool,
     ) -> Result<IntValueResult, VerificationResult> {
-        Ok(match op {
-            BinOp::Add => self
-                .solver
-                .lower_int_binary_value(IntValueBinaryOp::Add, lhs, rhs),
-            BinOp::Sub => self
-                .solver
-                .lower_int_binary_value(IntValueBinaryOp::Sub, lhs, rhs),
-            BinOp::Mul => self
-                .solver
-                .lower_int_binary_value(IntValueBinaryOp::Mul, lhs, rhs),
+        let op = match op {
+            BinOp::Add => IntValueBinaryOp::Add,
+            BinOp::Sub => IntValueBinaryOp::Sub,
+            BinOp::Mul => IntValueBinaryOp::Mul,
+            BinOp::AddWithOverflow if allow_checked_ops => IntValueBinaryOp::Add,
+            BinOp::SubWithOverflow if allow_checked_ops => IntValueBinaryOp::Sub,
+            BinOp::MulWithOverflow if allow_checked_ops => IntValueBinaryOp::Mul,
             other => {
                 return Err(
                     self.unsupported_result(span, format!("unsupported binary operator {other:?}"))
                 );
             }
-        })
+        };
+        Ok(self.solver.lower_int_binary_value(op, lhs, rhs))
+    }
+
+    fn lower_unary_value_for_eval(
+        &self,
+        op: UnOp,
+        value: &SymValue,
+        span: Span,
+    ) -> Result<(SymValue, Option<Int>), VerificationResult> {
+        match op {
+            UnOp::Not => Ok((self.solver.lower_bool_not_value(value), None)),
+            UnOp::Neg => {
+                let result = self.solver.lower_int_neg_value(value);
+                Ok((result.value, Some(result.term)))
+            }
+            other => {
+                Err(self.unsupported_result(span, format!("unsupported unary operator {other:?}")))
+            }
+        }
+    }
+
+    fn lower_binary_value_for_eval(
+        &self,
+        op: BinOp,
+        lhs_ty: Ty<'tcx>,
+        lhs: &SymValue,
+        rhs: &SymValue,
+        span: Span,
+    ) -> Result<(SymValue, Option<Int>), VerificationResult> {
+        match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul => {
+                let result = self.lower_int_binary_value(op, lhs, rhs, span, false)?;
+                Ok((result.value, Some(result.term)))
+            }
+            _ => self
+                .lower_binary_value(op, lhs_ty, lhs, rhs, span)
+                .map(|value| (value, None)),
+        }
+    }
+
+    fn lower_checked_binary_value(
+        &self,
+        op: BinOp,
+        lhs: &SymValue,
+        rhs: &SymValue,
+        span: Span,
+    ) -> Result<IntValueResult, VerificationResult> {
+        self.lower_int_binary_value(op, lhs, rhs, span, true)
+    }
+
+    fn checked_binary_result_value(
+        &self,
+        result_ty: Ty<'tcx>,
+        result_value: SymValue,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let result_spec_ty = self.spec_ty_for_place_ty(result_ty, span)?;
+        let overflow_value = self.overflow_value_for_result(result_ty, &result_value, span)?;
+        self.solver_result(
+            span,
+            self.solver
+                .checked_result_tuple_value(result_spec_ty, result_value, overflow_value),
+        )
     }
 
     fn lower_binary_value(
@@ -2217,35 +2252,6 @@ impl<'tcx> Verifier<'tcx> {
                 Err(self.unsupported_result(span, format!("unsupported binary operator {other:?}")))
             }
         }
-    }
-
-    fn lower_checked_binary_value(
-        &self,
-        op: BinOp,
-        lhs: &SymValue,
-        rhs: &SymValue,
-        span: Span,
-    ) -> Result<IntValueResult, VerificationResult> {
-        Ok(match op {
-            BinOp::Add | BinOp::AddWithOverflow => {
-                self.solver
-                    .lower_int_binary_value(IntValueBinaryOp::Add, lhs, rhs)
-            }
-            BinOp::Sub | BinOp::SubWithOverflow => {
-                self.solver
-                    .lower_int_binary_value(IntValueBinaryOp::Sub, lhs, rhs)
-            }
-            BinOp::Mul | BinOp::MulWithOverflow => {
-                self.solver
-                    .lower_int_binary_value(IntValueBinaryOp::Mul, lhs, rhs)
-            }
-            other => {
-                return Err(self.unsupported_result(
-                    span,
-                    format!("unsupported checked binary operator {other:?}"),
-                ));
-            }
-        })
     }
 
     fn unsafe_ptr_for_place(
@@ -4390,20 +4396,18 @@ impl<'tcx> Verifier<'tcx> {
         ) {
             return self.eval_checked_binary_op(state, op, lhs, rhs, span);
         }
-        match op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul => {
-                let result = self.lower_int_binary_value(op, &lhs_value, &rhs_value, span)?;
-                self.require_int_invariant(
-                    state,
-                    lhs_ty,
-                    &result.term,
-                    span,
-                    "type invariant does not hold".to_owned(),
-                )?;
-                Ok(result.value)
-            }
-            _ => self.lower_binary_value(op, lhs_ty, &lhs_value, &rhs_value, span),
+        let (value, int_term) =
+            self.lower_binary_value_for_eval(op, lhs_ty, &lhs_value, &rhs_value, span)?;
+        if let Some(term) = int_term {
+            self.require_int_invariant(
+                state,
+                lhs_ty,
+                &term,
+                span,
+                "type invariant does not hold".to_owned(),
+            )?;
         }
+        Ok(value)
     }
 
     fn eval_checked_binary_op(
@@ -4417,7 +4421,6 @@ impl<'tcx> Verifier<'tcx> {
         let lhs_value = self.eval_operand(state, lhs, span)?;
         let rhs_value = self.eval_operand(state, rhs, span)?;
         let result_ty = lhs.ty(&self.body().local_decls, self.tcx);
-        let result_spec_ty = self.spec_ty_for_place_ty(result_ty, span)?;
         let result = self.lower_checked_binary_value(op, &lhs_value, &rhs_value, span)?;
         self.require_int_invariant(
             state,
@@ -4426,13 +4429,7 @@ impl<'tcx> Verifier<'tcx> {
             span,
             "type invariant does not hold".to_owned(),
         )?;
-        let result_value = result.value;
-        let overflow_value = self.overflow_value_for_result(result_ty, &result_value, span)?;
-        self.solver_result(
-            span,
-            self.solver
-                .checked_result_tuple_value(result_spec_ty, result_value, overflow_value),
-        )
+        self.checked_binary_result_value(result_ty, result.value, span)
     }
 
     fn eval_unary_op(
@@ -4444,23 +4441,17 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<SymValue, VerificationResult> {
         let value = self.eval_operand(state, operand, span)?;
         let operand_ty = operand.ty(&self.body().local_decls, self.tcx);
-        match op {
-            UnOp::Not => Ok(self.solver.lower_bool_not_value(&value)),
-            UnOp::Neg => {
-                let result = self.solver.lower_int_neg_value(&value);
-                self.require_int_invariant(
-                    state,
-                    operand_ty,
-                    &result.term,
-                    span,
-                    "type invariant does not hold".to_owned(),
-                )?;
-                Ok(result.value)
-            }
-            other => {
-                Err(self.unsupported_result(span, format!("unsupported unary operator {other:?}")))
-            }
+        let (value, int_term) = self.lower_unary_value_for_eval(op, &value, span)?;
+        if let Some(term) = int_term {
+            self.require_int_invariant(
+                state,
+                operand_ty,
+                &term,
+                span,
+                "type invariant does not hold".to_owned(),
+            )?;
         }
+        Ok(value)
     }
 
     fn eval_operand(
