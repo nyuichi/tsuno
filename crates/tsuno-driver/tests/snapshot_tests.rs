@@ -29,14 +29,33 @@ fn fixture_file(kind: FixtureKind, name: &str) -> PathBuf {
     fixture_dir(kind).join(format!("{name}.rs"))
 }
 
+fn copy_fixture_support_dir(src: &Path, dst: &Path) {
+    if !src.exists() {
+        return;
+    }
+    for entry in fs::read_dir(src).expect("read fixture support dir") {
+        let entry = entry.expect("fixture support entry");
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if entry.file_type().expect("fixture support type").is_dir() {
+            fs::create_dir_all(&dst_path).expect("create fixture support subdir");
+            copy_fixture_support_dir(&src_path, &dst_path);
+        } else {
+            fs::copy(src_path, dst_path).expect("copy fixture support file");
+        }
+    }
+}
+
 fn run_fixture(kind: FixtureKind, name: &str) -> Output {
     let tmp = tempdir().expect("tempdir");
     let root = tmp.path();
-    fs::create_dir(root.join("src")).expect("src dir");
-    fs::copy(fixture_file(kind, name), root.join("src/main.rs")).expect("copy fixture");
+    let src_dir = root.join("src");
+    fs::create_dir(&src_dir).expect("src dir");
+    fs::copy(fixture_file(kind, name), src_dir.join("main.rs")).expect("copy fixture");
+    copy_fixture_support_dir(&fixture_dir(kind).join(name), &src_dir);
     let sidecar = fixture_dir(kind).join(format!("{name}.rs.tsuno"));
     if sidecar.exists() {
-        fs::copy(sidecar, root.join("src/main.rs.tsuno")).expect("copy sidecar fixture");
+        fs::copy(sidecar, src_dir.join("main.rs.tsuno")).expect("copy sidecar fixture");
     }
 
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());

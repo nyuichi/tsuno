@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -6,8 +7,69 @@ use camino::Utf8PathBuf;
 use clap::Parser;
 use serde::Deserialize;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cli {
+    workspace: bool,
+    packages: Vec<String>,
+    manifest_path: Option<PathBuf>,
+}
+
 #[derive(Parser)]
-struct Cli {}
+#[command(name = "cargo-tsuno")]
+struct RawCli {
+    /// Verify all workspace members.
+    #[arg(long)]
+    workspace: bool,
+
+    /// Verify only the named package.
+    #[arg(short = 'p', long = "package")]
+    packages: Vec<String>,
+
+    /// Path to Cargo.toml.
+    #[arg(long)]
+    manifest_path: Option<PathBuf>,
+}
+
+impl Cli {
+    fn parse() -> Self {
+        Self::try_parse_from(std::env::args_os()).unwrap_or_else(|err| err.exit())
+    }
+
+    fn try_parse_from<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString>,
+    {
+        let mut args = args.into_iter().map(Into::into).collect::<Vec<OsString>>();
+        if args.get(1).is_some_and(|arg| arg == OsStr::new("tsuno")) {
+            args.remove(1);
+        }
+        let raw = RawCli::try_parse_from(args)?;
+        Ok(Self {
+            workspace: raw.workspace,
+            packages: raw.packages,
+            manifest_path: raw.manifest_path,
+        })
+    }
+
+    fn cargo_check_args(&self, manifest_path: &Utf8PathBuf) -> Vec<String> {
+        let mut args = vec![
+            "check".to_string(),
+            "--offline".to_string(),
+            "--quiet".to_string(),
+            "--manifest-path".to_string(),
+            manifest_path.to_string(),
+        ];
+        if self.workspace {
+            args.push("--workspace".to_string());
+        }
+        for package in &self.packages {
+            args.push("--package".to_string());
+            args.push(package.clone());
+        }
+        args
+    }
+}
 
 fn main() {
     match try_main() {
@@ -20,11 +82,15 @@ fn main() {
 }
 
 fn try_main() -> anyhow::Result<i32> {
-    Cli::parse();
-    let manifest_path = find_manifest_path_from_current_dir()?;
+    let cli = Cli::parse();
+    let manifest_path = cli
+        .manifest_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(find_manifest_path_from_current_dir)?;
     let manifest_path = std::fs::canonicalize(manifest_path).context("resolve manifest path")?;
     let invocation = CargoInvocation::discover(&manifest_path)?;
-    verify(&invocation)
+    verify(&invocation, &cli)
 }
 
 #[derive(Debug, Clone)]
@@ -69,16 +135,16 @@ impl CargoInvocation {
     }
 }
 
-fn verify(invocation: &CargoInvocation) -> anyhow::Result<i32> {
+fn verify(invocation: &CargoInvocation, cli: &Cli) -> anyhow::Result<i32> {
     let wrapper_exe = std::env::current_exe()
         .expect("current executable path invalid")
         .with_file_name(format!("tsuno-driver{}", std::env::consts::EXE_SUFFIX));
+    let cargo_check_args = cli.cargo_check_args(&invocation.manifest_path);
 
     // Cargo drives compilation here so rustc can be wrapped and analyzed MIR can be collected.
     let status = Command::new("cargo")
         .current_dir(&invocation.workspace_root)
-        .args(["check", "--offline", "--quiet", "--manifest-path"])
-        .arg(&invocation.manifest_path)
+        .args(cargo_check_args)
         .env("RUSTC_WORKSPACE_WRAPPER", wrapper_exe)
         .spawn()
         .context("run cargo check")?
@@ -105,7 +171,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use clap::Parser;
+    use camino::Utf8PathBuf;
     use tempfile::tempdir;
 
     struct CurrentDirGuard {
@@ -132,7 +198,65 @@ mod tests {
     }
 
     #[test]
-    fn rejects_verify_subcommand() {
+    fn parses_cargo_subcommand_name() {
+        let cli = Cli::try_parse_from(["cargo-tsuno", "tsuno", "--workspace"]).expect("parse cli");
+
+        assert!(cli.workspace);
+    }
+
+    #[test]
+    fn parses_workspace_package_and_manifest_path() {
+        let cli = Cli::try_parse_from([
+            "cargo-tsuno",
+            "--workspace",
+            "-p",
+            "first-crate",
+            "--package",
+            "second-crate",
+            "--manifest-path",
+            "crates/demo/Cargo.toml",
+        ])
+        .expect("parse cli");
+
+        assert!(cli.workspace);
+        assert_eq!(cli.packages, ["first-crate", "second-crate"]);
+        assert_eq!(
+            cli.manifest_path.as_deref(),
+            Some(Path::new("crates/demo/Cargo.toml"))
+        );
+    }
+
+    #[test]
+    fn builds_cargo_check_selection_args() {
+        let cli = Cli::try_parse_from([
+            "cargo-tsuno",
+            "--workspace",
+            "-p",
+            "first-crate",
+            "-p",
+            "second-crate",
+        ])
+        .expect("parse cli");
+
+        assert_eq!(
+            cli.cargo_check_args(&Utf8PathBuf::from("/repo/Cargo.toml")),
+            [
+                "check",
+                "--offline",
+                "--quiet",
+                "--manifest-path",
+                "/repo/Cargo.toml",
+                "--workspace",
+                "--package",
+                "first-crate",
+                "--package",
+                "second-crate",
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unrecognized_subcommand() {
         assert!(Cli::try_parse_from(["cargo-tsuno", "verify"]).is_err());
     }
 
