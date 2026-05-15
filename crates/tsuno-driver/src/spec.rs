@@ -338,6 +338,44 @@ pub struct StandaloneFnContractDef {
     pub raw_reqs: Vec<RawAssertion>,
     pub ens: Expr,
     pub raw_ens: Vec<RawAssertion>,
+    pub proof_blocks: Vec<StandaloneProofBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandaloneProofBlock {
+    pub anchor: StandaloneProofAnchor,
+    pub directives: Vec<StandaloneProofDirective>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StandaloneProofAnchor {
+    Stmt(usize),
+    Loop(usize),
+    Exit(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandaloneProofDirectiveKind {
+    Let,
+    Inv,
+    Assert,
+    Assume,
+    RawAssert,
+    LemmaCall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandaloneProofDirective {
+    pub kind: StandaloneProofDirectiveKind,
+    pub payload: StandaloneProofPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StandaloneProofPayload {
+    Predicate(Expr),
+    Let { name: String, value: Expr },
+    RawAssert(Box<RawAssertion>),
+    LemmaCall(Expr),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
