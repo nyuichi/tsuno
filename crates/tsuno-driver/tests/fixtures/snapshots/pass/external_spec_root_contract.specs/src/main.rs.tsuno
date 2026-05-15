@@ -1,0 +1,8 @@
+fn external_specified(x: i32) -> ()
+  req x == 0i32
+  ens true
+{
+  at loop #0 {
+    inv {x} <= {y} && {y} <= 3i32;
+  }
+}

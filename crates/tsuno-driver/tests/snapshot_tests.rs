@@ -53,26 +53,34 @@ fn run_fixture(kind: FixtureKind, name: &str) -> Output {
     fs::create_dir(&src_dir).expect("src dir");
     fs::copy(fixture_file(kind, name), src_dir.join("main.rs")).expect("copy fixture");
     copy_fixture_support_dir(&fixture_dir(kind).join(name), &src_dir);
+    let external_spec_fixture_dir = fixture_dir(kind).join(format!("{name}.specs"));
+    let external_spec_root = root.join("specs");
+    if external_spec_fixture_dir.exists() {
+        fs::create_dir(&external_spec_root).expect("create external spec root");
+        copy_fixture_support_dir(&external_spec_fixture_dir, &external_spec_root);
+    }
     let sidecar = fixture_dir(kind).join(format!("{name}.rs.tsuno"));
     if sidecar.exists() {
         fs::copy(sidecar, src_dir.join("main.rs.tsuno")).expect("copy sidecar fixture");
     }
 
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());
-    let output = Command::new(env!("CARGO_BIN_EXE_tsuno-driver"))
-        .current_dir(root)
-        .arg(rustc)
-        .args([
-            "--crate-name",
-            "fixture",
-            "--edition=2024",
-            "--crate-type",
-            "bin",
-            "--emit=metadata",
-            "src/main.rs",
-        ])
-        .output()
-        .expect("driver output");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tsuno-driver"));
+    command.current_dir(root).arg(rustc).args([
+        "--crate-name",
+        "fixture",
+        "--edition=2024",
+        "--crate-type",
+        "bin",
+        "--emit=metadata",
+        "src/main.rs",
+    ]);
+    if external_spec_fixture_dir.exists() {
+        command
+            .env("TSUNO_SUBJECT_ROOT", root)
+            .env("TSUNO_SPEC_ROOT", &external_spec_root);
+    }
+    let output = command.output().expect("driver output");
 
     Output {
         status: output.status,
