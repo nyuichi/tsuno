@@ -40,7 +40,8 @@ struct GhostSource {
 enum GhostSourceOrigin {
     Prelude,
     RustSource,
-    Sidecar { path: PathBuf },
+    AdjacentSidecar { path: PathBuf },
+    ExternalSidecar { path: PathBuf },
 }
 
 struct GhostItemSink<'a> {
@@ -55,7 +56,9 @@ impl GhostSourceOrigin {
     fn parse_error_message(&self, err: &crate::directive::ParseError) -> String {
         match self {
             Self::Prelude | Self::RustSource => err.to_string(),
-            Self::Sidecar { path } => format!("{}: {err}", path.display()),
+            Self::AdjacentSidecar { path } | Self::ExternalSidecar { path } => {
+                format!("{}: {err}", path.display())
+            }
         }
     }
 }
@@ -989,6 +992,7 @@ fn collect_global_ghost_sources<'tcx>(
         origin: GhostSourceOrigin::Prelude,
     }];
     let mut seen_sources = HashSet::new();
+    let external_spec_roots = ExternalSpecRoots::from_env();
     for item_id in tcx.hir_free_items() {
         let item = tcx.hir_item(item_id);
         let loc = tcx.sess.source_map().lookup_char_pos(item.span.lo());
@@ -1004,7 +1008,15 @@ fn collect_global_ghost_sources<'tcx>(
                 origin: GhostSourceOrigin::RustSource,
             });
             let path = loc.file.name.prefer_local().to_string();
-            if let Some(source) = read_sidecar_ghost_source(Path::new(&path), item.span)? {
+            let source_path = Path::new(&path);
+            if let Some(source) = read_adjacent_sidecar_ghost_source(source_path, item.span)? {
+                sources.push(source);
+            }
+            if let Some(source) = read_external_sidecar_ghost_source(
+                external_spec_roots.as_ref(),
+                source_path,
+                item.span,
+            )? {
                 sources.push(source);
             }
         }
@@ -1012,7 +1024,23 @@ fn collect_global_ghost_sources<'tcx>(
     Ok(sources)
 }
 
-fn read_sidecar_ghost_source(
+struct ExternalSpecRoots {
+    subject_root: PathBuf,
+    spec_root: PathBuf,
+}
+
+impl ExternalSpecRoots {
+    fn from_env() -> Option<Self> {
+        let subject_root = std::env::var_os("TSUNO_SUBJECT_ROOT").map(PathBuf::from)?;
+        let spec_root = std::env::var_os("TSUNO_SPEC_ROOT").map(PathBuf::from)?;
+        Some(Self {
+            subject_root: subject_root.canonicalize().unwrap_or(subject_root),
+            spec_root: spec_root.canonicalize().unwrap_or(spec_root),
+        })
+    }
+}
+
+fn read_adjacent_sidecar_ghost_source(
     source_path: &Path,
     span: Span,
 ) -> Result<Option<GhostSource>, LoopPrepassError> {
@@ -1037,7 +1065,58 @@ fn read_sidecar_ghost_source(
     Ok(Some(GhostSource {
         span,
         text: format!("/*@\n{text}\n*/"),
-        origin: GhostSourceOrigin::Sidecar { path: sidecar_path },
+        origin: GhostSourceOrigin::AdjacentSidecar { path: sidecar_path },
+    }))
+}
+
+fn read_external_sidecar_ghost_source(
+    roots: Option<&ExternalSpecRoots>,
+    source_path: &Path,
+    span: Span,
+) -> Result<Option<GhostSource>, LoopPrepassError> {
+    let Some(roots) = roots else {
+        return Ok(None);
+    };
+    let absolute_source_path = if source_path.is_absolute() {
+        source_path.to_owned()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::new())
+            .join(source_path)
+    };
+    let absolute_source_path = absolute_source_path
+        .canonicalize()
+        .unwrap_or(absolute_source_path);
+    let Ok(relative_path) = absolute_source_path.strip_prefix(&roots.subject_root) else {
+        return Ok(None);
+    };
+    let Some(file_name) = relative_path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    let external_path = roots
+        .spec_root
+        .join(relative_path)
+        .with_file_name(format!("{file_name}.tsuno"));
+    let text = match fs::read_to_string(&external_path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(LoopPrepassError {
+                span,
+                display_span: None,
+                message: format!(
+                    "failed to read external spec file `{}`: {err}",
+                    external_path.display()
+                ),
+            });
+        }
+    };
+    Ok(Some(GhostSource {
+        span,
+        text: format!("/*@\n{text}\n*/"),
+        origin: GhostSourceOrigin::ExternalSidecar {
+            path: external_path,
+        },
     }))
 }
 

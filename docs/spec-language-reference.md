@@ -12,6 +12,12 @@ also treated as ghost-item source. For example, if `src/foo.rs` is verified and
 `src/foo.rs.tsuno` exists, the sidecar contents are interpreted as if they were
 wrapped in `/*@ ... */` and inserted at the start of `src/foo.rs`.
 
+When `cargo tsuno` is configured with an external spec root, the same rule is
+applied using paths relative to the subject root. For example, with subject root
+`prod-repo` and spec root `proof-repo/specs`, `prod-repo/src/foo.rs` reads
+`proof-repo/specs/src/foo.rs.tsuno` as an additional ghost-item source. The
+production Rust file does not need to contain any tsuno comments.
+
 ## 1. Where Spec Code Appears
 
 Function contracts are written immediately before the function body.
