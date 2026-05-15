@@ -447,7 +447,8 @@ enum Maybe<T> {
 //@ assert (Maybe::<i32>::Some({x}) as Maybe::Some::<i32>).0 == {x};
 ```
 
-Struct-like variants expose their declared field names:
+Struct-like variants expose their declared field names. Internally, the payload
+has the same shape as a generated spec struct named `Enum::Ctor`.
 
 ```rust
 enum List<T> {
@@ -762,7 +763,10 @@ Named field access works on structs.
 ```
 
 Spec-side structs can be declared in ghost blocks and constructed with named
-fields.
+fields. A struct literal must name a declared spec struct. Rust structs used by
+the verified program are also registered as same-shaped spec structs during the
+prepass, so Rust struct field access and spec struct field access use the same
+nominal struct model.
 
 ```rust
 /*@

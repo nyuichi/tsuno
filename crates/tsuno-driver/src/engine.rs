@@ -50,8 +50,8 @@ use crate::prepass::{
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::solver::{
-    CompositeCtorView, IntValueBinaryOp, IntValuePredicateOp, OptionCtorKind, Solver, SymValue,
-    with_z3_context, with_z3_deadline,
+    CompositeCtorView, IntValueBinaryOp, IntValuePredicateOp, IntValueResult, OptionCtorKind,
+    Solver, SymValue, with_z3_context, with_z3_deadline,
 };
 use crate::spec::{
     BinaryOp, RustTyKey, SpecTy, StructFieldTy, TypedExpr, TypedExprKind, TypedMatchBinding,
@@ -1913,7 +1913,17 @@ impl<'tcx> Verifier<'tcx> {
             Rvalue::UnaryOp(op, operand) => {
                 let value = self.unsafe_eval_operand(state, bridge, operand, span)?;
                 let operand_ty = operand.ty(&self.body().local_decls, self.tcx);
-                self.lower_unsafe_unary_value(state, *op, operand_ty, &value, span)
+                let (value, int_term) = self.lower_unary_value_for_eval(*op, &value, span)?;
+                if let Some(term) = int_term {
+                    self.require_unsafe_int_invariant(
+                        state,
+                        operand_ty,
+                        &term,
+                        span,
+                        "type invariant does not hold".to_owned(),
+                    )?;
+                }
+                Ok(value)
             }
             Rvalue::Aggregate(kind, operands) => match **kind {
                 AggregateKind::Tuple => {
@@ -2077,7 +2087,18 @@ impl<'tcx> Verifier<'tcx> {
         let lhs_value = self.unsafe_eval_operand(state, bridge, lhs, span)?;
         let rhs_value = self.unsafe_eval_operand(state, bridge, rhs, span)?;
         let lhs_ty = lhs.ty(&self.body().local_decls, self.tcx);
-        self.lower_unsafe_binary_value(state, op, lhs_ty, &lhs_value, &rhs_value, span)
+        let (value, int_term) =
+            self.lower_binary_value_for_eval(op, lhs_ty, &lhs_value, &rhs_value, span)?;
+        if let Some(term) = int_term {
+            self.require_unsafe_int_invariant(
+                state,
+                lhs_ty,
+                &term,
+                span,
+                "type invariant does not hold".to_owned(),
+            )?;
+        }
+        Ok(value)
     }
 
     fn unsafe_eval_checked_binary_op(
@@ -2092,60 +2113,95 @@ impl<'tcx> Verifier<'tcx> {
         let lhs_value = self.unsafe_eval_operand(state, bridge, lhs, span)?;
         let rhs_value = self.unsafe_eval_operand(state, bridge, rhs, span)?;
         let result_ty = lhs.ty(&self.body().local_decls, self.tcx);
-        let result_spec_ty = self.spec_ty_for_place_ty(result_ty, span)?;
-        let result_value = match op {
-            BinOp::Add | BinOp::AddWithOverflow => {
-                let result = self.solver.lower_int_binary_value(
-                    IntValueBinaryOp::Add,
-                    &lhs_value,
-                    &rhs_value,
-                );
-                self.require_unsafe_int_invariant(
-                    state,
-                    result_ty,
-                    &result.term,
-                    span,
-                    "type invariant does not hold".to_owned(),
-                )?;
-                result.value
-            }
-            BinOp::Sub | BinOp::SubWithOverflow => {
-                let result = self.solver.lower_int_binary_value(
-                    IntValueBinaryOp::Sub,
-                    &lhs_value,
-                    &rhs_value,
-                );
-                self.require_unsafe_int_invariant(
-                    state,
-                    result_ty,
-                    &result.term,
-                    span,
-                    "type invariant does not hold".to_owned(),
-                )?;
-                result.value
-            }
-            BinOp::Mul | BinOp::MulWithOverflow => {
-                let result = self.solver.lower_int_binary_value(
-                    IntValueBinaryOp::Mul,
-                    &lhs_value,
-                    &rhs_value,
-                );
-                self.require_unsafe_int_invariant(
-                    state,
-                    result_ty,
-                    &result.term,
-                    span,
-                    "type invariant does not hold".to_owned(),
-                )?;
-                result.value
-            }
+        let result = self.lower_checked_binary_value(op, &lhs_value, &rhs_value, span)?;
+        self.require_unsafe_int_invariant(
+            state,
+            result_ty,
+            &result.term,
+            span,
+            "type invariant does not hold".to_owned(),
+        )?;
+        self.checked_binary_result_value(result_ty, result.value, span)
+    }
+
+    fn lower_int_binary_value(
+        &self,
+        op: BinOp,
+        lhs: &SymValue,
+        rhs: &SymValue,
+        span: Span,
+        allow_checked_ops: bool,
+    ) -> Result<IntValueResult, VerificationResult> {
+        let op = match op {
+            BinOp::Add => IntValueBinaryOp::Add,
+            BinOp::Sub => IntValueBinaryOp::Sub,
+            BinOp::Mul => IntValueBinaryOp::Mul,
+            BinOp::AddWithOverflow if allow_checked_ops => IntValueBinaryOp::Add,
+            BinOp::SubWithOverflow if allow_checked_ops => IntValueBinaryOp::Sub,
+            BinOp::MulWithOverflow if allow_checked_ops => IntValueBinaryOp::Mul,
             other => {
-                return Err(self.unsupported_result(
-                    span,
-                    format!("unsupported checked binary operator {other:?}"),
-                ));
+                return Err(
+                    self.unsupported_result(span, format!("unsupported binary operator {other:?}"))
+                );
             }
         };
+        Ok(self.solver.lower_int_binary_value(op, lhs, rhs))
+    }
+
+    fn lower_unary_value_for_eval(
+        &self,
+        op: UnOp,
+        value: &SymValue,
+        span: Span,
+    ) -> Result<(SymValue, Option<Int>), VerificationResult> {
+        match op {
+            UnOp::Not => Ok((self.solver.lower_bool_not_value(value), None)),
+            UnOp::Neg => {
+                let result = self.solver.lower_int_neg_value(value);
+                Ok((result.value, Some(result.term)))
+            }
+            other => {
+                Err(self.unsupported_result(span, format!("unsupported unary operator {other:?}")))
+            }
+        }
+    }
+
+    fn lower_binary_value_for_eval(
+        &self,
+        op: BinOp,
+        lhs_ty: Ty<'tcx>,
+        lhs: &SymValue,
+        rhs: &SymValue,
+        span: Span,
+    ) -> Result<(SymValue, Option<Int>), VerificationResult> {
+        match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul => {
+                let result = self.lower_int_binary_value(op, lhs, rhs, span, false)?;
+                Ok((result.value, Some(result.term)))
+            }
+            _ => self
+                .lower_binary_value(op, lhs_ty, lhs, rhs, span)
+                .map(|value| (value, None)),
+        }
+    }
+
+    fn lower_checked_binary_value(
+        &self,
+        op: BinOp,
+        lhs: &SymValue,
+        rhs: &SymValue,
+        span: Span,
+    ) -> Result<IntValueResult, VerificationResult> {
+        self.lower_int_binary_value(op, lhs, rhs, span, true)
+    }
+
+    fn checked_binary_result_value(
+        &self,
+        result_ty: Ty<'tcx>,
+        result_value: SymValue,
+        span: Span,
+    ) -> Result<SymValue, VerificationResult> {
+        let result_spec_ty = self.spec_ty_for_place_ty(result_ty, span)?;
         let overflow_value = self.overflow_value_for_result(result_ty, &result_value, span)?;
         self.solver_result(
             span,
@@ -2154,9 +2210,8 @@ impl<'tcx> Verifier<'tcx> {
         )
     }
 
-    fn lower_unsafe_binary_value(
+    fn lower_binary_value(
         &self,
-        state: &mut UnsafeState,
         op: BinOp,
         lhs_ty: Ty<'tcx>,
         lhs: &SymValue,
@@ -2165,45 +2220,6 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<SymValue, VerificationResult> {
         let lhs_spec_ty = self.spec_ty_for_place_ty(lhs_ty, span)?;
         match op {
-            BinOp::Add => {
-                let result = self
-                    .solver
-                    .lower_int_binary_value(IntValueBinaryOp::Add, lhs, rhs);
-                self.require_unsafe_int_invariant(
-                    state,
-                    lhs_ty,
-                    &result.term,
-                    span,
-                    "type invariant does not hold".to_owned(),
-                )?;
-                Ok(result.value)
-            }
-            BinOp::Sub => {
-                let result = self
-                    .solver
-                    .lower_int_binary_value(IntValueBinaryOp::Sub, lhs, rhs);
-                self.require_unsafe_int_invariant(
-                    state,
-                    lhs_ty,
-                    &result.term,
-                    span,
-                    "type invariant does not hold".to_owned(),
-                )?;
-                Ok(result.value)
-            }
-            BinOp::Mul => {
-                let result = self
-                    .solver
-                    .lower_int_binary_value(IntValueBinaryOp::Mul, lhs, rhs);
-                self.require_unsafe_int_invariant(
-                    state,
-                    lhs_ty,
-                    &result.term,
-                    span,
-                    "type invariant does not hold".to_owned(),
-                )?;
-                Ok(result.value)
-            }
             BinOp::Eq => self.solver_result(
                 span,
                 self.solver.lower_eq_value(&lhs_spec_ty, lhs, rhs, false),
@@ -2234,33 +2250,6 @@ impl<'tcx> Verifier<'tcx> {
             }
             other => {
                 Err(self.unsupported_result(span, format!("unsupported binary operator {other:?}")))
-            }
-        }
-    }
-
-    fn lower_unsafe_unary_value(
-        &self,
-        state: &mut UnsafeState,
-        op: UnOp,
-        operand_ty: Ty<'tcx>,
-        value: &SymValue,
-        span: Span,
-    ) -> Result<SymValue, VerificationResult> {
-        match op {
-            UnOp::Not => Ok(self.solver.lower_bool_not_value(value)),
-            UnOp::Neg => {
-                let result = self.solver.lower_int_neg_value(value);
-                self.require_unsafe_int_invariant(
-                    state,
-                    operand_ty,
-                    &result.term,
-                    span,
-                    "type invariant does not hold".to_owned(),
-                )?;
-                Ok(result.value)
-            }
-            other => {
-                Err(self.unsupported_result(span, format!("unsupported unary operator {other:?}")))
             }
         }
     }
@@ -4401,91 +4390,24 @@ impl<'tcx> Verifier<'tcx> {
         let lhs_value = self.eval_operand(state, lhs, span)?;
         let rhs_value = self.eval_operand(state, rhs, span)?;
         let lhs_ty = lhs.ty(&self.body().local_decls, self.tcx);
-        let lhs_spec_ty = self.spec_ty_for_place_ty(lhs_ty, span)?;
-        let result = match op {
-            BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow => {
-                self.eval_checked_binary_op(state, op, lhs, rhs, span)
-            }
-            BinOp::Add => {
-                let result = self.solver.lower_int_binary_value(
-                    IntValueBinaryOp::Add,
-                    &lhs_value,
-                    &rhs_value,
-                );
-                self.require_int_invariant(
-                    state,
-                    lhs_ty,
-                    &result.term,
-                    span,
-                    "type invariant does not hold".to_owned(),
-                )?;
-                Ok(result.value)
-            }
-            BinOp::Sub => {
-                let result = self.solver.lower_int_binary_value(
-                    IntValueBinaryOp::Sub,
-                    &lhs_value,
-                    &rhs_value,
-                );
-                self.require_int_invariant(
-                    state,
-                    lhs_ty,
-                    &result.term,
-                    span,
-                    "type invariant does not hold".to_owned(),
-                )?;
-                Ok(result.value)
-            }
-            BinOp::Mul => {
-                let result = self.solver.lower_int_binary_value(
-                    IntValueBinaryOp::Mul,
-                    &lhs_value,
-                    &rhs_value,
-                );
-                self.require_int_invariant(
-                    state,
-                    lhs_ty,
-                    &result.term,
-                    span,
-                    "type invariant does not hold".to_owned(),
-                )?;
-                Ok(result.value)
-            }
-            BinOp::Eq => self.solver_result(
+        if matches!(
+            op,
+            BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow
+        ) {
+            return self.eval_checked_binary_op(state, op, lhs, rhs, span);
+        }
+        let (value, int_term) =
+            self.lower_binary_value_for_eval(op, lhs_ty, &lhs_value, &rhs_value, span)?;
+        if let Some(term) = int_term {
+            self.require_int_invariant(
+                state,
+                lhs_ty,
+                &term,
                 span,
-                self.solver
-                    .lower_eq_value(&lhs_spec_ty, &lhs_value, &rhs_value, false),
-            ),
-            BinOp::Ne => self.solver_result(
-                span,
-                self.solver
-                    .lower_eq_value(&lhs_spec_ty, &lhs_value, &rhs_value, true),
-            ),
-            BinOp::Lt => Ok(self.solver.lower_int_predicate_value(
-                IntValuePredicateOp::Lt,
-                &lhs_value,
-                &rhs_value,
-            )),
-            BinOp::Le => Ok(self.solver.lower_int_predicate_value(
-                IntValuePredicateOp::Le,
-                &lhs_value,
-                &rhs_value,
-            )),
-            BinOp::Gt => Ok(self.solver.lower_int_predicate_value(
-                IntValuePredicateOp::Gt,
-                &lhs_value,
-                &rhs_value,
-            )),
-            BinOp::Ge => Ok(self.solver.lower_int_predicate_value(
-                IntValuePredicateOp::Ge,
-                &lhs_value,
-                &rhs_value,
-            )),
-            other => {
-                Err(self.unsupported_result(span, format!("unsupported binary operator {other:?}")))
-            }
-        }?;
-        Ok(result)
+                "type invariant does not hold".to_owned(),
+            )?;
+        }
+        Ok(value)
     }
 
     fn eval_checked_binary_op(
@@ -4499,66 +4421,15 @@ impl<'tcx> Verifier<'tcx> {
         let lhs_value = self.eval_operand(state, lhs, span)?;
         let rhs_value = self.eval_operand(state, rhs, span)?;
         let result_ty = lhs.ty(&self.body().local_decls, self.tcx);
-        let result_spec_ty = self.spec_ty_for_place_ty(result_ty, span)?;
-        let result_value = match op {
-            BinOp::Add | BinOp::AddWithOverflow => {
-                let result = self.solver.lower_int_binary_value(
-                    IntValueBinaryOp::Add,
-                    &lhs_value,
-                    &rhs_value,
-                );
-                self.require_int_invariant(
-                    state,
-                    result_ty,
-                    &result.term,
-                    span,
-                    "type invariant does not hold".to_owned(),
-                )?;
-                result.value
-            }
-            BinOp::Sub | BinOp::SubWithOverflow => {
-                let result = self.solver.lower_int_binary_value(
-                    IntValueBinaryOp::Sub,
-                    &lhs_value,
-                    &rhs_value,
-                );
-                self.require_int_invariant(
-                    state,
-                    result_ty,
-                    &result.term,
-                    span,
-                    "type invariant does not hold".to_owned(),
-                )?;
-                result.value
-            }
-            BinOp::Mul | BinOp::MulWithOverflow => {
-                let result = self.solver.lower_int_binary_value(
-                    IntValueBinaryOp::Mul,
-                    &lhs_value,
-                    &rhs_value,
-                );
-                self.require_int_invariant(
-                    state,
-                    result_ty,
-                    &result.term,
-                    span,
-                    "type invariant does not hold".to_owned(),
-                )?;
-                result.value
-            }
-            other => {
-                return Err(self.unsupported_result(
-                    span,
-                    format!("unsupported checked binary operator {other:?}"),
-                ));
-            }
-        };
-        let overflow_value = self.overflow_value_for_result(result_ty, &result_value, span)?;
-        self.solver_result(
+        let result = self.lower_checked_binary_value(op, &lhs_value, &rhs_value, span)?;
+        self.require_int_invariant(
+            state,
+            result_ty,
+            &result.term,
             span,
-            self.solver
-                .checked_result_tuple_value(result_spec_ty, result_value, overflow_value),
-        )
+            "type invariant does not hold".to_owned(),
+        )?;
+        self.checked_binary_result_value(result_ty, result.value, span)
     }
 
     fn eval_unary_op(
@@ -4570,24 +4441,17 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<SymValue, VerificationResult> {
         let value = self.eval_operand(state, operand, span)?;
         let operand_ty = operand.ty(&self.body().local_decls, self.tcx);
-        let result = match op {
-            UnOp::Not => Ok(self.solver.lower_bool_not_value(&value)),
-            UnOp::Neg => {
-                let result = self.solver.lower_int_neg_value(&value);
-                self.require_int_invariant(
-                    state,
-                    operand_ty,
-                    &result.term,
-                    span,
-                    "type invariant does not hold".to_owned(),
-                )?;
-                Ok(result.value)
-            }
-            other => {
-                Err(self.unsupported_result(span, format!("unsupported unary operator {other:?}")))
-            }
-        }?;
-        Ok(result)
+        let (value, int_term) = self.lower_unary_value_for_eval(op, &value, span)?;
+        if let Some(term) = int_term {
+            self.require_int_invariant(
+                state,
+                operand_ty,
+                &term,
+                span,
+                "type invariant does not hold".to_owned(),
+            )?;
+        }
+        Ok(value)
     }
 
     fn eval_operand(
@@ -4746,14 +4610,15 @@ impl<'tcx> Verifier<'tcx> {
             }
             PlaceElem::Field(field, _) => {
                 let next = self.project_field(value, spec_ty, field.index(), span)?;
-                let Some(field_spec_ty) = self.composite_spec_field_ty(spec_ty, field.index())
+                let Some(field_spec_ty) =
+                    self.composite_spec_field_ty(spec_ty, field.index(), span)?
                 else {
                     return Err(self.unsupported_result(
                         span,
                         "field projection on non-composite place".to_owned(),
                     ));
                 };
-                self.read_projection(next, field_spec_ty, &projection[1..], mode, span)
+                self.read_projection(next, &field_spec_ty, &projection[1..], mode, span)
             }
             other => {
                 Err(self
@@ -4823,13 +4688,16 @@ impl<'tcx> Verifier<'tcx> {
             }
             PlaceElem::Field(field, _) => {
                 let index = field.index();
-                let field_count = self.composite_spec_field_count(spec_ty).ok_or_else(|| {
-                    self.unsupported_result(
-                        span,
-                        "field assignment on non-composite place".to_owned(),
-                    )
-                })?;
-                let Some(field_spec_ty) = self.composite_spec_field_ty(spec_ty, index) else {
+                let field_count =
+                    self.composite_spec_field_count(spec_ty, span)?
+                        .ok_or_else(|| {
+                            self.unsupported_result(
+                                span,
+                                "field assignment on non-composite place".to_owned(),
+                            )
+                        })?;
+                let Some(field_spec_ty) = self.composite_spec_field_ty(spec_ty, index, span)?
+                else {
                     return Err(
                         self.unsupported_result(span, "field index out of range".to_owned())
                     );
@@ -4841,7 +4709,7 @@ impl<'tcx> Verifier<'tcx> {
                     if current_index == index {
                         items.push(self.write_projection(
                             field_value,
-                            field_spec_ty,
+                            &field_spec_ty,
                             &projection[1..],
                             replacement.clone(),
                             span,
@@ -4881,14 +4749,6 @@ impl<'tcx> Verifier<'tcx> {
                 for (index, field_ty) in items.iter().enumerate() {
                     let field_value = self.project_field(value.clone(), spec_ty, index, span)?;
                     updated.push(self.dangle_value(field_ty, &field_value, span)?);
-                }
-                self.construct_composite(spec_ty, &updated)
-            }
-            SpecTy::Record(struct_ty) => {
-                let mut updated = Vec::with_capacity(struct_ty.fields.len());
-                for (index, field_ty) in struct_ty.fields.iter().enumerate() {
-                    let field_value = self.project_field(value.clone(), spec_ty, index, span)?;
-                    updated.push(self.dangle_value(&field_ty.ty, &field_value, span)?);
                 }
                 self.construct_composite(spec_ty, &updated)
             }
@@ -7016,7 +6876,9 @@ impl<'tcx> Verifier<'tcx> {
     ) -> Result<SymValue, VerificationResult> {
         let field_len = match payload_ty {
             SpecTy::Tuple(items) => items.len(),
-            SpecTy::Record(struct_ty) => struct_ty.fields.len(),
+            SpecTy::Struct { .. } => self
+                .struct_fields_for_ty(payload_ty, self.report_span())?
+                .len(),
             _ => {
                 return Err(self.unsupported_result(
                     self.report_span(),
@@ -7133,20 +6995,32 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
-    fn composite_spec_field_count(&self, ty: &SpecTy) -> Option<usize> {
-        match ty {
+    fn composite_spec_field_count(
+        &self,
+        ty: &SpecTy,
+        span: Span,
+    ) -> Result<Option<usize>, VerificationResult> {
+        Ok(match ty {
             SpecTy::Tuple(items) => Some(items.len()),
-            SpecTy::Record(struct_ty) => Some(struct_ty.fields.len()),
+            SpecTy::Struct { .. } => Some(self.struct_fields_for_ty(ty, span)?.len()),
             _ => None,
-        }
+        })
     }
 
-    fn composite_spec_field_ty<'a>(&self, ty: &'a SpecTy, index: usize) -> Option<&'a SpecTy> {
-        match ty {
-            SpecTy::Tuple(items) => items.get(index),
-            SpecTy::Record(struct_ty) => struct_ty.fields.get(index).map(|field| &field.ty),
+    fn composite_spec_field_ty(
+        &self,
+        ty: &SpecTy,
+        index: usize,
+        span: Span,
+    ) -> Result<Option<SpecTy>, VerificationResult> {
+        Ok(match ty {
+            SpecTy::Tuple(items) => items.get(index).cloned(),
+            SpecTy::Struct { .. } => self
+                .struct_fields_for_ty(ty, span)?
+                .get(index)
+                .map(|field| field.ty.clone()),
             _ => None,
-        }
+        })
     }
 
     fn fresh_name(&self, hint: &str) -> String {
@@ -7361,32 +7235,6 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(Some(bool_and(formulas)))
             }
-            SpecTy::Record(struct_ty) => {
-                if let Some(formula) =
-                    self.direct_struct_invariant_formula(ty, struct_ty, value, span)?
-                {
-                    let mut formulas = vec![formula];
-                    if let Some(user_formula) =
-                        self.user_struct_invariant_formula(ty, struct_ty, value, span)?
-                    {
-                        formulas.push(user_formula);
-                    }
-                    return Ok(Some(bool_and(formulas)));
-                }
-                let view = self.composite_ctor_view(ty, value, 0, span)?;
-                let mut formulas = vec![view.tag];
-                for (field, (_, field_value)) in struct_ty.fields.iter().zip(view.fields) {
-                    if let Some(formula) = self.spec_ty_formula(&field.ty, &field_value, span)? {
-                        formulas.push(formula);
-                    }
-                }
-                if let Some(user_formula) =
-                    self.user_struct_invariant_formula(ty, struct_ty, value, span)?
-                {
-                    formulas.push(user_formula);
-                }
-                Ok(Some(bool_and(formulas)))
-            }
             SpecTy::Struct { name, .. } => {
                 if name == "Ptr" {
                     return Ok(Some(self.composite_tag_formula(ty, value, 0, span)?));
@@ -7498,22 +7346,6 @@ impl<'tcx> Verifier<'tcx> {
                 .map(|item| self.instantiate_spec_ty(item, bindings, span))
                 .collect::<Result<Vec<_>, _>>()
                 .map(SpecTy::Tuple),
-            SpecTy::Record(struct_ty) => struct_ty
-                .fields
-                .iter()
-                .map(|field| {
-                    Ok(StructFieldTy {
-                        name: field.name.clone(),
-                        ty: self.instantiate_spec_ty(&field.ty, bindings, span)?,
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map(|fields| {
-                    SpecTy::Record(crate::spec::StructTy {
-                        name: struct_ty.name.clone(),
-                        fields,
-                    })
-                }),
             SpecTy::Struct { name, args } => args
                 .iter()
                 .map(|arg| self.instantiate_spec_ty(arg, bindings, span))
@@ -7540,57 +7372,6 @@ impl<'tcx> Verifier<'tcx> {
                 self.instantiate_spec_ty(inner, bindings, span)?,
             ))),
         }
-    }
-
-    fn direct_struct_invariant_formula(
-        &self,
-        ty: &SpecTy,
-        struct_ty: &crate::spec::StructTy,
-        value: &SymValue,
-        span: Span,
-    ) -> Result<Option<Bool>, VerificationResult> {
-        let Some(fields) = self
-            .solver
-            .direct_composite_fields_for_ty(ty, value)
-            .map_err(|err| self.unsupported_result(span, err))?
-        else {
-            return Ok(None);
-        };
-        let mut formulas = Vec::new();
-        for (field, field_value) in struct_ty.fields.iter().zip(fields) {
-            if let Some(formula) = self.spec_ty_formula(&field.ty, &field_value, span)? {
-                formulas.push(formula);
-            }
-        }
-        Ok(Some(bool_and(formulas)))
-    }
-
-    fn user_struct_invariant_formula(
-        &self,
-        ty: &SpecTy,
-        struct_ty: &crate::spec::StructTy,
-        value: &SymValue,
-        span: Span,
-    ) -> Result<Option<Bool>, VerificationResult> {
-        let Some(invariant) = self.struct_invariants.get(&struct_ty.name) else {
-            return Ok(None);
-        };
-        let mut env = HashMap::new();
-        for field in &invariant.fields {
-            let Some((index, _)) = struct_ty.field(&field.name) else {
-                return Err(self.unsupported_result(
-                    span,
-                    format!(
-                        "struct `{}` invariant field `{}` is missing",
-                        struct_ty.name, field.name
-                    ),
-                ));
-            };
-            let field_value = self.project_field(value.clone(), ty, index, span)?;
-            env.insert(field.name.clone(), field_value);
-        }
-        self.contract_expr_to_bool(&env, &HashMap::new(), &invariant.condition)
-            .map(Some)
     }
 
     fn resolve_formula_for_spec_ty(
@@ -7642,22 +7423,6 @@ impl<'tcx> Verifier<'tcx> {
                 formulas.push(view.tag);
                 for (field_ty, (_, field)) in items.iter().zip(view.fields) {
                     formulas.push(self.resolve_formula_for_spec_ty(field_ty, &field, span)?);
-                }
-                Ok(bool_and(formulas))
-            }
-            SpecTy::Record(struct_ty) => {
-                if struct_ty.name == "Ptr" {
-                    return self.composite_tag_formula(ty, value, 0, span);
-                }
-                let view = self.composite_ctor_view(ty, value, 0, span)?;
-                let mut formulas = Vec::with_capacity(struct_ty.fields.len() + 1);
-                formulas.push(view.tag);
-                for (field, (_, field_value)) in struct_ty.fields.iter().zip(view.fields) {
-                    formulas.push(self.resolve_formula_for_spec_ty(
-                        &field.ty,
-                        &field_value,
-                        span,
-                    )?);
                 }
                 Ok(bool_and(formulas))
             }
@@ -8255,10 +8020,6 @@ fn spec_ty_contains_mut_ref(ty: &SpecTy) -> bool {
         SpecTy::Ref(inner) => spec_ty_contains_mut_ref(inner),
         SpecTy::Seq(inner) => spec_ty_contains_mut_ref(inner),
         SpecTy::Tuple(items) => items.iter().any(spec_ty_contains_mut_ref),
-        SpecTy::Record(struct_ty) => struct_ty
-            .fields
-            .iter()
-            .any(|field| spec_ty_contains_mut_ref(&field.ty)),
         _ => false,
     }
 }

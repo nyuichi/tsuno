@@ -10,7 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::spec::{
-    BinaryOp, EnumDef, RustTyKey, SpecTy, StructDef, StructTy, UnaryOp, option_spec_ty, ptr_spec_ty,
+    BinaryOp, EnumDef, RustTyKey, SpecTy, StructDef, UnaryOp, option_spec_ty, ptr_spec_ty,
 };
 use z3::ast::{self, Ast, BV, Bool, Dynamic, Int, Seq as Z3Seq};
 use z3::{
@@ -493,14 +493,6 @@ impl Solver {
         with_z3_solver(|solver| {
             self.composite_ctor_view_for_ty_with_z3(ty, ctor_index, value, solver)
         })
-    }
-
-    pub(crate) fn direct_composite_fields_for_ty(
-        &self,
-        ty: &SpecTy,
-        value: &SymValue,
-    ) -> Result<Option<Vec<SymValue>>, String> {
-        with_z3_solver(|solver| self.direct_composite_fields_for_ty_with_z3(ty, value, solver))
     }
 
     pub(crate) fn direct_composite_ctor_fields_for_ty(
@@ -1088,7 +1080,6 @@ impl Solver {
                 .map(|(lhs, rhs)| lhs == rhs)),
             SpecTy::Tuple(_)
             | SpecTy::Struct { .. }
-            | SpecTy::Record(_)
             | SpecTy::Enum { .. }
             | SpecTy::Ref(_)
             | SpecTy::Mut(_) => self.try_ground_composite_eq_for_spec_ty(ty, lhs, rhs),
@@ -1525,32 +1516,6 @@ impl Solver {
         Ok(CompositeCtorView { tag, fields })
     }
 
-    fn direct_composite_fields(
-        &self,
-        composite: &CompositeEncoding,
-        value: &SymValue,
-    ) -> Result<Option<Vec<SymValue>>, String> {
-        let ctor = composite.single_constructor()?;
-        if value.dynamic().decl().name() != ctor.symbol.name() {
-            return Ok(None);
-        }
-        let children = value.dynamic().children();
-        if children.len() != ctor.fields.len() {
-            return Ok(None);
-        }
-        Ok(Some(children.into_iter().map(SymValue::new).collect()))
-    }
-
-    fn direct_composite_fields_for_ty_with_z3(
-        &self,
-        ty: &SpecTy,
-        value: &SymValue,
-        solver: &Z3Solver,
-    ) -> Result<Option<Vec<SymValue>>, String> {
-        let composite = self.composite_encoding(ty, solver)?;
-        self.direct_composite_fields(&composite, value)
-    }
-
     fn direct_composite_ctor_fields(
         &self,
         composite: &CompositeEncoding,
@@ -1720,7 +1685,6 @@ impl Solver {
             SpecTy::Seq(_) => (TypeEncodingKind::Seq, self.seq_value_sort.clone()),
             SpecTy::Tuple(_)
             | SpecTy::Struct { .. }
-            | SpecTy::Record(_)
             | SpecTy::Enum { .. }
             | SpecTy::Ref(_)
             | SpecTy::Mut(_) => (
@@ -2159,22 +2123,6 @@ impl Solver {
                 }
                 Ok(Some(bool_conjoin(forms)))
             }
-            SpecTy::Record(struct_ty) => {
-                let composite = self.composite_encoding(ty, solver)?;
-                if struct_ty.name == "Ptr" {
-                    return Ok(Some(self.tag_formula(&composite, 0, value)?));
-                }
-                let mut forms = vec![self.tag_formula(&composite, 0, value)?];
-                for (index, field_ty) in struct_ty.fields.iter().enumerate() {
-                    let field = self.project_composite_field(&composite, value, index)?;
-                    if let Some(formula) =
-                        self.field_invariant_formula(&field_ty.ty, &field, solver)?
-                    {
-                        forms.push(formula);
-                    }
-                }
-                Ok(Some(bool_conjoin(forms)))
-            }
             SpecTy::Struct { name, args } => {
                 let composite = self.composite_encoding(ty, solver)?;
                 if name == "Ptr" {
@@ -2283,13 +2231,6 @@ impl Solver {
                         .collect::<Result<Vec<_>, String>>()?,
                 )])
             }
-            SpecTy::Record(StructTy { fields, .. }) => Ok(vec![(
-                String::new(),
-                fields
-                    .iter()
-                    .map(|field| (field.name.clone(), field.ty.clone()))
-                    .collect(),
-            )]),
             SpecTy::Enum { name, args } => self.named_ctor_specs(name, args),
             other => Err(format!(
                 "expected composite-backed spec type, found {other:?}"
@@ -2367,19 +2308,6 @@ impl Solver {
                     .map(|item| self.instantiate_named_field_ty(item, bindings))
                     .collect::<Result<Vec<_>, _>>()?,
             )),
-            SpecTy::Record(struct_ty) => Ok(SpecTy::Record(StructTy {
-                name: struct_ty.name.clone(),
-                fields: struct_ty
-                    .fields
-                    .iter()
-                    .map(|field| {
-                        Ok(crate::spec::StructFieldTy {
-                            name: field.name.clone(),
-                            ty: self.instantiate_named_field_ty(&field.ty, bindings)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, String>>()?,
-            })),
             SpecTy::Struct { name, args } => Ok(SpecTy::Struct {
                 name: name.clone(),
                 args: args
@@ -2445,7 +2373,6 @@ impl Solver {
                     .collect::<Vec<_>>()
                     .join("_")
             ),
-            SpecTy::Record(struct_ty) => format!("struct_{}", sanitize(&struct_ty.name)),
             SpecTy::Struct { name, args } => self.instantiated_named_type_name(name, args),
             SpecTy::Enum { name, args } => self.instantiated_named_type_name(name, args),
             SpecTy::Seq(inner) => format!("seq_{}", self.type_name(inner)),
@@ -2582,7 +2509,7 @@ pub(crate) fn with_z3_deadline<T>(budget: Duration, f: impl FnOnce() -> T) -> (T
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{StructFieldTy, StructTy};
+    use crate::spec::StructFieldTy;
     use z3::{SatResult, SortKind};
 
     fn with_test_solver<T>(f: impl FnOnce(&Solver, &Z3Solver) -> T) -> T {
@@ -2652,21 +2579,27 @@ mod tests {
             let tuple_encoding = solver
                 .type_encoding(&SpecTy::Tuple(vec![SpecTy::Bool, SpecTy::I32]), z3_solver)
                 .expect("tuple encoding");
+            solver.register_struct_def(StructDef {
+                name: "Pair".to_owned(),
+                type_params: Vec::new(),
+                fields: vec![
+                    StructFieldTy {
+                        name: "flag".to_owned(),
+                        ty: SpecTy::Bool,
+                    },
+                    StructFieldTy {
+                        name: "count".to_owned(),
+                        ty: SpecTy::I32,
+                    },
+                ],
+                invariant: None,
+            });
             let struct_encoding = solver
                 .type_encoding(
-                    &SpecTy::Record(StructTy {
+                    &SpecTy::Struct {
                         name: "Pair".to_owned(),
-                        fields: vec![
-                            StructFieldTy {
-                                name: "flag".to_owned(),
-                                ty: SpecTy::Bool,
-                            },
-                            StructFieldTy {
-                                name: "count".to_owned(),
-                                ty: SpecTy::I32,
-                            },
-                        ],
-                    }),
+                        args: Vec::new(),
+                    },
                     z3_solver,
                 )
                 .expect("struct encoding");
