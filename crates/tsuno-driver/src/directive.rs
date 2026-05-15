@@ -12,8 +12,9 @@ use crate::spec::{
     self, BinaryOp, EnumCtorDef, EnumDef, Expr, GhostBlock, GhostMatchArm, GhostStmt, IntLiteral,
     IntSuffix, LemmaDef, MatchArm, MatchBinding, MatchPattern, PureFnDef, PureFnParam,
     RawAssertion, RawPattern, RustTypeExpr, SpecTy, StandaloneFnContractDef, StandaloneFnParam,
-    StructDef, StructFieldTy, StructLitField, UnaryOp, ValuePattern, ValuePatternStructField,
-    provenance_spec_ty, ptr_spec_ty,
+    StandaloneProofAnchor, StandaloneProofBlock, StandaloneProofDirective,
+    StandaloneProofDirectiveKind, StandaloneProofPayload, StructDef, StructFieldTy, StructLitField,
+    UnaryOp, ValuePattern, ValuePatternStructField, provenance_spec_ty, ptr_spec_ty,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,11 +63,69 @@ pub enum DirectiveAttach {
 }
 
 #[derive(Debug, Clone)]
+pub enum DirectiveOrigin {
+    Inline {
+        line_no: usize,
+    },
+    Standalone {
+        path: String,
+        anchor: StandaloneProofAnchor,
+        directive_index: usize,
+    },
+}
+
+impl DirectiveOrigin {
+    pub fn sort_key(&self) -> usize {
+        match self {
+            Self::Inline { line_no } => *line_no,
+            Self::Standalone {
+                anchor,
+                directive_index,
+                ..
+            } => 1_000_000 + anchor.sort_index() * 1_000 + directive_index,
+        }
+    }
+
+    pub fn display(&self) -> String {
+        match self {
+            Self::Inline { line_no } => format!("inline directive at line {line_no}"),
+            Self::Standalone {
+                path,
+                anchor,
+                directive_index,
+            } => format!(
+                "standalone contract {path} at {} directive #{directive_index}",
+                anchor.display()
+            ),
+        }
+    }
+}
+
+impl StandaloneProofAnchor {
+    fn sort_index(&self) -> usize {
+        match self {
+            Self::Stmt(index) => index * 3,
+            Self::Loop(index) => index * 3 + 1,
+            Self::Exit(index) => index * 3 + 2,
+        }
+    }
+
+    fn display(&self) -> String {
+        match self {
+            Self::Stmt(index) => format!("stmt #{index}"),
+            Self::Loop(index) => format!("loop #{index}"),
+            Self::Exit(index) => format!("exit #{index}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct FunctionDirective {
     pub kind: DirectiveKind,
     pub span: Span,
     pub span_text: String,
     pub line_no: usize,
+    pub origin: DirectiveOrigin,
     pub attach: DirectiveAttach,
     pub payload: DirectivePayload,
     pub scope_span: Option<Span>,
@@ -112,6 +171,26 @@ pub struct CollectedFunctionDirectives {
 }
 
 #[derive(Debug, Clone)]
+pub struct FunctionDirectiveAnchors {
+    pub statements: Vec<StatementDirectiveAnchor>,
+    pub loops: Vec<LoopDirectiveAnchor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StatementDirectiveAnchor {
+    pub span: Span,
+    pub scope_span: Option<Span>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoopDirectiveAnchor {
+    pub loop_expr_id: HirId,
+    pub loop_span: Span,
+    pub body_span: Span,
+    pub entry_span: Span,
+}
+
+#[derive(Debug, Clone)]
 pub struct DirectiveError {
     pub span: Span,
     pub message: String,
@@ -131,9 +210,27 @@ pub fn collect_function_directives<'tcx>(
     match intravisit::walk_body(&mut collector, body) {
         ControlFlow::Continue(()) => {
             directives.extend(collector.directives);
-            directives.sort_by_key(|directive| directive.line_no);
+            directives.sort_by_key(|directive| directive.origin.sort_key());
             Ok(CollectedFunctionDirectives { directives })
         }
+        ControlFlow::Break(err) => Err(err),
+    }
+}
+
+pub fn collect_function_directive_anchors<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+) -> Result<FunctionDirectiveAnchors, DirectiveError> {
+    let body = tcx.hir_body_owned_by(def_id);
+    let mut collector = FunctionAnchorCollector {
+        statements: Vec::new(),
+        loops: Vec::new(),
+    };
+    match intravisit::walk_body(&mut collector, body) {
+        ControlFlow::Continue(()) => Ok(FunctionDirectiveAnchors {
+            statements: collector.statements,
+            loops: collector.loops,
+        }),
         ControlFlow::Break(err) => Err(err),
     }
 }
@@ -175,6 +272,9 @@ fn collect_contract_directives<'tcx>(
             span: item_span,
             span_text: display_line_span(&file_name, entry.line_no, &entry.line_text),
             line_no: entry.line_no,
+            origin: DirectiveOrigin::Inline {
+                line_no: entry.line_no,
+            },
             attach: DirectiveAttach::Function,
             payload,
             scope_span: None,
@@ -1032,7 +1132,7 @@ impl<'a> FunctionDirectiveCollector<'a> {
         let prefix_source = &loop_source[..body_index];
         let entries = loop_invariant_entries(prefix_source, entry_span)?;
         if entries.is_empty() {
-            return Err(self.missing_invariant_error(loop_expr, loop_body));
+            return Ok(());
         };
         if entries.len() > 1 {
             return Err(self.multiple_invariant_error(entry_span));
@@ -1067,6 +1167,7 @@ impl<'a> FunctionDirectiveCollector<'a> {
             span: entry_span,
             span_text,
             line_no,
+            origin: DirectiveOrigin::Inline { line_no },
             attach: DirectiveAttach::Loop {
                 loop_expr_id: loop_expr.hir_id,
                 loop_span: loop_expr.span,
@@ -1229,6 +1330,7 @@ impl<'a> FunctionDirectiveCollector<'a> {
                 span: anchor_span,
                 span_text,
                 line_no,
+                origin: DirectiveOrigin::Inline { line_no },
                 attach: DirectiveAttach::Statement { anchor_span },
                 payload,
                 scope_span,
@@ -1381,6 +1483,118 @@ impl<'tcx> Visitor<'tcx> for FunctionDirectiveCollector<'tcx> {
         if let Err(err) = self.collect_block_directives(block) {
             return ControlFlow::Break(err);
         }
+        intravisit::walk_block(self, block)
+    }
+}
+
+struct FunctionAnchorCollector {
+    statements: Vec<StatementDirectiveAnchor>,
+    loops: Vec<LoopDirectiveAnchor>,
+}
+
+impl<'a> FunctionAnchorCollector {
+    fn collect_loop_anchor(
+        &mut self,
+        loop_expr: &'a HirExpr<'a>,
+        body: &'a Block<'a>,
+        source: LoopSource,
+    ) -> Result<(), DirectiveError> {
+        let loop_body = self.loop_body_block(loop_expr, body, source)?;
+        self.loops.push(LoopDirectiveAnchor {
+            loop_expr_id: loop_expr.hir_id,
+            loop_span: loop_expr.span,
+            body_span: loop_body.span,
+            entry_span: body_entry_span(loop_body),
+        });
+        Ok(())
+    }
+
+    fn collect_block_anchors(&mut self, block: &'a Block<'a>) {
+        for stmt in block.stmts {
+            self.statements.push(StatementDirectiveAnchor {
+                span: stmt.span,
+                scope_span: Some(block.span),
+            });
+        }
+        if let Some(expr) = block.expr {
+            self.statements.push(StatementDirectiveAnchor {
+                span: expr.span,
+                scope_span: Some(block.span),
+            });
+        }
+    }
+
+    fn loop_body_block(
+        &self,
+        loop_expr: &'a HirExpr<'a>,
+        body: &'a Block<'a>,
+        source: LoopSource,
+    ) -> Result<&'a Block<'a>, DirectiveError> {
+        match source {
+            LoopSource::Loop => Ok(body.innermost_block()),
+            LoopSource::While => {
+                let control_expr = self
+                    .first_loop_control_expr(body)
+                    .ok_or_else(|| self.unsupported_loop_shape_error(loop_expr.span))?;
+                let control_expr = control_expr.peel_blocks().peel_drop_temps();
+                let ExprKind::If(_, then, _) = control_expr.kind else {
+                    return Err(self.unsupported_loop_shape_error(control_expr.span));
+                };
+                let ExprKind::Block(then_block, _) = then.peel_blocks().kind else {
+                    return Err(self.unsupported_loop_shape_error(then.span));
+                };
+                Ok(then_block.innermost_block())
+            }
+            LoopSource::ForLoop => {
+                let control_expr = self
+                    .first_loop_control_expr(body)
+                    .ok_or_else(|| self.unsupported_loop_shape_error(loop_expr.span))?;
+                let control_expr = control_expr.peel_blocks().peel_drop_temps();
+                let ExprKind::Match(_, arms, MatchSource::ForLoopDesugar) = control_expr.kind
+                else {
+                    return Err(self.unsupported_loop_shape_error(control_expr.span));
+                };
+                for arm in arms {
+                    let arm_body = arm.body.peel_blocks().peel_drop_temps();
+                    if let ExprKind::Block(block, _) = arm_body.kind {
+                        return Ok(block.innermost_block());
+                    }
+                }
+                Err(self.unsupported_loop_shape_error(control_expr.span))
+            }
+        }
+    }
+
+    fn first_loop_control_expr(&self, body: &'a Block<'a>) -> Option<&'a HirExpr<'a>> {
+        if let Some(expr) = body.expr {
+            return Some(expr);
+        }
+        body.stmts.iter().find_map(stmt_expr)
+    }
+
+    fn unsupported_loop_shape_error(&self, span: Span) -> DirectiveError {
+        DirectiveError {
+            span,
+            message: "unsupported loop desugaring shape for proof anchor".to_owned(),
+        }
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for FunctionAnchorCollector {
+    type NestedFilter = intravisit::nested_filter::None;
+    type Result = ControlFlow<DirectiveError>;
+
+    fn visit_expr(&mut self, expr: &'tcx HirExpr<'tcx>) -> Self::Result {
+        if let ExprKind::Loop(body, _, source, _) = expr.kind
+            && let Err(err) = self.collect_loop_anchor(expr, body, source)
+        {
+            return ControlFlow::Break(err);
+        }
+        intravisit::walk_expr(self, expr)
+    }
+
+    fn visit_block(&mut self, block: &'tcx Block<'tcx>) -> Self::Result {
+        self.collect_block_anchors(block);
         intravisit::walk_block(self, block)
     }
 }
@@ -2903,9 +3117,16 @@ impl<'a> GhostBlockParser<'a> {
         let mut raw_reqs = Vec::new();
         let mut ens = None;
         let mut raw_ens = Vec::new();
+        let mut proof_blocks = Vec::new();
         loop {
             self.skip_ws();
             if self.eat_char(';') {
+                break;
+            }
+            if self.peek_char() == Some('{') {
+                self.expect_char('{')?;
+                let body = self.parse_braced_body()?;
+                proof_blocks = self.parse_standalone_proof_blocks(body, &type_params)?;
                 break;
             }
             if self.starts_with_keyword("raw") {
@@ -2953,6 +3174,147 @@ impl<'a> GhostBlockParser<'a> {
             raw_reqs,
             ens: ens.unwrap_or(Expr::Bool(true)),
             raw_ens,
+            proof_blocks,
+        })
+    }
+
+    fn parse_standalone_proof_blocks(
+        &self,
+        body: &'a str,
+        type_params: &[String],
+    ) -> Result<Vec<StandaloneProofBlock>, ParseError> {
+        let mut parser = Self::new(body);
+        let mut blocks = Vec::new();
+        while parser.skip_ws() {
+            parser.expect_keyword("at")?;
+            let anchor = parser.parse_standalone_proof_anchor()?;
+            parser.expect_char('{')?;
+            let body = parser.parse_braced_body()?;
+            let directives = parser.parse_standalone_proof_directives(body, type_params)?;
+            blocks.push(StandaloneProofBlock { anchor, directives });
+        }
+        Ok(blocks)
+    }
+
+    fn parse_standalone_proof_anchor(&mut self) -> Result<StandaloneProofAnchor, ParseError> {
+        let kind = self.parse_ident()?;
+        self.expect_char('#')?;
+        let index = self.parse_usize()?;
+        match kind.as_str() {
+            "stmt" => Ok(StandaloneProofAnchor::Stmt(index)),
+            "loop" => Ok(StandaloneProofAnchor::Loop(index)),
+            "exit" => Ok(StandaloneProofAnchor::Exit(index)),
+            _ => Err(ParseError::new(format!(
+                "unknown standalone proof anchor `{kind}`"
+            ))),
+        }
+    }
+
+    fn parse_standalone_proof_directives(
+        &self,
+        body: &'a str,
+        type_params: &[String],
+    ) -> Result<Vec<StandaloneProofDirective>, ParseError> {
+        let mut parser = Self::new(body);
+        let mut directives = Vec::new();
+        while parser.skip_ws() {
+            directives.push(parser.parse_standalone_proof_directive(type_params)?);
+        }
+        Ok(directives)
+    }
+
+    fn parse_standalone_proof_directive(
+        &mut self,
+        type_params: &[String],
+    ) -> Result<StandaloneProofDirective, ParseError> {
+        if self.starts_with_keyword("raw") {
+            self.expect_keyword("raw")?;
+            self.expect_keyword("assert")?;
+            let (text, next) = self.parse_stmt_expr_text(self.text, self.cursor)?;
+            self.cursor = next;
+            return Ok(StandaloneProofDirective {
+                kind: StandaloneProofDirectiveKind::RawAssert,
+                payload: StandaloneProofPayload::RawAssert(Box::new(
+                    parse_raw_assertion_with_type_params(text, type_params)?,
+                )),
+            });
+        }
+        if self.starts_with_keyword("let") {
+            self.expect_keyword("let")?;
+            let (text, next) = self.parse_stmt_expr_text(self.text, self.cursor)?;
+            self.cursor = next;
+            let Some((name, value)) = text.split_once('=') else {
+                return Err(ParseError::new(
+                    "standalone proof let directive must have the form `let name = expr;`",
+                ));
+            };
+            let name = name.trim();
+            if !is_ident(name) {
+                return Err(ParseError::new(
+                    "standalone proof let directive must bind an identifier",
+                ));
+            }
+            let value = parse_source_expr_with_type_params(
+                "standalone proof let",
+                value.trim(),
+                type_params,
+            )?;
+            return Ok(StandaloneProofDirective {
+                kind: StandaloneProofDirectiveKind::Let,
+                payload: StandaloneProofPayload::Let {
+                    name: name.to_owned(),
+                    value,
+                },
+            });
+        }
+        if self.starts_with_keyword("inv") {
+            self.expect_keyword("inv")?;
+            let (text, next) = self.parse_stmt_expr_text(self.text, self.cursor)?;
+            self.cursor = next;
+            return Ok(StandaloneProofDirective {
+                kind: StandaloneProofDirectiveKind::Inv,
+                payload: StandaloneProofPayload::Predicate(parse_source_expr_with_type_params(
+                    "standalone proof invariant",
+                    text,
+                    type_params,
+                )?),
+            });
+        }
+        if self.starts_with_keyword("assert") {
+            self.expect_keyword("assert")?;
+            let (text, next) = self.parse_stmt_expr_text(self.text, self.cursor)?;
+            self.cursor = next;
+            return Ok(StandaloneProofDirective {
+                kind: StandaloneProofDirectiveKind::Assert,
+                payload: StandaloneProofPayload::Predicate(parse_source_expr_with_type_params(
+                    "standalone proof assert",
+                    text,
+                    type_params,
+                )?),
+            });
+        }
+        if self.starts_with_keyword("assume") {
+            self.expect_keyword("assume")?;
+            let (text, next) = self.parse_stmt_expr_text(self.text, self.cursor)?;
+            self.cursor = next;
+            return Ok(StandaloneProofDirective {
+                kind: StandaloneProofDirectiveKind::Assume,
+                payload: StandaloneProofPayload::Predicate(parse_source_expr_with_type_params(
+                    "standalone proof assume",
+                    text,
+                    type_params,
+                )?),
+            });
+        }
+        let (text, next) = self.parse_stmt_expr_text(self.text, self.cursor)?;
+        self.cursor = next;
+        Ok(StandaloneProofDirective {
+            kind: StandaloneProofDirectiveKind::LemmaCall,
+            payload: StandaloneProofPayload::LemmaCall(parse_source_expr_with_type_params(
+                "standalone proof lemma call",
+                text,
+                type_params,
+            )?),
         })
     }
 
@@ -3589,6 +3951,24 @@ impl<'a> GhostBlockParser<'a> {
         Ok(self.text[start..self.cursor].to_owned())
     }
 
+    fn parse_usize(&mut self) -> Result<usize, ParseError> {
+        self.skip_ws();
+        let start = self.cursor;
+        while let Some(ch) = self.peek_char() {
+            if ch.is_ascii_digit() {
+                self.cursor += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if start == self.cursor {
+            return Err(ParseError::new("expected numeric proof anchor index"));
+        }
+        self.text[start..self.cursor]
+            .parse()
+            .map_err(|_| ParseError::new("invalid proof anchor index"))
+    }
+
     fn expect_keyword(&mut self, keyword: &str) -> Result<(), ParseError> {
         self.skip_ws();
         if self.starts_with_keyword(keyword) {
@@ -3658,11 +4038,63 @@ mod tests {
     use crate::spec::{
         BinaryOp, EnumCtorDef, EnumDef, Expr, GhostBlock, GhostStmt, IntLiteral, IntSuffix,
         LemmaDef, MatchArm, MatchBinding, MatchPattern, PureFnDef, PureFnParam, RustTypeExpr,
-        SpecTy, StructDef, StructFieldTy, UnaryOp,
+        SpecTy, StandaloneProofAnchor, StandaloneProofDirectiveKind, StandaloneProofPayload,
+        StructDef, StructFieldTy, UnaryOp,
     };
 
     fn true_expr() -> Expr {
         Expr::Bool(true)
+    }
+
+    #[test]
+    fn parses_standalone_contract_proof_blocks() {
+        let block = parse_ghost_block(
+            r#"
+            fn foo(x: i32) -> i32
+              req x >= 0i32
+              ens result >= x
+            {
+              at stmt #0 {
+                let old_x = {x};
+                assert old_x == {x};
+              }
+              at loop #0 {
+                inv 0i32 <= {i} && {i} <= {x};
+              }
+              at exit #0 {
+                assume true;
+              }
+            }
+            "#,
+        )
+        .expect("ghost block");
+        let contract = &block.standalone_fn_contracts[0];
+        assert_eq!(contract.proof_blocks.len(), 3);
+        assert_eq!(
+            contract.proof_blocks[0].anchor,
+            StandaloneProofAnchor::Stmt(0)
+        );
+        assert_eq!(contract.proof_blocks[0].directives.len(), 2);
+        assert_eq!(
+            contract.proof_blocks[0].directives[0].kind,
+            StandaloneProofDirectiveKind::Let
+        );
+        assert!(matches!(
+            contract.proof_blocks[0].directives[0].payload,
+            StandaloneProofPayload::Let { .. }
+        ));
+        assert_eq!(
+            contract.proof_blocks[1].anchor,
+            StandaloneProofAnchor::Loop(0)
+        );
+        assert_eq!(
+            contract.proof_blocks[1].directives[0].kind,
+            StandaloneProofDirectiveKind::Inv
+        );
+        assert_eq!(
+            contract.proof_blocks[2].anchor,
+            StandaloneProofAnchor::Exit(0)
+        );
     }
 
     #[test]

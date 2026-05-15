@@ -413,7 +413,7 @@ standalone function contract is a ghost item of the form
 `fn path::to::item<T>(...) -> ResultTy` or
 `unsafe fn path::to::item<T>(...) -> ResultTy`, followed by ordinary `req`/`ens`
 clauses and, for unsafe functions, raw `raw req`/`raw ens` clauses, and
-terminated by `;`. The parameter and result types use Rust type syntax, while
+terminated by `;` or followed by a standalone proof body. The parameter and result types use Rust type syntax, while
 ordinary contract expressions see the corresponding spec model values.
 Standalone contracts may target existing safe or unsafe Rust functions. If the
 target function body also has inline contract directives, the duplicate
@@ -429,6 +429,38 @@ unsafe fn core::intrinsics::read_via_copy<T>(ptr: *const T) -> T
 ;
 */
 ```
+
+A standalone proof body attaches function-body directives without writing them
+inside the Rust function body. The body contains `at` blocks:
+
+```rust
+/*@
+fn count_to(n: i32) -> ()
+  req n >= 0i32
+  ens true
+{
+  at stmt #0 {
+    let initial = {n};
+    assert initial == {n};
+  }
+  at loop #0 {
+    inv 0i32 <= {x} && {x} <= {n};
+  }
+  at exit #0 {
+    assert true;
+  }
+}
+*/
+```
+
+Rules:
+
+- `at stmt #N` attaches directives immediately before the Nth statement or tail expression visited in function-body order, including statements inside nested blocks
+- `at loop #N` attaches to the Nth loop visited in function-body order and must contain exactly one `inv` directive
+- `at exit #N` attaches directives immediately before the Nth return terminator
+- `at stmt` and `at exit` blocks may contain `let`, `assert`, `assume`, `raw assert`, and lemma-call directives
+- directive expressions inside `at` blocks use the same runtime syntax as inline body directives, so Rust locals are written as `{name}`
+- a function body may not mix inline body directives with standalone proof-body directives
 
 Enum variant selectors use `expr as Enum::Ctor` or
 `expr as Enum::Ctor::<T, ...>`. The selector projects the payload of the named

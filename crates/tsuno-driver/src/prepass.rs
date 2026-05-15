@@ -5,15 +5,17 @@ use std::ops::ControlFlow;
 use std::sync::OnceLock;
 
 use crate::directive::{
-    CollectedFunctionDirectives, DirectiveAttach, DirectiveError, DirectiveKind, FunctionDirective,
-    collect_function_directives, collect_ghost_blocks, collect_non_ghost_spec_comments,
+    CollectedFunctionDirectives, DirectiveAttach, DirectiveError, DirectiveKind, DirectiveOrigin,
+    FunctionDirective, collect_function_directive_anchors, collect_function_directives,
+    collect_ghost_blocks, collect_non_ghost_spec_comments,
 };
 use crate::report::{VerificationResult, VerificationStatus};
 use crate::spec::{
     EnumDef, Expr, GhostMatchArm, LemmaDef, MatchBinding, MatchPattern, PureFnDef, PureFnParam,
     RawAssertion, RawPattern, RustTyKey, RustTypeExpr, SpecTy, StandaloneFnContractDef,
-    StandaloneFnParam, StructDef, StructFieldTy, TypedExpr, TypedExprKind, TypedMatchArm,
-    TypedMatchBinding, ValuePattern, layout_spec_ty, option_spec_ty, ptr_spec_ty,
+    StandaloneFnParam, StandaloneProofAnchor, StandaloneProofDirectiveKind, StandaloneProofPayload,
+    StructDef, StructFieldTy, TypedExpr, TypedExprKind, TypedMatchArm, TypedMatchBinding,
+    ValuePattern, layout_spec_ty, option_spec_ty, ptr_spec_ty,
 };
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{
@@ -1876,6 +1878,7 @@ fn normalize_standalone_fn_contract_def(
         raw_reqs: def.raw_reqs.clone(),
         ens: def.ens.clone(),
         raw_ens: def.raw_ens.clone(),
+        proof_blocks: def.proof_blocks.clone(),
     })
 }
 
@@ -5126,8 +5129,18 @@ fn compute_directives<'tcx>(
     let binding_info = collect_hir_binding_info(tcx, def_id)?;
     let hir_locals = compute_hir_locals(tcx, body, &binding_info);
     let directive_type_param_scope = HashSet::new();
-    let directives =
+    let mut directives =
         collect_function_directives(tcx, def_id, item_span).map_err(directive_error_to_prepass)?;
+    let path = tcx.def_path_str(def_id.to_def_id());
+    append_standalone_proof_directives(
+        tcx,
+        def_id,
+        item_span,
+        body,
+        ghosts,
+        &path,
+        &mut directives,
+    )?;
     let unsafe_blocks = collect_unsafe_block_spans(tcx, def_id);
     reject_directives_inside_unsafe_blocks(&directives, &unsafe_blocks)?;
     let mut contract_scope = SpecScope::default();
@@ -6145,6 +6158,174 @@ fn compute_directives<'tcx>(
         function_contract,
         unsafe_blocks,
     })
+}
+
+fn append_standalone_proof_directives<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    item_span: Span,
+    body: &Body<'tcx>,
+    ghosts: &RawGlobalGhostPrepass,
+    path: &str,
+    directives: &mut CollectedFunctionDirectives,
+) -> Result<(), LoopPrepassError> {
+    let Some(def) = ghosts.standalone_fn_contracts.get(path) else {
+        return Ok(());
+    };
+    if def.proof_blocks.is_empty() {
+        return Ok(());
+    }
+    if directives.directives.iter().any(|directive| {
+        !matches!(
+            directive.kind,
+            DirectiveKind::Req | DirectiveKind::Ens | DirectiveKind::RawReq | DirectiveKind::RawEns
+        ) && !matches!(
+            (directive.kind, &directive.attach),
+            (DirectiveKind::Let, DirectiveAttach::Function)
+        )
+    }) {
+        return Err(LoopPrepassError {
+            span: item_span,
+            display_span: None,
+            message: "inline body directives cannot be mixed with standalone proof directives"
+                .to_owned(),
+        });
+    }
+
+    let anchors =
+        collect_function_directive_anchors(tcx, def_id).map_err(directive_error_to_prepass)?;
+    let exits = function_exit_spans(body);
+    for proof_block in &def.proof_blocks {
+        let (attach, scope_span) = match proof_block.anchor {
+            StandaloneProofAnchor::Stmt(index) => {
+                let anchor = anchors
+                    .statements
+                    .get(index)
+                    .ok_or_else(|| LoopPrepassError {
+                        span: item_span,
+                        display_span: None,
+                        message: format!(
+                            "standalone proof anchor `at stmt #{index}` does not exist in `{path}`"
+                        ),
+                    })?;
+                (
+                    DirectiveAttach::Statement {
+                        anchor_span: anchor.span,
+                    },
+                    anchor.scope_span,
+                )
+            }
+            StandaloneProofAnchor::Loop(index) => {
+                let anchor = anchors.loops.get(index).ok_or_else(|| LoopPrepassError {
+                    span: item_span,
+                    display_span: None,
+                    message: format!(
+                        "standalone proof anchor `at loop #{index}` does not exist in `{path}`"
+                    ),
+                })?;
+                if proof_block.directives.len() != 1
+                    || proof_block.directives[0].kind != StandaloneProofDirectiveKind::Inv
+                {
+                    return Err(LoopPrepassError {
+                        span: item_span,
+                        display_span: None,
+                        message:
+                            "standalone proof `at loop` blocks must contain exactly one `inv` directive"
+                                .to_owned(),
+                    });
+                }
+                (
+                    DirectiveAttach::Loop {
+                        loop_expr_id: anchor.loop_expr_id,
+                        loop_span: anchor.loop_span,
+                        body_span: anchor.body_span,
+                        entry_span: anchor.entry_span,
+                    },
+                    None,
+                )
+            }
+            StandaloneProofAnchor::Exit(index) => {
+                let span = exits.get(index).copied().ok_or_else(|| LoopPrepassError {
+                    span: item_span,
+                    display_span: None,
+                    message: format!(
+                        "standalone proof anchor `at exit #{index}` does not exist in `{path}`"
+                    ),
+                })?;
+                (DirectiveAttach::Statement { anchor_span: span }, None)
+            }
+        };
+        for (directive_index, proof_directive) in proof_block.directives.iter().enumerate() {
+            if matches!(
+                proof_block.anchor,
+                StandaloneProofAnchor::Stmt(_) | StandaloneProofAnchor::Exit(_)
+            ) && proof_directive.kind == StandaloneProofDirectiveKind::Inv
+            {
+                return Err(LoopPrepassError {
+                    span: item_span,
+                    display_span: None,
+                    message: "`inv` directives are only supported in `at loop` proof blocks"
+                        .to_owned(),
+                });
+            }
+            let kind = match proof_directive.kind {
+                StandaloneProofDirectiveKind::Let => DirectiveKind::Let,
+                StandaloneProofDirectiveKind::Inv => DirectiveKind::Inv,
+                StandaloneProofDirectiveKind::Assert => DirectiveKind::Assert,
+                StandaloneProofDirectiveKind::Assume => DirectiveKind::Assume,
+                StandaloneProofDirectiveKind::RawAssert => DirectiveKind::RawAssert,
+                StandaloneProofDirectiveKind::LemmaCall => DirectiveKind::LemmaCall,
+            };
+            let payload = match &proof_directive.payload {
+                StandaloneProofPayload::Predicate(expr) => {
+                    crate::directive::DirectivePayload::Predicate(expr.clone())
+                }
+                StandaloneProofPayload::Let { name, value } => {
+                    crate::directive::DirectivePayload::Let {
+                        name: name.clone(),
+                        value: value.clone(),
+                    }
+                }
+                StandaloneProofPayload::RawAssert(assertion) => {
+                    crate::directive::DirectivePayload::RawAssert(assertion.clone())
+                }
+                StandaloneProofPayload::LemmaCall(expr) => {
+                    crate::directive::DirectivePayload::LemmaCall(expr.clone())
+                }
+            };
+            let origin = DirectiveOrigin::Standalone {
+                path: path.to_owned(),
+                anchor: proof_block.anchor.clone(),
+                directive_index,
+            };
+            let line_no = origin.sort_key();
+            let span_text = origin.display();
+            directives.directives.push(FunctionDirective {
+                kind,
+                span: item_span,
+                span_text,
+                line_no,
+                origin,
+                attach: attach.clone(),
+                payload,
+                scope_span,
+            });
+        }
+    }
+    directives
+        .directives
+        .sort_by_key(|directive| directive.origin.sort_key());
+    Ok(())
+}
+
+fn function_exit_spans(body: &Body<'_>) -> Vec<Span> {
+    body.basic_blocks
+        .iter()
+        .filter_map(|data| {
+            let terminator = data.terminator();
+            matches!(terminator.kind, TerminatorKind::Return).then_some(terminator.source_info.span)
+        })
+        .collect()
 }
 
 fn collect_unsafe_block_spans<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Vec<Span> {
