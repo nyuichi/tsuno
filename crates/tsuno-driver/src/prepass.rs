@@ -1,7 +1,10 @@
 //! HIR/MIR prepass that resolves directives into typed verification input.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::fs;
+use std::io::ErrorKind;
 use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::directive::{
@@ -27,6 +30,35 @@ use rustc_span::def_id::LocalDefId;
 use rustc_span::{DUMMY_SP, Span, Symbol};
 
 const PRELUDE_GHOST_SOURCE: &str = include_str!("../lib/prelude.rs");
+
+struct GhostSource {
+    span: Span,
+    text: String,
+    origin: GhostSourceOrigin,
+}
+
+enum GhostSourceOrigin {
+    Prelude,
+    RustSource,
+    Sidecar { path: PathBuf },
+}
+
+struct GhostItemSink<'a> {
+    enums: &'a mut Vec<EnumDef>,
+    structs: &'a mut Vec<StructDef>,
+    pure_fns: &'a mut Vec<PureFnDef>,
+    lemmas: &'a mut Vec<LemmaDef>,
+    standalone_fn_contracts: &'a mut Vec<StandaloneFnContractDef>,
+}
+
+impl GhostSourceOrigin {
+    fn parse_error_message(&self, err: &crate::directive::ParseError) -> String {
+        match self {
+            Self::Prelude | Self::RustSource => err.to_string(),
+            Self::Sidecar { path } => format!("{}: {err}", path.display()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct HirBindingInfo {
@@ -478,23 +510,22 @@ fn compute_raw_global_ghost_prepass<'tcx>(
     anchor_span: Span,
 ) -> Result<RawGlobalGhostPrepass, LoopPrepassError> {
     validate_global_spec_comment_positions(tcx)?;
-    let sources = collect_global_ghost_sources(tcx, anchor_span);
+    let sources = collect_global_ghost_sources(tcx, anchor_span)?;
 
     let mut enum_defs = Vec::new();
     let mut struct_defs = Vec::new();
     let mut pure_fn_defs = Vec::new();
     let mut lemma_defs = Vec::new();
     let mut standalone_fn_contract_defs = Vec::new();
-    for (span, source) in sources {
-        collect_ghost_items_in_source(
-            &source,
-            span,
-            &mut enum_defs,
-            &mut struct_defs,
-            &mut pure_fn_defs,
-            &mut lemma_defs,
-            &mut standalone_fn_contract_defs,
-        )?;
+    for source in sources {
+        let mut sink = GhostItemSink {
+            enums: &mut enum_defs,
+            structs: &mut struct_defs,
+            pure_fns: &mut pure_fn_defs,
+            lemmas: &mut lemma_defs,
+            standalone_fn_contracts: &mut standalone_fn_contract_defs,
+        };
+        collect_ghost_items_in_source(&source.text, source.span, &source.origin, &mut sink)?;
     }
 
     let mut enums = HashMap::new();
@@ -948,24 +979,66 @@ fn type_type_invariants(
     Ok((struct_invariants, enum_invariants))
 }
 
-fn collect_global_ghost_sources<'tcx>(tcx: TyCtxt<'tcx>, anchor_span: Span) -> Vec<(Span, String)> {
-    let mut sources = vec![(anchor_span, PRELUDE_GHOST_SOURCE.to_owned())];
+fn collect_global_ghost_sources<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    anchor_span: Span,
+) -> Result<Vec<GhostSource>, LoopPrepassError> {
+    let mut sources = vec![GhostSource {
+        span: anchor_span,
+        text: PRELUDE_GHOST_SOURCE.to_owned(),
+        origin: GhostSourceOrigin::Prelude,
+    }];
     let mut seen_sources = HashSet::new();
     for item_id in tcx.hir_free_items() {
         let item = tcx.hir_item(item_id);
         let loc = tcx.sess.source_map().lookup_char_pos(item.span.lo());
         let key = loc.file.start_pos;
         if seen_sources.insert(key) {
-            sources.push((
-                item.span,
-                loc.file
+            sources.push(GhostSource {
+                span: item.span,
+                text: loc
+                    .file
                     .src
                     .as_ref()
                     .map_or_else(String::new, |src| src.as_str().to_owned()),
-            ));
+                origin: GhostSourceOrigin::RustSource,
+            });
+            let path = loc.file.name.prefer_local().to_string();
+            if let Some(source) = read_sidecar_ghost_source(Path::new(&path), item.span)? {
+                sources.push(source);
+            }
         }
     }
-    sources
+    Ok(sources)
+}
+
+fn read_sidecar_ghost_source(
+    source_path: &Path,
+    span: Span,
+) -> Result<Option<GhostSource>, LoopPrepassError> {
+    let Some(file_name) = source_path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    let sidecar_path = source_path.with_file_name(format!("{file_name}.tsuno"));
+    let text = match fs::read_to_string(&sidecar_path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(LoopPrepassError {
+                span,
+                display_span: None,
+                message: format!(
+                    "failed to read sidecar spec file `{}`: {err}",
+                    sidecar_path.display()
+                ),
+            });
+        }
+    };
+    Ok(Some(GhostSource {
+        span,
+        text: format!("/*@\n{text}\n*/"),
+        origin: GhostSourceOrigin::Sidecar { path: sidecar_path },
+    }))
 }
 
 pub fn compute_hir_locals<'tcx>(
@@ -2009,11 +2082,14 @@ fn prelude_struct_defs() -> &'static HashMap<String, StructDef> {
         collect_ghost_items_in_source(
             PRELUDE_GHOST_SOURCE,
             DUMMY_SP,
-            &mut enum_defs,
-            &mut struct_defs,
-            &mut pure_fn_defs,
-            &mut lemma_defs,
-            &mut standalone_fn_contract_defs,
+            &GhostSourceOrigin::Prelude,
+            &mut GhostItemSink {
+                enums: &mut enum_defs,
+                structs: &mut struct_defs,
+                pure_fns: &mut pure_fn_defs,
+                lemmas: &mut lemma_defs,
+                standalone_fn_contracts: &mut standalone_fn_contract_defs,
+            },
         )
         .unwrap_or_else(|err| panic!("prelude ghost source must parse: {}", err.message));
         let enums = enum_defs
@@ -10073,22 +10149,20 @@ fn collect_loop_contracts<'tcx>(
 fn collect_ghost_items_in_source(
     source: &str,
     error_span: Span,
-    enums: &mut Vec<EnumDef>,
-    structs: &mut Vec<StructDef>,
-    pure_fns: &mut Vec<PureFnDef>,
-    lemmas: &mut Vec<LemmaDef>,
-    standalone_fn_contracts: &mut Vec<StandaloneFnContractDef>,
+    origin: &GhostSourceOrigin,
+    sink: &mut GhostItemSink<'_>,
 ) -> Result<(), LoopPrepassError> {
     for parsed in collect_ghost_blocks(source).map_err(|err| LoopPrepassError {
         span: error_span,
         display_span: None,
-        message: err.to_string(),
+        message: origin.parse_error_message(&err),
     })? {
-        enums.extend(parsed.enums);
-        structs.extend(parsed.structs);
-        pure_fns.extend(parsed.pure_fns);
-        lemmas.extend(parsed.lemmas);
-        standalone_fn_contracts.extend(parsed.standalone_fn_contracts);
+        sink.enums.extend(parsed.enums);
+        sink.structs.extend(parsed.structs);
+        sink.pure_fns.extend(parsed.pure_fns);
+        sink.lemmas.extend(parsed.lemmas);
+        sink.standalone_fn_contracts
+            .extend(parsed.standalone_fn_contracts);
     }
     Ok(())
 }

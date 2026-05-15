@@ -7,6 +7,11 @@ The language appears in two places:
 - directives written in spec comments, such as `//@ let`, `//@ req`, `//@ ens`, `//@ assert`, `//@ assume`, `//@ inv`, and `//@ lemma_name(...)`
 - ghost item blocks written as `/*@ ... */` whose contents begin with `def`, `lem`, `unsafe lem`, `fn`, `unsafe fn`, `enum`, or `struct`
 
+For each Rust source file, a sidecar file with the same path plus `.tsuno` is
+also treated as ghost-item source. For example, if `src/foo.rs` is verified and
+`src/foo.rs.tsuno` exists, the sidecar contents are interpreted as if they were
+wrapped in `/*@ ... */` and inserted at the start of `src/foo.rs`.
+
 ## 1. Where Spec Code Appears
 
 Function contracts are written immediately before the function body.

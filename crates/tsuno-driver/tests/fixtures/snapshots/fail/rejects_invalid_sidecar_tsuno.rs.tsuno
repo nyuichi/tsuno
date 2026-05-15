@@ -1,0 +1,7 @@
+fn target() -> i32
+  ens result == 1i32
+;
+
+fn target() -> i32
+  ens result == 1i32
+;

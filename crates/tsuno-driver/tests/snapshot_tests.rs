@@ -34,6 +34,10 @@ fn run_fixture(kind: FixtureKind, name: &str) -> Output {
     let root = tmp.path();
     fs::create_dir(root.join("src")).expect("src dir");
     fs::copy(fixture_file(kind, name), root.join("src/main.rs")).expect("copy fixture");
+    let sidecar = fixture_dir(kind).join(format!("{name}.rs.tsuno"));
+    if sidecar.exists() {
+        fs::copy(sidecar, root.join("src/main.rs.tsuno")).expect("copy sidecar fixture");
+    }
 
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());
     let output = Command::new(env!("CARGO_BIN_EXE_tsuno-driver"))
