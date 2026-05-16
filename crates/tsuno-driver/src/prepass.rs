@@ -149,6 +149,10 @@ pub enum TypedRawPattern {
         ty: TypedExpr,
         value: TypedValuePattern,
     },
+    Own {
+        ty: SpecTy,
+        value: TypedValuePattern,
+    },
     DeallocToken {
         base: TypedExpr,
         layout: TypedExpr,
@@ -6624,6 +6628,20 @@ fn resolve_raw_pattern_env_into(
             )?;
             Ok(())
         }
+        RawPattern::Own { value, .. } => {
+            resolve_value_pattern_env(
+                value,
+                pure_fns,
+                enum_defs,
+                binding_info,
+                hir_locals,
+                span,
+                anchor_span,
+                spec_scope,
+                resolved,
+            )?;
+            Ok(())
+        }
         RawPattern::DeallocToken { base, layout } => {
             for expr in [base, layout] {
                 let expr_resolved = resolve_expr_env(
@@ -6807,6 +6825,21 @@ fn infer_raw_pattern_types_into(
                 return Ok(());
             }
             if let ValuePattern::Expr(expr) = value {
+                infer_body_expr_types(
+                    expr,
+                    call_ctx,
+                    DirectiveKind::RawAssert,
+                    spec_scope,
+                    local_tys,
+                    inferred,
+                )?;
+            }
+            Ok(())
+        }
+        RawPattern::Own { ty, value } => {
+            if value_pattern_contains_bind(value) {
+                infer_value_pattern_types(value, ty, call_ctx, spec_scope, local_tys, inferred)?;
+            } else if let ValuePattern::Expr(expr) = value {
                 infer_body_expr_types(
                     expr,
                     call_ctx,
@@ -7040,6 +7073,24 @@ fn typed_lemma_raw_pattern(
         RawPattern::PointsToSugar { .. } => {
             Err("`|-?->` raw sugar in unsafe lemmas is unsupported; use `PointsTo(...)`".to_owned())
         }
+        RawPattern::Own { ty, value } => {
+            let value = typed_contract_value_pattern(
+                value,
+                ty,
+                pure_fns,
+                enum_defs,
+                struct_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?;
+            Ok(TypedRawPattern::Own {
+                ty: ty.clone(),
+                value,
+            })
+        }
         RawPattern::DeallocToken { base, layout } => Ok(TypedRawPattern::DeallocToken {
             base: typed_contract_raw_expr(
                 base,
@@ -7211,6 +7262,24 @@ fn typed_contract_raw_pattern<'tcx>(
                 inferred,
             )?;
             Ok(TypedRawPattern::PointsTo { addr, ty, value })
+        }
+        RawPattern::Own { ty, value } => {
+            let value = typed_contract_value_pattern(
+                value,
+                ty,
+                pure_fns,
+                enum_defs,
+                struct_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?;
+            Ok(TypedRawPattern::Own {
+                ty: ty.clone(),
+                value,
+            })
         }
         RawPattern::DeallocToken { base, layout } => Ok(TypedRawPattern::DeallocToken {
             base: typed_contract_raw_expr(
@@ -7524,6 +7593,17 @@ fn infer_contract_raw_pattern_types(
             result_ty,
             inferred,
         ),
+        RawPattern::Own { value, .. } => infer_contract_value_pattern(
+            value,
+            pure_fns,
+            enum_defs,
+            struct_defs,
+            spec_scope,
+            params,
+            allow_result,
+            result_ty,
+            inferred,
+        ),
         RawPattern::DeallocToken { base, layout } => {
             infer_contract_expr_types_with_expected(
                 base,
@@ -7692,6 +7772,14 @@ fn typed_raw_pattern_into(
                 unreachable!("pattern without binders must be an expression")
             };
             Ok(TypedRawPattern::PointsTo { addr, ty, value })
+        }
+        RawPattern::Own { ty, value } => {
+            let value =
+                typed_value_pattern(value, ty, call_ctx, spec_scope, ctx.local_tys, inferred)?;
+            Ok(TypedRawPattern::Own {
+                ty: ty.clone(),
+                value,
+            })
         }
         RawPattern::DeallocToken { base, layout } => {
             let base = typed_raw_expr(base, call_ctx, spec_scope, ctx.local_tys, inferred)?;
@@ -8072,6 +8160,34 @@ fn typed_standalone_fn_raw_pattern(
     inferred: &mut SpecTypeInference,
 ) -> Result<TypedRawPattern, String> {
     match pattern {
+        RawPattern::Star(lhs, rhs) => Ok(TypedRawPattern::Star(
+            Box::new(typed_standalone_fn_raw_pattern(
+                lhs,
+                pure_fns,
+                enum_defs,
+                struct_defs,
+                spec_scope,
+                params,
+                rust_params,
+                allow_result,
+                result_ty,
+                result_rust_ty,
+                inferred,
+            )?),
+            Box::new(typed_standalone_fn_raw_pattern(
+                rhs,
+                pure_fns,
+                enum_defs,
+                struct_defs,
+                spec_scope,
+                params,
+                rust_params,
+                allow_result,
+                result_ty,
+                result_rust_ty,
+                inferred,
+            )?),
+        )),
         RawPattern::PointsToSugar { pointer, value } => {
             let pointer_rust_ty = if allow_result && pointer == "result" {
                 result_rust_ty
@@ -8113,8 +8229,8 @@ fn typed_standalone_fn_raw_pattern(
             Ok(TypedRawPattern::PointsTo { addr, ty, value })
         }
         RawPattern::Emp
-        | RawPattern::Star(_, _)
         | RawPattern::PointsTo { .. }
+        | RawPattern::Own { .. }
         | RawPattern::DeallocToken { .. } => typed_lemma_raw_pattern(
             pattern,
             pure_fns,
@@ -10392,6 +10508,16 @@ fn validate_function_contract_raw_pattern_prepass(
                 spec_scope,
             )
         }
+        RawPattern::Own { value, .. } => validate_function_contract_value_pattern_prepass(
+            value,
+            directive,
+            pure_fns,
+            enum_defs,
+            type_param_scope,
+            params,
+            allow_result,
+            spec_scope,
+        ),
         RawPattern::DeallocToken { base, layout } => {
             for expr in [base, layout] {
                 validate_function_contract_expr_prepass(

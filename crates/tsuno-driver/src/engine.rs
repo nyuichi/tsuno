@@ -144,6 +144,10 @@ enum Resource {
         ty: SymValue,
         value: Option<SymValue>,
     },
+    Own {
+        ty: SpecTy,
+        value: SymValue,
+    },
     DeallocToken {
         base: SymValue,
         layout: SymValue,
@@ -727,7 +731,7 @@ impl<'tcx> Verifier<'tcx> {
             }
             StatementKind::StorageDead(local) => {
                 state.store.remove(local);
-                self.remove_unsafe_local_allocation(state, *local);
+                self.remove_unsafe_local_allocation(state, *local, stmt.source_info.span)?;
             }
             StatementKind::Assign(assign) => {
                 let (place, rvalue) = &**assign;
@@ -1722,6 +1726,8 @@ impl<'tcx> Verifier<'tcx> {
                 Some(Resource::PointsTo {
                     value: Some(value), ..
                 }) => {
+                    let ty = self.spec_ty_for_place_ty(self.body().local_decls[*local].ty, span)?;
+                    self.consume_owned_value_exact(unsafe_state, &ty, &value, span)?;
                     unsafe_state.store.insert(*local, value);
                 }
                 Some(Resource::PointsTo { value: None, .. }) | None => {
@@ -1729,6 +1735,9 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Some(Resource::DeallocToken { .. }) => {
                     unreachable!("points_to_index returned a deallocation token")
+                }
+                Some(Resource::Own { .. }) => {
+                    unreachable!("points_to_index returned an Own resource")
                 }
             }
         }
@@ -1755,7 +1764,7 @@ impl<'tcx> Verifier<'tcx> {
         hint: &str,
         span: Span,
     ) -> Result<(), VerificationResult> {
-        self.remove_unsafe_local_allocation(state, local);
+        self.remove_unsafe_local_allocation(state, local, span)?;
         let ty = self.body().local_decls[local].ty;
         let layout = self.layout_value_for_ty(ty, span)?;
         let base_addr =
@@ -1788,7 +1797,12 @@ impl<'tcx> Verifier<'tcx> {
         Ok(())
     }
 
-    fn remove_unsafe_local_allocation(&self, state: &mut UnsafeState, local: Local) {
+    fn remove_unsafe_local_allocation(
+        &self,
+        state: &mut UnsafeState,
+        local: Local,
+        _span: Span,
+    ) -> Result<(), VerificationResult> {
         let local_alloc = state.allocs.remove(&local);
         let ty = self.local_rust_ty_model_value(local);
         state.heap.retain(|resource| match resource {
@@ -1799,8 +1813,10 @@ impl<'tcx> Verifier<'tcx> {
             } => local_alloc
                 .as_ref()
                 .is_none_or(|alloc| *addr != alloc.base_addr || *resource_ty != ty),
+            Resource::Own { .. } => true,
             Resource::DeallocToken { .. } => true,
         });
+        Ok(())
     }
 
     fn write_local_points_to(
@@ -1814,10 +1830,19 @@ impl<'tcx> Verifier<'tcx> {
             return Ok(());
         };
         let ty = self.local_rust_ty_model_value(local);
+        let spec_ty = self.spec_ty_for_place_ty(self.body().local_decls[local].ty, span)?;
         if let Some(index) = self.points_to_index_for_ty_value(state, &alloc.base_addr, &ty) {
-            if let Resource::PointsTo { value: slot, .. } = &mut state.heap[index] {
-                *slot = Some(value);
+            let old = match &state.heap[index] {
+                Resource::PointsTo { value, .. } => value.clone(),
+                _ => None,
+            };
+            if let Some(old) = old.as_ref() {
+                self.consume_owned_value_exact(state, &spec_ty, old, span)?;
             }
+            if let Resource::PointsTo { value: slot, .. } = &mut state.heap[index] {
+                *slot = Some(value.clone());
+            }
+            self.add_owned_value(state, &spec_ty, value)?;
             return Ok(());
         }
 
@@ -1827,6 +1852,7 @@ impl<'tcx> Verifier<'tcx> {
             ty,
             value: Some(value.clone()),
         });
+        self.add_owned_value(state, &spec_ty, value.clone())?;
         let addr_int = self.solver.int_term(&addr);
         self.add_unsafe_path_condition(state, addr_int.eq(Int::from_i64(0)).not());
         self.add_unsafe_path_condition(
@@ -1838,12 +1864,73 @@ impl<'tcx> Verifier<'tcx> {
                 )
                 .eq(0),
         );
-        let ty = self.body().local_decls[local].ty;
-        let spec_ty = self.spec_ty_for_place_ty(ty, span)?;
         if let Some(formula) = self.spec_ty_formula(&spec_ty, &value, span)? {
             self.add_unsafe_path_condition(state, formula);
         }
         Ok(())
+    }
+
+    fn add_owned_value(
+        &self,
+        state: &mut UnsafeState,
+        ty: &SpecTy,
+        value: SymValue,
+    ) -> Result<(), VerificationResult> {
+        if own_is_emp(ty) {
+            return Ok(());
+        }
+        state.heap.push(Resource::Own {
+            ty: ty.clone(),
+            value,
+        });
+        Ok(())
+    }
+
+    fn consume_owned_value_exact(
+        &self,
+        state: &mut UnsafeState,
+        ty: &SpecTy,
+        value: &SymValue,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        if own_is_emp(ty) {
+            return Ok(());
+        }
+        let Some(index) = state.heap.iter().position(|resource| {
+            matches!(
+                resource,
+                Resource::Own {
+                    ty: resource_ty,
+                    value: resource_value,
+                } if resource_ty == ty && resource_value == value
+            )
+        }) else {
+            return Err(self.fail_result(span, "missing Own resource".to_owned()));
+        };
+        state.heap.remove(index);
+        Ok(())
+    }
+
+    fn consume_owned_value_if_present(
+        &self,
+        state: &mut UnsafeState,
+        ty: &SpecTy,
+        value: &SymValue,
+    ) {
+        if own_is_emp(ty) {
+            return;
+        }
+        if let Some(index) = state.heap.iter().position(|resource| {
+            matches!(
+                resource,
+                Resource::Own {
+                    ty: resource_ty,
+                    value: resource_value,
+                } if resource_ty == ty && resource_value == value
+            )
+        }) {
+            state.heap.remove(index);
+        }
     }
 
     fn bridge_local_for_points_to(
@@ -2396,8 +2483,7 @@ impl<'tcx> Verifier<'tcx> {
                     ))
                 } else if place.projection.is_empty() {
                     state.store.remove(&place.local);
-                    self.deinit_local_points_to(state, place.local);
-                    Ok(())
+                    self.deinit_local_points_to(state, place.local, span)
                 } else {
                     let value = self.unsafe_read_place(state, *place, span)?;
                     let place_ty = self.spec_ty_for_place_ty(self.place_ty(*place), span)?;
@@ -2811,6 +2897,59 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(out)
             }
+            TypedRawPattern::Own { ty, value } if own_is_emp(ty) => {
+                self.ensure_own_emp_pattern_has_no_binder(value, span)?;
+                Ok(candidates)
+            }
+            TypedRawPattern::Own { ty, value } => {
+                let mut out = Vec::new();
+                for candidate in candidates {
+                    for (index, resource) in state.heap.iter().enumerate() {
+                        if candidate.used.contains(&index) {
+                            continue;
+                        }
+                        let Resource::Own {
+                            ty: resource_ty,
+                            value: resource_value,
+                        } = resource
+                        else {
+                            continue;
+                        };
+                        if resource_ty != ty {
+                            continue;
+                        }
+                        let mut next_spec = env.spec.clone();
+                        next_spec.extend(candidate.env.clone());
+                        if let TypedValuePattern::Expr(expr) = value {
+                            let expected =
+                                self.contract_expr_to_value(&env.current, &next_spec, expr)?;
+                            if expected != *resource_value {
+                                continue;
+                            }
+                        }
+                        let mut next_env = candidate.env.clone();
+                        let value_condition = self.match_contract_value_pattern(
+                            &env.current,
+                            &next_spec,
+                            value,
+                            resource_value,
+                            span,
+                            &mut next_env,
+                        )?;
+                        let mut used = candidate.used.clone();
+                        used.insert(index);
+                        out.push(RawPatternMatch {
+                            used,
+                            condition: Solver::simplify_bool(&bool_and(vec![
+                                candidate.condition.clone(),
+                                value_condition,
+                            ])),
+                            env: next_env,
+                        });
+                    }
+                }
+                Ok(out)
+            }
             TypedRawPattern::DeallocToken { base, layout } => {
                 let base = self.contract_expr_to_value(&env.current, &env.spec, base)?;
                 let layout = self.contract_expr_to_value(&env.current, &env.spec, layout)?;
@@ -2929,6 +3068,59 @@ impl<'tcx> Verifier<'tcx> {
                                         resource_ty,
                                     ),
                                 )?,
+                                value_condition,
+                            ])),
+                            env: next_env,
+                        });
+                    }
+                }
+                Ok(out)
+            }
+            TypedRawPattern::Own { ty, value } if own_is_emp(ty) => {
+                self.ensure_own_emp_pattern_has_no_binder(value, span)?;
+                Ok(candidates)
+            }
+            TypedRawPattern::Own { ty, value } => {
+                let mut out = Vec::new();
+                for candidate in candidates {
+                    for (index, resource) in state.heap.iter().enumerate() {
+                        if candidate.used.contains(&index) {
+                            continue;
+                        }
+                        let Resource::Own {
+                            ty: resource_ty,
+                            value: resource_value,
+                        } = resource
+                        else {
+                            continue;
+                        };
+                        if resource_ty != ty {
+                            continue;
+                        }
+                        let mut candidate_view = view.clone();
+                        candidate_view.env.extend(candidate.env.clone());
+                        if let TypedValuePattern::Expr(expr) = value {
+                            let expected =
+                                self.spec_expr_to_value(&candidate_view, expr, resolution)?;
+                            if expected != *resource_value {
+                                continue;
+                            }
+                        }
+                        let mut next_env = candidate.env.clone();
+                        let value_condition = self.match_value_pattern(
+                            &candidate_view,
+                            value,
+                            resource_value,
+                            resolution,
+                            span,
+                            &mut next_env,
+                        )?;
+                        let mut used = candidate.used.clone();
+                        used.insert(index);
+                        out.push(RawPatternMatch {
+                            used,
+                            condition: Solver::simplify_bool(&bool_and(vec![
+                                candidate.condition.clone(),
                                 value_condition,
                             ])),
                             env: next_env,
@@ -3226,6 +3418,18 @@ impl<'tcx> Verifier<'tcx> {
                 state.heap.push(Resource::PointsTo { addr, ty, value });
                 Ok(())
             }
+            TypedRawPattern::Own { ty, value } if own_is_emp(ty) => {
+                self.ensure_own_emp_pattern_has_no_binder(value, span)?;
+                if let TypedValuePattern::Expr(expr) = value {
+                    let _ = self.contract_expr_to_value(current, spec, expr)?;
+                }
+                Ok(())
+            }
+            TypedRawPattern::Own { ty, value } => {
+                let value =
+                    self.materialize_contract_value_pattern(current, spec, value, ty, span)?;
+                self.add_owned_value(state, ty, value)
+            }
             TypedRawPattern::DeallocToken { base, layout } => {
                 let base = self.contract_expr_to_value(current, spec, base)?;
                 let layout = self.contract_expr_to_value(current, spec, layout)?;
@@ -3390,6 +3594,20 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
+    fn ensure_own_emp_pattern_has_no_binder(
+        &self,
+        value: &TypedValuePattern,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
+        if typed_value_pattern_has_bind(value) {
+            return Err(self.unsupported_result(
+                span,
+                "Own<T> with emp ownership cannot bind a value".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn write_matching_points_to(
         &self,
         state: &mut UnsafeState,
@@ -3437,16 +3655,27 @@ impl<'tcx> Verifier<'tcx> {
         })
     }
 
-    fn deinit_local_points_to(&self, state: &mut UnsafeState, local: Local) {
+    fn deinit_local_points_to(
+        &self,
+        state: &mut UnsafeState,
+        local: Local,
+        span: Span,
+    ) -> Result<(), VerificationResult> {
         let Some(alloc) = state.allocs.get(&local) else {
-            return;
+            return Ok(());
         };
         let ty = self.local_rust_ty_model_value(local);
         if let Some(index) = self.points_to_index_for_ty_value(state, &alloc.base_addr, &ty)
             && let Resource::PointsTo { value, .. } = &mut state.heap[index]
         {
+            let old = value.clone();
             *value = None;
+            if let Some(old) = old {
+                let spec_ty = self.spec_ty_for_place_ty(self.body().local_decls[local].ty, span)?;
+                self.consume_owned_value_if_present(state, &spec_ty, &old);
+            }
         }
+        Ok(())
     }
 
     fn place_starts_with_raw_pointer_deref(&self, place: Place<'tcx>) -> bool {
@@ -5995,6 +6224,10 @@ impl<'tcx> Verifier<'tcx> {
                 ty: self.instantiate_typed_expr(ty, bindings, span)?,
                 value: self.instantiate_value_pattern(value, bindings, span)?,
             },
+            TypedRawPattern::Own { ty, value } => TypedRawPattern::Own {
+                ty: self.instantiate_spec_ty(ty, bindings, span)?,
+                value: self.instantiate_value_pattern(value, bindings, span)?,
+            },
             TypedRawPattern::DeallocToken { base, layout } => TypedRawPattern::DeallocToken {
                 base: self.instantiate_typed_expr(base, bindings, span)?,
                 layout: self.instantiate_typed_expr(layout, bindings, span)?,
@@ -7904,6 +8137,9 @@ fn collect_typed_raw_pattern_pure_fn_refs(pattern: &TypedRawPattern, out: &mut B
             collect_typed_expr_pure_fn_refs(ty, out);
             collect_typed_value_pattern_pure_fn_refs(value, out);
         }
+        TypedRawPattern::Own { value, .. } => {
+            collect_typed_value_pattern_pure_fn_refs(value, out);
+        }
         TypedRawPattern::DeallocToken { base, layout } => {
             collect_typed_expr_pure_fn_refs(base, out);
             collect_typed_expr_pure_fn_refs(layout, out);
@@ -8038,6 +8274,46 @@ fn typed_value_pattern_ty(pattern: &TypedValuePattern) -> &SpecTy {
         | TypedValuePattern::StructLit { ty, .. }
         | TypedValuePattern::CtorCall { ty, .. } => ty,
         TypedValuePattern::Expr(expr) => &expr.ty,
+    }
+}
+
+fn typed_value_pattern_has_bind(pattern: &TypedValuePattern) -> bool {
+    match pattern {
+        TypedValuePattern::Bind { .. } => true,
+        TypedValuePattern::Expr(_) => false,
+        TypedValuePattern::SeqLit { items, .. }
+        | TypedValuePattern::CtorCall { args: items, .. } => {
+            items.iter().any(typed_value_pattern_has_bind)
+        }
+        TypedValuePattern::StructLit { fields, .. } => {
+            fields.iter().any(typed_value_pattern_has_bind)
+        }
+    }
+}
+
+fn own_is_emp(ty: &SpecTy) -> bool {
+    match ty {
+        SpecTy::Bool
+        | SpecTy::RustTy
+        | SpecTy::Int
+        | SpecTy::IntLiteral
+        | SpecTy::I8
+        | SpecTy::I16
+        | SpecTy::I32
+        | SpecTy::I64
+        | SpecTy::Isize
+        | SpecTy::U8
+        | SpecTy::U16
+        | SpecTy::U32
+        | SpecTy::U64
+        | SpecTy::Usize
+        | SpecTy::Ref(_)
+        | SpecTy::Mut(_) => true,
+        SpecTy::Tuple(items) => items.iter().all(own_is_emp),
+        SpecTy::Struct { name, args } if name == "Ptr" && args.is_empty() => true,
+        SpecTy::Seq(_) | SpecTy::Struct { .. } | SpecTy::Enum { .. } | SpecTy::TypeParam(_) => {
+            false
+        }
     }
 }
 

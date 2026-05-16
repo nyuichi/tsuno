@@ -397,6 +397,10 @@ pub enum RawPattern {
         pointer: String,
         value: ValuePattern,
     },
+    Own {
+        ty: SpecTy,
+        value: ValuePattern,
+    },
     DeallocToken {
         base: Expr,
         layout: Expr,

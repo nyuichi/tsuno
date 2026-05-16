@@ -647,6 +647,22 @@ Reflection may use path-condition equalities, so a resource such as
 `PointsTo(result.addr, {type T}, Some(v))` can be reflected to a bridged local
 when the unsafe path condition proves `result.addr == base`.
 
+Raw contracts may also mention `Own::<T>(v)`. `PointsTo` is a shallow typed
+cell resource: it records that an address currently stores `Some(v)` or is
+typed but uninitialized with `None`. `Own::<T>(v)` is the separate ownership
+resource for the value `v` itself. For primitive scalar types and raw pointer
+models, `Own` is currently `emp`; for type parameters and structs it is a
+linear opaque token. A fully initialized non-scalar cell is therefore modeled
+as both resources:
+
+```rust
+//@ raw req *p |-?-> Option::<T>::Some(?v) * Own::<T>(v);
+```
+
+This is intentionally conservative. User-defined `Own` unfolding rules are not
+yet part of the language; `Own` can be carried, consumed, and produced by raw
+contracts, but the verifier does not currently expand it into field ownership.
+
 Branching inside an unsafe block keeps separate unsafe states for the feasible
 paths. Unsafe heap resources are not merged at unsafe control-flow joins.
 Instead, each unsafe exit state is converted back to a safe state with
