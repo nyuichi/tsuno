@@ -1902,7 +1902,7 @@ impl<'tcx> Verifier<'tcx> {
                 Resource::Own {
                     ty: resource_ty,
                     value: resource_value,
-                } if resource_ty == ty && resource_value == value
+                } if own_spec_ty_matches(resource_ty, ty) && resource_value == value
             )
         }) else {
             return Err(self.fail_result(span, "missing Own resource".to_owned()));
@@ -1926,7 +1926,7 @@ impl<'tcx> Verifier<'tcx> {
                 Resource::Own {
                     ty: resource_ty,
                     value: resource_value,
-                } if resource_ty == ty && resource_value == value
+                } if own_spec_ty_matches(resource_ty, ty) && resource_value == value
             )
         }) {
             state.heap.remove(index);
@@ -2672,7 +2672,10 @@ impl<'tcx> Verifier<'tcx> {
         else {
             unreachable!("initialized PointsTo match must contain a value");
         };
-        Ok(value.clone())
+        let value = value.clone();
+        let spec_ty = self.spec_ty_for_place_ty(ty, span)?;
+        self.consume_owned_value_exact(state, &spec_ty, &value, span)?;
+        Ok(value)
     }
 
     fn assert_unsafe_raw_pattern(
@@ -2915,7 +2918,7 @@ impl<'tcx> Verifier<'tcx> {
                         else {
                             continue;
                         };
-                        if resource_ty != ty {
+                        if !own_spec_ty_matches(resource_ty, ty) {
                             continue;
                         }
                         let mut next_spec = env.spec.clone();
@@ -3094,7 +3097,7 @@ impl<'tcx> Verifier<'tcx> {
                         else {
                             continue;
                         };
-                        if resource_ty != ty {
+                        if !own_spec_ty_matches(resource_ty, ty) {
                             continue;
                         }
                         let mut candidate_view = view.clone();
@@ -3628,9 +3631,18 @@ impl<'tcx> Verifier<'tcx> {
         } else {
             unreachable!("points-to match must be PointsTo");
         };
+        let old = match &state.heap[index] {
+            Resource::PointsTo { value, .. } => value.clone(),
+            _ => None,
+        };
+        let spec_ty = self.spec_ty_for_place_ty(ty, span)?;
+        if let Some(old) = old.as_ref() {
+            self.consume_owned_value_if_present(state, &spec_ty, old);
+        }
         if let Resource::PointsTo { value: slot, .. } = &mut state.heap[index] {
             *slot = Some(value.clone());
         }
+        self.add_owned_value(state, &spec_ty, value.clone())?;
         if let Some(local) = local {
             state.store.insert(local, value);
         }
@@ -8314,6 +8326,33 @@ fn own_is_emp(ty: &SpecTy) -> bool {
         SpecTy::Seq(_) | SpecTy::Struct { .. } | SpecTy::Enum { .. } | SpecTy::TypeParam(_) => {
             false
         }
+    }
+}
+
+fn own_spec_ty_matches(actual: &SpecTy, expected: &SpecTy) -> bool {
+    match (actual, expected) {
+        (
+            SpecTy::Struct {
+                name: actual_name,
+                args: actual_args,
+            },
+            SpecTy::Struct {
+                name: expected_name,
+                args: expected_args,
+            },
+        ) => {
+            actual_args == expected_args
+                && (actual_name == expected_name
+                    || actual_name
+                        .rsplit("::")
+                        .next()
+                        .is_some_and(|short| short == expected_name)
+                    || expected_name
+                        .rsplit("::")
+                        .next()
+                        .is_some_and(|short| short == actual_name))
+        }
+        _ => actual == expected,
     }
 }
 

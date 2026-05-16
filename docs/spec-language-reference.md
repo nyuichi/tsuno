@@ -434,7 +434,7 @@ forms are not accepted.
 ```rust
 /*@
 unsafe fn core::intrinsics::read_via_copy<T>(ptr: *const T) -> T
-  raw req *ptr |-?-> Option::<T>::Some(?old)
+  raw req *ptr |-?-> Option::<T>::Some(?old) * Own::<T>(old)
   raw ens *ptr |-?-> Option::<T>::Some(old)
   ens result == old
 ;
@@ -662,6 +662,11 @@ as both resources:
 This is intentionally conservative. User-defined `Own` unfolding rules are not
 yet part of the language; `Own` can be carried, consumed, and produced by raw
 contracts, but the verifier does not currently expand it into field ownership.
+Raw pointer reads transfer `Own::<T>(v)` from the pointed cell to the produced
+value for non-`emp` `Own`; raw pointer writes transfer ownership of the written
+value back to the pointed cell. This makes contracts such as
+`write_via_move<T>` express the movement of ownership separately from the
+shallow `PointsTo` cell update.
 
 Branching inside an unsafe block keeps separate unsafe states for the feasible
 paths. Unsafe heap resources are not merged at unsafe control-flow joins.

@@ -662,6 +662,10 @@ fn spec_ty_for_rust_type_text(text: &str, type_params: &[String]) -> Result<Spec
         type_param if type_params.iter().any(|param| param == type_param) => {
             Ok(SpecTy::TypeParam(type_param.to_owned()))
         }
+        rust_struct if is_ident(rust_struct) => Ok(SpecTy::Struct {
+            name: rust_struct.to_owned(),
+            args: Vec::new(),
+        }),
         other => Err(ParseError::new(format!(
             "unsupported Rust type `{other}` in function contract declaration"
         ))),
