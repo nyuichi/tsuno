@@ -1902,7 +1902,7 @@ impl<'tcx> Verifier<'tcx> {
                 Resource::Own {
                     ty: resource_ty,
                     value: resource_value,
-                } if own_spec_ty_matches(resource_ty, ty) && resource_value == value
+                } if resource_ty == ty && resource_value == value
             )
         }) else {
             return Err(self.fail_result(span, "missing Own resource".to_owned()));
@@ -1926,7 +1926,7 @@ impl<'tcx> Verifier<'tcx> {
                 Resource::Own {
                     ty: resource_ty,
                     value: resource_value,
-                } if own_spec_ty_matches(resource_ty, ty) && resource_value == value
+                } if resource_ty == ty && resource_value == value
             )
         }) {
             state.heap.remove(index);
@@ -2918,7 +2918,7 @@ impl<'tcx> Verifier<'tcx> {
                         else {
                             continue;
                         };
-                        if !own_spec_ty_matches(resource_ty, ty) {
+                        if resource_ty != ty {
                             continue;
                         }
                         let mut next_spec = env.spec.clone();
@@ -3097,7 +3097,7 @@ impl<'tcx> Verifier<'tcx> {
                         else {
                             continue;
                         };
-                        if !own_spec_ty_matches(resource_ty, ty) {
+                        if resource_ty != ty {
                             continue;
                         }
                         let mut candidate_view = view.clone();
@@ -8326,33 +8326,6 @@ fn own_is_emp(ty: &SpecTy) -> bool {
         SpecTy::Seq(_) | SpecTy::Struct { .. } | SpecTy::Enum { .. } | SpecTy::TypeParam(_) => {
             false
         }
-    }
-}
-
-fn own_spec_ty_matches(actual: &SpecTy, expected: &SpecTy) -> bool {
-    match (actual, expected) {
-        (
-            SpecTy::Struct {
-                name: actual_name,
-                args: actual_args,
-            },
-            SpecTy::Struct {
-                name: expected_name,
-                args: expected_args,
-            },
-        ) => {
-            actual_args == expected_args
-                && (actual_name == expected_name
-                    || actual_name
-                        .rsplit("::")
-                        .next()
-                        .is_some_and(|short| short == expected_name)
-                    || expected_name
-                        .rsplit("::")
-                        .next()
-                        .is_some_and(|short| short == actual_name))
-        }
-        _ => actual == expected,
     }
 }
 

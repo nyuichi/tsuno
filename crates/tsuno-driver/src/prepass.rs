@@ -1914,6 +1914,72 @@ fn resolve_named_struct_spec_ty(
     }
 }
 
+fn resolve_own_spec_ty(
+    ty: &SpecTy,
+    enum_defs: &HashMap<String, EnumDef>,
+    struct_defs: &HashMap<String, StructDef>,
+    type_params: &HashSet<String>,
+) -> Result<SpecTy, String> {
+    match ty {
+        SpecTy::Struct { name, args } => {
+            let name = struct_defs
+                .get(name)
+                .or_else(|| prelude_struct_defs().get(name))
+                .map(|def| def.name.clone())
+                .ok_or_else(|| format!("unknown Rust type `{name}` in `Own`"))?;
+            let args = args
+                .iter()
+                .map(|arg| resolve_own_spec_ty(arg, enum_defs, struct_defs, type_params))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(SpecTy::Struct { name, args })
+        }
+        SpecTy::Seq(inner) => Ok(SpecTy::Seq(Box::new(resolve_own_spec_ty(
+            inner,
+            enum_defs,
+            struct_defs,
+            type_params,
+        )?))),
+        SpecTy::Tuple(items) => items
+            .iter()
+            .map(|item| resolve_own_spec_ty(item, enum_defs, struct_defs, type_params))
+            .collect::<Result<Vec<_>, _>>()
+            .map(SpecTy::Tuple),
+        SpecTy::Enum { .. } => {
+            resolve_named_struct_spec_ty(ty, enum_defs, struct_defs, type_params)
+        }
+        SpecTy::Ref(inner) => Ok(SpecTy::Ref(Box::new(resolve_own_spec_ty(
+            inner,
+            enum_defs,
+            struct_defs,
+            type_params,
+        )?))),
+        SpecTy::Mut(inner) => Ok(SpecTy::Mut(Box::new(resolve_own_spec_ty(
+            inner,
+            enum_defs,
+            struct_defs,
+            type_params,
+        )?))),
+        SpecTy::TypeParam(name) => type_params
+            .contains(name)
+            .then(|| ty.clone())
+            .ok_or_else(|| format!("unbound Rust type parameter `{name}` in `Own`")),
+        SpecTy::Bool
+        | SpecTy::RustTy
+        | SpecTy::Int
+        | SpecTy::IntLiteral
+        | SpecTy::I8
+        | SpecTy::I16
+        | SpecTy::I32
+        | SpecTy::I64
+        | SpecTy::Isize
+        | SpecTy::U8
+        | SpecTy::U16
+        | SpecTy::U32
+        | SpecTy::U64
+        | SpecTy::Usize => Ok(ty.clone()),
+    }
+}
+
 fn normalize_pure_fn_param(
     param: &PureFnParam,
     enum_defs: &HashMap<String, EnumDef>,
@@ -7074,9 +7140,11 @@ fn typed_lemma_raw_pattern(
             Err("`|-?->` raw sugar in unsafe lemmas is unsupported; use `PointsTo(...)`".to_owned())
         }
         RawPattern::Own { ty, value } => {
+            let type_params = contract_type_param_scope(params, result_ty);
+            let ty = resolve_own_spec_ty(ty, enum_defs, struct_defs, &type_params)?;
             let value = typed_contract_value_pattern(
                 value,
-                ty,
+                &ty,
                 pure_fns,
                 enum_defs,
                 struct_defs,
@@ -7086,10 +7154,7 @@ fn typed_lemma_raw_pattern(
                 result_ty,
                 inferred,
             )?;
-            Ok(TypedRawPattern::Own {
-                ty: ty.clone(),
-                value,
-            })
+            Ok(TypedRawPattern::Own { ty, value })
         }
         RawPattern::DeallocToken { base, layout } => Ok(TypedRawPattern::DeallocToken {
             base: typed_contract_raw_expr(
@@ -7264,9 +7329,11 @@ fn typed_contract_raw_pattern<'tcx>(
             Ok(TypedRawPattern::PointsTo { addr, ty, value })
         }
         RawPattern::Own { ty, value } => {
+            let type_params = contract_type_param_scope(params, result_ty);
+            let ty = resolve_own_spec_ty(ty, enum_defs, struct_defs, &type_params)?;
             let value = typed_contract_value_pattern(
                 value,
-                ty,
+                &ty,
                 pure_fns,
                 enum_defs,
                 struct_defs,
@@ -7276,10 +7343,7 @@ fn typed_contract_raw_pattern<'tcx>(
                 result_ty,
                 inferred,
             )?;
-            Ok(TypedRawPattern::Own {
-                ty: ty.clone(),
-                value,
-            })
+            Ok(TypedRawPattern::Own { ty, value })
         }
         RawPattern::DeallocToken { base, layout } => Ok(TypedRawPattern::DeallocToken {
             base: typed_contract_raw_expr(
@@ -7774,12 +7838,15 @@ fn typed_raw_pattern_into(
             Ok(TypedRawPattern::PointsTo { addr, ty, value })
         }
         RawPattern::Own { ty, value } => {
+            let ty = resolve_own_spec_ty(
+                ty,
+                ctx.enum_defs,
+                ctx.struct_defs,
+                call_ctx.type_param_scope,
+            )?;
             let value =
-                typed_value_pattern(value, ty, call_ctx, spec_scope, ctx.local_tys, inferred)?;
-            Ok(TypedRawPattern::Own {
-                ty: ty.clone(),
-                value,
-            })
+                typed_value_pattern(value, &ty, call_ctx, spec_scope, ctx.local_tys, inferred)?;
+            Ok(TypedRawPattern::Own { ty, value })
         }
         RawPattern::DeallocToken { base, layout } => {
             let base = typed_raw_expr(base, call_ctx, spec_scope, ctx.local_tys, inferred)?;
