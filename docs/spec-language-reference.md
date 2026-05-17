@@ -650,10 +650,12 @@ when the unsafe path condition proves `result.addr == base`.
 Raw contracts may also mention `Own::<T>(v)`. `PointsTo` is a shallow typed
 cell resource: it records that an address currently stores `Some(v)` or is
 typed but uninitialized with `None`. `Own::<T>(v)` is the separate ownership
-resource for the value `v` itself. For primitive scalar types and raw pointer
-models, `Own` is currently `emp`; for type parameters and structs it is a
-linear opaque token. A fully initialized non-scalar cell is therefore modeled
-as both resources:
+resource for the value `v` itself. The type argument to `Own` is a Rust type
+annotation and is resolved against Rust type parameters and known Rust struct
+definitions before verification. For primitive scalar types and raw pointer
+models, `Own` is currently `emp`; for type parameters and structs it is a linear
+opaque token. A fully initialized non-scalar cell is therefore modeled as both
+resources:
 
 ```rust
 //@ raw req *p |-?-> Option::<T>::Some(?v) * Own::<T>(v);

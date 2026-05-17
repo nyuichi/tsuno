@@ -1914,69 +1914,87 @@ fn resolve_named_struct_spec_ty(
     }
 }
 
-fn resolve_own_spec_ty(
-    ty: &SpecTy,
-    enum_defs: &HashMap<String, EnumDef>,
+fn resolve_own_rust_type_expr(
+    ty: &RustTypeExpr,
     struct_defs: &HashMap<String, StructDef>,
     type_params: &HashSet<String>,
 ) -> Result<SpecTy, String> {
-    match ty {
-        SpecTy::Struct { name, args } => {
-            let name = struct_defs
-                .get(name)
-                .or_else(|| prelude_struct_defs().get(name))
-                .map(|def| def.name.clone())
-                .ok_or_else(|| format!("unknown Rust type `{name}` in `Own`"))?;
-            let args = args
-                .iter()
-                .map(|arg| resolve_own_spec_ty(arg, enum_defs, struct_defs, type_params))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(SpecTy::Struct { name, args })
+    rust_type_text_to_own_spec_ty(&ty.text, struct_defs, type_params)
+}
+
+fn rust_type_text_to_own_spec_ty(
+    text: &str,
+    struct_defs: &HashMap<String, StructDef>,
+    type_params: &HashSet<String>,
+) -> Result<SpecTy, String> {
+    match text {
+        "()" => Ok(SpecTy::Tuple(vec![])),
+        "bool" => Ok(SpecTy::Bool),
+        "i8" => Ok(SpecTy::I8),
+        "i16" => Ok(SpecTy::I16),
+        "i32" => Ok(SpecTy::I32),
+        "i64" => Ok(SpecTy::I64),
+        "isize" => Ok(SpecTy::Isize),
+        "u8" => Ok(SpecTy::U8),
+        "u16" => Ok(SpecTy::U16),
+        "u32" => Ok(SpecTy::U32),
+        "u64" => Ok(SpecTy::U64),
+        "usize" => Ok(SpecTy::Usize),
+        raw if raw.starts_with("*const ") || raw.starts_with("*mut ") => Ok(ptr_spec_ty()),
+        raw if raw.starts_with("&mut ") => {
+            Ok(SpecTy::Mut(Box::new(rust_type_text_to_own_spec_ty(
+                raw.trim_start_matches("&mut ").trim(),
+                struct_defs,
+                type_params,
+            )?)))
         }
-        SpecTy::Seq(inner) => Ok(SpecTy::Seq(Box::new(resolve_own_spec_ty(
-            inner,
-            enum_defs,
+        raw if raw.starts_with('&') => Ok(SpecTy::Ref(Box::new(rust_type_text_to_own_spec_ty(
+            raw.trim_start_matches('&').trim(),
             struct_defs,
             type_params,
         )?))),
-        SpecTy::Tuple(items) => items
-            .iter()
-            .map(|item| resolve_own_spec_ty(item, enum_defs, struct_defs, type_params))
-            .collect::<Result<Vec<_>, _>>()
-            .map(SpecTy::Tuple),
-        SpecTy::Enum { .. } => {
-            resolve_named_struct_spec_ty(ty, enum_defs, struct_defs, type_params)
+        type_param if type_params.contains(type_param) => {
+            Ok(SpecTy::TypeParam(type_param.to_owned()))
         }
-        SpecTy::Ref(inner) => Ok(SpecTy::Ref(Box::new(resolve_own_spec_ty(
-            inner,
-            enum_defs,
-            struct_defs,
-            type_params,
-        )?))),
-        SpecTy::Mut(inner) => Ok(SpecTy::Mut(Box::new(resolve_own_spec_ty(
-            inner,
-            enum_defs,
-            struct_defs,
-            type_params,
-        )?))),
-        SpecTy::TypeParam(name) => type_params
-            .contains(name)
-            .then(|| ty.clone())
-            .ok_or_else(|| format!("unbound Rust type parameter `{name}` in `Own`")),
-        SpecTy::Bool
-        | SpecTy::RustTy
-        | SpecTy::Int
-        | SpecTy::IntLiteral
-        | SpecTy::I8
-        | SpecTy::I16
-        | SpecTy::I32
-        | SpecTy::I64
-        | SpecTy::Isize
-        | SpecTy::U8
-        | SpecTy::U16
-        | SpecTy::U32
-        | SpecTy::U64
-        | SpecTy::Usize => Ok(ty.clone()),
+        rust_struct => resolve_own_rust_struct_ty(rust_struct, struct_defs),
+    }
+}
+
+fn resolve_own_rust_struct_ty(
+    text: &str,
+    struct_defs: &HashMap<String, StructDef>,
+) -> Result<SpecTy, String> {
+    if text.contains('<') {
+        return Err(format!(
+            "generic Rust type `{text}` in `Own` is unsupported"
+        ));
+    }
+    if let Some(def) = struct_defs
+        .get(text)
+        .or_else(|| prelude_struct_defs().get(text))
+    {
+        return Ok(SpecTy::Struct {
+            name: def.name.clone(),
+            args: Vec::new(),
+        });
+    }
+    let matches = struct_defs
+        .values()
+        .chain(prelude_struct_defs().values())
+        .filter(|def| {
+            def.name
+                .rsplit("::")
+                .next()
+                .is_some_and(|short| short == text)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [def] => Ok(SpecTy::Struct {
+            name: def.name.clone(),
+            args: Vec::new(),
+        }),
+        [] => Err(format!("unknown Rust type `{text}` in `Own`")),
+        _ => Err(format!("ambiguous Rust type `{text}` in `Own`")),
     }
 }
 
@@ -6904,7 +6922,12 @@ fn infer_raw_pattern_types_into(
         }
         RawPattern::Own { ty, value } => {
             if value_pattern_contains_bind(value) {
-                infer_value_pattern_types(value, ty, call_ctx, spec_scope, local_tys, inferred)?;
+                let ty = resolve_own_rust_type_expr(
+                    ty,
+                    call_ctx.struct_defs,
+                    call_ctx.type_param_scope,
+                )?;
+                infer_value_pattern_types(value, &ty, call_ctx, spec_scope, local_tys, inferred)?;
             } else if let ValuePattern::Expr(expr) = value {
                 infer_body_expr_types(
                     expr,
@@ -7141,7 +7164,7 @@ fn typed_lemma_raw_pattern(
         }
         RawPattern::Own { ty, value } => {
             let type_params = contract_type_param_scope(params, result_ty);
-            let ty = resolve_own_spec_ty(ty, enum_defs, struct_defs, &type_params)?;
+            let ty = resolve_own_rust_type_expr(ty, struct_defs, &type_params)?;
             let value = typed_contract_value_pattern(
                 value,
                 &ty,
@@ -7330,7 +7353,7 @@ fn typed_contract_raw_pattern<'tcx>(
         }
         RawPattern::Own { ty, value } => {
             let type_params = contract_type_param_scope(params, result_ty);
-            let ty = resolve_own_spec_ty(ty, enum_defs, struct_defs, &type_params)?;
+            let ty = resolve_own_rust_type_expr(ty, struct_defs, &type_params)?;
             let value = typed_contract_value_pattern(
                 value,
                 &ty,
@@ -7838,12 +7861,7 @@ fn typed_raw_pattern_into(
             Ok(TypedRawPattern::PointsTo { addr, ty, value })
         }
         RawPattern::Own { ty, value } => {
-            let ty = resolve_own_spec_ty(
-                ty,
-                ctx.enum_defs,
-                ctx.struct_defs,
-                call_ctx.type_param_scope,
-            )?;
+            let ty = resolve_own_rust_type_expr(ty, ctx.struct_defs, call_ctx.type_param_scope)?;
             let value =
                 typed_value_pattern(value, &ty, call_ctx, spec_scope, ctx.local_tys, inferred)?;
             Ok(TypedRawPattern::Own { ty, value })

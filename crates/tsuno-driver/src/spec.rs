@@ -398,7 +398,7 @@ pub enum RawPattern {
         value: ValuePattern,
     },
     Own {
-        ty: SpecTy,
+        ty: RustTypeExpr,
         value: ValuePattern,
     },
     DeallocToken {

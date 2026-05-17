@@ -388,7 +388,7 @@ fn parse_raw_pattern(text: &str, type_params: &[String]) -> Result<RawPattern, P
     }
     if let Some((ty, value)) = own_pattern_parts(text) {
         return Ok(RawPattern::Own {
-            ty: spec_ty_for_rust_type_text(ty, type_params)?,
+            ty: rust_type_expr_for_own_text(ty, type_params)?,
             value: parse_value_pattern(value, type_params)?,
         });
     }
@@ -428,6 +428,16 @@ fn own_pattern_parts(text: &str) -> Option<(&str, &str)> {
     let ty = rest[..close].trim();
     let args = rest[close + 2..].strip_suffix(')')?;
     Some((ty, args.trim()))
+}
+
+fn rust_type_expr_for_own_text(
+    text: &str,
+    type_params: &[String],
+) -> Result<RustTypeExpr, ParseError> {
+    match parse_raw_expr_with_type_params("Own type", &format!("{{type {text}}}"), type_params)? {
+        Expr::RustType(ty) => Ok(ty),
+        _ => Err(ParseError::new("expected Rust type in `Own`")),
+    }
 }
 
 fn parse_points_to_sugar(
@@ -662,10 +672,6 @@ fn spec_ty_for_rust_type_text(text: &str, type_params: &[String]) -> Result<Spec
         type_param if type_params.iter().any(|param| param == type_param) => {
             Ok(SpecTy::TypeParam(type_param.to_owned()))
         }
-        rust_struct if is_ident(rust_struct) => Ok(SpecTy::Struct {
-            name: rust_struct.to_owned(),
-            args: Vec::new(),
-        }),
         other => Err(ParseError::new(format!(
             "unsupported Rust type `{other}` in function contract declaration"
         ))),
