@@ -1,7 +1,7 @@
 /*@
 unsafe lem keep_i32_cell(p: Ptr)
-  raw req PointsTo(p.addr, {type i32}, Option::Some(?old))
-  raw ens PointsTo(p.addr, {type i32}, Option::Some(?v)) where v == old
+  raw req PointsTo(p.addr, {type i32}, Option::Some(?old)) * Own::<i32>(old)
+  raw ens PointsTo(p.addr, {type i32}, Option::Some(?v)) * Own::<i32>(v) where v == old
 {
 }
 */

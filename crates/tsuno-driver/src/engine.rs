@@ -1801,10 +1801,22 @@ impl<'tcx> Verifier<'tcx> {
         &self,
         state: &mut UnsafeState,
         local: Local,
-        _span: Span,
+        span: Span,
     ) -> Result<(), VerificationResult> {
         let local_alloc = state.allocs.remove(&local);
         let ty = self.local_rust_ty_model_value(local);
+        if let Some(alloc) = local_alloc.as_ref()
+            && let Some(index) = self.points_to_index_for_ty_value(state, &alloc.base_addr, &ty)
+        {
+            let value = match &state.heap[index] {
+                Resource::PointsTo { value, .. } => value.clone(),
+                _ => None,
+            };
+            if let Some(value) = value.as_ref() {
+                let spec_ty = self.spec_ty_for_place_ty(self.body().local_decls[local].ty, span)?;
+                self.consume_owned_value_if_present(state, &spec_ty, value);
+            }
+        }
         state.heap.retain(|resource| match resource {
             Resource::PointsTo {
                 addr,
@@ -1876,9 +1888,6 @@ impl<'tcx> Verifier<'tcx> {
         ty: &SpecTy,
         value: SymValue,
     ) -> Result<(), VerificationResult> {
-        if own_is_emp(ty) {
-            return Ok(());
-        }
         state.heap.push(Resource::Own {
             ty: ty.clone(),
             value,
@@ -1893,9 +1902,6 @@ impl<'tcx> Verifier<'tcx> {
         value: &SymValue,
         span: Span,
     ) -> Result<(), VerificationResult> {
-        if own_is_emp(ty) {
-            return Ok(());
-        }
         let Some(index) = state.heap.iter().position(|resource| {
             matches!(
                 resource,
@@ -1917,9 +1923,6 @@ impl<'tcx> Verifier<'tcx> {
         ty: &SpecTy,
         value: &SymValue,
     ) {
-        if own_is_emp(ty) {
-            return;
-        }
         if let Some(index) = state.heap.iter().position(|resource| {
             matches!(
                 resource,
@@ -2674,7 +2677,9 @@ impl<'tcx> Verifier<'tcx> {
         };
         let value = value.clone();
         let spec_ty = self.spec_ty_for_place_ty(ty, span)?;
-        self.consume_owned_value_exact(state, &spec_ty, &value, span)?;
+        if !self.rust_ty_has_copyable_own(ty) {
+            self.consume_owned_value_exact(state, &spec_ty, &value, span)?;
+        }
         Ok(value)
     }
 
@@ -2900,10 +2905,6 @@ impl<'tcx> Verifier<'tcx> {
                 }
                 Ok(out)
             }
-            TypedRawPattern::Own { ty, value } if own_is_emp(ty) => {
-                self.ensure_own_emp_pattern_has_no_binder(value, span)?;
-                Ok(candidates)
-            }
             TypedRawPattern::Own { ty, value } => {
                 let mut out = Vec::new();
                 for candidate in candidates {
@@ -3078,10 +3079,6 @@ impl<'tcx> Verifier<'tcx> {
                     }
                 }
                 Ok(out)
-            }
-            TypedRawPattern::Own { ty, value } if own_is_emp(ty) => {
-                self.ensure_own_emp_pattern_has_no_binder(value, span)?;
-                Ok(candidates)
             }
             TypedRawPattern::Own { ty, value } => {
                 let mut out = Vec::new();
@@ -3421,13 +3418,6 @@ impl<'tcx> Verifier<'tcx> {
                 state.heap.push(Resource::PointsTo { addr, ty, value });
                 Ok(())
             }
-            TypedRawPattern::Own { ty, value } if own_is_emp(ty) => {
-                self.ensure_own_emp_pattern_has_no_binder(value, span)?;
-                if let TypedValuePattern::Expr(expr) = value {
-                    let _ = self.contract_expr_to_value(current, spec, expr)?;
-                }
-                Ok(())
-            }
             TypedRawPattern::Own { ty, value } => {
                 let value =
                     self.materialize_contract_value_pattern(current, spec, value, ty, span)?;
@@ -3595,20 +3585,6 @@ impl<'tcx> Verifier<'tcx> {
                 ),
             ))
         }
-    }
-
-    fn ensure_own_emp_pattern_has_no_binder(
-        &self,
-        value: &TypedValuePattern,
-        span: Span,
-    ) -> Result<(), VerificationResult> {
-        if typed_value_pattern_has_bind(value) {
-            return Err(self.unsupported_result(
-                span,
-                "Own<T> with emp ownership cannot bind a value".to_owned(),
-            ));
-        }
-        Ok(())
     }
 
     fn write_matching_points_to(
@@ -7078,6 +7054,17 @@ impl<'tcx> Verifier<'tcx> {
         }
     }
 
+    fn rust_ty_has_copyable_own(&self, ty: Ty<'tcx>) -> bool {
+        match ty.kind() {
+            TyKind::Bool | TyKind::Int(_) | TyKind::Uint(_) | TyKind::RawPtr(_, _) => true,
+            TyKind::Ref(_, _, _) => true,
+            TyKind::Tuple(fields) => fields
+                .iter()
+                .all(|field| self.rust_ty_has_copyable_own(field)),
+            _ => false,
+        }
+    }
+
     fn fresh_for_spec_ty(&self, ty: &SpecTy, hint: &str) -> Result<SymValue, VerificationResult> {
         match ty {
             SpecTy::Ref(inner) => {
@@ -8286,46 +8273,6 @@ fn typed_value_pattern_ty(pattern: &TypedValuePattern) -> &SpecTy {
         | TypedValuePattern::StructLit { ty, .. }
         | TypedValuePattern::CtorCall { ty, .. } => ty,
         TypedValuePattern::Expr(expr) => &expr.ty,
-    }
-}
-
-fn typed_value_pattern_has_bind(pattern: &TypedValuePattern) -> bool {
-    match pattern {
-        TypedValuePattern::Bind { .. } => true,
-        TypedValuePattern::Expr(_) => false,
-        TypedValuePattern::SeqLit { items, .. }
-        | TypedValuePattern::CtorCall { args: items, .. } => {
-            items.iter().any(typed_value_pattern_has_bind)
-        }
-        TypedValuePattern::StructLit { fields, .. } => {
-            fields.iter().any(typed_value_pattern_has_bind)
-        }
-    }
-}
-
-fn own_is_emp(ty: &SpecTy) -> bool {
-    match ty {
-        SpecTy::Bool
-        | SpecTy::RustTy
-        | SpecTy::Int
-        | SpecTy::IntLiteral
-        | SpecTy::I8
-        | SpecTy::I16
-        | SpecTy::I32
-        | SpecTy::I64
-        | SpecTy::Isize
-        | SpecTy::U8
-        | SpecTy::U16
-        | SpecTy::U32
-        | SpecTy::U64
-        | SpecTy::Usize
-        | SpecTy::Ref(_)
-        | SpecTy::Mut(_) => true,
-        SpecTy::Tuple(items) => items.iter().all(own_is_emp),
-        SpecTy::Struct { name, args } if name == "Ptr" && args.is_empty() => true,
-        SpecTy::Seq(_) | SpecTy::Struct { .. } | SpecTy::Enum { .. } | SpecTy::TypeParam(_) => {
-            false
-        }
     }
 }
 

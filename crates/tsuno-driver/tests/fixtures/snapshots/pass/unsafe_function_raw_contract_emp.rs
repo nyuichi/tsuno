@@ -5,8 +5,8 @@ unsafe fn empty_raw_contract()
 }
 
 unsafe fn preserves_i32_with_emp(p: *mut i32)
-//@ raw req emp * *p |-?-> Option::Some(?old) where old == 42i32;
-//@ raw ens *p |-?-> Option::Some(?v) * emp where v == old;
+//@ raw req emp * *p |-?-> Option::Some(?old) * Own::<i32>(old) where old == 42i32;
+//@ raw ens *p |-?-> Option::Some(?v) * Own::<i32>(v) * emp where v == old;
 {
 }
 

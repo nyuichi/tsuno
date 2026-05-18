@@ -1,6 +1,6 @@
 unsafe fn overwrite_points_to(p: *mut i32)
-//@ raw req *p |-?-> Option::Some(0i32);
-//@ raw ens *p |-?-> Option::Some(1i32);
+//@ raw req *p |-?-> Option::Some(0i32) * Own::<i32>(0i32);
+//@ raw ens *p |-?-> Option::Some(1i32) * Own::<i32>(1i32);
 {
     *p = 1i32;
 }

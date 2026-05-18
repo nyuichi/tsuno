@@ -6,8 +6,8 @@ unsafe lem empty_unsafe_lemma()
 }
 
 unsafe lem keep_i32_cell_with_emp(p: Ptr)
-  raw req emp * PointsTo(p.addr, {type i32}, Option::Some(?old))
-  raw ens PointsTo(p.addr, {type i32}, Option::Some(?v)) * emp where v == old
+  raw req emp * PointsTo(p.addr, {type i32}, Option::Some(?old)) * Own::<i32>(old)
+  raw ens PointsTo(p.addr, {type i32}, Option::Some(?v)) * Own::<i32>(v) * emp where v == old
 {
 }
 */

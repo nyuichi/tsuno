@@ -1,7 +1,7 @@
 unsafe fn set_to_expected(p: *mut i32)
 //@ let expected = 42i32;
-//@ raw req *p |-?-> Option::Some(?old) where old == 0i32;
-//@ raw ens *p |-?-> Option::Some(?v) where v == expected;
+//@ raw req *p |-?-> Option::Some(?old) * Own::<i32>(old) where old == 0i32;
+//@ raw ens *p |-?-> Option::Some(?v) * Own::<i32>(v) where v == expected;
 {
     *p = 42i32;
 }
