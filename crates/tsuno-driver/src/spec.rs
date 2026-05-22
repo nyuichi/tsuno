@@ -397,6 +397,10 @@ pub enum RawPattern {
         pointer: String,
         value: ValuePattern,
     },
+    Own {
+        ty: RustTypeExpr,
+        value: ValuePattern,
+    },
     DeallocToken {
         base: Expr,
         layout: Expr,

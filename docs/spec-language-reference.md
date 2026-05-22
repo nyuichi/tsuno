@@ -434,7 +434,7 @@ forms are not accepted.
 ```rust
 /*@
 unsafe fn core::intrinsics::read_via_copy<T>(ptr: *const T) -> T
-  raw req *ptr |-?-> Option::<T>::Some(?old)
+  raw req *ptr |-?-> Option::<T>::Some(?old) * Own::<T>(old)
   raw ens *ptr |-?-> Option::<T>::Some(old)
   ens result == old
 ;
@@ -646,6 +646,32 @@ resources from being silently discarded when control returns to safe code.
 Reflection may use path-condition equalities, so a resource such as
 `PointsTo(result.addr, {type T}, Some(v))` can be reflected to a bridged local
 when the unsafe path condition proves `result.addr == base`.
+
+Raw contracts may also mention `Own::<T>(v)`. `PointsTo` is a shallow typed
+cell resource: it records that an address currently stores `Some(v)` or is
+typed but uninitialized with `None`. `Own::<T>(v)` is the separate ownership
+resource for the value `v` itself. The type argument to `Own` is a Rust type
+annotation and is resolved against Rust type parameters and known Rust struct
+definitions before verification. `Own` is always a linear raw resource. For
+primitive scalar types, the prelude provides unsafe lemmas such as `own_i32` and
+`drop_own_i32` to produce and consume the corresponding `Own` resource from
+`emp`; those lemmas are the mechanism for treating primitive ownership as freely
+available when a proof wants that convention. A fully initialized cell is
+therefore modeled as both resources:
+
+```rust
+//@ raw req *p |-?-> Option::<T>::Some(?v) * Own::<T>(v);
+```
+
+This is intentionally conservative. User-defined `Own` unfolding rules are not
+yet part of the language; `Own` can be carried, consumed, and produced by raw
+contracts, but the verifier does not currently expand it into field ownership.
+Raw pointer reads of non-copy ownership transfer `Own::<T>(v)` from the pointed
+cell to the produced value; reads of primitive/copy ownership leave the `Own`
+resource available. Raw pointer writes transfer ownership of the written value
+back to the pointed cell. This makes contracts such as `write_via_move<T>`
+express the movement of ownership separately from the shallow `PointsTo` cell
+update.
 
 Branching inside an unsafe block keeps separate unsafe states for the feasible
 paths. Unsafe heap resources are not merged at unsafe control-flow joins.

@@ -4,7 +4,7 @@ use std::ops::ControlFlow;
 
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{Block, Expr as HirExpr, ExprKind, HirId, LoopSource, MatchSource, Stmt, StmtKind};
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::ty::{GenericParamDefKind, TyCtxt};
 use rustc_span::Span;
 use rustc_span::def_id::LocalDefId;
 
@@ -202,10 +202,13 @@ pub fn collect_function_directives<'tcx>(
     item_span: Span,
 ) -> Result<CollectedFunctionDirectives, DirectiveError> {
     let body = tcx.hir_body_owned_by(def_id);
-    let mut directives = collect_contract_directives(tcx, def_id, item_span, body.value.span)?;
+    let type_params = function_type_params(tcx, def_id);
+    let mut directives =
+        collect_contract_directives(tcx, def_id, item_span, body.value.span, &type_params)?;
     let mut collector = FunctionDirectiveCollector {
         tcx,
         directives: Vec::new(),
+        type_params,
     };
     match intravisit::walk_body(&mut collector, body) {
         ControlFlow::Continue(()) => {
@@ -240,6 +243,7 @@ fn collect_contract_directives<'tcx>(
     _def_id: LocalDefId,
     item_span: Span,
     body_span: Span,
+    type_params: &[String],
 ) -> Result<Vec<FunctionDirective>, DirectiveError> {
     let loc = tcx.sess.source_map().lookup_char_pos(item_span.lo());
     let Some(source) = loc.file.src.as_deref() else {
@@ -266,7 +270,12 @@ fn collect_contract_directives<'tcx>(
     let file_name = loc.file.name.prefer_local().to_string();
     let mut directives = Vec::new();
     for entry in contract_directive_entries(&lines, item_span)? {
-        let payload = parse_directive_payload(entry.kind, entry.text.trim(), item_span)?;
+        let payload = parse_directive_payload_with_type_params(
+            entry.kind,
+            entry.text.trim(),
+            item_span,
+            type_params,
+        )?;
         directives.push(FunctionDirective {
             kind: entry.kind,
             span: item_span,
@@ -283,13 +292,25 @@ fn collect_contract_directives<'tcx>(
     Ok(directives)
 }
 
-fn parse_directive_payload(
+fn function_type_params<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Vec<String> {
+    tcx.generics_of(def_id)
+        .own_params
+        .iter()
+        .filter_map(|param| match param.kind {
+            GenericParamDefKind::Type { .. } => Some(param.name.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn parse_directive_payload_with_type_params(
     kind: DirectiveKind,
     text: &str,
     span: Span,
+    type_params: &[String],
 ) -> Result<DirectivePayload, DirectiveError> {
     if kind == DirectiveKind::LemmaCall {
-        return parse_statement_expr("lemma call", text.trim())
+        return parse_statement_expr_with_type_params("lemma call", text.trim(), type_params)
             .map_err(|err| DirectiveError {
                 span,
                 message: err.to_string().replace("spec expression", "//@ lemma call"),
@@ -303,11 +324,13 @@ fn parse_directive_payload(
         kind,
         DirectiveKind::RawAssert | DirectiveKind::RawReq | DirectiveKind::RawEns
     ) {
-        return parse_raw_assert_directive(text, span);
+        return parse_raw_assert_directive(text, span, type_params);
     }
     let parsed = match kind {
-        DirectiveKind::Assert | DirectiveKind::Assume => parse_statement_expr(kind.keyword(), text),
-        _ => parse_source_expr(kind.keyword(), text),
+        DirectiveKind::Assert | DirectiveKind::Assume => {
+            parse_statement_expr_with_type_params(kind.keyword(), text, type_params)
+        }
+        _ => parse_source_expr_with_type_params(kind.keyword(), text, type_params),
     };
     parsed
         .map_err(|err| DirectiveError {
@@ -317,8 +340,12 @@ fn parse_directive_payload(
         .map(DirectivePayload::Predicate)
 }
 
-fn parse_raw_assert_directive(text: &str, span: Span) -> Result<DirectivePayload, DirectiveError> {
-    parse_raw_assertion(text)
+fn parse_raw_assert_directive(
+    text: &str,
+    span: Span,
+    type_params: &[String],
+) -> Result<DirectivePayload, DirectiveError> {
+    parse_raw_assertion_with_type_params(text, type_params)
         .map(Box::new)
         .map(DirectivePayload::RawAssert)
         .map_err(|err| DirectiveError {
@@ -327,6 +354,7 @@ fn parse_raw_assert_directive(text: &str, span: Span) -> Result<DirectivePayload
         })
 }
 
+#[cfg(test)]
 fn parse_raw_assertion(text: &str) -> Result<RawAssertion, ParseError> {
     parse_raw_assertion_with_type_params(text, &[])
 }
@@ -358,6 +386,12 @@ fn parse_raw_pattern(text: &str, type_params: &[String]) -> Result<RawPattern, P
     if let Some(index) = top_level_points_to_arrow(text) {
         return parse_points_to_sugar(&text[..index], &text[index + "|-?->".len()..], type_params);
     }
+    if let Some((ty, value)) = own_pattern_parts(text) {
+        return Ok(RawPattern::Own {
+            ty: rust_type_expr_for_own_text(ty, type_params)?,
+            value: parse_value_pattern(value, type_params)?,
+        });
+    }
     if let Some(args) = atom_args(text, "PointsTo") {
         let args = split_top_level_args(args)?;
         if args.len() != 3 {
@@ -384,8 +418,26 @@ fn parse_raw_pattern(text: &str, type_params: &[String]) -> Result<RawPattern, P
         });
     }
     Err(ParseError::new(
-        "raw assertion must be an `emp`, `PointsTo`, `DeallocToken`, or `*` pattern",
+        "raw assertion must be an `emp`, `PointsTo`, `Own`, `DeallocToken`, or `*` pattern",
     ))
+}
+
+fn own_pattern_parts(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix("Own::<")?;
+    let close = rest.find(">(")?;
+    let ty = rest[..close].trim();
+    let args = rest[close + 2..].strip_suffix(')')?;
+    Some((ty, args.trim()))
+}
+
+fn rust_type_expr_for_own_text(
+    text: &str,
+    type_params: &[String],
+) -> Result<RustTypeExpr, ParseError> {
+    match parse_raw_expr_with_type_params("Own type", &format!("{{type {text}}}"), type_params)? {
+        Expr::RustType(ty) => Ok(ty),
+        _ => Err(ParseError::new("expected Rust type in `Own`")),
+    }
 }
 
 fn parse_points_to_sugar(
@@ -1103,6 +1155,7 @@ fn directive_kind_prefix(text: &str, kinds: &[DirectiveKind]) -> Option<Directiv
 struct FunctionDirectiveCollector<'tcx> {
     tcx: TyCtxt<'tcx>,
     directives: Vec<FunctionDirective>,
+    type_params: Vec<String>,
 }
 
 impl<'a> FunctionDirectiveCollector<'a> {
@@ -1161,7 +1214,12 @@ impl<'a> FunctionDirectiveCollector<'a> {
             entry.start_offset,
         );
         let span_text = display_line_span(&file_name, line_no, &entry.line_text);
-        let payload = parse_directive_payload(DirectiveKind::Inv, entry.text.trim(), entry_span)?;
+        let payload = parse_directive_payload_with_type_params(
+            DirectiveKind::Inv,
+            entry.text.trim(),
+            entry_span,
+            &self.type_params,
+        )?;
         self.directives.push(FunctionDirective {
             kind: DirectiveKind::Inv,
             span: entry_span,
@@ -1322,7 +1380,12 @@ impl<'a> FunctionDirectiveCollector<'a> {
             self.statement_directive_position_error(anchor_span, DirectiveKind::LemmaCall),
         )? {
             let directive_pos = first_directive + entry.start_offset;
-            let payload = parse_directive_payload(entry.kind, entry.text.trim(), anchor_span)?;
+            let payload = parse_directive_payload_with_type_params(
+                entry.kind,
+                entry.text.trim(),
+                anchor_span,
+                &self.type_params,
+            )?;
             let line_no = directive_line_number(line_anchor, source, directive_pos);
             let span_text = display_line_span(file_name, line_no, &entry.line_text);
             found.push(FunctionDirective {
@@ -1931,14 +1994,23 @@ fn parse_source_expr_with_type_params(
     parse_raw_expr_with_type_params(kind, text.trim(), type_params)
 }
 
+#[cfg(test)]
 fn parse_statement_expr(kind: &str, text: &str) -> Result<Expr, ParseError> {
+    parse_statement_expr_with_type_params(kind, text, &[])
+}
+
+fn parse_statement_expr_with_type_params(
+    kind: &str,
+    text: &str,
+    type_params: &[String],
+) -> Result<Expr, ParseError> {
     let text = text.trim();
     let Some(text) = text.strip_suffix(';') else {
         return Err(ParseError::new(format!(
             "failed to parse //@ {kind} predicate: expected trailing `;`"
         )));
     };
-    parse_source_expr(kind, text.trim_end())
+    parse_source_expr_with_type_params(kind, text.trim_end(), type_params)
 }
 
 #[cfg(test)]

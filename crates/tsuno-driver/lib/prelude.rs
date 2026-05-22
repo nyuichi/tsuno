@@ -42,15 +42,169 @@ lem layout_of_i32()
 }
 
 unsafe fn core::intrinsics::read_via_copy<T>(ptr: *const T) -> T
-  raw req *ptr |-?-> Option::<T>::Some(?old)
+  raw req *ptr |-?-> Option::<T>::Some(?old) * Own::<T>(old)
   raw ens *ptr |-?-> Option::<T>::Some(old)
   ens result == old
 ;
 
 unsafe fn core::intrinsics::write_via_move<T>(ptr: *mut T, value: T) -> ()
-  raw req *ptr |-?-> ?old
-  raw ens *ptr |-?-> Option::<T>::Some(value)
+  raw req *ptr |-?-> ?old * Own::<T>(value)
+  raw ens *ptr |-?-> Option::<T>::Some(value) * Own::<T>(value)
 ;
+
+unsafe lem own_i32(v: i32)
+  raw req emp
+  raw ens Own::<i32>(v)
+{
+    assume false;
+}
+
+unsafe lem drop_own_i32(v: i32)
+  raw req Own::<i32>(v)
+  raw ens emp
+{
+    assume false;
+}
+
+unsafe lem own_bool(v: bool)
+  raw req emp
+  raw ens Own::<bool>(v)
+{
+    assume false;
+}
+
+unsafe lem drop_own_bool(v: bool)
+  raw req Own::<bool>(v)
+  raw ens emp
+{
+    assume false;
+}
+
+unsafe lem own_i8(v: i8)
+  raw req emp
+  raw ens Own::<i8>(v)
+{
+    assume false;
+}
+
+unsafe lem drop_own_i8(v: i8)
+  raw req Own::<i8>(v)
+  raw ens emp
+{
+    assume false;
+}
+
+unsafe lem own_i16(v: i16)
+  raw req emp
+  raw ens Own::<i16>(v)
+{
+    assume false;
+}
+
+unsafe lem drop_own_i16(v: i16)
+  raw req Own::<i16>(v)
+  raw ens emp
+{
+    assume false;
+}
+
+unsafe lem own_i64(v: i64)
+  raw req emp
+  raw ens Own::<i64>(v)
+{
+    assume false;
+}
+
+unsafe lem drop_own_i64(v: i64)
+  raw req Own::<i64>(v)
+  raw ens emp
+{
+    assume false;
+}
+
+unsafe lem own_isize(v: isize)
+  raw req emp
+  raw ens Own::<isize>(v)
+{
+    assume false;
+}
+
+unsafe lem drop_own_isize(v: isize)
+  raw req Own::<isize>(v)
+  raw ens emp
+{
+    assume false;
+}
+
+unsafe lem own_u8(v: u8)
+  raw req emp
+  raw ens Own::<u8>(v)
+{
+    assume false;
+}
+
+unsafe lem drop_own_u8(v: u8)
+  raw req Own::<u8>(v)
+  raw ens emp
+{
+    assume false;
+}
+
+unsafe lem own_u16(v: u16)
+  raw req emp
+  raw ens Own::<u16>(v)
+{
+    assume false;
+}
+
+unsafe lem drop_own_u16(v: u16)
+  raw req Own::<u16>(v)
+  raw ens emp
+{
+    assume false;
+}
+
+unsafe lem own_u32(v: u32)
+  raw req emp
+  raw ens Own::<u32>(v)
+{
+    assume false;
+}
+
+unsafe lem drop_own_u32(v: u32)
+  raw req Own::<u32>(v)
+  raw ens emp
+{
+    assume false;
+}
+
+unsafe lem own_u64(v: u64)
+  raw req emp
+  raw ens Own::<u64>(v)
+{
+    assume false;
+}
+
+unsafe lem drop_own_u64(v: u64)
+  raw req Own::<u64>(v)
+  raw ens emp
+{
+    assume false;
+}
+
+unsafe lem own_usize(v: usize)
+  raw req emp
+  raw ens Own::<usize>(v)
+{
+    assume false;
+}
+
+unsafe lem drop_own_usize(v: usize)
+  raw req Own::<usize>(v)
+  raw ens emp
+{
+    assume false;
+}
 
 enum Nat {
     Zero,

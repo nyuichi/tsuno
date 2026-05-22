@@ -1,6 +1,6 @@
 unsafe fn leaves_value_unchanged(p: *mut i32)
-//@ raw req *p |-?-> Option::Some(0i32);
-//@ raw ens *p |-?-> Option::Some(42i32);
+//@ raw req *p |-?-> Option::Some(0i32) * Own::<i32>(0i32);
+//@ raw ens *p |-?-> Option::Some(42i32) * Own::<i32>(42i32);
 {
 }
 

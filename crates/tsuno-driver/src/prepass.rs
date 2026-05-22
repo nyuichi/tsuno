@@ -149,6 +149,10 @@ pub enum TypedRawPattern {
         ty: TypedExpr,
         value: TypedValuePattern,
     },
+    Own {
+        ty: SpecTy,
+        value: TypedValuePattern,
+    },
     DeallocToken {
         base: TypedExpr,
         layout: TypedExpr,
@@ -1907,6 +1911,90 @@ fn resolve_named_struct_spec_ty(
             struct_defs,
             type_params,
         )?))),
+    }
+}
+
+fn resolve_own_rust_type_expr(
+    ty: &RustTypeExpr,
+    struct_defs: &HashMap<String, StructDef>,
+    type_params: &HashSet<String>,
+) -> Result<SpecTy, String> {
+    rust_type_text_to_own_spec_ty(&ty.text, struct_defs, type_params)
+}
+
+fn rust_type_text_to_own_spec_ty(
+    text: &str,
+    struct_defs: &HashMap<String, StructDef>,
+    type_params: &HashSet<String>,
+) -> Result<SpecTy, String> {
+    match text {
+        "()" => Ok(SpecTy::Tuple(vec![])),
+        "bool" => Ok(SpecTy::Bool),
+        "i8" => Ok(SpecTy::I8),
+        "i16" => Ok(SpecTy::I16),
+        "i32" => Ok(SpecTy::I32),
+        "i64" => Ok(SpecTy::I64),
+        "isize" => Ok(SpecTy::Isize),
+        "u8" => Ok(SpecTy::U8),
+        "u16" => Ok(SpecTy::U16),
+        "u32" => Ok(SpecTy::U32),
+        "u64" => Ok(SpecTy::U64),
+        "usize" => Ok(SpecTy::Usize),
+        raw if raw.starts_with("*const ") || raw.starts_with("*mut ") => Ok(ptr_spec_ty()),
+        raw if raw.starts_with("&mut ") => {
+            Ok(SpecTy::Mut(Box::new(rust_type_text_to_own_spec_ty(
+                raw.trim_start_matches("&mut ").trim(),
+                struct_defs,
+                type_params,
+            )?)))
+        }
+        raw if raw.starts_with('&') => Ok(SpecTy::Ref(Box::new(rust_type_text_to_own_spec_ty(
+            raw.trim_start_matches('&').trim(),
+            struct_defs,
+            type_params,
+        )?))),
+        type_param if type_params.contains(type_param) => {
+            Ok(SpecTy::TypeParam(type_param.to_owned()))
+        }
+        rust_struct => resolve_own_rust_struct_ty(rust_struct, struct_defs),
+    }
+}
+
+fn resolve_own_rust_struct_ty(
+    text: &str,
+    struct_defs: &HashMap<String, StructDef>,
+) -> Result<SpecTy, String> {
+    if text.contains('<') {
+        return Err(format!(
+            "generic Rust type `{text}` in `Own` is unsupported"
+        ));
+    }
+    if let Some(def) = struct_defs
+        .get(text)
+        .or_else(|| prelude_struct_defs().get(text))
+    {
+        return Ok(SpecTy::Struct {
+            name: def.name.clone(),
+            args: Vec::new(),
+        });
+    }
+    let matches = struct_defs
+        .values()
+        .chain(prelude_struct_defs().values())
+        .filter(|def| {
+            def.name
+                .rsplit("::")
+                .next()
+                .is_some_and(|short| short == text)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [def] => Ok(SpecTy::Struct {
+            name: def.name.clone(),
+            args: Vec::new(),
+        }),
+        [] => Err(format!("unknown Rust type `{text}` in `Own`")),
+        _ => Err(format!("ambiguous Rust type `{text}` in `Own`")),
     }
 }
 
@@ -6624,6 +6712,20 @@ fn resolve_raw_pattern_env_into(
             )?;
             Ok(())
         }
+        RawPattern::Own { value, .. } => {
+            resolve_value_pattern_env(
+                value,
+                pure_fns,
+                enum_defs,
+                binding_info,
+                hir_locals,
+                span,
+                anchor_span,
+                spec_scope,
+                resolved,
+            )?;
+            Ok(())
+        }
         RawPattern::DeallocToken { base, layout } => {
             for expr in [base, layout] {
                 let expr_resolved = resolve_expr_env(
@@ -6807,6 +6909,26 @@ fn infer_raw_pattern_types_into(
                 return Ok(());
             }
             if let ValuePattern::Expr(expr) = value {
+                infer_body_expr_types(
+                    expr,
+                    call_ctx,
+                    DirectiveKind::RawAssert,
+                    spec_scope,
+                    local_tys,
+                    inferred,
+                )?;
+            }
+            Ok(())
+        }
+        RawPattern::Own { ty, value } => {
+            if value_pattern_contains_bind(value) {
+                let ty = resolve_own_rust_type_expr(
+                    ty,
+                    call_ctx.struct_defs,
+                    call_ctx.type_param_scope,
+                )?;
+                infer_value_pattern_types(value, &ty, call_ctx, spec_scope, local_tys, inferred)?;
+            } else if let ValuePattern::Expr(expr) = value {
                 infer_body_expr_types(
                     expr,
                     call_ctx,
@@ -7040,6 +7162,23 @@ fn typed_lemma_raw_pattern(
         RawPattern::PointsToSugar { .. } => {
             Err("`|-?->` raw sugar in unsafe lemmas is unsupported; use `PointsTo(...)`".to_owned())
         }
+        RawPattern::Own { ty, value } => {
+            let type_params = contract_type_param_scope(params, result_ty);
+            let ty = resolve_own_rust_type_expr(ty, struct_defs, &type_params)?;
+            let value = typed_contract_value_pattern(
+                value,
+                &ty,
+                pure_fns,
+                enum_defs,
+                struct_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?;
+            Ok(TypedRawPattern::Own { ty, value })
+        }
         RawPattern::DeallocToken { base, layout } => Ok(TypedRawPattern::DeallocToken {
             base: typed_contract_raw_expr(
                 base,
@@ -7211,6 +7350,23 @@ fn typed_contract_raw_pattern<'tcx>(
                 inferred,
             )?;
             Ok(TypedRawPattern::PointsTo { addr, ty, value })
+        }
+        RawPattern::Own { ty, value } => {
+            let type_params = contract_type_param_scope(params, result_ty);
+            let ty = resolve_own_rust_type_expr(ty, struct_defs, &type_params)?;
+            let value = typed_contract_value_pattern(
+                value,
+                &ty,
+                pure_fns,
+                enum_defs,
+                struct_defs,
+                spec_scope,
+                params,
+                allow_result,
+                result_ty,
+                inferred,
+            )?;
+            Ok(TypedRawPattern::Own { ty, value })
         }
         RawPattern::DeallocToken { base, layout } => Ok(TypedRawPattern::DeallocToken {
             base: typed_contract_raw_expr(
@@ -7524,6 +7680,17 @@ fn infer_contract_raw_pattern_types(
             result_ty,
             inferred,
         ),
+        RawPattern::Own { value, .. } => infer_contract_value_pattern(
+            value,
+            pure_fns,
+            enum_defs,
+            struct_defs,
+            spec_scope,
+            params,
+            allow_result,
+            result_ty,
+            inferred,
+        ),
         RawPattern::DeallocToken { base, layout } => {
             infer_contract_expr_types_with_expected(
                 base,
@@ -7692,6 +7859,12 @@ fn typed_raw_pattern_into(
                 unreachable!("pattern without binders must be an expression")
             };
             Ok(TypedRawPattern::PointsTo { addr, ty, value })
+        }
+        RawPattern::Own { ty, value } => {
+            let ty = resolve_own_rust_type_expr(ty, ctx.struct_defs, call_ctx.type_param_scope)?;
+            let value =
+                typed_value_pattern(value, &ty, call_ctx, spec_scope, ctx.local_tys, inferred)?;
+            Ok(TypedRawPattern::Own { ty, value })
         }
         RawPattern::DeallocToken { base, layout } => {
             let base = typed_raw_expr(base, call_ctx, spec_scope, ctx.local_tys, inferred)?;
@@ -8072,6 +8245,34 @@ fn typed_standalone_fn_raw_pattern(
     inferred: &mut SpecTypeInference,
 ) -> Result<TypedRawPattern, String> {
     match pattern {
+        RawPattern::Star(lhs, rhs) => Ok(TypedRawPattern::Star(
+            Box::new(typed_standalone_fn_raw_pattern(
+                lhs,
+                pure_fns,
+                enum_defs,
+                struct_defs,
+                spec_scope,
+                params,
+                rust_params,
+                allow_result,
+                result_ty,
+                result_rust_ty,
+                inferred,
+            )?),
+            Box::new(typed_standalone_fn_raw_pattern(
+                rhs,
+                pure_fns,
+                enum_defs,
+                struct_defs,
+                spec_scope,
+                params,
+                rust_params,
+                allow_result,
+                result_ty,
+                result_rust_ty,
+                inferred,
+            )?),
+        )),
         RawPattern::PointsToSugar { pointer, value } => {
             let pointer_rust_ty = if allow_result && pointer == "result" {
                 result_rust_ty
@@ -8113,8 +8314,8 @@ fn typed_standalone_fn_raw_pattern(
             Ok(TypedRawPattern::PointsTo { addr, ty, value })
         }
         RawPattern::Emp
-        | RawPattern::Star(_, _)
         | RawPattern::PointsTo { .. }
+        | RawPattern::Own { .. }
         | RawPattern::DeallocToken { .. } => typed_lemma_raw_pattern(
             pattern,
             pure_fns,
@@ -10392,6 +10593,16 @@ fn validate_function_contract_raw_pattern_prepass(
                 spec_scope,
             )
         }
+        RawPattern::Own { value, .. } => validate_function_contract_value_pattern_prepass(
+            value,
+            directive,
+            pure_fns,
+            enum_defs,
+            type_param_scope,
+            params,
+            allow_result,
+            spec_scope,
+        ),
         RawPattern::DeallocToken { base, layout } => {
             for expr in [base, layout] {
                 validate_function_contract_expr_prepass(
